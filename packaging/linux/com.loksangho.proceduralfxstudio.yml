@@ -319,6 +319,7 @@ modules:
         url: https://github.com/RenderKit/oidn/releases/download/v2.3.3/oidn-2.3.3.src.tar.gz
         sha256: ccf221535b4007607fb53d3ff5afa74de25413bb8ef5d03d215f46c7cc2f96cf
 
+  # OpenGL stays enabled: that builds libosdGPU, which MoonRay's FindOpenSubDiv requires.
   - name: opensubdiv
     buildsystem: cmake-ninja
     builddir: true
@@ -330,7 +331,6 @@ modules:
       - -DNO_CUDA=ON
       - -DNO_OPENCL=ON
       - -DNO_CLEW=ON
-      - -DNO_OPENGL=ON
       - -DNO_GLFW=ON
       - -DNO_DOC=ON
       - -DNO_EXAMPLES=ON
@@ -408,6 +408,15 @@ modules:
           - rm -f cmake_modules/cmake/FindTBB.cmake
           # rats is the render regression suite (LFS test images); not needed.
           - sed -i 's/^add_subdirectory(rats)/# &/' CMakeLists.txt
+
+  # Some CMake projects install into /app/lib64; the runtime linker path and the
+  # app's build script only use /app/lib, so fold lib64 into it.
+  - name: merge-lib64
+    buildsystem: simple
+    build-commands:
+      - if [ -d /app/lib64 ] && [ ! -L /app/lib64 ]; then cp -a /app/lib64/. /app/lib/
+          && rm -rf /app/lib64 && ln -s lib /app/lib64; fi
+    sources: []
 
   - name: proceduralfx-studio
     buildsystem: simple
