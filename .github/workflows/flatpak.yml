@@ -27,6 +27,18 @@ jobs:
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
           df -h /
 
+      # OpenVDB/USD/MoonRay translation units each take 2-3 GB to compile;
+      # without swap the runner runs out of memory and gets shut down.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - uses: actions/checkout@v4
 
       - name: Install flatpak-builder
