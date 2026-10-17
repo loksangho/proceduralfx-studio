@@ -370,7 +370,9 @@ modules:
   - name: moonray
     buildsystem: simple
     build-commands:
-      - cmake -S . -B _build -G Ninja
+      # Unix Makefiles, not Ninja: MoonRay's DSO rules declare some generated
+      # files (e.g. BakeCamera.json) as outputs twice, which Ninja rejects.
+      - cmake -S . -B _build -G 'Unix Makefiles'
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_INSTALL_PREFIX=/app
           -DCMAKE_PREFIX_PATH=/app
