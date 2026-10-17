@@ -1,4 +1,8 @@
+<p align="center"><img src="packaging/logo/icon-256.png" width="128" alt="ProceduralFX Studio logo"></p>
+
 # ProceduralFX Studio
+
+<a href="https://buymeacoffee.com/sangstari"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=sangstari&button_colour=FFDD00&font_colour=000000&font_family=Inter&outline_colour=000000&coffee_colour=ffffff" height="40" alt="Buy me a coffee"></a>
 
 A node-based procedural 3D tool in the spirit of Houdini. You build geometry
 from networks of nodes, and the app includes:
@@ -89,6 +93,11 @@ Files kept on the Linux side are much faster to work with.
 | `MESA: error: ZINK: failed to choose pdev` | Harmless if the window opens. Otherwise make sure step 3 was run. |
 | `IO error: Broken pipe` at startup | WSLg's Wayland connection dropped. Step 3 switches the app to X11. |
 | Slow viewport | Step 3 uses software OpenGL, because WSL's GPU isn't reachable from Flatpak. MoonRay renders run on the CPU either way, so they're unaffected. |
+
+## Support
+
+ProceduralFX Studio is free. If it's useful to you, you can support its
+development with a coffee: [buymeacoffee.com/sangstari](https://buymeacoffee.com/sangstari).
 
 ## Building from source
 
