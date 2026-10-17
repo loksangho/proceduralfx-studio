@@ -372,9 +372,11 @@ modules:
     build-options:
       # MoonRay relies on headers that older libstdc++ pulled in transitively
       # (e.g. CPUID.h uses std::uint64_t/std::tuple without <cstdint>/<tuple>);
-      # GCC 15 doesn't, so include them up front.
+      # GCC 15 doesn't, so include them up front. GCC 15's <cpuid.h> also
+      # dropped the Xeon Phi bits (CPUID leaf 7 EBX bits 26/27) CPUID.h tests.
       cxxflags: -include cstdint -include cstring -include string -include tuple
         -include limits -include memory -include stdexcept -include algorithm
+        -Dbit_AVX512PF=0x04000000 -Dbit_AVX512ER=0x08000000
     build-commands:
       # Unix Makefiles, not Ninja: MoonRay's DSO rules declare some generated
       # files (e.g. BakeCamera.json) as outputs twice, which Ninja rejects.
