@@ -117,8 +117,12 @@ modules:
 
   - name: openvdb
     buildsystem: cmake-ninja
+    # OpenVDB refuses in-source builds (it sets CMAKE_DISABLE_SOURCE_CHANGES).
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
+      # Plain malloc; don't look for jemalloc/tbbmalloc.
+      - -DCONCURRENT_MALLOC=None
       - -DOPENVDB_BUILD_BINARIES=OFF
       - -DOPENVDB_BUILD_UNITTESTS=OFF
       - -DOPENVDB_BUILD_PYTHON_MODULE=OFF
@@ -133,6 +137,7 @@ modules:
 
   - name: jsoncpp
     buildsystem: cmake-ninja
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
       - -DBUILD_SHARED_LIBS=ON
@@ -208,6 +213,7 @@ modules:
 
   - name: embree
     buildsystem: cmake-ninja
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
       - -DEMBREE_ISPC_SUPPORT=ON
@@ -226,6 +232,7 @@ modules:
   # robin-map...) at configure time, so these two modules get network access.
   - name: opencolorio
     buildsystem: cmake-ninja
+    builddir: true
     build-options:
       build-args:
         - --share=network
@@ -244,6 +251,7 @@ modules:
 
   - name: openimageio
     buildsystem: cmake-ninja
+    builddir: true
     build-options:
       build-args:
         - --share=network
@@ -269,6 +277,7 @@ modules:
 
   - name: openimagedenoise
     buildsystem: cmake-ninja
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
       - -DISPC_EXECUTABLE=/app/bin/ispc
@@ -285,6 +294,7 @@ modules:
 
   - name: opensubdiv
     buildsystem: cmake-ninja
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
       - -DNO_PTEX=ON
@@ -309,6 +319,7 @@ modules:
   # Core USD only (no Hydra/imaging); same commit as the macOS build.
   - name: openusd
     buildsystem: cmake-ninja
+    builddir: true
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
       - -DPython3_EXECUTABLE=/usr/bin/python3
