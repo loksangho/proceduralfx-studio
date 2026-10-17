@@ -10,6 +10,9 @@ env:
   APP_ID: com.loksangho.proceduralfxstudio
   MANIFEST: packaging/linux/com.loksangho.proceduralfxstudio.yml
   BUNDLE: ProceduralFxStudio-x86_64.flatpak
+  # MoonRay's rats test-suite submodule stores images in Git LFS, and some of
+  # those objects are missing upstream; nothing in the build needs them.
+  GIT_LFS_SKIP_SMUDGE: '1'
 
 permissions:
   contents: write

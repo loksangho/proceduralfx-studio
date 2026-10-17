@@ -405,6 +405,8 @@ modules:
       - type: shell
         commands:
           - rm -f cmake_modules/cmake/FindTBB.cmake
+          # rats is the render regression suite (LFS test images); not needed.
+          - sed -i 's/^add_subdirectory(rats)/# &/' CMakeLists.txt
 
   - name: proceduralfx-studio
     buildsystem: simple
