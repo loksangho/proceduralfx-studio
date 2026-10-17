@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Helper script for running or packaging the app on macOS.
+# Usage:
+#   ./proceduralfx_studio.sh            # run in debug via `cargo run`
+#   ./proceduralfx_studio.sh package-macos  # build release and create .app with bundled MoonRay if present
+#   ./proceduralfx_studio.sh preview-exr <file.exr> [out.png]
+#   ./proceduralfx_studio.sh render-moonray <scene.rdla> <out.exr> [width] [height]
+
+OPENVDB_ROOT="$(brew --prefix openvdb)"
+PKG_CONFIG_PATH="$(brew --prefix tbb)/lib/pkgconfig:${PKG_CONFIG_PATH-}"
+
+preview_exr() {
+  local input_exr="$1"
+  local output_png="${2-}"
+  if [[ -z "$output_png" ]]; then
+    output_png="${input_exr%.exr}_preview.png"
+  fi
+  python3 scripts/exr_preview.py "$input_exr" -o "$output_png"
+}
+
+find_moonray() {
+  if [[ -x dist/ProceduralFxStudio.app/Contents/Resources/moonray ]]; then
+    echo "dist/ProceduralFxStudio.app/Contents/Resources/moonray"
+    return 0
+  fi
+  if [[ -x native/moonray/macos/moonray ]]; then
+    echo "native/moonray/macos/moonray"
+    return 0
+  fi
+  if command -v moonray >/dev/null 2>&1; then
+    command -v moonray
+    return 0
+  fi
+  return 1
+}
+
+if [[ ${1-} == "preview-exr" ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "Usage: ./proceduralfx_studio.sh preview-exr <file.exr> [out.png]"
+    exit 2
+  fi
+  preview_exr "$2" "${3-}"
+  exit 0
+fi
+
+if [[ ${1-} == "render-moonray" ]]; then
+  if [[ $# -lt 3 ]]; then
+    echo "Usage: ./proceduralfx_studio.sh render-moonray <scene.rdla> <out.exr> [width] [height]"
+    exit 2
+  fi
+  SCENE="$2"
+  OUT_EXR="$3"
+  WIDTH="${4-256}"
+  HEIGHT="${5-256}"
+
+  MOONRAY_BIN="$(find_moonray || true)"
+  if [[ -z "$MOONRAY_BIN" ]]; then
+    echo "No MoonRay binary found (checked dist bundle, native/moonray/macos, PATH)"
+    exit 2
+  fi
+
+  export RDL2_DSO_PATH="${RDL2_DSO_PATH:-/Users/loksangho/moonray/build/rdl2dso}"
+  echo "MoonRay: $MOONRAY_BIN"
+  echo "RDL2_DSO_PATH: $RDL2_DSO_PATH"
+  "$MOONRAY_BIN" -in "$SCENE" -out "$OUT_EXR" -size "$WIDTH" "$HEIGHT"
+  preview_exr "$OUT_EXR"
+  exit 0
+fi
+
+if [[ ${1-} == "package-macos" ]]; then
+  echo "Building release and packaging macOS .app..."
+  # Lowest macOS the Rust/C++ code itself targets. The bundle's real minimum
+  # is the highest of this and every bundled library; the bundler reports it.
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+  # Ensure build.rs can find OpenVDB and tbb when building release
+  OPENVDB_ROOT="$(brew --prefix openvdb)" \
+  PKG_CONFIG_PATH="$(brew --prefix tbb)/lib/pkgconfig:${PKG_CONFIG_PATH-}" \
+  cargo build --release --features "native-openvdb native-usd"
+  APP_NAME="ProceduralFxStudio"
+  APP_DIR="dist/${APP_NAME}.app"
+  BIN_DIR="${APP_DIR}/Contents/MacOS"
+  RES_DIR="${APP_DIR}/Contents/Resources"
+  # Start from an empty bundle so nothing stale is left inside the signature.
+  rm -rf "$APP_DIR"
+  mkdir -p "$BIN_DIR" "$RES_DIR"
+
+  # Copy the compiled binary
+  cp target/release/proceduralfx_studio "$BIN_DIR/${APP_NAME}"
+  chmod +x "$BIN_DIR/${APP_NAME}"
+
+  # If a bundled moonray exists in native/moonray/macos, copy it into Resources
+  if [[ -x native/moonray/macos/moonray ]]; then
+    echo "Bundling MoonRay from native/moonray/macos/moonray into app Resources"
+    mkdir -p "$RES_DIR"
+    cp native/moonray/macos/moonray "$RES_DIR/moonray"
+    chmod +x "$RES_DIR/moonray"
+  else
+    echo "No native/moonray/macos/moonray found; skipping MoonRay bundle"
+  fi
+
+  # Bundle RDL2 DSOs so constructors like RdlMeshGeometry are available at runtime.
+  # Source priority:
+  #  1) RDL2_DSO_PATH env var if it points to a directory
+  #  2) default local MoonRay build path used in development
+  DSO_SRC=""
+  if [[ -n "${RDL2_DSO_PATH-}" && -d "${RDL2_DSO_PATH}" ]]; then
+    DSO_SRC="${RDL2_DSO_PATH}"
+  elif [[ -d /Users/loksangho/moonray/build/rdl2dso ]]; then
+    DSO_SRC="/Users/loksangho/moonray/build/rdl2dso"
+  fi
+
+  if [[ -n "$DSO_SRC" ]]; then
+    echo "Bundling RDL2 DSOs from $DSO_SRC into app Resources/rdl2dso"
+    mkdir -p "$RES_DIR/rdl2dso"
+    rm -rf "$RES_DIR/rdl2dso"/*
+    cp -RL "$DSO_SRC"/. "$RES_DIR/rdl2dso/"
+  else
+    echo "No RDL2 DSO directory found (set RDL2_DSO_PATH to bundle DSOs)"
+  fi
+
+  # Copy every non-system dylib the app, MoonRay and the DSOs need into
+  # Contents/Frameworks and point their load paths there.
+  echo "Bundling shared libraries into the app"
+  rm -rf "$APP_DIR/Contents/Frameworks"
+  # OpenUSD needs its plugin registry (file formats, schemas). It searches
+  # <libraries>/../plugin/usd, and signed bundles only allow code in Frameworks,
+  # so it goes in Contents/plugin/usd with library paths pointing back into Frameworks.
+  USD_ROOT="${USD_ROOT:-/Users/loksangho/openusd-build}"
+  if [[ -d "$USD_ROOT/lib/usd" ]]; then
+    echo "Bundling USD plugin registry from $USD_ROOT/lib/usd"
+    rm -rf "$RES_DIR/usd" "$APP_DIR/Contents/plugin"
+    mkdir -p "$APP_DIR/Contents/plugin"
+    cp -R "$USD_ROOT/lib/usd" "$APP_DIR/Contents/plugin/usd"
+    find "$APP_DIR/Contents/plugin/usd" -name plugInfo.json -exec sed -i '' 's|"LibraryPath": "\.\./\.\./|"LibraryPath": "../../../Frameworks/|' {} +
+  else
+    echo "No USD plugin registry found (set USD_ROOT); USD files will not open in the app"
+  fi
+
+  # Also writes Info.plist and signs the bundle (SIGN_IDENTITY, default ad-hoc).
+  python3 scripts/bundle_app_libs.py "$APP_DIR"
+
+  # Copy the app to other Macs via this zip: ditto keeps symlinks and code
+  # signatures intact, which Finder copies or plain zip/cp can break.
+  ZIP="dist/${APP_NAME}.zip"
+  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP_DIR" "$ZIP"
+
+  # Notarization (needs SIGN_IDENTITY=Developer ID and a notarytool keychain profile,
+  # e.g. NOTARY_PROFILE=pfx-notary): notarize and staple the app, then wrap it in a
+  # signed, notarized DMG with an Applications shortcut.
+  if [[ -n "${NOTARY_PROFILE-}" && -n "${SIGN_IDENTITY-}" && "${SIGN_IDENTITY}" != "-" ]]; then
+    echo "Notarizing the app (this usually takes a few minutes)..."
+    xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP_DIR"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP_DIR" "$ZIP"
+
+    DMG="dist/${APP_NAME}.dmg"
+    STAGE="$(mktemp -d)"
+    ditto "$APP_DIR" "$STAGE/${APP_NAME}.app"
+    ln -s /Applications "$STAGE/Applications"
+    rm -f "$DMG"
+    hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+    rm -rf "$STAGE"
+    codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+    echo "Notarizing the disk image..."
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
+    spctl --assess --type open --context context:primary-signature -v "$DMG"
+    echo "Notarized disk image: $DMG"
+  fi
+
+  echo "Packaged app in $APP_DIR"
+  echo "Distributable archive: $ZIP"
+  exit 0
+fi
+
+echo "Running (debug) via cargo run..."
+OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cargo run --features "native-openvdb native-usd"

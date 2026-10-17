@@ -1,0 +1,81 @@
+name: Flatpak
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  APP_ID: com.loksangho.proceduralfxstudio
+  MANIFEST: packaging/linux/com.loksangho.proceduralfxstudio.yml
+  BUNDLE: ProceduralFxStudio-x86_64.flatpak
+
+permissions:
+  contents: write
+
+jobs:
+  flatpak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      # The dependency stack (Boost, USD, OpenVDB, OIIO, MoonRay...) needs far
+      # more disk than the runner has free by default.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder ccache python3-aiohttp python3-tomlkit
+          # Ubuntu 24.04 blocks the unprivileged user namespaces bubblewrap needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Generate vendored Cargo sources
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/flatpak-cargo-generator.py" \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          python3 "$RUNNER_TEMP/flatpak-cargo-generator.py" Cargo.lock -o packaging/linux/cargo-sources.json
+
+      # flatpak-builder caches every finished module, so a run that hits the
+      # time limit still saves its progress and the next run picks up from there.
+      - name: Restore build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .flatpak-builder
+          key: flatpak-${{ hashFiles('packaging/linux/**') }}-${{ github.sha }}
+          restore-keys: |
+            flatpak-${{ hashFiles('packaging/linux/**') }}-
+            flatpak-
+
+      - name: Build
+        timeout-minutes: 320
+        run: |
+          flatpak-builder --user --install-deps-from=flathub --ccache --force-clean \
+            --disable-rofiles-fuse --repo=repo build-dir "$MANIFEST"
+          flatpak build-bundle repo "$BUNDLE" "$APP_ID" \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Save build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .flatpak-builder
+          key: flatpak-${{ hashFiles('packaging/linux/**') }}-${{ github.sha }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}
+          path: ${{ env.BUNDLE }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.BUNDLE }}

@@ -1,0 +1,399 @@
+# Flatpak manifest for ProceduralFX Studio, including a full MoonRay build.
+#
+# Build (x86_64):
+#   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/linux/cargo-sources.json
+#   flatpak-builder --user --install-deps-from=flathub --repo=repo build-dir \
+#       packaging/linux/com.loksangho.proceduralfxstudio.yml
+#
+# CI does this in .github/workflows/flatpak.yml. Dependency versions follow
+# what MoonRay is known to build against (see moonray/building/Rocky9).
+id: com.loksangho.proceduralfxstudio
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: proceduralfx-studio
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  # MoonRay runtime environment (see moonray scripts/setup.sh).
+  - --env=RDL2_DSO_PATH=/app/rdl2dso
+  - --env=REZ_MOONRAY_ROOT=/app
+  - --env=ARRAS_SESSION_PATH=/app/sessions
+build-options:
+  env:
+    CMAKE_PREFIX_PATH: /app
+cleanup:
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - /share/aclocal
+  - /share/doc
+  - /share/man
+  - '*.a'
+  - '*.la'
+  - /bin/ispc
+
+modules:
+  - name: boost
+    buildsystem: simple
+    build-commands:
+      - ./bootstrap.sh --prefix=/app --with-python=/usr/bin/python3
+          --with-libraries=atomic,chrono,date_time,filesystem,iostreams,program_options,python,regex,system,thread
+      - ./b2 -j${FLATPAK_BUILDER_N_JOBS} install variant=release link=shared threading=multi
+          cxxflags=-fPIC
+    sources:
+      - type: archive
+        url: https://archives.boost.io/release/1.88.0/source/boost_1_88_0.tar.bz2
+        sha256: 46d9d2c06637b219270877c9e16155cbd015b6dc84349af064c088e9b5b12f7b
+
+  - name: onetbb
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DTBB_TEST=OFF
+      - -DTBB_STRICT=OFF
+    sources:
+      - type: archive
+        url: https://github.com/uxlfoundation/oneTBB/archive/refs/tags/v2022.2.0.tar.gz
+        sha256: f0f78001c8c8edb4bddc3d4c5ee7428d56ae313254158ad1eec49eced57f6a5b
+
+  - name: c-blosc
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_TESTS=OFF
+      - -DBUILD_BENCHMARKS=OFF
+      - -DBUILD_FUZZERS=OFF
+      - -DBUILD_STATIC=OFF
+      - -DPREFER_EXTERNAL_ZLIB=ON
+    sources:
+      - type: archive
+        url: https://github.com/Blosc/c-blosc/archive/refs/tags/v1.21.6.tar.gz
+        sha256: 9fcd60301aae28f97f1301b735f966cc19e7c49b6b4321b839b4579a0c156f38
+
+  - name: libdeflate
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DLIBDEFLATE_BUILD_STATIC_LIB=OFF
+      - -DLIBDEFLATE_BUILD_GZIP=OFF
+    sources:
+      - type: archive
+        url: https://github.com/ebiggers/libdeflate/releases/download/v1.24/libdeflate-1.24.tar.gz
+        sha256: a0dda1c4b804742066db07b9510876edd09cc0ca06cdc32c5dfe1b2016a26463
+
+  - name: imath
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_TESTING=OFF
+      - -DPYTHON=OFF
+    sources:
+      - type: archive
+        url: https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.1.12.tar.gz
+        sha256: 8a1bc258f3149b5729c2f4f8ffd337c0e57f09096e4ba9784329f40c4a9035da
+
+  - name: openexr
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_TESTING=OFF
+      - -DOPENEXR_BUILD_TOOLS=OFF
+      - -DOPENEXR_BUILD_EXAMPLES=OFF
+      - -DOPENEXR_INSTALL_EXAMPLES=OFF
+      - -DOPENEXR_FORCE_INTERNAL_DEFLATE=OFF
+    sources:
+      - type: archive
+        url: https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.3.5.tar.gz
+        sha256: cb0c88710c906c9bfc59027eb147e780d508c7be1a90b43af3ec9e3c2987b70d
+
+  - name: openvdb
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DOPENVDB_BUILD_BINARIES=OFF
+      - -DOPENVDB_BUILD_UNITTESTS=OFF
+      - -DOPENVDB_BUILD_PYTHON_MODULE=OFF
+      - -DOPENVDB_USE_DELAYED_LOADING=OFF
+      - -DUSE_BLOSC=ON
+      - -DUSE_ZLIB=ON
+      - -DUSE_IMATH_HALF=ON
+    sources:
+      - type: archive
+        url: https://github.com/AcademySoftwareFoundation/openvdb/archive/refs/tags/v12.1.1.tar.gz
+        sha256: ccd0ea1669a53c7c13087a08ac5a1351041c4cdd308f6d6f591074a106fcb565
+
+  - name: jsoncpp
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_SHARED_LIBS=ON
+      - -DBUILD_STATIC_LIBS=OFF
+      - -DBUILD_OBJECT_LIBS=OFF
+      - -DJSONCPP_WITH_TESTS=OFF
+      - -DJSONCPP_WITH_POST_BUILD_UNITTEST=OFF
+      - -DJSONCPP_WITH_PKGCONFIG_SUPPORT=OFF
+    sources:
+      - type: archive
+        url: https://github.com/open-source-parsers/jsoncpp/archive/refs/tags/1.9.6.tar.gz
+        sha256: f93b6dd7ce796b13d02c108bc9f79812245a82e577581c4c9aabe57075c90ea2
+
+  - name: log4cplus
+    config-opts:
+      - --disable-static
+      - --without-tests
+    sources:
+      - type: archive
+        url: https://github.com/log4cplus/log4cplus/releases/download/REL_2_1_2/log4cplus-2.1.2.tar.xz
+        sha256: fbdabb4ef734fe1cc62169b23f0b480cc39127ac7b09b810a9c1229490d67e9e
+
+  - name: cppunit
+    config-opts:
+      - --disable-static
+      - --disable-doxygen
+    sources:
+      - type: archive
+        url: https://dev-www.libreoffice.org/src/cppunit-1.15.1.tar.gz
+        sha256: 89c5c6665337f56fd2db36bc3805a5619709d51fb136e51937072f63fcc717a7
+
+  - name: libmicrohttpd
+    config-opts:
+      - --disable-static
+      - --disable-doc
+      - --disable-examples
+      - --disable-https
+    sources:
+      - type: archive
+        url: https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz
+        sha256: a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94
+
+  - name: lua
+    buildsystem: simple
+    build-commands:
+      - make -j${FLATPAK_BUILDER_N_JOBS} linux MYCFLAGS=-fPIC
+      - make install INSTALL_TOP=/app
+    sources:
+      - type: archive
+        url: https://www.lua.org/ftp/lua-5.4.7.tar.gz
+        sha256: 9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
+
+  - name: random123
+    buildsystem: simple
+    build-commands:
+      - make install-include prefix=/app
+    sources:
+      - type: archive
+        url: https://github.com/DEShawResearch/random123/archive/refs/tags/v1.14.0.tar.gz
+        sha256: effafd8656b18030b2a5b995cd3650c51a7c45052e6e1c21e48b9fa7a59d926e
+
+  # Build-time only (removed by cleanup): compiles Embree, OIDN and MoonRay kernels.
+  - name: ispc
+    buildsystem: simple
+    only-arches:
+      - x86_64
+    build-commands:
+      - install -Dm755 bin/ispc /app/bin/ispc
+    sources:
+      - type: archive
+        url: https://github.com/ispc/ispc/releases/download/v1.28.2/ispc-v1.28.2-linux.tar.gz
+        sha256: 32e611de1252cf1e09a6a13327f5746b8477f99e15ffa4cbd1b422386776688c
+
+  - name: embree
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DEMBREE_ISPC_SUPPORT=ON
+      - -DEMBREE_ISPC_EXECUTABLE=/app/bin/ispc
+      - -DEMBREE_IGNORE_INVALID_RAYS=ON
+      - -DEMBREE_RAY_MASK=ON
+      - -DEMBREE_MAX_ISA=AVX512
+      - -DEMBREE_TUTORIALS=OFF
+      - -DEMBREE_TESTING_INSTALL_TESTS=OFF
+    sources:
+      - type: archive
+        url: https://github.com/RenderKit/embree/archive/refs/tags/v4.4.0.tar.gz
+        sha256: acb517b0ea0f4b442235d5331b69f96192c28da6aca5d5dde0cbe40799638d5c
+
+  # OCIO and OIIO fetch a few small libraries (yaml-cpp, pystring, fmt,
+  # robin-map...) at configure time, so these two modules get network access.
+  - name: opencolorio
+    buildsystem: cmake-ninja
+    build-options:
+      build-args:
+        - --share=network
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DOCIO_BUILD_APPS=OFF
+      - -DOCIO_BUILD_TESTS=OFF
+      - -DOCIO_BUILD_GPU_TESTS=OFF
+      - -DOCIO_BUILD_PYTHON=OFF
+      - -DOCIO_BUILD_DOCS=OFF
+      - -DOCIO_INSTALL_EXT_PACKAGES=MISSING
+    sources:
+      - type: archive
+        url: https://github.com/AcademySoftwareFoundation/OpenColorIO/archive/refs/tags/v2.4.2.tar.gz
+        sha256: 2d8f2c47c40476d6e8cea9d878f6601d04f6d5642b47018eaafa9e9f833f3690
+
+  - name: openimageio
+    buildsystem: cmake-ninja
+    build-options:
+      build-args:
+        - --share=network
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DOpenImageIO_BUILD_MISSING_DEPS=all
+      - -DOIIO_BUILD_TESTS=OFF
+      - -DOIIO_BUILD_TOOLS=OFF
+      - -DOIIO_BUILD_DOCS=OFF
+      - -DUSE_PYTHON=OFF
+      - -DUSE_QT=OFF
+      # No FFmpeg: keeps the Linux build free of the GPL codecs.
+      - -DUSE_FFMPEG=OFF
+      - -DUSE_OPENCV=OFF
+      - -DUSE_OPENVDB=OFF
+      - -DUSE_PTEX=OFF
+      - -DUSE_LIBRAW=OFF
+      - -DUSE_DCMTK=OFF
+    sources:
+      - type: archive
+        url: https://github.com/AcademySoftwareFoundation/OpenImageIO/archive/refs/tags/v3.0.10.0.tar.gz
+        sha256: c424637af66fc6d04f202156c3f7cf4a5484ccbe07966d3d8a1fde27c7472721
+
+  - name: openimagedenoise
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DISPC_EXECUTABLE=/app/bin/ispc
+      - -DOIDN_APPS=OFF
+      - -DOIDN_DEVICE_CPU=ON
+      - -DOIDN_DEVICE_SYCL=OFF
+      - -DOIDN_DEVICE_CUDA=OFF
+      - -DOIDN_DEVICE_HIP=OFF
+      - -DOIDN_DEVICE_METAL=OFF
+    sources:
+      - type: archive
+        url: https://github.com/RenderKit/oidn/releases/download/v2.3.3/oidn-2.3.3.src.tar.gz
+        sha256: ccf221535b4007607fb53d3ff5afa74de25413bb8ef5d03d215f46c7cc2f96cf
+
+  - name: opensubdiv
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DNO_PTEX=ON
+      - -DNO_OMP=ON
+      - -DNO_TBB=ON
+      - -DNO_CUDA=ON
+      - -DNO_OPENCL=ON
+      - -DNO_CLEW=ON
+      - -DNO_OPENGL=ON
+      - -DNO_GLFW=ON
+      - -DNO_DOC=ON
+      - -DNO_EXAMPLES=ON
+      - -DNO_TUTORIALS=ON
+      - -DNO_REGRESSION=ON
+      - -DNO_TESTS=ON
+      - -DNO_GLTESTS=ON
+    sources:
+      - type: archive
+        url: https://github.com/PixarAnimationStudios/OpenSubdiv/archive/refs/tags/v3_6_1.tar.gz
+        sha256: e9d99a480d80e999667643747c76eb0138d36c418fc154fd71b4bd65be103d52
+
+  # Core USD only (no Hydra/imaging); same commit as the macOS build.
+  - name: openusd
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DPython3_EXECUTABLE=/usr/bin/python3
+      - -DPXR_ENABLE_PYTHON_SUPPORT=ON
+      - -DPXR_BUILD_IMAGING=OFF
+      - -DPXR_BUILD_USD_IMAGING=OFF
+      - -DPXR_BUILD_USDVIEW=OFF
+      - -DPXR_BUILD_TESTS=OFF
+      - -DPXR_BUILD_EXAMPLES=OFF
+      - -DPXR_BUILD_TUTORIALS=OFF
+      - -DPXR_BUILD_USD_TOOLS=OFF
+      - -DPXR_BUILD_DOCUMENTATION=OFF
+      - -DPXR_ENABLE_MATERIALX_SUPPORT=OFF
+      - -DPXR_ENABLE_OPENVDB_SUPPORT=OFF
+      - -DPXR_ENABLE_PTEX_SUPPORT=OFF
+    sources:
+      - type: git
+        url: https://github.com/PixarAnimationStudios/OpenUSD.git
+        commit: dd6886c0085ed132320248ef444f0bb910a6531d
+
+  - name: moonray
+    buildsystem: simple
+    build-commands:
+      - cmake -S . -B _build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX=/app
+          -DCMAKE_PREFIX_PATH=/app
+          -Dpxr_DIR=/app
+          -DPYTHON_EXECUTABLE=/usr/bin/python3
+          -DBOOST_PYTHON_COMPONENT_NAME=python$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])')
+          -DABI_VERSION=0
+          -DBUILD_QT_APPS=OFF
+          -DBUILD_TESTING=OFF
+          -DARRASCORE_BUILD_TESTING=OFF
+          -DMCRTCOMPUTATION_BUILD_TESTING=OFF
+          -DMCRTDATAIO_BUILD_TESTING=OFF
+          -DMCRTDENOISE_BUILD_TESTING=OFF
+          -DMCRTMESSAGES_BUILD_TESTING=OFF
+          -DMOONRAY_BUILD_TESTING=OFF
+          -DMOONSHINE_BUILD_TESTING=OFF
+          -DMOONSHINEUSD_BUILD_TESTING=OFF
+          -DSCENERDL2_BUILD_TESTING=OFF
+      - cmake --build _build -j${FLATPAK_BUILDER_N_JOBS}
+      - cmake --install _build
+    sources:
+      - type: git
+        url: https://github.com/OpenMoonRay/openmoonray.git
+        commit: b9b0ac29135b26e20a51edf9028558bb64df6700
+      # Boost >= 1.87 removed asio::io_service.
+      - type: patch
+        path: patches/arras4_core-boost-asio.patch
+      # hdMoonray needs USD imaging, Ptex and OpenGL; the app only uses the CLI.
+      - type: patch
+        path: patches/moonray-skip-hydra.patch
+      # The bundled FindTBB only understands TBB 2020; use oneTBB's own config.
+      - type: shell
+        commands:
+          - rm -f cmake_modules/cmake/FindTBB.cmake
+
+  - name: proceduralfx-studio
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/proceduralfx-studio/cargo
+        CARGO_NET_OFFLINE: 'true'
+        OPENVDB_ROOT: /app
+        USD_ROOT: /app
+    build-commands:
+      - cargo --offline build --release --features "native-openvdb native-usd"
+      - install -Dm755 target/release/proceduralfx_studio /app/bin/proceduralfx_studio
+      - install -Dm755 packaging/linux/proceduralfx-studio.sh /app/bin/proceduralfx-studio
+      - install -Dm644 packaging/linux/com.loksangho.proceduralfxstudio.desktop
+          /app/share/applications/com.loksangho.proceduralfxstudio.desktop
+      - install -Dm644 packaging/linux/com.loksangho.proceduralfxstudio.metainfo.xml
+          /app/share/metainfo/com.loksangho.proceduralfxstudio.metainfo.xml
+      - install -Dm644 packaging/linux/com.loksangho.proceduralfxstudio.svg
+          /app/share/icons/hicolor/scalable/apps/com.loksangho.proceduralfxstudio.svg
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - dist
+          - cache
+          - repo
+          - build-dir
+          - .flatpak-builder
+          - native/moonray
+      # Generated from Cargo.lock by flatpak-cargo-generator (see the CI workflow).
+      - cargo-sources.json

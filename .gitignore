@@ -1,0 +1,10 @@
+/target
+.DS_Store
+/dist
+/cache
+# Flatpak build outputs
+/.flatpak-builder
+/build-dir
+/repo
+*.flatpak
+/packaging/linux/cargo-sources.json

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ProceduralFX Studio
+Comment=Node-based procedural modelling, simulation and rendering
+Exec=proceduralfx-studio
+Icon=com.loksangho.proceduralfxstudio
+Terminal=false
+Categories=Graphics;3DGraphics;
+Keywords=procedural;3D;nodes;simulation;render;USD;

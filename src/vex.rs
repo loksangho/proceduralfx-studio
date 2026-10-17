@@ -1,0 +1,3475 @@
+// VEX-style language for the Wrangle node, modelled on Houdini's VEX: a lexer,
+// a parser that resolves variables to frame slots, and a tree-walking
+// interpreter that runs the snippet once per element (detail, primitive, point
+// or vertex). Supports typed locals, arrays, strings, control flow, user
+// functions and geometry functions; writes made through set*attrib, add* and
+// remove* are deferred until every element has run, as in Houdini.
+
+use super::{hash01, Mesh, Vec3};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+// Loop iterations plus function calls allowed per cook, so a runaway loop cannot freeze the app.
+#[cfg(not(test))]
+const STEP_LIMIT: u64 = 50_000_000;
+#[cfg(test)]
+const STEP_LIMIT: u64 = 200_000;
+const MAX_CALL_DEPTH: usize = 64;
+const MAX_LOG_LINES: usize = 500;
+
+type R<T> = Result<T, String>;
+
+// ============================================================================
+// Values and types
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ty {
+    Int,
+    Float,
+    Vector,
+    Str,
+    IntArr,
+    FloatArr,
+    VecArr,
+    StrArr,
+}
+
+impl Ty {
+    fn array(self) -> Ty {
+        match self {
+            Ty::Int => Ty::IntArr,
+            Ty::Float => Ty::FloatArr,
+            Ty::Vector => Ty::VecArr,
+            Ty::Str => Ty::StrArr,
+            array => array,
+        }
+    }
+
+    fn element(self) -> Option<Ty> {
+        match self {
+            Ty::IntArr => Some(Ty::Int),
+            Ty::FloatArr => Some(Ty::Float),
+            Ty::VecArr => Some(Ty::Vector),
+            Ty::StrArr => Some(Ty::Str),
+            _ => None,
+        }
+    }
+
+    fn default_value(self) -> Value {
+        match self {
+            Ty::Int => Value::Int(0),
+            Ty::Float => Value::Float(0.0),
+            Ty::Vector => Value::Vec([0.0; 3]),
+            Ty::Str => Value::Str("".into()),
+            _ => Value::Arr(Rc::new(Vec::new())),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Ty::Int => "int",
+            Ty::Float => "float",
+            Ty::Vector => "vector",
+            Ty::Str => "string",
+            Ty::IntArr => "int[]",
+            Ty::FloatArr => "float[]",
+            Ty::VecArr => "vector[]",
+            Ty::StrArr => "string[]",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Value {
+    Int(i32),
+    Float(f32),
+    Vec([f32; 3]),
+    Str(Rc<str>),
+    Arr(Rc<Vec<Value>>),
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Value::Int(0)
+    }
+}
+
+impl Value {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::Vec(_) => "vector",
+            Value::Str(_) => "string",
+            Value::Arr(_) => "array",
+        }
+    }
+
+    fn num(&self) -> R<f32> {
+        match self {
+            Value::Int(i) => Ok(*i as f32),
+            Value::Float(f) => Ok(*f),
+            Value::Vec(v) => Ok(v[0]),
+            Value::Str(s) => Err(format!("expected a number, got string \"{s}\"")),
+            Value::Arr(_) => Err("expected a number, got an array".into()),
+        }
+    }
+
+    fn int(&self) -> R<i32> {
+        match self {
+            Value::Int(i) => Ok(*i),
+            other => other.num().map(|f| f as i32),
+        }
+    }
+
+    fn vec(&self) -> R<[f32; 3]> {
+        match self {
+            Value::Int(i) => Ok([*i as f32; 3]),
+            Value::Float(f) => Ok([*f; 3]),
+            Value::Vec(v) => Ok(*v),
+            Value::Arr(items) if items.len() == 3 => Ok([items[0].num()?, items[1].num()?, items[2].num()?]),
+            Value::Arr(items) => Err(format!("expected a vector, got an array of {} items", items.len())),
+            Value::Str(s) => Err(format!("expected a vector, got string \"{s}\"")),
+        }
+    }
+
+    fn string(&self) -> R<Rc<str>> {
+        match self {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(format!("expected a string, got {}", other.type_name())),
+        }
+    }
+
+    fn items(&self) -> R<Rc<Vec<Value>>> {
+        match self {
+            Value::Arr(items) => Ok(items.clone()),
+            Value::Vec(v) => Ok(Rc::new(v.iter().map(|c| Value::Float(*c)).collect())),
+            other => Err(format!("expected an array, got {}", other.type_name())),
+        }
+    }
+
+    fn is_vector_like(&self) -> bool {
+        match self {
+            Value::Vec(_) => true,
+            Value::Arr(items) => items.len() == 3,
+            _ => false,
+        }
+    }
+
+    fn truthy(&self) -> bool {
+        match self {
+            Value::Int(i) => *i != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::Vec(v) => v.iter().any(|c| *c != 0.0),
+            Value::Str(s) => !s.is_empty(),
+            Value::Arr(items) => !items.is_empty(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Vec(v) => format!("{{{}, {}, {}}}", v[0], v[1], v[2]),
+            Value::Str(s) => s.to_string(),
+            Value::Arr(items) => format!("{{{}}}", items.iter().map(Value::display).collect::<Vec<_>>().join(", ")),
+        }
+    }
+
+    // A zero of the same kind, used to pad arrays.
+    fn zero_like(&self) -> Value {
+        match self {
+            Value::Int(_) => Value::Int(0),
+            Value::Float(_) => Value::Float(0.0),
+            Value::Vec(_) => Value::Vec([0.0; 3]),
+            Value::Str(_) => Value::Str("".into()),
+            Value::Arr(_) => Value::Arr(Rc::new(Vec::new())),
+        }
+    }
+
+    fn convert(self, ty: Ty) -> R<Value> {
+        let fail = |v: &Value| Err(format!("cannot convert {} to {}", v.type_name(), ty.name()));
+        match ty {
+            Ty::Int => match self {
+                Value::Int(_) => Ok(self),
+                Value::Float(_) | Value::Vec(_) => Ok(Value::Int(self.num()? as i32)),
+                _ => fail(&self),
+            },
+            Ty::Float => match self {
+                Value::Float(_) => Ok(self),
+                Value::Int(_) | Value::Vec(_) => Ok(Value::Float(self.num()?)),
+                _ => fail(&self),
+            },
+            Ty::Vector => match self {
+                Value::Vec(_) => Ok(self),
+                Value::Int(_) | Value::Float(_) | Value::Arr(_) => Ok(Value::Vec(self.vec()?)),
+                _ => fail(&self),
+            },
+            Ty::Str => match self {
+                Value::Str(_) => Ok(self),
+                _ => fail(&self),
+            },
+            _ => {
+                let element = ty.element().expect("array type");
+                let items = match self {
+                    Value::Arr(items) => items,
+                    Value::Vec(v) if element != Ty::Str => Rc::new(v.iter().map(|c| Value::Float(*c)).collect()),
+                    _ => return fail(&self),
+                };
+                let matches = |v: &Value| {
+                    matches!(
+                        (element, v),
+                        (Ty::Int, Value::Int(_)) | (Ty::Float, Value::Float(_)) | (Ty::Vector, Value::Vec(_)) | (Ty::Str, Value::Str(_))
+                    )
+                };
+                if items.iter().all(matches) {
+                    return Ok(Value::Arr(items));
+                }
+                let converted = items.iter().cloned().map(|v| v.convert(element)).collect::<R<Vec<_>>>()?;
+                Ok(Value::Arr(Rc::new(converted)))
+            }
+        }
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Arr(x), Value::Arr(y)) if !(a.is_vector_like() && b.is_vector_like()) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| values_equal(p, q))
+        }
+        (Value::Str(_), _) | (_, Value::Str(_)) => false,
+        _ if a.is_vector_like() || b.is_vector_like() => matches!((a.vec(), b.vec()), (Ok(x), Ok(y)) if x == y),
+        _ => matches!((a.num(), b.num()), (Ok(x), Ok(y)) if x == y),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+fn binop(op: BinOp, a: Value, b: Value) -> R<Value> {
+    use BinOp::*;
+    match op {
+        Eq => return Ok(Value::Int(values_equal(&a, &b) as i32)),
+        Ne => return Ok(Value::Int(!values_equal(&a, &b) as i32)),
+        Lt | Le | Gt | Ge => {
+            let ordering = match (&a, &b) {
+                (Value::Str(x), Value::Str(y)) => x.cmp(y),
+                _ if a.is_vector_like() || b.is_vector_like() || matches!(a, Value::Str(_)) || matches!(b, Value::Str(_)) => {
+                    return Err(format!("cannot compare {} with {}", a.type_name(), b.type_name()));
+                }
+                _ => a.num()?.partial_cmp(&b.num()?).unwrap_or(std::cmp::Ordering::Equal),
+            };
+            let result = match op {
+                Lt => ordering.is_lt(),
+                Le => ordering.is_le(),
+                Gt => ordering.is_gt(),
+                _ => ordering.is_ge(),
+            };
+            return Ok(Value::Int(result as i32));
+        }
+        _ => {}
+    }
+    if op == Add && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
+        return Ok(Value::Str(format!("{}{}", a.display(), b.display()).into()));
+    }
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        let (x, y) = (*x, *y);
+        return Ok(Value::Int(match op {
+            Add => x.wrapping_add(y),
+            Sub => x.wrapping_sub(y),
+            Mul => x.wrapping_mul(y),
+            Div => if y == 0 { 0 } else { x.wrapping_div(y) },
+            _ => if y == 0 { 0 } else { x.wrapping_rem(y) },
+        }));
+    }
+    let apply = |x: f32, y: f32| match op {
+        Add => x + y,
+        Sub => x - y,
+        Mul => x * y,
+        Div => if y == 0.0 { 0.0 } else { x / y },
+        _ => if y == 0.0 { 0.0 } else { x % y },
+    };
+    if a.is_vector_like() || b.is_vector_like() {
+        let (x, y) = (a.vec()?, b.vec()?);
+        return Ok(Value::Vec([apply(x[0], y[0]), apply(x[1], y[1]), apply(x[2], y[2])]));
+    }
+    if matches!(a, Value::Arr(_)) || matches!(b, Value::Arr(_)) {
+        return Err(format!("cannot do arithmetic on {} and {}", a.type_name(), b.type_name()));
+    }
+    Ok(Value::Float(apply(a.num()?, b.num()?)))
+}
+
+fn normalize_index(i: i32, len: usize) -> Option<usize> {
+    let index = if i < 0 { len as i64 + i as i64 } else { i as i64 };
+    (index >= 0).then_some(index as usize)
+}
+
+fn component(v: &Value, c: usize) -> R<Value> {
+    match v {
+        Value::Vec(x) => Ok(Value::Float(x[c])),
+        Value::Int(_) | Value::Float(_) => Ok(v.clone()),
+        Value::Arr(_) => index_read(v, c as i32),
+        Value::Str(_) => Err("strings have no .x/.y/.z components".into()),
+    }
+}
+
+fn set_component(base: Value, c: usize, f: f32) -> R<Value> {
+    if matches!(base, Value::Str(_)) {
+        return Err("strings have no .x/.y/.z components".into());
+    }
+    if matches!(&base, Value::Arr(items) if items.len() != 3) {
+        return index_write(base, c as i32, Value::Float(f)).map(|(v, _)| v);
+    }
+    let mut v = base.vec()?;
+    v[c] = f;
+    Ok(Value::Vec(v))
+}
+
+fn index_read(base: &Value, i: i32) -> R<Value> {
+    match base {
+        Value::Arr(items) => Ok(normalize_index(i, items.len())
+            .and_then(|i| items.get(i).cloned())
+            .unwrap_or_else(|| items.first().map_or(Value::Int(0), Value::zero_like))),
+        Value::Vec(v) => Ok(Value::Float(normalize_index(i, 3).and_then(|i| v.get(i).copied()).unwrap_or(0.0))),
+        Value::Str(s) => Ok(Value::Str(
+            normalize_index(i, s.chars().count())
+                .and_then(|i| s.chars().nth(i))
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+                .into(),
+        )),
+        other => Err(format!("cannot index a {} with [ ]", other.type_name())),
+    }
+}
+
+fn index_write(base: Value, i: i32, v: Value) -> R<(Value, Value)> {
+    match base {
+        Value::Arr(items) => {
+            let mut items = Rc::try_unwrap(items).unwrap_or_else(|shared| (*shared).clone());
+            let index = normalize_index(i, items.len()).ok_or_else(|| format!("array index {i} is out of range"))?;
+            if index >= items.len() {
+                // Writing past the end grows the array, as in VEX.
+                items.resize(index + 1, v.zero_like());
+            }
+            items[index] = v.clone();
+            Ok((Value::Arr(Rc::new(items)), v))
+        }
+        Value::Vec(mut x) => {
+            let index = normalize_index(i, 3).filter(|i| *i < 3).ok_or_else(|| format!("vector index {i} is out of range (0-2)"))?;
+            x[index] = v.num()?;
+            Ok((Value::Vec(x), v))
+        }
+        other => Err(format!("cannot index a {} with [ ]", other.type_name())),
+    }
+}
+
+// ============================================================================
+// Lexer
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Int(i32),
+    Float(f32),
+    Str(String),
+    Ident(String),
+    Attr(Option<char>, String),
+    P(&'static str),
+    Eof,
+}
+
+#[derive(Clone, Debug)]
+struct Token {
+    tok: Tok,
+    line: usize,
+    col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VexError {
+    pub line: usize,
+    pub col: usize,
+    pub message: String,
+}
+
+impl fmt::Display for VexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "line {}, col {}: {}", self.line, self.col, self.message)
+    }
+}
+
+const PUNCTS: [&str; 33] = [
+    "++", "--", "+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "+", "-", "*", "/", "%", "=", "<", ">",
+    "!", "?", ":", ";", ",", ".", "(", ")", "{", "}", "[", "]",
+];
+
+fn lex(src: &str) -> Result<Vec<Token>, VexError> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out: Vec<Token> = Vec::new();
+    let (mut i, mut line, mut line_start) = (0usize, 1usize, 0usize);
+    let error = |line: usize, col: usize, message: String| Err(VexError { line, col, message });
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied().unwrap_or('\0');
+        let col = i - line_start + 1;
+        if c == '\n' {
+            i += 1;
+            line += 1;
+            line_start = i;
+            continue;
+        }
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '/' && next == '/' || c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && next == '*' {
+            let (start_line, start_col) = (line, col);
+            i += 2;
+            loop {
+                if i >= chars.len() {
+                    return error(start_line, start_col, "unterminated /* comment".into());
+                }
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    i += 2;
+                    break;
+                }
+                if chars[i] == '\n' {
+                    line += 1;
+                    line_start = i + 1;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        let after_value = matches!(
+            out.last().map(|t| &t.tok),
+            Some(Tok::Ident(_) | Tok::Attr(..) | Tok::Int(_) | Tok::Float(_) | Tok::P(")") | Tok::P("]"))
+        );
+        let tok = if c.is_ascii_digit() || (c == '.' && next.is_ascii_digit() && !after_value) {
+            let mut is_float = false;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                is_float |= chars[i] == '.';
+                i += 1;
+            }
+            if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                let mut j = i + 1;
+                if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_digit() {
+                    is_float = true;
+                    i = j;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
+            let text: String = chars[start..i].iter().collect();
+            if i < chars.len() && (chars[i] == 'f' || chars[i] == 'F') {
+                is_float = true;
+                i += 1;
+            }
+            match (is_float, text.parse::<i32>()) {
+                (false, Ok(n)) => Tok::Int(n),
+                _ => match text.parse::<f32>() {
+                    Ok(f) => Tok::Float(f),
+                    Err(_) => return error(line, col, format!("invalid number '{text}'")),
+                },
+            }
+        } else if c == '"' || c == '\'' {
+            let quote = c;
+            let mut text = String::new();
+            i += 1;
+            loop {
+                match chars.get(i) {
+                    None | Some('\n') => return error(line, col, "unterminated string".into()),
+                    Some(&ch) if ch == quote => {
+                        i += 1;
+                        break;
+                    }
+                    Some('\\') => {
+                        let escaped = chars.get(i + 1).copied().unwrap_or('\\');
+                        text.push(match escaped {
+                            'n' => '\n',
+                            't' => '\t',
+                            other => other,
+                        });
+                        i += 2;
+                    }
+                    Some(&ch) => {
+                        text.push(ch);
+                        i += 1;
+                    }
+                }
+            }
+            Tok::Str(text)
+        } else if c == '@' {
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            if i == start + 1 {
+                return error(line, col, "expected an attribute name after '@'".into());
+            }
+            Tok::Attr(None, chars[start + 1..i].iter().collect())
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let name: String = chars[start..i].iter().collect();
+            // Typed attribute bindings: f@mass, i@id, v@vel, s@name ...
+            if name.len() == 1 && chars.get(i) == Some(&'@') {
+                let name_start = i + 1;
+                i += 1;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                if i == name_start {
+                    return error(line, col, "expected an attribute name after '@'".into());
+                }
+                Tok::Attr(name.chars().next(), chars[name_start..i].iter().collect())
+            } else {
+                Tok::Ident(name)
+            }
+        } else {
+            let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+            let found = PUNCTS
+                .iter()
+                .find(|p| p.len() == 2 && **p == two)
+                .or_else(|| PUNCTS.iter().find(|p| p.len() == 1 && p.starts_with(c)));
+            match found {
+                Some(p) => {
+                    i += p.len();
+                    Tok::P(p)
+                }
+                None => return error(line, col, format!("unexpected character '{c}'")),
+            }
+        };
+        out.push(Token { tok, line, col, end_col: i - line_start + 1 });
+    }
+    let col = chars.len() - line_start + 1;
+    out.push(Token { tok: Tok::Eof, line, col, end_col: col });
+    Ok(out)
+}
+
+fn describe(tok: &Tok) -> String {
+    match tok {
+        Tok::Int(i) => format!("number {i}"),
+        Tok::Float(f) => format!("number {f}"),
+        Tok::Str(_) => "a string".into(),
+        Tok::Ident(name) => format!("'{name}'"),
+        Tok::Attr(_, name) => format!("@{name}"),
+        Tok::P(p) => format!("'{p}'"),
+        Tok::Eof => "the end of the code".into(),
+    }
+}
+
+// ============================================================================
+// Syntax tree
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AttrKind {
+    P,
+    N,
+    Ptnum,
+    Primnum,
+    Vtxnum,
+    Numpt,
+    Numprim,
+    Numvtx,
+    Elemnum,
+    Numelem,
+    Time,
+    TimeInc,
+    Frame,
+    Other,
+}
+
+impl AttrKind {
+    fn of(name: &str) -> AttrKind {
+        match name {
+            "P" => AttrKind::P,
+            "N" => AttrKind::N,
+            "ptnum" => AttrKind::Ptnum,
+            "primnum" => AttrKind::Primnum,
+            "vtxnum" => AttrKind::Vtxnum,
+            "numpt" => AttrKind::Numpt,
+            "numprim" => AttrKind::Numprim,
+            "numvtx" => AttrKind::Numvtx,
+            "elemnum" => AttrKind::Elemnum,
+            "numelem" => AttrKind::Numelem,
+            "Time" | "SimTime" => AttrKind::Time,
+            "TimeInc" => AttrKind::TimeInc,
+            "Frame" | "SimFrame" => AttrKind::Frame,
+            _ => AttrKind::Other,
+        }
+    }
+
+    fn read_only(self) -> bool {
+        !matches!(self, AttrKind::P | AttrKind::N | AttrKind::Other)
+    }
+}
+
+// Type of well-known attributes when no f@/i@/v@ prefix is given.
+fn known_hint(name: &str) -> Option<Ty> {
+    match name {
+        "P" | "N" | "Cd" | "v" | "up" | "rest" | "scale" | "force" | "accel" | "uv" | "w" => Some(Ty::Vector),
+        "ptnum" | "primnum" | "vtxnum" | "numpt" | "numprim" | "numvtx" | "elemnum" | "numelem" | "id" => Some(Ty::Int),
+        "Time" | "SimTime" | "TimeInc" | "Frame" | "SimFrame" | "pscale" => Some(Ty::Float),
+        _ => None,
+    }
+}
+
+// Attribute names usable without '@' (the original wrangle syntax).
+const LEGACY_ATTRS: [&str; 11] = ["P", "N", "Cd", "Time", "ptnum", "primnum", "vtxnum", "numpt", "numprim", "numvtx", "pscale"];
+
+#[derive(Clone, Debug)]
+struct AttrRef {
+    name: String,
+    kind: AttrKind,
+    hint: Option<Ty>,
+    // Assigned somewhere in the code (used to warn about reads of missing attributes).
+    written: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Expr {
+    Const(Value),
+    Local(usize),
+    Attr(usize),
+    List(Vec<Expr>),
+    Neg(Box<Expr>),
+    Not(Box<Expr>),
+    Bin(BinOp, Box<Expr>, Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
+    Assign(Box<Place>, Option<BinOp>, Box<Expr>),
+    // ++/--: delta, and whether the new (prefix) or old (postfix) value is the result.
+    Step(Box<Place>, i32, bool),
+    Member(Box<Expr>, usize),
+    Index(Box<Expr>, Box<Expr>),
+    // Name, arguments, assignable argument places (array-mutating builtins), vector return context.
+    Builtin(&'static str, Vec<Expr>, Vec<Option<Place>>, bool),
+    // User function index, arguments, argument places written back (VEX passes by reference).
+    Call(usize, Vec<Expr>, Vec<Option<Place>>),
+}
+
+#[derive(Clone, Debug)]
+enum Place {
+    Local(usize),
+    Attr(usize),
+    Member(Box<Place>, usize),
+    Index(Box<Place>, Box<Expr>),
+}
+
+fn to_place(e: &Expr) -> Option<Place> {
+    match e {
+        Expr::Local(slot) => Some(Place::Local(*slot)),
+        Expr::Attr(id) => Some(Place::Attr(*id)),
+        Expr::Member(base, c) => Some(Place::Member(Box::new(to_place(base)?), *c)),
+        Expr::Index(base, index) => Some(Place::Index(Box::new(to_place(base)?), index.clone())),
+        _ => None,
+    }
+}
+
+fn root_attr(place: &Place) -> Option<usize> {
+    match place {
+        Place::Attr(id) => Some(*id),
+        Place::Member(base, _) | Place::Index(base, _) => root_attr(base),
+        Place::Local(_) => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Stmt {
+    line: usize,
+    kind: StmtKind,
+}
+
+#[derive(Clone, Debug)]
+enum StmtKind {
+    Expr(Expr),
+    Decl(usize, Option<Expr>),
+    If(Expr, Box<Stmt>, Option<Box<Stmt>>),
+    While(Expr, Box<Stmt>),
+    DoWhile(Box<Stmt>, Expr),
+    For(Vec<Stmt>, Option<Expr>, Option<Expr>, Box<Stmt>),
+    Foreach(Option<usize>, usize, Expr, Box<Stmt>),
+    Block(Vec<Stmt>),
+    Break,
+    Continue,
+    Return(Option<Expr>),
+}
+
+#[derive(Clone, Debug)]
+struct Function {
+    name: String,
+    ret: Option<Ty>,
+    param_types: Vec<Ty>,
+    // Declared type of every local slot; None for implicitly declared (dynamic) locals.
+    slot_types: Vec<Option<Ty>>,
+    body: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Program {
+    main: Function,
+    functions: Vec<Function>,
+    attrs: Vec<AttrRef>,
+}
+
+// ============================================================================
+// Built-in function table
+// ============================================================================
+
+// (name, min args, max args, group, signature)
+const VARIADIC: usize = usize::MAX;
+pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
+    ("abs", 1, 1, "Math", "abs(x)"),
+    ("sign", 1, 1, "Math", "sign(x)"),
+    ("floor", 1, 1, "Math", "floor(x)"),
+    ("ceil", 1, 1, "Math", "ceil(x)"),
+    ("round", 1, 1, "Math", "round(x)"),
+    ("trunc", 1, 1, "Math", "trunc(x)"),
+    ("frac", 1, 1, "Math", "frac(x)"),
+    ("sqrt", 1, 1, "Math", "sqrt(x)"),
+    ("exp", 1, 1, "Math", "exp(x)"),
+    ("log", 1, 1, "Math", "log(x)"),
+    ("log10", 1, 1, "Math", "log10(x)"),
+    ("pow", 2, 2, "Math", "pow(x, y)"),
+    ("sin", 1, 1, "Math", "sin(x)"),
+    ("cos", 1, 1, "Math", "cos(x)"),
+    ("tan", 1, 1, "Math", "tan(x)"),
+    ("asin", 1, 1, "Math", "asin(x)"),
+    ("acos", 1, 1, "Math", "acos(x)"),
+    ("atan", 1, 2, "Math", "atan(x) / atan(y, x)"),
+    ("atan2", 2, 2, "Math", "atan2(y, x)"),
+    ("sinh", 1, 1, "Math", "sinh(x)"),
+    ("cosh", 1, 1, "Math", "cosh(x)"),
+    ("tanh", 1, 1, "Math", "tanh(x)"),
+    ("radians", 1, 1, "Math", "radians(degrees)"),
+    ("degrees", 1, 1, "Math", "degrees(radians)"),
+    ("min", 1, VARIADIC, "Math", "min(a, b, ...) / min(array)"),
+    ("max", 1, VARIADIC, "Math", "max(a, b, ...) / max(array)"),
+    ("clamp", 3, 3, "Math", "clamp(x, lo, hi)"),
+    ("mod", 2, 2, "Math", "mod(x, y)"),
+    ("fit", 5, 5, "Math", "fit(x, omin, omax, nmin, nmax) (clamped)"),
+    ("efit", 5, 5, "Math", "efit(x, omin, omax, nmin, nmax) (unclamped)"),
+    ("fitclamp", 5, 5, "Math", "fitclamp(x, omin, omax, nmin, nmax)"),
+    ("fit01", 3, 3, "Math", "fit01(x, nmin, nmax)"),
+    ("fit10", 3, 3, "Math", "fit10(x, nmin, nmax)"),
+    ("fit11", 3, 3, "Math", "fit11(x, nmin, nmax)"),
+    ("lerp", 3, 3, "Math", "lerp(a, b, t)"),
+    ("smooth", 3, 3, "Math", "smooth(edge0, edge1, x)"),
+    ("smoothstep", 3, 3, "Math", "smoothstep(edge0, edge1, x)"),
+    ("set", 1, 3, "Vector", "set(x, y, z)"),
+    ("vector", 1, 3, "Vector", "vector(x) / vector(x, y, z)"),
+    ("length", 1, 1, "Vector", "length(v)"),
+    ("length2", 1, 1, "Vector", "length2(v)"),
+    ("normalize", 1, 1, "Vector", "normalize(v)"),
+    ("normalizesafe", 1, 1, "Vector", "normalizesafe(v)"),
+    ("dot", 2, 2, "Vector", "dot(a, b)"),
+    ("cross", 2, 2, "Vector", "cross(a, b)"),
+    ("distance", 2, 2, "Vector", "distance(a, b)"),
+    ("distance2", 2, 2, "Vector", "distance2(a, b)"),
+    ("reflect", 2, 2, "Vector", "reflect(dir, normal)"),
+    ("refract", 3, 3, "Vector", "refract(dir, normal, eta)"),
+    ("avg", 1, VARIADIC, "Vector", "avg(a, b, ...) / avg(array) / avg(vector)"),
+    ("luminance", 1, 1, "Vector", "luminance(color)"),
+    ("hsvtorgb", 1, 1, "Vector", "hsvtorgb(hsv)"),
+    ("rgbtohsv", 1, 1, "Vector", "rgbtohsv(rgb)"),
+    ("rand", 1, 2, "Random", "rand(seed [, seed2]) (vector when assigned to a vector)"),
+    ("random", 1, 2, "Random", "random(seed [, seed2])"),
+    ("noise", 1, 3, "Random", "noise(pos) Perlin noise in 0..1 (vector when assigned to a vector)"),
+    ("snoise", 1, 3, "Random", "snoise(pos) signed Perlin noise in -1..1"),
+    ("int", 1, 1, "Conversion", "int(x)"),
+    ("float", 1, 1, "Conversion", "float(x)"),
+    ("string", 1, 1, "Conversion", "string(x)"),
+    ("itoa", 1, 1, "Conversion", "itoa(i)"),
+    ("atoi", 1, 1, "Conversion", "atoi(s)"),
+    ("atof", 1, 1, "Conversion", "atof(s)"),
+    ("printf", 1, VARIADIC, "String", "printf(format, ...) prints to the node output (%d %f %g %s %v)"),
+    ("sprintf", 1, VARIADIC, "String", "sprintf(format, ...)"),
+    ("warning", 1, VARIADIC, "String", "warning(format, ...)"),
+    ("error", 1, VARIADIC, "String", "error(format, ...) stops the cook"),
+    ("concat", 1, VARIADIC, "String", "concat(a, b, ...)"),
+    ("strlen", 1, 1, "String", "strlen(s)"),
+    ("toupper", 1, 1, "String", "toupper(s)"),
+    ("tolower", 1, 1, "String", "tolower(s)"),
+    ("startswith", 2, 2, "String", "startswith(s, prefix)"),
+    ("endswith", 2, 2, "String", "endswith(s, suffix)"),
+    ("replace", 3, 3, "String", "replace(s, old, new)"),
+    ("split", 1, 2, "String", "split(s [, separators])"),
+    ("join", 2, 2, "String", "join(array, separator)"),
+    ("array", 0, VARIADIC, "Array", "array(a, b, ...)"),
+    ("len", 1, 1, "Array", "len(array | string | vector)"),
+    ("push", 2, 2, "Array", "push(array, value)"),
+    ("append", 2, 2, "Array", "append(array, value | array)"),
+    ("pop", 1, 2, "Array", "pop(array [, index])"),
+    ("insert", 3, 3, "Array", "insert(array, index, value)"),
+    ("removeindex", 2, 2, "Array", "removeindex(array, index)"),
+    ("removevalue", 2, 2, "Array", "removevalue(array, value)"),
+    ("resize", 2, 3, "Array", "resize(array, size [, value])"),
+    ("sort", 1, 1, "Array", "sort(array)"),
+    ("argsort", 1, 1, "Array", "argsort(array)"),
+    ("reverse", 1, 1, "Array", "reverse(array | string)"),
+    ("sum", 1, 1, "Array", "sum(array)"),
+    ("find", 2, 2, "Array", "find(array | string, value) index or -1"),
+    ("isvalidindex", 2, 2, "Array", "isvalidindex(array, index)"),
+    ("npoints", 1, 1, "Geometry", "npoints(0)"),
+    ("nprimitives", 1, 1, "Geometry", "nprimitives(0)"),
+    ("nvertices", 1, 1, "Geometry", "nvertices(0)"),
+    ("point", 3, 3, "Geometry", "point(0, \"name\", ptnum) reads the input geometry"),
+    ("prim", 3, 3, "Geometry", "prim(0, \"name\", primnum)"),
+    ("vertex", 3, 3, "Geometry", "vertex(0, \"name\", vtxnum)"),
+    ("detail", 2, 2, "Geometry", "detail(0, \"name\")"),
+    ("haspointattrib", 2, 2, "Geometry", "haspointattrib(0, \"name\")"),
+    ("hasprimattrib", 2, 2, "Geometry", "hasprimattrib(0, \"name\")"),
+    ("setpointattrib", 4, 5, "Geometry", "setpointattrib(0, \"name\", ptnum, value [, \"set\"|\"add\"|\"min\"|\"max\"|\"mult\"])"),
+    ("setprimattrib", 4, 5, "Geometry", "setprimattrib(0, \"name\", primnum, value [, mode])"),
+    ("setdetailattrib", 3, 4, "Geometry", "setdetailattrib(0, \"name\", value [, mode])"),
+    ("addpoint", 2, 2, "Geometry", "addpoint(0, pos | ptnum) returns the new point number"),
+    ("addprim", 5, 6, "Geometry", "addprim(0, \"poly\", pt0, pt1, pt2 [, pt3])"),
+    ("removepoint", 2, 2, "Geometry", "removepoint(0, ptnum) also removes its triangles"),
+    ("removeprim", 2, 3, "Geometry", "removeprim(0, primnum [, andpoints])"),
+    ("nearpoint", 2, 3, "Geometry", "nearpoint(0, pos [, maxdist]) or -1"),
+    ("nearpoints", 3, 4, "Geometry", "nearpoints(0, pos, maxdist [, maxpts])"),
+    ("neighbours", 2, 2, "Geometry", "neighbours(0, ptnum) connected points"),
+    ("neighbourcount", 2, 2, "Geometry", "neighbourcount(0, ptnum)"),
+    ("primpoints", 2, 2, "Geometry", "primpoints(0, primnum)"),
+    ("pointprims", 2, 2, "Geometry", "pointprims(0, ptnum)"),
+    ("getbbox_min", 1, 1, "Geometry", "getbbox_min(0)"),
+    ("getbbox_max", 1, 1, "Geometry", "getbbox_max(0)"),
+    ("getbbox_center", 1, 1, "Geometry", "getbbox_center(0)"),
+    ("getbbox_size", 1, 1, "Geometry", "getbbox_size(0)"),
+    ("relpointbbox", 2, 2, "Geometry", "relpointbbox(0, pos) position within the bounds, 0..1"),
+];
+
+// Builtins that modify their first (array) argument in place.
+const MUTATING: [&str; 7] = ["push", "append", "pop", "insert", "removeindex", "removevalue", "resize"];
+// Builtins whose return type follows the assignment target, as VEX overloads them.
+const VECTOR_CONTEXT: [&str; 4] = ["rand", "random", "noise", "snoise"];
+
+fn builtin_info(name: &str) -> Option<&'static (&'static str, usize, usize, &'static str, &'static str)> {
+    BUILTINS.iter().find(|b| b.0 == name)
+}
+
+// ============================================================================
+// Parser
+// ============================================================================
+
+type PR<T> = Result<T, VexError>;
+
+fn type_keyword(name: &str) -> Option<Ty> {
+    match name {
+        "int" => Some(Ty::Int),
+        "float" => Some(Ty::Float),
+        "vector" => Some(Ty::Vector),
+        "string" => Some(Ty::Str),
+        _ => None,
+    }
+}
+
+const UNSUPPORTED_TYPES: [&str; 8] = ["vector2", "vector4", "matrix", "matrix2", "matrix3", "dict", "bsdf", "struct"];
+const QUALIFIERS: [&str; 3] = ["const", "export", "function"];
+
+struct Parser {
+    toks: Vec<Token>,
+    pos: usize,
+    scopes: Vec<HashMap<String, usize>>,
+    slot_types: Vec<Option<Ty>>,
+    functions: Vec<Function>,
+    fn_index: HashMap<String, usize>,
+    attrs: Vec<AttrRef>,
+    attr_index: HashMap<String, usize>,
+    loop_depth: usize,
+    // Some(return type) while parsing a function body.
+    fn_ret: Option<Option<Ty>>,
+}
+
+impl Parser {
+    fn peek(&self) -> &Tok {
+        &self.toks[self.pos].tok
+    }
+
+    fn peek_n(&self, n: usize) -> &Tok {
+        &self.toks[(self.pos + n).min(self.toks.len() - 1)].tok
+    }
+
+    fn advance(&mut self) -> Token {
+        let token = self.toks[self.pos].clone();
+        if self.pos < self.toks.len() - 1 {
+            self.pos += 1;
+        }
+        token
+    }
+
+    fn at(&self, p: &str) -> bool {
+        matches!(self.peek(), Tok::P(q) if *q == p)
+    }
+
+    fn eat(&mut self, p: &str) -> bool {
+        let found = self.at(p);
+        if found {
+            self.advance();
+        }
+        found
+    }
+
+    fn at_kw(&self, kw: &str) -> bool {
+        matches!(self.peek(), Tok::Ident(name) if name == kw)
+    }
+
+    fn err_at<T>(token: &Token, message: impl Into<String>) -> PR<T> {
+        Err(VexError { line: token.line, col: token.col, message: message.into() })
+    }
+
+    fn error<T>(&self, message: impl Into<String>) -> PR<T> {
+        Self::err_at(&self.toks[self.pos], message)
+    }
+
+    fn line(&self) -> usize {
+        self.toks[self.pos].line
+    }
+
+    fn expect(&mut self, p: &str, context: &str) -> PR<()> {
+        if self.eat(p) {
+            return Ok(());
+        }
+        let current = &self.toks[self.pos];
+        let previous = &self.toks[self.pos.saturating_sub(1)];
+        // A missing ';' is reported at the end of the line it belongs to, not on the next line.
+        let (line, col) = if self.pos > 0 && current.line > previous.line {
+            (previous.line, previous.end_col)
+        } else {
+            (current.line, current.col)
+        };
+        Err(VexError { line, col, message: format!("expected '{p}' {context}, found {}", describe(&current.tok)) })
+    }
+
+    fn ident(&mut self, what: &str) -> PR<String> {
+        match self.peek().clone() {
+            Tok::Ident(name) => {
+                self.advance();
+                Ok(name)
+            }
+            other => self.error(format!("expected {what}, found {}", describe(&other))),
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name).copied())
+    }
+
+    fn declare(&mut self, name: String, ty: Option<Ty>) -> usize {
+        let slot = self.slot_types.len();
+        self.slot_types.push(ty);
+        self.scopes.last_mut().expect("scope").insert(name, slot);
+        slot
+    }
+
+    fn attr(&mut self, prefix: Option<char>, name: &str, token: &Token) -> PR<usize> {
+        let hint = match prefix {
+            None => known_hint(name),
+            Some('f') => Some(Ty::Float),
+            Some('i') => Some(Ty::Int),
+            Some('v') => Some(Ty::Vector),
+            Some('s') => return Self::err_at(token, "string attributes (s@) are not supported yet"),
+            Some(c) => return Self::err_at(token, format!("{c}@ attributes are not supported (use f@, i@ or v@)")),
+        };
+        if let Some(&id) = self.attr_index.get(name) {
+            if prefix.is_some() {
+                self.attrs[id].hint = hint;
+            }
+            return Ok(id);
+        }
+        let id = self.attrs.len();
+        self.attrs.push(AttrRef { name: name.into(), kind: AttrKind::of(name), hint, written: false });
+        self.attr_index.insert(name.into(), id);
+        Ok(id)
+    }
+
+    fn is_decl_start(&self) -> bool {
+        let mut n = 0;
+        while matches!(self.peek_n(n), Tok::Ident(name) if QUALIFIERS.contains(&name.as_str())) {
+            n += 1;
+        }
+        let Tok::Ident(name) = self.peek_n(n) else { return false };
+        let is_type = type_keyword(name).is_some() || UNSUPPORTED_TYPES.contains(&name.as_str()) || name == "void";
+        is_type && (n > 0 || matches!(self.peek_n(n + 1), Tok::Ident(_) | Tok::P("[")))
+    }
+
+    // Parses a type; None means void.
+    fn parse_type(&mut self) -> PR<Option<Ty>> {
+        while QUALIFIERS.iter().any(|q| self.at_kw(q)) {
+            self.advance();
+        }
+        let name = self.ident("a type")?;
+        if name == "void" {
+            return Ok(None);
+        }
+        if UNSUPPORTED_TYPES.contains(&name.as_str()) {
+            return self.error(format!("type '{name}' is not supported (use int, float, vector, string or arrays of them)"));
+        }
+        let Some(mut ty) = type_keyword(&name) else {
+            return self.error(format!("unknown type '{name}'"));
+        };
+        if self.at("[") && matches!(self.peek_n(1), Tok::P("]")) {
+            self.advance();
+            self.advance();
+            ty = ty.array();
+        }
+        Ok(Some(ty))
+    }
+
+    fn statement(&mut self, top: bool) -> PR<Option<Stmt>> {
+        let line = self.line();
+        let stmt = |kind| Ok(Some(Stmt { line, kind }));
+        if self.eat(";") {
+            return stmt(StmtKind::Block(Vec::new()));
+        }
+        if self.eat("{") {
+            self.scopes.push(HashMap::new());
+            let body = self.block_body();
+            self.scopes.pop();
+            return stmt(StmtKind::Block(body?));
+        }
+        if self.at_kw("if") {
+            self.advance();
+            self.expect("(", "after 'if'")?;
+            let cond = self.expression()?;
+            self.expect(")", "to close the if condition")?;
+            let then = self.scoped_statement()?;
+            let otherwise = if self.at_kw("else") {
+                self.advance();
+                Some(Box::new(self.scoped_statement()?))
+            } else {
+                None
+            };
+            return stmt(StmtKind::If(cond, Box::new(then), otherwise));
+        }
+        if self.at_kw("while") {
+            self.advance();
+            self.expect("(", "after 'while'")?;
+            let cond = self.expression()?;
+            self.expect(")", "to close the while condition")?;
+            let body = self.loop_body()?;
+            return stmt(StmtKind::While(cond, Box::new(body)));
+        }
+        if self.at_kw("do") {
+            self.advance();
+            let body = self.loop_body()?;
+            if !self.at_kw("while") {
+                return self.error("expected 'while' after the do body");
+            }
+            self.advance();
+            self.expect("(", "after 'while'")?;
+            let cond = self.expression()?;
+            self.expect(")", "to close the while condition")?;
+            self.expect(";", "after do ... while (...)")?;
+            return stmt(StmtKind::DoWhile(Box::new(body), cond));
+        }
+        if self.at_kw("for") {
+            self.advance();
+            self.expect("(", "after 'for'")?;
+            self.scopes.push(HashMap::new());
+            let result = self.for_rest(line);
+            self.scopes.pop();
+            return result.map(Some);
+        }
+        if self.at_kw("foreach") {
+            self.advance();
+            self.expect("(", "after 'foreach'")?;
+            self.scopes.push(HashMap::new());
+            let result = self.foreach_rest(line);
+            self.scopes.pop();
+            return result.map(Some);
+        }
+        if self.at_kw("break") || self.at_kw("continue") {
+            let is_break = self.at_kw("break");
+            if self.loop_depth == 0 {
+                return self.error(format!("'{}' outside a loop", if is_break { "break" } else { "continue" }));
+            }
+            self.advance();
+            self.expect(";", "after break/continue")?;
+            return stmt(if is_break { StmtKind::Break } else { StmtKind::Continue });
+        }
+        if self.at_kw("return") {
+            self.advance();
+            let value = if self.at(";") {
+                None
+            } else {
+                let mut e = self.expression()?;
+                if self.fn_ret == Some(Some(Ty::Vector)) {
+                    hint_vector(&mut e);
+                }
+                Some(e)
+            };
+            self.expect(";", "after return")?;
+            return stmt(StmtKind::Return(value));
+        }
+        if self.is_decl_start() {
+            let ty = self.parse_type()?;
+            let name_token = self.toks[self.pos].clone();
+            let name = self.ident("a variable or function name")?;
+            if self.at("(") {
+                if !top || self.fn_ret.is_some() {
+                    return Self::err_at(&name_token, "functions must be defined at the top level, outside other code blocks");
+                }
+                self.function_def(ty, name)?;
+                return Ok(None);
+            }
+            let Some(ty) = ty else {
+                return Self::err_at(&name_token, "variables cannot be void");
+            };
+            let decls = self.declaration_rest(ty, name, &name_token)?;
+            self.expect(";", "after the declaration")?;
+            return stmt(StmtKind::Block(decls));
+        }
+        let e = self.expression()?;
+        self.expect(";", "after the statement")?;
+        stmt(StmtKind::Expr(e))
+    }
+
+    fn scoped_statement(&mut self) -> PR<Stmt> {
+        let line = self.line();
+        self.scopes.push(HashMap::new());
+        let s = self.statement(false);
+        self.scopes.pop();
+        Ok(s?.unwrap_or(Stmt { line, kind: StmtKind::Block(Vec::new()) }))
+    }
+
+    fn loop_body(&mut self) -> PR<Stmt> {
+        self.loop_depth += 1;
+        let body = self.scoped_statement();
+        self.loop_depth -= 1;
+        body
+    }
+
+    fn block_body(&mut self) -> PR<Vec<Stmt>> {
+        let mut body = Vec::new();
+        loop {
+            if self.eat("}") {
+                return Ok(body);
+            }
+            if matches!(self.peek(), Tok::Eof) {
+                return self.error("missing '}' to close a block");
+            }
+            if let Some(s) = self.statement(false)? {
+                body.push(s);
+            }
+        }
+    }
+
+    fn for_rest(&mut self, line: usize) -> PR<Stmt> {
+        let mut init = Vec::new();
+        if !self.eat(";") {
+            let init_line = self.line();
+            if self.is_decl_start() {
+                let ty = self.parse_type()?.ok_or_else(|| VexError { line: init_line, col: 1, message: "variables cannot be void".into() })?;
+                let name_token = self.toks[self.pos].clone();
+                let name = self.ident("a variable name")?;
+                init = self.declaration_rest(ty, name, &name_token)?;
+            } else {
+                init.push(Stmt { line: init_line, kind: StmtKind::Expr(self.expression()?) });
+            }
+            self.expect(";", "after the for-loop initializer")?;
+        }
+        let cond = if self.at(";") { None } else { Some(self.expression()?) };
+        self.expect(";", "after the for-loop condition")?;
+        let step = if self.at(")") { None } else { Some(self.expression()?) };
+        self.expect(")", "to close the for-loop header")?;
+        let body = self.loop_body()?;
+        Ok(Stmt { line, kind: StmtKind::For(init, cond, step, Box::new(body)) })
+    }
+
+    fn foreach_rest(&mut self, line: usize) -> PR<Stmt> {
+        let mut ty = self.parse_type()?.ok_or_else(|| VexError { line, col: 1, message: "foreach variables cannot be void".into() })?;
+        let mut name = self.ident("the loop variable name")?;
+        let mut index = None;
+        self.expect(";", "after the foreach variable")?;
+        if self.is_decl_start() {
+            // foreach (int i; type value; array): the first variable is the index.
+            if ty != Ty::Int {
+                return self.error("the index variable of foreach must be an int");
+            }
+            index = Some(self.declare(name, Some(Ty::Int)));
+            ty = self.parse_type()?.ok_or_else(|| VexError { line, col: 1, message: "foreach variables cannot be void".into() })?;
+            name = self.ident("the loop variable name")?;
+            self.expect(";", "after the foreach variable")?;
+        }
+        let array = self.expression()?;
+        self.expect(")", "to close the foreach header")?;
+        let var = self.declare(name, Some(ty));
+        let body = self.loop_body()?;
+        Ok(Stmt { line, kind: StmtKind::Foreach(index, var, array, Box::new(body)) })
+    }
+
+    fn declaration_rest(&mut self, ty: Ty, first: String, first_token: &Token) -> PR<Vec<Stmt>> {
+        let mut out = Vec::new();
+        let (mut name, mut token) = (first, first_token.clone());
+        loop {
+            let mut var_ty = ty;
+            if self.eat("[") {
+                if matches!(self.peek(), Tok::Int(_)) {
+                    self.advance();
+                }
+                self.expect("]", "after '['")?;
+                var_ty = ty.array();
+            }
+            let init = if self.eat("=") {
+                let mut e = self.assignment()?;
+                if var_ty == Ty::Vector {
+                    hint_vector(&mut e);
+                }
+                Some(e)
+            } else {
+                None
+            };
+            if self.scopes.last().is_some_and(|scope| scope.contains_key(&name)) {
+                return Self::err_at(&token, format!("'{name}' is already declared in this scope"));
+            }
+            let slot = self.declare(name, Some(var_ty));
+            out.push(Stmt { line: token.line, kind: StmtKind::Decl(slot, init) });
+            if !self.eat(",") {
+                return Ok(out);
+            }
+            token = self.toks[self.pos].clone();
+            name = self.ident("a variable name")?;
+        }
+    }
+
+    fn function_def(&mut self, ret: Option<Ty>, name: String) -> PR<()> {
+        if self.fn_index.contains_key(&name) {
+            return self.error(format!("function '{name}' is already defined"));
+        }
+        if builtin_info(&name).is_some() {
+            return self.error(format!("'{name}' is a built-in function and cannot be redefined"));
+        }
+        self.expect("(", "after the function name")?;
+        let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
+        let saved_types = std::mem::take(&mut self.slot_types);
+        let saved_loops = std::mem::replace(&mut self.loop_depth, 0);
+        let mut param_types = Vec::new();
+        if !self.eat(")") {
+            let mut ty = self.param_type()?;
+            loop {
+                let pname = self.ident("a parameter name")?;
+                let mut pty = ty;
+                if self.eat("[") {
+                    self.expect("]", "after '['")?;
+                    pty = ty.array();
+                }
+                self.declare(pname, Some(pty));
+                param_types.push(pty);
+                if self.eat(")") {
+                    break;
+                }
+                // VEX separates parameter groups with ';' and names of one type with ','.
+                if self.eat(";") {
+                    ty = self.param_type()?;
+                    continue;
+                }
+                self.expect(",", "between parameters")?;
+                if self.is_decl_start() {
+                    ty = self.param_type()?;
+                }
+            }
+        }
+        let index = self.functions.len();
+        self.functions.push(Function { name: name.clone(), ret, param_types, slot_types: Vec::new(), body: Vec::new() });
+        self.fn_index.insert(name, index);
+        let saved_ret = self.fn_ret.replace(ret);
+        self.expect("{", "to start the function body")?;
+        let body = self.block_body();
+        self.fn_ret = saved_ret;
+        self.functions[index].slot_types = std::mem::replace(&mut self.slot_types, saved_types);
+        self.functions[index].body = body?;
+        self.scopes = saved_scopes;
+        self.loop_depth = saved_loops;
+        Ok(())
+    }
+
+    fn param_type(&mut self) -> PR<Ty> {
+        match self.parse_type()? {
+            Some(ty) => Ok(ty),
+            None => self.error("parameters cannot be void"),
+        }
+    }
+
+    fn expression(&mut self) -> PR<Expr> {
+        self.assignment()
+    }
+
+    fn assignment(&mut self) -> PR<Expr> {
+        let start = self.pos;
+        let lhs = self.ternary()?;
+        let op = match self.peek() {
+            Tok::P("=") => None,
+            Tok::P("+=") => Some(BinOp::Add),
+            Tok::P("-=") => Some(BinOp::Sub),
+            Tok::P("*=") => Some(BinOp::Mul),
+            Tok::P("/=") => Some(BinOp::Div),
+            Tok::P("%=") => Some(BinOp::Mod),
+            _ => return Ok(lhs),
+        };
+        let place = self.place_of(&lhs, start)?;
+        self.advance();
+        let mut rhs = self.assignment()?;
+        if self.place_is_vector(&place) {
+            hint_vector(&mut rhs);
+        }
+        Ok(Expr::Assign(Box::new(place), op, Box::new(rhs)))
+    }
+
+    fn place_of(&mut self, e: &Expr, at: usize) -> PR<Place> {
+        let token = &self.toks[at];
+        let Some(place) = to_place(e) else {
+            return Self::err_at(token, "this cannot be assigned to (expected a variable, attribute, component or array element)");
+        };
+        if let Some(id) = root_attr(&place) {
+            let attr = &self.attrs[id];
+            if attr.kind.read_only() {
+                return Self::err_at(token, format!("@{} is read-only", attr.name));
+            }
+            self.attrs[id].written = true;
+        }
+        Ok(place)
+    }
+
+    fn place_is_vector(&self, place: &Place) -> bool {
+        match place {
+            Place::Local(slot) => self.slot_types[*slot] == Some(Ty::Vector),
+            Place::Attr(id) => self.attrs[*id].hint == Some(Ty::Vector),
+            Place::Index(base, _) => matches!(**base, Place::Local(slot) if self.slot_types[slot] == Some(Ty::VecArr)),
+            Place::Member(..) => false,
+        }
+    }
+
+    fn ternary(&mut self) -> PR<Expr> {
+        let cond = self.or()?;
+        if !self.eat("?") {
+            return Ok(cond);
+        }
+        let a = self.assignment()?;
+        self.expect(":", "in the ?: expression")?;
+        let b = self.ternary()?;
+        Ok(Expr::Ternary(Box::new(cond), Box::new(a), Box::new(b)))
+    }
+
+    fn or(&mut self) -> PR<Expr> {
+        let mut lhs = self.and()?;
+        while self.eat("||") {
+            lhs = Expr::Or(Box::new(lhs), Box::new(self.and()?));
+        }
+        Ok(lhs)
+    }
+
+    fn and(&mut self) -> PR<Expr> {
+        let mut lhs = self.binary_level(0)?;
+        while self.eat("&&") {
+            lhs = Expr::And(Box::new(lhs), Box::new(self.binary_level(0)?));
+        }
+        Ok(lhs)
+    }
+
+    // Precedence levels from loosest: equality, relational, additive, multiplicative.
+    fn binary_level(&mut self, level: usize) -> PR<Expr> {
+        const LEVELS: [&[(&str, BinOp)]; 4] = [
+            &[("==", BinOp::Eq), ("!=", BinOp::Ne)],
+            &[("<", BinOp::Lt), ("<=", BinOp::Le), (">", BinOp::Gt), (">=", BinOp::Ge)],
+            &[("+", BinOp::Add), ("-", BinOp::Sub)],
+            &[("*", BinOp::Mul), ("/", BinOp::Div), ("%", BinOp::Mod)],
+        ];
+        if level == LEVELS.len() {
+            return self.unary();
+        }
+        let mut lhs = self.binary_level(level + 1)?;
+        loop {
+            let Some(&(_, op)) = LEVELS[level].iter().find(|(p, _)| self.at(p)) else {
+                return Ok(lhs);
+            };
+            self.advance();
+            let rhs = self.binary_level(level + 1)?;
+            lhs = match (&lhs, &rhs) {
+                (Expr::Const(a), Expr::Const(b)) => match binop(op, a.clone(), b.clone()) {
+                    Ok(folded) => Expr::Const(folded),
+                    Err(_) => Expr::Bin(op, Box::new(lhs), Box::new(rhs)),
+                },
+                _ => Expr::Bin(op, Box::new(lhs), Box::new(rhs)),
+            };
+        }
+    }
+
+    fn unary(&mut self) -> PR<Expr> {
+        if self.eat("-") {
+            return Ok(match self.unary()? {
+                Expr::Const(Value::Int(i)) => Expr::Const(Value::Int(i.wrapping_neg())),
+                Expr::Const(Value::Float(f)) => Expr::Const(Value::Float(-f)),
+                e => Expr::Neg(Box::new(e)),
+            });
+        }
+        if self.eat("+") {
+            return self.unary();
+        }
+        if self.eat("!") {
+            return Ok(Expr::Not(Box::new(self.unary()?)));
+        }
+        if self.at("++") || self.at("--") {
+            let delta = if self.at("++") { 1 } else { -1 };
+            self.advance();
+            let start = self.pos;
+            let e = self.unary()?;
+            let place = self.place_of(&e, start)?;
+            return Ok(Expr::Step(Box::new(place), delta, true));
+        }
+        self.postfix()
+    }
+
+    fn postfix(&mut self) -> PR<Expr> {
+        let start = self.pos;
+        let mut e = self.primary()?;
+        loop {
+            if self.eat(".") {
+                let component = self.ident("a component name (x, y or z)")?;
+                let index = match component.as_str() {
+                    "x" | "r" | "u" => 0,
+                    "y" | "g" | "v" => 1,
+                    "z" | "b" => 2,
+                    _ => return Self::err_at(&self.toks[self.pos - 1], format!("unknown component '.{component}' (use .x, .y or .z)")),
+                };
+                e = Expr::Member(Box::new(e), index);
+            } else if self.eat("[") {
+                let index = self.expression()?;
+                self.expect("]", "to close the index")?;
+                e = Expr::Index(Box::new(e), Box::new(index));
+            } else if self.at("++") || self.at("--") {
+                let delta = if self.at("++") { 1 } else { -1 };
+                let place = self.place_of(&e, start)?;
+                self.advance();
+                e = Expr::Step(Box::new(place), delta, false);
+            } else {
+                return Ok(e);
+            }
+        }
+    }
+
+    fn primary(&mut self) -> PR<Expr> {
+        let token = self.advance();
+        match token.tok.clone() {
+            Tok::Int(i) => Ok(Expr::Const(Value::Int(i))),
+            Tok::Float(f) => Ok(Expr::Const(Value::Float(f))),
+            Tok::Str(s) => Ok(Expr::Const(Value::Str(s.into()))),
+            Tok::P("(") => {
+                let e = self.expression()?;
+                self.expect(")", "to close the parenthesis")?;
+                Ok(e)
+            }
+            Tok::P("{") => {
+                let mut items = Vec::new();
+                if !self.eat("}") {
+                    loop {
+                        items.push(self.assignment()?);
+                        if self.eat("}") {
+                            break;
+                        }
+                        self.expect(",", "between list items")?;
+                    }
+                }
+                if items.iter().all(|e| matches!(e, Expr::Const(_))) {
+                    let values: Vec<Value> = items.into_iter().map(|e| if let Expr::Const(v) = e { v } else { unreachable!() }).collect();
+                    return Ok(Expr::Const(Value::Arr(Rc::new(values))));
+                }
+                Ok(Expr::List(items))
+            }
+            Tok::Attr(prefix, name) => Ok(Expr::Attr(self.attr(prefix, &name, &token)?)),
+            Tok::Ident(name) => self.identifier(name, &token),
+            other => Self::err_at(&token, format!("expected a value, found {}", describe(&other))),
+        }
+    }
+
+    fn identifier(&mut self, name: String, token: &Token) -> PR<Expr> {
+        if self.eat("(") {
+            let mut args = Vec::new();
+            if !self.eat(")") {
+                loop {
+                    args.push(self.assignment()?);
+                    if self.eat(")") {
+                        break;
+                    }
+                    self.expect(",", "between arguments")?;
+                }
+            }
+            return self.call(name, args, token);
+        }
+        match name.as_str() {
+            "M_PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::PI))),
+            "M_TWO_PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::TAU))),
+            "M_E" => return Ok(Expr::Const(Value::Float(std::f32::consts::E))),
+            _ => {}
+        }
+        if let Some(slot) = self.lookup(&name) {
+            return Ok(Expr::Local(slot));
+        }
+        if LEGACY_ATTRS.contains(&name.as_str()) {
+            return Ok(Expr::Attr(self.attr(None, &name, token)?));
+        }
+        if self.at("=") && type_keyword(&name).is_none() {
+            // Assigning to a new name declares it, like the original wrangle syntax allowed.
+            return Ok(Expr::Local(self.declare(name, None)));
+        }
+        Self::err_at(token, format!("unknown variable '{name}' (declare it first, e.g. float {name} = 0;)"))
+    }
+
+    fn call(&mut self, name: String, mut args: Vec<Expr>, token: &Token) -> PR<Expr> {
+        if let Some(&index) = self.fn_index.get(&name) {
+            let params = self.functions[index].param_types.clone();
+            if args.len() != params.len() {
+                return Self::err_at(token, format!("'{name}' expects {} argument(s), got {}", params.len(), args.len()));
+            }
+            for (arg, ty) in args.iter_mut().zip(&params) {
+                if *ty == Ty::Vector {
+                    hint_vector(arg);
+                }
+            }
+            let places = args.iter().map(to_place).collect();
+            return Ok(Expr::Call(index, args, places));
+        }
+        let Some(&(static_name, min, max, ..)) = builtin_info(&name) else {
+            return Self::err_at(token, format!("unknown function '{name}'"));
+        };
+        if args.len() < min || args.len() > max {
+            let expected = match (min, max) {
+                (a, b) if a == b => a.to_string(),
+                (a, VARIADIC) => format!("at least {a}"),
+                (a, b) => format!("{a} to {b}"),
+            };
+            return Self::err_at(token, format!("'{name}' expects {expected} argument(s), got {}", args.len()));
+        }
+        let mut places = Vec::new();
+        if MUTATING.contains(&static_name) {
+            let place = to_place(&args[0]).ok_or_else(|| VexError {
+                line: token.line,
+                col: token.col,
+                message: format!("the first argument of '{name}' must be an array variable"),
+            })?;
+            places.push(Some(place));
+        }
+        Ok(Expr::Builtin(static_name, args, places, false))
+    }
+}
+
+// Marks rand/noise calls whose result is assigned to a vector so they return vectors.
+fn hint_vector(e: &mut Expr) {
+    match e {
+        Expr::Builtin(name, _, _, want) if VECTOR_CONTEXT.contains(name) => *want = true,
+        Expr::Bin(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, a, b) => {
+            hint_vector(a);
+            hint_vector(b);
+        }
+        Expr::Neg(a) => hint_vector(a),
+        Expr::Ternary(_, a, b) => {
+            hint_vector(a);
+            hint_vector(b);
+        }
+        _ => {}
+    }
+}
+
+pub fn compile(src: &str) -> Result<Program, VexError> {
+    let mut parser = Parser {
+        toks: lex(src)?,
+        pos: 0,
+        scopes: vec![HashMap::new()],
+        slot_types: Vec::new(),
+        functions: Vec::new(),
+        fn_index: HashMap::new(),
+        attrs: Vec::new(),
+        attr_index: HashMap::new(),
+        loop_depth: 0,
+        fn_ret: None,
+    };
+    let mut body = Vec::new();
+    while !matches!(parser.peek(), Tok::Eof) {
+        if let Some(stmt) = parser.statement(true)? {
+            body.push(stmt);
+        }
+    }
+    Ok(Program {
+        main: Function { name: "main".into(), ret: None, param_types: Vec::new(), slot_types: parser.slot_types, body },
+        functions: parser.functions,
+        attrs: parser.attrs,
+    })
+}
+
+// ============================================================================
+// Interpreter
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Domain {
+    Detail,
+    Prim,
+    Point,
+    Vertex,
+}
+
+impl Domain {
+    fn prefix(self) -> &'static str {
+        match self {
+            Domain::Detail => "detail:",
+            Domain::Prim => "prim:",
+            Domain::Point => "",
+            Domain::Vertex => "vertex:",
+        }
+    }
+
+    fn of_key(key: &str) -> Domain {
+        if key.starts_with("prim:") {
+            Domain::Prim
+        } else if key.starts_with("vertex:") {
+            Domain::Vertex
+        } else if key.starts_with("detail:") {
+            Domain::Detail
+        } else {
+            Domain::Point
+        }
+    }
+
+    fn count(self, mesh: &Mesh) -> usize {
+        match self {
+            Domain::Detail => 1,
+            Domain::Prim => mesh.indices.len(),
+            Domain::Point => mesh.vertices.len(),
+            Domain::Vertex => mesh.indices.len() * 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WriteMode {
+    Set,
+    Add,
+    Min,
+    Max,
+    Mult,
+}
+
+#[derive(Default)]
+struct Pending {
+    add_points: Vec<[f32; 3]>,
+    add_prims: Vec<[usize; 3]>,
+    remove_points: HashSet<usize>,
+    remove_prims: HashSet<usize>,
+    // Points of removed primitives to delete if nothing else uses them (removeprim andpoints).
+    orphan_candidates: HashSet<usize>,
+    writes: Vec<(Domain, String, usize, Value, WriteMode)>,
+}
+
+enum Flow {
+    Normal,
+    Break,
+    Continue,
+    Return(Value),
+}
+
+struct Frame<'a> {
+    vals: Vec<Value>,
+    types: &'a [Option<Ty>],
+}
+
+struct Runtime<'a> {
+    prog: &'a Program,
+    input: &'a Mesh,
+    normals: &'a [Vec3],
+    out: Mesh,
+    domain: Domain,
+    count: usize,
+    // Storage key (domain prefix + name) of every attribute the program uses.
+    keys: Vec<String>,
+    elem: usize,
+    time: f32,
+    // Seconds per step: one frame, or one SOP Solver substep.
+    time_inc: f32,
+    pending: Pending,
+    steps: u64,
+    depth: usize,
+    log: Vec<String>,
+    partial_line: String,
+    neighbours: Option<Vec<Vec<usize>>>,
+    point_prims: Option<Vec<Vec<usize>>>,
+}
+
+fn vec3(v: [f32; 3]) -> Vec3 {
+    Vec3::new(v[0], v[1], v[2])
+}
+
+fn arr3(v: Vec3) -> [f32; 3] {
+    [v.x, v.y, v.z]
+}
+
+fn with_line(error: String, line: usize) -> String {
+    if error.starts_with("line ") {
+        error
+    } else {
+        format!("line {line}: {error}")
+    }
+}
+
+// Reads one element of a stored attribute; missing attributes read as zero of the hinted type.
+fn read_storage(mesh: &Mesh, key: &str, index: usize, count: usize, hint: Option<Ty>) -> Value {
+    match mesh.point_attributes.get(key) {
+        Some(vals) if count > 0 && !vals.is_empty() => {
+            let comps = (vals.len() / count).max(1);
+            let at = |c: usize| vals.get(index * comps + c).copied().unwrap_or(0.0);
+            if comps >= 3 {
+                Value::Vec([at(0), at(1), at(2)])
+            } else if hint == Some(Ty::Int) {
+                Value::Int(at(0).round() as i32)
+            } else {
+                Value::Float(at(0))
+            }
+        }
+        _ => hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value),
+    }
+}
+
+// Re-lays out an attribute array with a different number of components per element.
+fn reshape(old: &[f32], count: usize, comps: usize) -> Vec<f32> {
+    let old_comps = if count > 0 { old.len() / count } else { 0 };
+    let mut out = vec![0.0; count * comps];
+    for i in 0..count {
+        for c in 0..comps {
+            out[i * comps + c] = match old_comps {
+                0 => 0.0,
+                1 => old[i],
+                n if c < n => old[i * n + c],
+                _ => 0.0,
+            };
+        }
+    }
+    out
+}
+
+fn write_storage(mesh: &mut Mesh, key: &str, index: usize, count: usize, v: &Value, hint: Option<Ty>, name: &str) -> R<()> {
+    match v {
+        Value::Str(_) => return Err(format!("cannot store a string in @{name}: string attributes are not supported yet")),
+        Value::Arr(items) if items.len() != 3 => return Err(format!("cannot store an array in @{name}: array attributes are not supported")),
+        _ => {}
+    }
+    if index >= count {
+        return Ok(());
+    }
+    let existing = mesh
+        .point_attributes
+        .get(key)
+        .filter(|vals| count > 0 && !vals.is_empty())
+        .map(|vals| (vals.len() / count).max(1));
+    let comps = if v.is_vector_like() || hint == Some(Ty::Vector) || name == "Cd" {
+        existing.filter(|c| *c >= 3).unwrap_or(3)
+    } else {
+        existing.unwrap_or(1)
+    };
+    let vals = mesh.point_attributes.entry(key.to_string()).or_default();
+    if vals.len() != count * comps {
+        *vals = reshape(vals, count, comps);
+    }
+    if comps == 1 {
+        vals[index] = v.num()?;
+    } else {
+        vals[index * comps..index * comps + 3].copy_from_slice(&v.vec()?);
+    }
+    Ok(())
+}
+
+fn tri_centroid(mesh: &Mesh, tri: [usize; 3]) -> Vec3 {
+    mesh.vertices[tri[0]].add(mesh.vertices[tri[1]]).add(mesh.vertices[tri[2]]).scale(1.0 / 3.0)
+}
+
+fn tri_normal(mesh: &Mesh, tri: [usize; 3]) -> Vec3 {
+    let [a, b, c] = tri.map(|i| mesh.vertices[i]);
+    b.sub(a).cross(c.sub(a)).normalize()
+}
+
+// Point normal: an explicit N attribute when present, else the computed normal.
+fn point_normal(mesh: &Mesh, normals: &[Vec3], pt: usize) -> Value {
+    if let Some(vals) = mesh.point_attributes.get("N").filter(|vals| vals.len() == mesh.vertices.len() * 3) {
+        return Value::Vec([vals[pt * 3], vals[pt * 3 + 1], vals[pt * 3 + 2]]);
+    }
+    Value::Vec(arr3(normals.get(pt).copied().unwrap_or(Vec3::new(0.0, 1.0, 0.0))))
+}
+
+fn fit(x: f32, omin: f32, omax: f32, nmin: f32, nmax: f32, clamp: bool) -> f32 {
+    let range = omax - omin;
+    let mut t = if range.abs() < 1e-12 { 0.0 } else { (x - omin) / range };
+    if clamp {
+        t = t.clamp(0.0, 1.0);
+    }
+    nmin + t * (nmax - nmin)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = if (edge1 - edge0).abs() < 1e-12 { if x < edge0 { 0.0 } else { 1.0 } } else { ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0) };
+    t * t * (3.0 - 2.0 * t)
+}
+
+// Applies `f` per component when any argument is a vector, otherwise once on scalars.
+fn per_lane(args: &[Value], f: impl Fn(&[f32]) -> f32) -> R<Value> {
+    let mut lanes = [0.0f32; 8];
+    let n = args.len().min(8);
+    if args.iter().any(Value::is_vector_like) {
+        let mut vs = [[0.0f32; 3]; 8];
+        for (i, a) in args.iter().take(8).enumerate() {
+            vs[i] = a.vec()?;
+        }
+        let mut out = [0.0; 3];
+        for (lane, slot) in out.iter_mut().enumerate() {
+            for i in 0..n {
+                lanes[i] = vs[i][lane];
+            }
+            *slot = f(&lanes[..n]);
+        }
+        return Ok(Value::Vec(out));
+    }
+    for (i, a) in args.iter().take(8).enumerate() {
+        lanes[i] = a.num()?;
+    }
+    Ok(Value::Float(f(&lanes[..n])))
+}
+
+fn all_int(args: &[Value]) -> bool {
+    args.iter().all(|v| matches!(v, Value::Int(_)))
+}
+
+fn pick_extreme(a: Value, b: Value, min: bool) -> R<Value> {
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        return Ok(Value::Int(if min { *x.min(y) } else { *x.max(y) }));
+    }
+    per_lane(&[a, b], |x| if min { x[0].min(x[1]) } else { x[0].max(x[1]) })
+}
+
+fn average(items: &[Value]) -> R<Value> {
+    if items.is_empty() {
+        return Ok(Value::Float(0.0));
+    }
+    let n = items.len() as f32;
+    if items.iter().any(Value::is_vector_like) {
+        let mut sum = [0.0f32; 3];
+        for item in items {
+            let v = item.vec()?;
+            (0..3).for_each(|c| sum[c] += v[c]);
+        }
+        return Ok(Value::Vec(sum.map(|c| c / n)));
+    }
+    Ok(Value::Float(items.iter().map(Value::num).sum::<R<f32>>()? / n))
+}
+
+fn seed_bits(v: &Value) -> R<u32> {
+    Ok(match v {
+        Value::Vec(_) | Value::Arr(_) => {
+            let p = v.vec()?;
+            p[0].to_bits() ^ p[1].to_bits().rotate_left(11) ^ p[2].to_bits().rotate_left(22)
+        }
+        other => other.num()?.to_bits(),
+    })
+}
+
+fn lattice_hash(x: i32, y: i32, z: i32, seed: u32) -> u32 {
+    let mut h = (x as u32).wrapping_mul(0x8DA6_B343)
+        ^ (y as u32).wrapping_mul(0xD816_3841)
+        ^ (z as u32).wrapping_mul(0xCB1A_B31F)
+        ^ seed.wrapping_mul(0x1656_67B1);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5BD1_E995);
+    h ^ (h >> 15)
+}
+
+fn gradient(hash: u32, x: f32, y: f32, z: f32) -> f32 {
+    let h = hash & 15;
+    let u = if h < 8 { x } else { y };
+    let v = if h < 4 { y } else if h == 12 || h == 14 { x } else { z };
+    (if h & 1 == 0 { u } else { -u }) + (if h & 2 == 0 { v } else { -v })
+}
+
+// Improved Perlin gradient noise, roughly in -1..1.
+pub(crate) fn perlin3(p: [f32; 3], seed: u32) -> f32 {
+    let cell = p.map(f32::floor);
+    let [ix, iy, iz] = cell.map(|c| c as i32);
+    let [fx, fy, fz] = [p[0] - cell[0], p[1] - cell[1], p[2] - cell[2]];
+    let fade = |t: f32| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let (u, v, w) = (fade(fx), fade(fy), fade(fz));
+    let g = |dx: i32, dy: i32, dz: i32| {
+        gradient(lattice_hash(ix + dx, iy + dy, iz + dz, seed), fx - dx as f32, fy - dy as f32, fz - dz as f32)
+    };
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    lerp(
+        lerp(lerp(g(0, 0, 0), g(1, 0, 0), u), lerp(g(0, 1, 0), g(1, 1, 0), u), v),
+        lerp(lerp(g(0, 0, 1), g(1, 0, 1), u), lerp(g(0, 1, 1), g(1, 1, 1), u), v),
+        w,
+    )
+}
+
+fn hsv_to_rgb([h, s, v]: [f32; 3]) -> [f32; 3] {
+    let h = (h - h.floor()) * 6.0;
+    let i = h.floor() as i32;
+    let f = h - i as f32;
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match i {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
+fn rgb_to_hsv([r, g, b]: [f32; 3]) -> [f32; 3] {
+    let max = r.max(g).max(b);
+    let delta = max - r.min(g).min(b);
+    let h = if delta <= 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if max == g {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+    [h, if max > 0.0 { delta / max } else { 0.0 }, max]
+}
+
+// printf-style formatting: %d %i %f %g %e %s %c %x %v with flags, width and precision.
+fn format_vex(args: &[Value]) -> R<String> {
+    let fmt = args[0].string()?;
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut next_arg = 1;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if chars.get(i) == Some(&'%') {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        let (mut left, mut zero, mut plus) = (false, false, false);
+        while let Some(&flag) = chars.get(i) {
+            match flag {
+                '-' => left = true,
+                '0' => zero = true,
+                '+' => plus = true,
+                ' ' => {}
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        while let Some(d) = chars.get(i).and_then(|c| c.to_digit(10)) {
+            width = width * 10 + d as usize;
+            i += 1;
+        }
+        let mut precision = None;
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            let mut p = 0usize;
+            while let Some(d) = chars.get(i).and_then(|c| c.to_digit(10)) {
+                p = p * 10 + d as usize;
+                i += 1;
+            }
+            precision = Some(p);
+        }
+        while chars.get(i) == Some(&'l') {
+            i += 1;
+        }
+        let Some(&conv) = chars.get(i) else {
+            out.push('%');
+            break;
+        };
+        i += 1;
+        let arg = args.get(next_arg).ok_or_else(|| format!("not enough arguments for the format \"{fmt}\""))?;
+        next_arg += 1;
+        let body = format_one(conv, arg, precision, plus)?;
+        let pad = width.saturating_sub(body.chars().count());
+        if left {
+            out.push_str(&body);
+            out.extend(std::iter::repeat(' ').take(pad));
+        } else if zero && !matches!(conv, 's' | 'c' | 'v') && !arg.is_vector_like() {
+            let (sign, digits) = if body.starts_with('-') || body.starts_with('+') { body.split_at(1) } else { ("", body.as_str()) };
+            out.push_str(sign);
+            out.extend(std::iter::repeat('0').take(pad));
+            out.push_str(digits);
+        } else {
+            out.extend(std::iter::repeat(' ').take(pad));
+            out.push_str(&body);
+        }
+    }
+    Ok(out)
+}
+
+fn format_one(conv: char, v: &Value, precision: Option<usize>, plus: bool) -> R<String> {
+    if let Value::Vec(c) = v {
+        let parts = c.iter().map(|x| format_one(conv, &Value::Float(*x), precision, plus)).collect::<R<Vec<_>>>()?;
+        return Ok(format!("{{{}}}", parts.join(", ")));
+    }
+    if let Value::Arr(items) = v {
+        let parts = items.iter().map(|x| format_one(conv, x, precision, plus)).collect::<R<Vec<_>>>()?;
+        return Ok(format!("{{{}}}", parts.join(", ")));
+    }
+    let sign = |s: String, positive: bool| if plus && positive { format!("+{s}") } else { s };
+    Ok(match conv {
+        'd' | 'i' => {
+            let n = v.int()?;
+            sign(n.to_string(), n >= 0)
+        }
+        'f' | 'F' => {
+            let f = v.num()?;
+            sign(format!("{:.*}", precision.unwrap_or(6), f), f >= 0.0)
+        }
+        'e' | 'E' => {
+            let f = v.num()?;
+            let s = format!("{:.*e}", precision.unwrap_or(6), f);
+            sign(if conv == 'E' { s.to_uppercase() } else { s }, f >= 0.0)
+        }
+        'g' | 'G' => match v {
+            Value::Str(s) => s.to_string(),
+            _ => {
+                let f = v.num()?;
+                let s = match precision {
+                    Some(p) => {
+                        let s = format!("{:.*}", p, f);
+                        if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+                    }
+                    None => f.to_string(),
+                };
+                sign(s, f >= 0.0)
+            }
+        },
+        's' | 'v' => match (v, precision) {
+            (Value::Float(f), Some(p)) => format!("{:.*}", p, f),
+            _ => v.display(),
+        },
+        'c' => char::from_u32(v.int()? as u32).map(String::from).unwrap_or_default(),
+        'x' => format!("{:x}", v.int()?),
+        'X' => format!("{:X}", v.int()?),
+        other => return Err(format!("unknown format '%{other}'")),
+    })
+}
+
+fn sort_values(items: &[Value]) -> R<Vec<usize>> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    if items.iter().all(|v| matches!(v, Value::Str(_))) {
+        order.sort_by(|&a, &b| items[a].display().cmp(&items[b].display()));
+    } else {
+        let keys = items.iter().map(Value::num).collect::<R<Vec<f32>>>().map_err(|_| "can only sort numbers or strings".to_string())?;
+        order.sort_by(|&a, &b| keys[a].partial_cmp(&keys[b]).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    Ok(order)
+}
+
+fn int_array(values: impl IntoIterator<Item = usize>) -> Value {
+    Value::Arr(Rc::new(values.into_iter().map(|i| Value::Int(i as i32)).collect()))
+}
+
+fn write_mode(v: Option<&Value>) -> R<WriteMode> {
+    let Some(v) = v else { return Ok(WriteMode::Set) };
+    Ok(match &*v.string()? {
+        "set" => WriteMode::Set,
+        "add" => WriteMode::Add,
+        "min" => WriteMode::Min,
+        "max" => WriteMode::Max,
+        "mult" | "multiply" => WriteMode::Mult,
+        other => return Err(format!("unknown write mode \"{other}\" (use set, add, min, max or mult)")),
+    })
+}
+
+fn mutate_array(name: &str, target: Value, args: &[Value]) -> R<(Value, Value)> {
+    let mut items = match target {
+        Value::Arr(items) => Rc::try_unwrap(items).unwrap_or_else(|shared| (*shared).clone()),
+        other => return Err(format!("the first argument must be an array, got {}", other.type_name())),
+    };
+    let result = match name {
+        "push" => {
+            items.push(args[0].clone());
+            Value::Int(items.len() as i32)
+        }
+        "append" => {
+            match &args[0] {
+                Value::Arr(more) => items.extend(more.iter().cloned()),
+                other => items.push(other.clone()),
+            }
+            Value::Int(items.len() as i32)
+        }
+        "pop" => {
+            let index = match args.first() {
+                Some(i) => normalize_index(i.int()?, items.len()),
+                None => items.len().checked_sub(1),
+            };
+            match index.filter(|i| *i < items.len()) {
+                Some(i) => items.remove(i),
+                None => Value::Int(0),
+            }
+        }
+        "insert" => {
+            let index = normalize_index(args[0].int()?, items.len()).unwrap_or(0).min(items.len());
+            items.insert(index, args[1].clone());
+            Value::Int(items.len() as i32)
+        }
+        "removeindex" => match normalize_index(args[0].int()?, items.len()).filter(|i| *i < items.len()) {
+            Some(i) => items.remove(i),
+            None => Value::Int(0),
+        },
+        "removevalue" => match items.iter().position(|v| values_equal(v, &args[0])) {
+            Some(i) => {
+                items.remove(i);
+                Value::Int(1)
+            }
+            None => Value::Int(0),
+        },
+        "resize" => {
+            let size = args[0].int()?.max(0) as usize;
+            let value = args.get(1).cloned().unwrap_or_else(|| items.first().map_or(Value::Int(0), Value::zero_like));
+            items.resize(size, value);
+            Value::Int(size as i32)
+        }
+        _ => return Err(format!("internal: {name} is not an array function")),
+    };
+    Ok((Value::Arr(Rc::new(items)), result))
+}
+
+impl<'a> Runtime<'a> {
+    fn tick(&mut self) -> R<()> {
+        self.steps += 1;
+        if self.steps > STEP_LIMIT {
+            return Err(format!("stopped after {STEP_LIMIT} loop iterations: is there an infinite loop?"));
+        }
+        Ok(())
+    }
+
+    fn point_index(&self) -> Option<usize> {
+        match self.domain {
+            Domain::Point => Some(self.elem),
+            Domain::Vertex => Some(self.out.indices[self.elem / 3][self.elem % 3]),
+            _ => None,
+        }
+    }
+
+    fn print(&mut self, text: &str) {
+        self.partial_line.push_str(text);
+        while let Some(newline) = self.partial_line.find('\n') {
+            let line: String = self.partial_line.drain(..=newline).collect();
+            self.push_log(line.trim_end_matches('\n').to_string());
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        if self.log.len() < MAX_LOG_LINES {
+            self.log.push(line);
+        } else if self.log.len() == MAX_LOG_LINES {
+            self.log.push(format!("… output truncated after {MAX_LOG_LINES} lines"));
+        }
+    }
+
+    fn exec_block(&mut self, stmts: &'a [Stmt], fr: &mut Frame<'a>) -> R<Flow> {
+        for s in stmts {
+            match self.exec(s, fr)? {
+                Flow::Normal => {}
+                flow => return Ok(flow),
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    fn exec(&mut self, s: &'a Stmt, fr: &mut Frame<'a>) -> R<Flow> {
+        self.exec_kind(&s.kind, fr).map_err(|e| with_line(e, s.line))
+    }
+
+    fn exec_kind(&mut self, kind: &'a StmtKind, fr: &mut Frame<'a>) -> R<Flow> {
+        match kind {
+            StmtKind::Expr(e) => {
+                self.eval(e, fr)?;
+            }
+            StmtKind::Decl(slot, init) => {
+                let value = match init {
+                    Some(e) => self.eval(e, fr)?,
+                    None => fr.types[*slot].map_or(Value::Int(0), Ty::default_value),
+                };
+                store_local(fr, *slot, value)?;
+            }
+            StmtKind::If(cond, then, otherwise) => {
+                if self.eval(cond, fr)?.truthy() {
+                    return self.exec(then, fr);
+                } else if let Some(otherwise) = otherwise {
+                    return self.exec(otherwise, fr);
+                }
+            }
+            StmtKind::While(cond, body) => loop {
+                self.tick()?;
+                if !self.eval(cond, fr)?.truthy() {
+                    break;
+                }
+                match self.exec(body, fr)? {
+                    Flow::Break => break,
+                    Flow::Return(v) => return Ok(Flow::Return(v)),
+                    _ => {}
+                }
+            },
+            StmtKind::DoWhile(body, cond) => loop {
+                self.tick()?;
+                match self.exec(body, fr)? {
+                    Flow::Break => break,
+                    Flow::Return(v) => return Ok(Flow::Return(v)),
+                    _ => {}
+                }
+                if !self.eval(cond, fr)?.truthy() {
+                    break;
+                }
+            },
+            StmtKind::For(init, cond, step, body) => {
+                for s in init {
+                    self.exec(s, fr)?;
+                }
+                loop {
+                    self.tick()?;
+                    if let Some(cond) = cond {
+                        if !self.eval(cond, fr)?.truthy() {
+                            break;
+                        }
+                    }
+                    match self.exec(body, fr)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        _ => {}
+                    }
+                    if let Some(step) = step {
+                        self.eval(step, fr)?;
+                    }
+                }
+            }
+            StmtKind::Foreach(index, var, array, body) => {
+                let items = match self.eval(array, fr)? {
+                    Value::Arr(items) => items,
+                    Value::Vec(v) => Rc::new(v.iter().map(|c| Value::Float(*c)).collect()),
+                    other => return Err(format!("foreach needs an array, got {}", other.type_name())),
+                };
+                for (i, item) in items.iter().enumerate() {
+                    self.tick()?;
+                    if let Some(index) = index {
+                        fr.vals[*index] = Value::Int(i as i32);
+                    }
+                    store_local(fr, *var, item.clone())?;
+                    match self.exec(body, fr)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        _ => {}
+                    }
+                }
+            }
+            StmtKind::Block(stmts) => return self.exec_block(stmts, fr),
+            StmtKind::Break => return Ok(Flow::Break),
+            StmtKind::Continue => return Ok(Flow::Continue),
+            StmtKind::Return(value) => {
+                let value = match value {
+                    Some(e) => self.eval(e, fr)?,
+                    None => Value::Int(0),
+                };
+                return Ok(Flow::Return(value));
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    fn eval(&mut self, e: &'a Expr, fr: &mut Frame<'a>) -> R<Value> {
+        Ok(match e {
+            Expr::Const(v) => v.clone(),
+            Expr::Local(slot) => fr.vals[*slot].clone(),
+            Expr::Attr(id) => self.attr_read(*id)?,
+            Expr::List(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval(item, fr)?);
+                }
+                Value::Arr(Rc::new(values))
+            }
+            Expr::Neg(a) => match self.eval(a, fr)? {
+                Value::Int(i) => Value::Int(i.wrapping_neg()),
+                Value::Float(f) => Value::Float(-f),
+                Value::Str(_) => return Err("cannot negate a string".into()),
+                other => Value::Vec(other.vec()?.map(|c| -c)),
+            },
+            Expr::Not(a) => Value::Int(!self.eval(a, fr)?.truthy() as i32),
+            Expr::Bin(op, a, b) => {
+                let a = self.eval(a, fr)?;
+                let b = self.eval(b, fr)?;
+                binop(*op, a, b)?
+            }
+            Expr::And(a, b) => {
+                let result = self.eval(a, fr)?.truthy() && self.eval(b, fr)?.truthy();
+                Value::Int(result as i32)
+            }
+            Expr::Or(a, b) => {
+                let result = self.eval(a, fr)?.truthy() || self.eval(b, fr)?.truthy();
+                Value::Int(result as i32)
+            }
+            Expr::Ternary(cond, a, b) => {
+                if self.eval(cond, fr)?.truthy() {
+                    self.eval(a, fr)?
+                } else {
+                    self.eval(b, fr)?
+                }
+            }
+            Expr::Assign(place, op, rhs) => {
+                let value = self.eval(rhs, fr)?;
+                let value = match op {
+                    Some(op) => {
+                        let current = self.read_place(place, fr)?;
+                        binop(*op, current, value)?
+                    }
+                    None => value,
+                };
+                self.write_place(place, value, fr)?
+            }
+            Expr::Step(place, delta, prefix) => {
+                let current = self.read_place(place, fr)?;
+                let stepped = binop(BinOp::Add, current.clone(), Value::Int(*delta))?;
+                let stored = self.write_place(place, stepped, fr)?;
+                if *prefix {
+                    stored
+                } else {
+                    current
+                }
+            }
+            Expr::Member(a, c) => component(&self.eval(a, fr)?, *c)?,
+            Expr::Index(a, index) => {
+                let base = self.eval(a, fr)?;
+                let index = self.eval(index, fr)?.int()?;
+                index_read(&base, index)?
+            }
+            Expr::Builtin(name, args, places, want_vec) => self.call_builtin(*name, args, places, *want_vec, fr)?,
+            Expr::Call(index, args, places) => self.call_user(*index, args, places, fr)?,
+        })
+    }
+
+    fn take_place(&mut self, place: &'a Place, fr: &mut Frame<'a>) -> R<Value> {
+        match place {
+            // Taking the value leaves the frame's copy unshared, so arrays mutate in place.
+            Place::Local(slot) => Ok(std::mem::take(&mut fr.vals[*slot])),
+            other => self.read_place(other, fr),
+        }
+    }
+
+    fn read_place(&mut self, place: &'a Place, fr: &mut Frame<'a>) -> R<Value> {
+        match place {
+            Place::Local(slot) => Ok(fr.vals[*slot].clone()),
+            Place::Attr(id) => self.attr_read(*id),
+            Place::Member(base, c) => component(&self.read_place(base, fr)?, *c),
+            Place::Index(base, index) => {
+                let index = self.eval(index, fr)?.int()?;
+                let base = self.read_place(base, fr)?;
+                index_read(&base, index)
+            }
+        }
+    }
+
+    fn write_place(&mut self, place: &'a Place, value: Value, fr: &mut Frame<'a>) -> R<Value> {
+        match place {
+            Place::Local(slot) => store_local(fr, *slot, value),
+            Place::Attr(id) => {
+                self.attr_write(*id, &value)?;
+                Ok(value)
+            }
+            Place::Member(base, c) => {
+                let f = value.num()?;
+                let current = self.take_place(base, fr)?;
+                let updated = set_component(current, *c, f)?;
+                self.write_place(base, updated, fr)?;
+                Ok(Value::Float(f))
+            }
+            Place::Index(base, index) => {
+                let index = self.eval(index, fr)?.int()?;
+                let current = self.take_place(base, fr)?;
+                let (updated, stored) = index_write(current, index, value)?;
+                self.write_place(base, updated, fr)?;
+                Ok(stored)
+            }
+        }
+    }
+
+    fn call_user(&mut self, index: usize, args: &'a [Expr], places: &'a [Option<Place>], fr: &mut Frame<'a>) -> R<Value> {
+        self.tick()?;
+        if self.depth >= MAX_CALL_DEPTH {
+            return Err(format!("too many nested function calls (more than {MAX_CALL_DEPTH}): runaway recursion?"));
+        }
+        let prog: &'a Program = self.prog;
+        let f = &prog.functions[index];
+        let mut vals: Vec<Value> = f.slot_types.iter().map(|t| t.map_or(Value::Int(0), Ty::default_value)).collect();
+        for (i, arg) in args.iter().enumerate() {
+            let value = self.eval(arg, fr)?;
+            vals[i] = value.convert(f.param_types[i]).map_err(|e| format!("argument {} of {}(): {e}", i + 1, f.name))?;
+        }
+        let mut frame = Frame { vals, types: &f.slot_types };
+        self.depth += 1;
+        let flow = self.exec_block(&f.body, &mut frame);
+        self.depth -= 1;
+        let result = match flow? {
+            Flow::Return(v) => v,
+            _ => Value::Int(0),
+        };
+        let result = match f.ret {
+            Some(ty) => result.convert(ty).map_err(|e| format!("return value of {}(): {e}", f.name))?,
+            None => Value::Int(0),
+        };
+        // Arguments are passed by reference: copy parameters back to assignable arguments.
+        for (i, place) in places.iter().enumerate() {
+            if let Some(place) = place {
+                let value = std::mem::take(&mut frame.vals[i]);
+                self.write_place(place, value, fr)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn call_builtin(&mut self, name: &'static str, args: &'a [Expr], places: &'a [Option<Place>], want_vec: bool, fr: &mut Frame<'a>) -> R<Value> {
+        if MUTATING.contains(&name) {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in &args[1..] {
+                values.push(self.eval(arg, fr)?);
+            }
+            let place = places[0].as_ref().expect("array place checked at compile time");
+            let target = self.take_place(place, fr)?;
+            let (updated, result) = mutate_array(name, target, &values).map_err(|e| format!("{name}(): {e}"))?;
+            self.write_place(place, updated, fr)?;
+            return Ok(result);
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg, fr)?);
+        }
+        self.builtin(name, &values, want_vec).map_err(|e| if name == "error" { e } else { format!("{name}(): {e}") })
+    }
+
+    fn attr_read(&mut self, id: usize) -> R<Value> {
+        let prog: &'a Program = self.prog;
+        let attr = &prog.attrs[id];
+        let int = |n: usize| Value::Int(n as i32);
+        Ok(match attr.kind {
+            AttrKind::Ptnum => int(self.point_index().unwrap_or(0)),
+            AttrKind::Primnum => int(match self.domain {
+                Domain::Prim => self.elem,
+                Domain::Vertex => self.elem / 3,
+                _ => 0,
+            }),
+            AttrKind::Vtxnum => int(if self.domain == Domain::Vertex { self.elem } else { 0 }),
+            AttrKind::Numpt => int(self.input.vertices.len()),
+            AttrKind::Numprim => int(self.input.indices.len()),
+            AttrKind::Numvtx => int(self.input.indices.len() * 3),
+            AttrKind::Elemnum => int(self.elem),
+            AttrKind::Numelem => int(self.count),
+            AttrKind::Time => Value::Float(self.time),
+            AttrKind::TimeInc => Value::Float(self.time_inc),
+            // Frames count from 1 at time 0, as in Houdini.
+            AttrKind::Frame => Value::Float(self.time * crate::sims::SIM_FPS + 1.0),
+            AttrKind::P => match self.domain {
+                Domain::Point | Domain::Vertex => Value::Vec(arr3(self.out.vertices[self.point_index().unwrap_or(0)])),
+                Domain::Prim => Value::Vec(arr3(tri_centroid(&self.out, self.out.indices[self.elem]))),
+                Domain::Detail => read_storage(&self.out, &self.keys[id], 0, 1, Some(Ty::Vector)),
+            },
+            AttrKind::N => match self.domain {
+                Domain::Point | Domain::Vertex => point_normal(&self.out, self.normals, self.point_index().unwrap_or(0)),
+                Domain::Prim => Value::Vec(arr3(tri_normal(&self.out, self.out.indices[self.elem]))),
+                Domain::Detail => read_storage(&self.out, &self.keys[id], 0, 1, Some(Ty::Vector)),
+            },
+            _ => read_storage(&self.out, &self.keys[id], self.elem, self.count, attr.hint),
+        })
+    }
+
+    fn attr_write(&mut self, id: usize, value: &Value) -> R<()> {
+        let prog: &'a Program = self.prog;
+        let attr = &prog.attrs[id];
+        match (attr.kind, self.domain) {
+            (AttrKind::P, Domain::Point | Domain::Vertex) => {
+                let pt = self.point_index().unwrap_or(0);
+                self.out.vertices[pt] = vec3(value.vec()?);
+            }
+            (AttrKind::P, Domain::Prim) => {
+                // Moving a primitive's centre moves its three points.
+                let tri = self.out.indices[self.elem];
+                let delta = vec3(value.vec()?).sub(tri_centroid(&self.out, tri));
+                for pt in tri {
+                    self.out.vertices[pt] = self.out.vertices[pt].add(delta);
+                }
+            }
+            (AttrKind::N, Domain::Point | Domain::Vertex) => {
+                let pt = self.point_index().unwrap_or(0);
+                let count = self.out.vertices.len();
+                write_storage(&mut self.out, "N", pt, count, value, Some(Ty::Vector), "N")?;
+            }
+            _ => write_storage(&mut self.out, &self.keys[id], self.elem, self.count, value, attr.hint, &attr.name)?,
+        }
+        Ok(())
+    }
+
+    // Reads an attribute of the input geometry (point(), prim(), vertex(), detail()).
+    fn input_attr(&self, domain: Domain, name: &str, index: i32) -> Value {
+        let mesh = self.input;
+        let count = domain.count(mesh);
+        let hint = known_hint(name);
+        let Some(index) = usize::try_from(index).ok().filter(|i| *i < count) else {
+            return hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value);
+        };
+        match (domain, name) {
+            (Domain::Point, "P") => Value::Vec(arr3(mesh.vertices[index])),
+            (Domain::Point, "N") => point_normal(mesh, self.normals, index),
+            (Domain::Point, "ptnum") | (Domain::Prim, "primnum") | (Domain::Vertex, "vtxnum") => Value::Int(index as i32),
+            (Domain::Prim, "P") => Value::Vec(arr3(tri_centroid(mesh, mesh.indices[index]))),
+            (Domain::Prim, "N") => Value::Vec(arr3(tri_normal(mesh, mesh.indices[index]))),
+            (Domain::Vertex, "P") => Value::Vec(arr3(mesh.vertices[mesh.indices[index / 3][index % 3]])),
+            _ => read_storage(mesh, &format!("{}{name}", domain.prefix()), index, count, hint),
+        }
+    }
+
+    fn neighbour_lists(&mut self) -> &Vec<Vec<usize>> {
+        let input = self.input;
+        self.neighbours.get_or_insert_with(|| {
+            let mut lists = vec![Vec::new(); input.vertices.len()];
+            for tri in &input.indices {
+                for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                    if a < lists.len() && b < lists.len() {
+                        lists[a].push(b);
+                        lists[b].push(a);
+                    }
+                }
+            }
+            for list in &mut lists {
+                list.sort_unstable();
+                list.dedup();
+            }
+            lists
+        })
+    }
+
+    fn point_prim_lists(&mut self) -> &Vec<Vec<usize>> {
+        let input = self.input;
+        self.point_prims.get_or_insert_with(|| {
+            let mut lists = vec![Vec::new(); input.vertices.len()];
+            for (t, tri) in input.indices.iter().enumerate() {
+                for &p in tri {
+                    if p < lists.len() && lists[p].last() != Some(&t) {
+                        lists[p].push(t);
+                    }
+                }
+            }
+            lists
+        })
+    }
+
+    fn bounds(&self) -> (Vec3, Vec3) {
+        self.input.bounds().unwrap_or((Vec3::zero(), Vec3::zero()))
+    }
+
+    fn builtin(&mut self, name: &str, a: &[Value], want_vec: bool) -> R<Value> {
+        use Value::{Float, Int, Str, Vec as V};
+        let index_of = |v: &Value| -> R<usize> { usize::try_from(v.int()?).map_err(|_| "index must not be negative".to_string()) };
+        Ok(match name {
+            "abs" if all_int(a) => Int(a[0].int()?.wrapping_abs()),
+            "abs" => per_lane(a, |x| x[0].abs())?,
+            "sign" => per_lane(a, |x| if x[0] > 0.0 { 1.0 } else if x[0] < 0.0 { -1.0 } else { 0.0 })?,
+            "floor" => per_lane(a, |x| x[0].floor())?,
+            "ceil" => per_lane(a, |x| x[0].ceil())?,
+            "round" => per_lane(a, |x| x[0].round())?,
+            "trunc" => per_lane(a, |x| x[0].trunc())?,
+            "frac" => per_lane(a, |x| x[0] - x[0].floor())?,
+            "sqrt" => per_lane(a, |x| x[0].max(0.0).sqrt())?,
+            "exp" => per_lane(a, |x| x[0].exp())?,
+            "log" => per_lane(a, |x| x[0].max(1e-30).ln())?,
+            "log10" => per_lane(a, |x| x[0].max(1e-30).log10())?,
+            "pow" => per_lane(a, |x| x[0].powf(x[1]))?,
+            "sin" => per_lane(a, |x| x[0].sin())?,
+            "cos" => per_lane(a, |x| x[0].cos())?,
+            "tan" => per_lane(a, |x| x[0].tan())?,
+            "asin" => per_lane(a, |x| x[0].clamp(-1.0, 1.0).asin())?,
+            "acos" => per_lane(a, |x| x[0].clamp(-1.0, 1.0).acos())?,
+            "atan" if a.len() == 2 => per_lane(a, |x| x[0].atan2(x[1]))?,
+            "atan" => per_lane(a, |x| x[0].atan())?,
+            "atan2" => per_lane(a, |x| x[0].atan2(x[1]))?,
+            "sinh" => per_lane(a, |x| x[0].sinh())?,
+            "cosh" => per_lane(a, |x| x[0].cosh())?,
+            "tanh" => per_lane(a, |x| x[0].tanh())?,
+            "radians" => per_lane(a, |x| x[0].to_radians())?,
+            "degrees" => per_lane(a, |x| x[0].to_degrees())?,
+            "min" | "max" => {
+                let items = if a.len() == 1 { a[0].items()? } else { Rc::new(a.to_vec()) };
+                let mut best = items.first().cloned().ok_or("needs at least one value")?;
+                for item in items.iter().skip(1) {
+                    best = pick_extreme(best, item.clone(), name == "min")?;
+                }
+                best
+            }
+            "clamp" if all_int(a) => Int(a[0].int()?.max(a[1].int()?).min(a[2].int()?)),
+            "clamp" => per_lane(a, |x| x[0].max(x[1]).min(x[2]))?,
+            "mod" if all_int(a) => binop(BinOp::Mod, a[0].clone(), a[1].clone())?,
+            "mod" => per_lane(a, |x| if x[1] == 0.0 { 0.0 } else { x[0] % x[1] })?,
+            "fit" | "fitclamp" => per_lane(a, |x| fit(x[0], x[1], x[2], x[3], x[4], true))?,
+            "efit" => per_lane(a, |x| fit(x[0], x[1], x[2], x[3], x[4], false))?,
+            "fit01" => per_lane(a, |x| fit(x[0], 0.0, 1.0, x[1], x[2], true))?,
+            "fit10" => per_lane(a, |x| fit(x[0], 1.0, 0.0, x[1], x[2], true))?,
+            "fit11" => per_lane(a, |x| fit(x[0], -1.0, 1.0, x[1], x[2], true))?,
+            "lerp" => per_lane(a, |x| x[0] + (x[1] - x[0]) * x[2])?,
+            "smooth" | "smoothstep" => per_lane(a, |x| smoothstep(x[0], x[1], x[2]))?,
+
+            "set" | "vector" if a.len() == 3 => V([a[0].num()?, a[1].num()?, a[2].num()?]),
+            "set" | "vector" if a.len() == 1 => V(a[0].vec()?),
+            "set" | "vector" => return Err("expects 1 or 3 arguments".into()),
+            "length" => Float(vec3(a[0].vec()?).length()),
+            "length2" => {
+                let v = vec3(a[0].vec()?);
+                Float(v.dot(v))
+            }
+            "normalize" | "normalizesafe" => V(arr3(vec3(a[0].vec()?).normalize())),
+            "dot" => Float(vec3(a[0].vec()?).dot(vec3(a[1].vec()?))),
+            "cross" => V(arr3(vec3(a[0].vec()?).cross(vec3(a[1].vec()?)))),
+            "distance" => Float(vec3(a[0].vec()?).sub(vec3(a[1].vec()?)).length()),
+            "distance2" => {
+                let d = vec3(a[0].vec()?).sub(vec3(a[1].vec()?));
+                Float(d.dot(d))
+            }
+            "reflect" => {
+                let (i, n) = (vec3(a[0].vec()?), vec3(a[1].vec()?).normalize());
+                V(arr3(i.sub(n.scale(2.0 * i.dot(n)))))
+            }
+            "refract" => {
+                let (i, n, eta) = (vec3(a[0].vec()?).normalize(), vec3(a[1].vec()?).normalize(), a[2].num()?);
+                let cos = n.dot(i);
+                let k = 1.0 - eta * eta * (1.0 - cos * cos);
+                V(if k < 0.0 { [0.0; 3] } else { arr3(i.scale(eta).sub(n.scale(eta * cos + k.sqrt()))) })
+            }
+            "avg" if a.len() == 1 => match &a[0] {
+                Value::Arr(items) => average(items)?,
+                V(v) => Float((v[0] + v[1] + v[2]) / 3.0),
+                other => Float(other.num()?),
+            },
+            "avg" => average(a)?,
+            "luminance" => {
+                let c = a[0].vec()?;
+                Float(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+            }
+            "hsvtorgb" => V(hsv_to_rgb(a[0].vec()?)),
+            "rgbtohsv" => V(rgb_to_hsv(a[0].vec()?)),
+
+            "rand" | "random" => {
+                let mut seed = seed_bits(&a[0])?;
+                if let Some(second) = a.get(1) {
+                    seed ^= seed_bits(second)?.wrapping_mul(0x9E37_79B9);
+                }
+                if want_vec {
+                    V([hash01(seed, 17), hash01(seed, 29), hash01(seed, 43)])
+                } else {
+                    Float(hash01(seed, 17))
+                }
+            }
+            "noise" | "snoise" => {
+                let p = match a {
+                    [single] if single.is_vector_like() => single.vec()?,
+                    [x] => [x.num()?, 0.0, 0.0],
+                    [x, y] => [x.num()?, y.num()?, 0.0],
+                    _ => [a[0].num()?, a[1].num()?, a[2].num()?],
+                };
+                let shape = |n: f32| if name == "noise" { (n * 0.5 + 0.5).clamp(0.0, 1.0) } else { n.clamp(-1.0, 1.0) };
+                if want_vec {
+                    V([shape(perlin3(p, 0)), shape(perlin3(p, 1)), shape(perlin3(p, 2))])
+                } else {
+                    Float(shape(perlin3(p, 0)))
+                }
+            }
+
+            "int" => match &a[0] {
+                Str(s) => Int(s.trim().parse::<f64>().map(|f| f as i32).unwrap_or(0)),
+                other => Int(other.int()?),
+            },
+            "float" => match &a[0] {
+                Str(s) => Float(s.trim().parse().unwrap_or(0.0)),
+                other => Float(other.num()?),
+            },
+            "string" => Str(a[0].display().into()),
+            "itoa" => Str(a[0].int()?.to_string().into()),
+            "atoi" => Int(a[0].string()?.trim().parse::<f64>().map(|f| f as i32).unwrap_or(0)),
+            "atof" => Float(a[0].string()?.trim().parse().unwrap_or(0.0)),
+
+            "sprintf" => Str(format_vex(a)?.into()),
+            "printf" => {
+                let text = format_vex(a)?;
+                self.print(&text);
+                Int(0)
+            }
+            "warning" => {
+                let text = format_vex(a)?;
+                self.push_log(format!("Warning: {}", text.trim_end()));
+                Int(0)
+            }
+            "error" => return Err(format_vex(a)?.trim_end().to_string()),
+            "concat" => Str(a.iter().map(Value::display).collect::<String>().into()),
+            "strlen" => Int(a[0].string()?.chars().count() as i32),
+            "toupper" => Str(a[0].string()?.to_uppercase().into()),
+            "tolower" => Str(a[0].string()?.to_lowercase().into()),
+            "startswith" => Int(a[0].string()?.starts_with(&*a[1].string()?) as i32),
+            "endswith" => Int(a[0].string()?.ends_with(&*a[1].string()?) as i32),
+            "replace" => Str(a[0].string()?.replace(&*a[1].string()?, &a[2].string()?).into()),
+            "split" => {
+                let s = a[0].string()?;
+                let parts: Vec<Value> = match a.get(1) {
+                    Some(sep) => {
+                        let sep = sep.string()?;
+                        s.split(|c| sep.contains(c)).filter(|p| !p.is_empty()).map(|p| Str(p.into())).collect()
+                    }
+                    None => s.split_whitespace().map(|p| Str(p.into())).collect(),
+                };
+                Value::Arr(Rc::new(parts))
+            }
+            "join" => Str(a[0].items()?.iter().map(Value::display).collect::<Vec<_>>().join(&a[1].string()?).into()),
+
+            "array" => Value::Arr(Rc::new(a.to_vec())),
+            "len" => Int((match &a[0] {
+                Value::Arr(items) => items.len(),
+                Str(s) => s.chars().count(),
+                V(_) => 3,
+                _ => 1,
+            }) as i32),
+            "sort" => {
+                let items = a[0].items()?;
+                let order = sort_values(&items)?;
+                Value::Arr(Rc::new(order.into_iter().map(|i| items[i].clone()).collect()))
+            }
+            "argsort" => int_array(sort_values(&a[0].items()?)?),
+            "reverse" => match &a[0] {
+                Str(s) => Str(s.chars().rev().collect::<String>().into()),
+                other => Value::Arr(Rc::new(other.items()?.iter().rev().cloned().collect())),
+            },
+            "sum" => match &a[0] {
+                V(v) => Float(v[0] + v[1] + v[2]),
+                other => {
+                    let items = other.items()?;
+                    let mut total = Int(0);
+                    for item in items.iter() {
+                        total = binop(BinOp::Add, total, item.clone())?;
+                    }
+                    total
+                }
+            },
+            "find" => match &a[0] {
+                Str(s) => {
+                    let needle = a[1].string()?;
+                    Int(s.find(&*needle).map_or(-1, |byte| s[..byte].chars().count() as i32))
+                }
+                other => Int(other.items()?.iter().position(|v| values_equal(v, &a[1])).map_or(-1, |i| i as i32)),
+            },
+            "isvalidindex" => {
+                let len = a[0].items()?.len() as i64;
+                let i = a[1].int()? as i64;
+                Int((i >= 0 && i < len) as i32)
+            }
+
+            "npoints" => Int(self.input.vertices.len() as i32),
+            "nprimitives" => Int(self.input.indices.len() as i32),
+            "nvertices" => Int(self.input.indices.len() as i32 * 3),
+            "point" => self.input_attr(Domain::Point, &a[1].string()?, a[2].int()?),
+            "prim" => self.input_attr(Domain::Prim, &a[1].string()?, a[2].int()?),
+            "vertex" => self.input_attr(Domain::Vertex, &a[1].string()?, a[2].int()?),
+            "detail" => self.input_attr(Domain::Detail, &a[1].string()?, 0),
+            "haspointattrib" => {
+                let attr = a[1].string()?;
+                Int((matches!(&*attr, "P" | "N") || self.input.point_attributes.contains_key(&*attr)) as i32)
+            }
+            "hasprimattrib" => Int(self.input.point_attributes.contains_key(&format!("prim:{}", a[1].string()?)) as i32),
+            "setpointattrib" | "setprimattrib" => {
+                let domain = if name == "setpointattrib" { Domain::Point } else { Domain::Prim };
+                let index = index_of(&a[2])?;
+                let mode = write_mode(a.get(4))?;
+                self.pending.writes.push((domain, a[1].string()?.to_string(), index, a[3].clone(), mode));
+                Int(index as i32)
+            }
+            "setdetailattrib" => {
+                let mode = write_mode(a.get(3))?;
+                self.pending.writes.push((Domain::Detail, a[1].string()?.to_string(), 0, a[2].clone(), mode));
+                Int(0)
+            }
+            "addpoint" => {
+                let position = match &a[1] {
+                    Int(pt) => self.input.vertices.get(*pt as usize).copied().map(arr3).unwrap_or([0.0; 3]),
+                    other => other.vec()?,
+                };
+                let index = self.input.vertices.len() + self.pending.add_points.len();
+                self.pending.add_points.push(position);
+                Int(index as i32)
+            }
+            "addprim" => {
+                let kind = a[1].string()?;
+                if &*kind != "poly" {
+                    return Err(format!("only \"poly\" primitives are supported, got \"{kind}\""));
+                }
+                let pts = a[2..].iter().map(index_of).collect::<R<Vec<usize>>>()?;
+                let index = self.input.indices.len() + self.pending.add_prims.len();
+                self.pending.add_prims.push([pts[0], pts[1], pts[2]]);
+                if let Some(&fourth) = pts.get(3) {
+                    self.pending.add_prims.push([pts[0], pts[2], fourth]);
+                }
+                Int(index as i32)
+            }
+            "removepoint" => {
+                if let Ok(pt) = usize::try_from(a[1].int()?) {
+                    self.pending.remove_points.insert(pt);
+                }
+                Int(1)
+            }
+            "removeprim" => {
+                if let Ok(prim) = usize::try_from(a[1].int()?) {
+                    self.pending.remove_prims.insert(prim);
+                    if a.get(2).is_some_and(Value::truthy) {
+                        if let Some(tri) = self.input.indices.get(prim) {
+                            self.pending.orphan_candidates.extend(tri.iter().copied());
+                        }
+                    }
+                }
+                Int(1)
+            }
+            "nearpoint" => {
+                let p = vec3(a[1].vec()?);
+                let max = a.get(2).map(Value::num).transpose()?.unwrap_or(f32::INFINITY);
+                let nearest = self
+                    .input
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i, v.sub(p).length()))
+                    .filter(|(_, d)| *d <= max)
+                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+                Int(nearest.map_or(-1, |(i, _)| i as i32))
+            }
+            "nearpoints" => {
+                let p = vec3(a[1].vec()?);
+                let max = a[2].num()?;
+                let limit = a.get(3).map(Value::int).transpose()?.map_or(usize::MAX, |n| n.max(0) as usize);
+                let mut found: Vec<(usize, f32)> =
+                    self.input.vertices.iter().enumerate().map(|(i, v)| (i, v.sub(p).length())).filter(|(_, d)| *d <= max).collect();
+                found.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+                int_array(found.into_iter().take(limit).map(|(i, _)| i))
+            }
+            "neighbours" | "neighbourcount" => {
+                let pt = a[1].int()?;
+                let list = usize::try_from(pt).ok().and_then(|pt| self.neighbour_lists().get(pt).cloned()).unwrap_or_default();
+                if name == "neighbourcount" { Int(list.len() as i32) } else { int_array(list) }
+            }
+            "primpoints" => match usize::try_from(a[1].int()?).ok().and_then(|p| self.input.indices.get(p)) {
+                Some(tri) => int_array(tri.iter().copied()),
+                None => int_array([]),
+            },
+            "pointprims" => {
+                let pt = a[1].int()?;
+                int_array(usize::try_from(pt).ok().and_then(|pt| self.point_prim_lists().get(pt).cloned()).unwrap_or_default())
+            }
+            "getbbox_min" => V(arr3(self.bounds().0)),
+            "getbbox_max" => V(arr3(self.bounds().1)),
+            "getbbox_center" => {
+                let (lo, hi) = self.bounds();
+                V(arr3(lo.add(hi).scale(0.5)))
+            }
+            "getbbox_size" => {
+                let (lo, hi) = self.bounds();
+                V(arr3(hi.sub(lo)))
+            }
+            "relpointbbox" => {
+                let (lo, hi) = self.bounds();
+                let p = a[1].vec()?;
+                let rel = |c: usize, l: f32, h: f32| if (h - l).abs() < 1e-12 { 0.0 } else { (p[c] - l) / (h - l) };
+                V([rel(0, lo.x, hi.x), rel(1, lo.y, hi.y), rel(2, lo.z, hi.z)])
+            }
+            _ => return Err(format!("internal: built-in '{name}' is not implemented")),
+        })
+    }
+}
+
+fn store_local(fr: &mut Frame, slot: usize, value: Value) -> R<Value> {
+    let value = match fr.types[slot] {
+        Some(ty) => value.convert(ty)?,
+        None => value,
+    };
+    fr.vals[slot] = value.clone();
+    Ok(value)
+}
+
+// Grows every attribute of `domain` by `added` zeroed elements.
+fn grow_attributes(mesh: &mut Mesh, domain: Domain, old_count: usize, added: usize) {
+    if old_count == 0 || added == 0 {
+        return;
+    }
+    for (key, vals) in mesh.point_attributes.iter_mut() {
+        if Domain::of_key(key) == domain {
+            let comps = vals.len() / old_count;
+            vals.resize(vals.len() + comps * added, 0.0);
+        }
+    }
+}
+
+// Keeps the elements of `domain` whose `keep` flag is set, in every attribute of that domain.
+fn compact_attributes(mesh: &mut Mesh, domain: Domain, keep: &[bool]) {
+    let count = keep.len();
+    if count == 0 {
+        return;
+    }
+    for (key, vals) in mesh.point_attributes.iter_mut() {
+        if Domain::of_key(key) != domain {
+            continue;
+        }
+        let comps = vals.len() / count;
+        if comps == 0 {
+            continue;
+        }
+        let kept: Vec<f32> = vals.chunks(comps).zip(keep).filter(|(_, k)| **k).flat_map(|(chunk, _)| chunk.iter().copied()).collect();
+        *vals = kept;
+    }
+}
+
+fn apply_pending(mesh: &mut Mesh, pending: Pending, log: &mut Vec<String>) -> R<()> {
+    let Pending { add_points, add_prims, remove_points, remove_prims, orphan_candidates, writes } = pending;
+
+    let old_points = mesh.vertices.len();
+    grow_attributes(mesh, Domain::Point, old_points, add_points.len());
+    mesh.vertices.extend(add_points.into_iter().map(vec3));
+
+    let point_count = mesh.vertices.len();
+    let (valid, invalid): (Vec<[usize; 3]>, Vec<[usize; 3]>) = add_prims.into_iter().partition(|tri| tri.iter().all(|&p| p < point_count));
+    if !invalid.is_empty() {
+        log.push(format!("Warning: skipped {} primitive(s) that use point numbers that do not exist", invalid.len()));
+    }
+    let old_prims = mesh.indices.len();
+    grow_attributes(mesh, Domain::Prim, old_prims, valid.len());
+    grow_attributes(mesh, Domain::Vertex, old_prims * 3, valid.len() * 3);
+    mesh.indices.extend(valid);
+
+    for (domain, name, index, value, mode) in writes {
+        let count = domain.count(mesh);
+        if index >= count {
+            continue;
+        }
+        let key = format!("{}{name}", domain.prefix());
+        let current = || {
+            if domain == Domain::Point && name == "P" {
+                Value::Vec(arr3(mesh.vertices[index]))
+            } else {
+                read_storage(mesh, &key, index, count, known_hint(&name))
+            }
+        };
+        let value = match mode {
+            WriteMode::Set => value,
+            WriteMode::Add => binop(BinOp::Add, current(), value)?,
+            WriteMode::Mult => binop(BinOp::Mul, current(), value)?,
+            WriteMode::Min => pick_extreme(current(), value, true)?,
+            WriteMode::Max => pick_extreme(current(), value, false)?,
+        };
+        if domain == Domain::Point && name == "P" {
+            mesh.vertices[index] = vec3(value.vec()?);
+        } else {
+            write_storage(mesh, &key, index, count, &value, known_hint(&name), &name)?;
+        }
+    }
+
+    if remove_points.is_empty() && remove_prims.is_empty() {
+        return Ok(());
+    }
+    let point_count = mesh.vertices.len();
+    let mut keep_point: Vec<bool> = (0..point_count).map(|i| !remove_points.contains(&i)).collect();
+    let keep_prim: Vec<bool> = mesh
+        .indices
+        .iter()
+        .enumerate()
+        .map(|(t, tri)| !remove_prims.contains(&t) && tri.iter().all(|&p| keep_point[p]))
+        .collect();
+    if !orphan_candidates.is_empty() {
+        let mut used = vec![false; point_count];
+        for (tri, _) in mesh.indices.iter().zip(&keep_prim).filter(|(_, k)| **k) {
+            tri.iter().for_each(|&p| used[p] = true);
+        }
+        for p in orphan_candidates {
+            if p < point_count && !used[p] {
+                keep_point[p] = false;
+            }
+        }
+    }
+    let mut remap = vec![usize::MAX; point_count];
+    let mut next = 0;
+    for (i, keep) in keep_point.iter().enumerate() {
+        if *keep {
+            remap[i] = next;
+            next += 1;
+        }
+    }
+    let keep_vertex: Vec<bool> = keep_prim.iter().flat_map(|k| [*k; 3]).collect();
+    compact_attributes(mesh, Domain::Point, &keep_point);
+    compact_attributes(mesh, Domain::Prim, &keep_prim);
+    compact_attributes(mesh, Domain::Vertex, &keep_vertex);
+    mesh.vertices = mesh.vertices.iter().zip(&keep_point).filter(|(_, k)| **k).map(|(v, _)| *v).collect();
+    mesh.indices = mesh.indices.iter().zip(&keep_prim).filter(|(_, k)| **k).map(|(tri, _)| tri.map(|p| remap[p])).collect();
+    Ok(())
+}
+
+// ============================================================================
+// Wrangle entry point and per-node reports
+// ============================================================================
+
+#[derive(Clone, Debug, Default)]
+pub struct VexReport {
+    pub error: Option<String>,
+    pub output: Vec<String>,
+    pub elements: usize,
+    pub millis: f32,
+}
+
+fn reports() -> &'static Mutex<HashMap<u64, VexReport>> {
+    static REPORTS: OnceLock<Mutex<HashMap<u64, VexReport>>> = OnceLock::new();
+    REPORTS.get_or_init(Default::default)
+}
+
+fn report_key(code: &str, domain: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    code.hash(&mut hasher);
+    domain.hash(&mut hasher);
+    hasher.finish()
+}
+
+// The result of the latest cook of this code, for the node's parameter panel.
+pub fn last_report(code: &str, domain: usize) -> Option<VexReport> {
+    reports().lock().ok()?.get(&report_key(code, domain)).cloned()
+}
+
+// Compile errors only, for code that has not been cooked yet.
+pub fn check(code: &str) -> Result<(), String> {
+    compile(code).map(|_| ()).map_err(|e| e.to_string())
+}
+
+// Runs `code` over every element of `domain` (0 detail, 1 primitives, 2 points, 3 vertices).
+// On any error the input geometry is returned unchanged and the error is reported.
+// `time_inc` is @TimeInc: seconds per frame, or per step inside a SOP Solver.
+pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> Mesh {
+    let start = Instant::now();
+    let (mesh, mut report) = run_timed(mesh, code, time, time_inc, domain_index);
+    report.millis = start.elapsed().as_secs_f32() * 1000.0;
+    if let Ok(mut map) = reports().lock() {
+        if map.len() > 256 {
+            map.clear();
+        }
+        map.insert(report_key(code, domain_index), report);
+    }
+    mesh
+}
+
+#[cfg(test)]
+fn run(mesh: Mesh, code: &str, time: f32, domain_index: usize) -> (Mesh, VexReport) {
+    run_timed(mesh, code, time, 1.0 / crate::sims::SIM_FPS, domain_index)
+}
+
+fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> (Mesh, VexReport) {
+    let program = match compile(code) {
+        Ok(program) => program,
+        Err(error) => return (mesh, VexReport { error: Some(error.to_string()), ..Default::default() }),
+    };
+    let domain = match domain_index {
+        0 => Domain::Detail,
+        1 => Domain::Prim,
+        2 => Domain::Point,
+        _ => Domain::Vertex,
+    };
+    let normals = mesh.compute_normals();
+    let count = domain.count(&mesh);
+    let input = mesh.clone();
+    let mut rt = Runtime {
+        prog: &program,
+        input: &input,
+        normals: &normals,
+        out: mesh,
+        domain,
+        count,
+        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), a.name)).collect(),
+        elem: 0,
+        time,
+        time_inc,
+        pending: Pending::default(),
+        steps: 0,
+        depth: 0,
+        log: Vec::new(),
+        partial_line: String::new(),
+        neighbours: None,
+        point_prims: None,
+    };
+    // Reading an attribute nothing creates is almost always a typo or an unsupported global.
+    let missing: Vec<String> = program
+        .attrs
+        .iter()
+        .zip(&rt.keys)
+        .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key))
+        .map(|(attr, _)| format!("Warning: @{} does not exist on the input and is never set, so it reads as 0", attr.name))
+        .collect();
+    for warning in missing {
+        rt.push_log(warning);
+    }
+    let defaults: Vec<Value> = program.main.slot_types.iter().map(|t| t.map_or(Value::Int(0), Ty::default_value)).collect();
+    let element_name = match domain {
+        Domain::Detail => "detail",
+        Domain::Prim => "primitive",
+        Domain::Point => "point",
+        Domain::Vertex => "vertex",
+    };
+    let mut failure = None;
+    for elem in 0..count {
+        rt.elem = elem;
+        let mut frame = Frame { vals: defaults.clone(), types: &program.main.slot_types };
+        if let Err(error) = rt.exec_block(&program.main.body, &mut frame) {
+            failure = Some(if domain == Domain::Detail { error } else { format!("{error} (at {element_name} {elem})") });
+            break;
+        }
+    }
+    if !rt.partial_line.is_empty() {
+        let rest = std::mem::take(&mut rt.partial_line);
+        rt.push_log(rest);
+    }
+    let Runtime { mut out, pending, mut log, .. } = rt;
+    if failure.is_none() {
+        if let Err(error) = apply_pending(&mut out, pending, &mut log) {
+            failure = Some(error);
+        }
+    }
+    match failure {
+        Some(error) => (input, VexReport { error: Some(error), output: log, elements: count, millis: 0.0 }),
+        None => (out, VexReport { error: None, output: log, elements: count, millis: 0.0 }),
+    }
+}
+
+// ============================================================================
+// Examples and reference shown in the node's parameter panel
+// ============================================================================
+
+// (menu label, run-over domain, code)
+pub const EXAMPLES: &[(&str, usize, &str)] = &[
+    ("Wave (points)", 2, "// Offset each point by a travelling sine wave\n@P.y += sin(@P.x * 3.0 + @Time) * 0.2;\n"),
+    (
+        "Color by height (if / ternary)",
+        2,
+        "// Blend two colors by height\nfloat h = fit(@P.y, -0.5, 0.5, 0, 1);\nif (h > 0.5) {\n    @Cd = set(1, h, 0.2);\n} else {\n    @Cd = h < 0.1 ? {0, 0, 0.4} : set(0.2, h, 1);\n}\n",
+    ),
+    (
+        "Ripples (for loop + array)",
+        2,
+        "// Sum ripples from several centres\nvector centres[] = array(set(0, 0, 0), set(1.5, 0, 1), set(-1, 0, -1.5));\nfloat h = 0;\nfor (int i = 0; i < len(centres); i++) {\n    float d = distance(@P, centres[i]);\n    h += sin(d * 8 - @Time * 4) * exp(-d * 1.5) * 0.15;\n}\n@P.y += h;\n",
+    ),
+    (
+        "Smooth (foreach neighbours)",
+        2,
+        "// Average each point with its connected neighbours\nint nbrs[] = neighbours(0, @ptnum);\nvector sum = @P;\nforeach (int n; nbrs) {\n    sum += point(0, \"P\", n);\n}\n@P = sum / (len(nbrs) + 1);\n",
+    ),
+    (
+        "Delete points (removepoint)",
+        2,
+        "// Remove points below a wavy cutoff, with their triangles\nfloat cutoff = sin(@P.x * 2 + @Time) * 0.2;\nif (@P.z < cutoff) {\n    removepoint(0, @ptnum);\n}\n",
+    ),
+    (
+        "Noise warp (user function)",
+        2,
+        "// Functions are defined before the code that uses them\nvector warp(vector p; float amount) {\n    vector n = noise(p * 1.5 + @Time * 0.2);\n    return p + (n - 0.5) * amount;\n}\n\n@P = warp(@P, 0.6);\n@Cd = noise(@P * 2);\n",
+    ),
+    (
+        "Random colors per face (primitives)",
+        1,
+        "// Run over Primitives: one random color per triangle\n@Cd = rand(@primnum);\n",
+    ),
+    (
+        "Spiral of points (detail, while)",
+        0,
+        "// Run over Detail: build a spiral of new points\nint i = 0;\nwhile (i < 200) {\n    float a = i * 0.2;\n    addpoint(0, set(cos(a) * a * 0.05, i * 0.01, sin(a) * a * 0.05));\n    i++;\n}\nprintf(\"Added %d points\\n\", i);\n",
+    ),
+    (
+        "Debug output (printf)",
+        2,
+        "// printf output appears below the code editor\nif (@ptnum < 5) {\n    printf(\"point %d at %g, %d neighbours\\n\", @ptnum, @P, neighbourcount(0, @ptnum));\n}\n",
+    ),
+];
+
+pub const SYNTAX_HELP: &str = "\
+Types      int, float, vector, string and arrays: float a[] = {1, 2}; vector[] pts;
+Attributes @P @N @Cd @pscale (read/write), @ptnum @primnum @vtxnum @numpt @numprim
+           @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel
+Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   M_PI  M_E
+Operators  + - * / %  == != < <= > >=  && || !  ?:  = += -= *= /= %=  ++ --
+           .x .y .z (.r .g .b) on vectors, [i] on arrays/vectors (negative from end)
+Control    if (...) {...} else if (...) {...} else {...}
+           for (int i = 0; i < 10; i++) {...}   while (...) {...}   do {...} while (...);
+           foreach (vector p; pts) {...}   foreach (int i; vector p; pts) {...}
+           break; continue; return;
+Functions  float twice(float x) { return x * 2; }   defined before use, at the top level;
+           parameters are separated by ';' or ',' and passed by reference
+Comments   // line   /* block */
+Notes      int / int is integer division (1 / 2 == 0, write 1.0 / 2 for 0.5).
+           rand() and noise() return a vector when assigned to a vector.
+           point() reads the input geometry; setpointattrib(), addpoint(), addprim(),
+           removepoint() and removeprim() take effect after every element has run.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A 3×3 grid of points (9 points, 8 triangles) in the XZ plane.
+    fn grid() -> Mesh {
+        let mut mesh = Mesh::default();
+        for z in 0..3 {
+            for x in 0..3 {
+                mesh.vertices.push(Vec3::new(x as f32 - 1.0, 0.0, z as f32 - 1.0));
+            }
+        }
+        for z in 0..2 {
+            for x in 0..2 {
+                let i = z * 3 + x;
+                mesh.indices.push([i, i + 3, i + 1]);
+                mesh.indices.push([i + 1, i + 3, i + 4]);
+            }
+        }
+        mesh
+    }
+
+    fn detail(code: &str) -> VexReport {
+        let (_, report) = run(grid(), code, 0.0, 0);
+        report
+    }
+
+    // Runs `code` over the detail and returns its printf output.
+    fn output(code: &str) -> String {
+        let report = detail(code);
+        assert_eq!(report.error, None, "code:\n{code}");
+        report.output.join("\n")
+    }
+
+    fn error(code: &str) -> String {
+        detail(code).error.expect("expected an error")
+    }
+
+    #[test]
+    fn arithmetic_and_precedence() {
+        assert_eq!(output("printf(\"%d %d %g %d\\n\", 1 + 2 * 3, (1 + 2) * 3, 1.0 / 4, 7 / 2);"), "7 9 0.25 3");
+        assert_eq!(output("printf(\"%d %d %d\\n\", 7 % 3, -7 / 2, 10 - 2 - 3);"), "1 -3 5");
+        assert_eq!(output("printf(\"%d %d %d %d\\n\", 1 < 2, 2 <= 1, 1 == 1.0, 3 != 3);"), "1 0 1 0");
+        assert_eq!(output("printf(\"%d %d %d\\n\", 1 && 0, 0 || 2, !5);"), "0 1 0");
+        assert_eq!(output("int x = 5; printf(\"%s\\n\", x > 3 ? \"big\" : \"small\");"), "big");
+        assert_eq!(output("printf(\"%g\\n\", {1, 2, 3} * 2 + 1);"), "{3, 5, 7}");
+    }
+
+    #[test]
+    fn variables_and_types() {
+        assert_eq!(output("int i = 2.9; float f = 3; vector v = 1; printf(\"%d %g %g\\n\", i, f, v);"), "2 3 {1, 1, 1}");
+        assert_eq!(output("vector v = {1, 2, 3}; v.y = 5; v[2] += 1; printf(\"%g %g\\n\", v, v.x);"), "{1, 5, 4} 1");
+        assert_eq!(output("int a = 1, b = a + 1; a += b; a *= 3; printf(\"%d %d\\n\", a, b);"), "9 2");
+        assert_eq!(output("int i = 1; int j = i++; int k = ++i; printf(\"%d %d %d\\n\", i, j, k);"), "3 1 3");
+        assert_eq!(output("string s = \"ab\" + \"cd\"; printf(\"%s %d\\n\", toupper(s), strlen(s));"), "ABCD 4");
+        assert_eq!(output("x = 4; x = x * 2; printf(\"%d\\n\", x);"), "8");
+    }
+
+    #[test]
+    fn control_flow() {
+        assert_eq!(output("int t = 0; for (int i = 0; i < 5; i++) { t += i; } printf(\"%d\\n\", t);"), "10");
+        assert_eq!(output("int i = 0; while (1) { i++; if (i >= 4) break; } printf(\"%d\\n\", i);"), "4");
+        assert_eq!(output("int i = 10; do { i++; } while (i < 5); printf(\"%d\\n\", i);"), "11");
+        assert_eq!(
+            output("int odd = 0; for (int i = 0; i < 10; i++) { if (i % 2 == 0) continue; odd++; } printf(\"%d\\n\", odd);"),
+            "5"
+        );
+        assert_eq!(
+            output("int g; if (0) g = 1; else if (2 > 1) g = 2; else g = 3; printf(\"%d\\n\", g);"),
+            "2"
+        );
+        assert_eq!(
+            output("float a[] = {1, 2, 3}; float s = 0; foreach (int i; float x; a) { s += x * i; } printf(\"%g\\n\", s);"),
+            "8"
+        );
+        assert_eq!(
+            output("int n = 0; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { if (j == 1) break; n++; } printf(\"%d\\n\", n);"),
+            "3"
+        );
+    }
+
+    #[test]
+    fn functions_recursion_and_references() {
+        assert_eq!(output("int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); }\nprintf(\"%d\\n\", fact(5));"), "120");
+        assert_eq!(output("void bump(float x) { x += 1; }\nfloat v = 1; bump(v); printf(\"%g\\n\", v);"), "2");
+        assert_eq!(output("vector mix(vector a, b; float t) { return lerp(a, b, t); }\nprintf(\"%g\\n\", mix({0,0,0}, {2,4,6}, 0.5));"), "{1, 2, 3}");
+    }
+
+    #[test]
+    fn arrays_and_strings() {
+        assert_eq!(output("int a[]; push(a, 3); push(a, 1); push(a, 2); printf(\"%d %d %d\\n\", len(a), a[-1], max(a));"), "3 2 3");
+        assert_eq!(output("int a[] = {3, 1, 2}; printf(\"%d %d %d\\n\", sort(a), find(a, 2), sum(a));"), "{1, 2, 3} 2 6");
+        assert_eq!(output("float a[] = {1}; a[3] = 5; printf(\"%g %d\\n\", a, pop(a));"), "{1, 0, 0, 5} 5");
+        assert_eq!(output("string parts[] = split(\"a,b,c\", \",\"); printf(\"%s %d\\n\", join(parts, \"-\"), len(parts));"), "a-b-c 3");
+        assert_eq!(output("printf(\"%05.1f|%-4d|%+d|%s\\n\", 3.14159, 7, 3, sprintf(\"%x\", 255));"), "003.1|7   |+3|ff");
+    }
+
+    #[test]
+    fn point_attributes_and_legacy_syntax() {
+        let (mesh, report) = run(grid(), "@P.y += 1; @Cd = set(@ptnum, 0, 0); f@mass = @ptnum * 0.5;", 0.0, 2);
+        assert_eq!(report.error, None);
+        assert!(mesh.vertices.iter().all(|v| v.y == 1.0));
+        assert_eq!(mesh.point_attributes["Cd"][3 * 4], 4.0);
+        assert_eq!(mesh.point_attributes["mass"][4], 2.0);
+        // The original syntax without '@' and with old-style statements keeps working.
+        let (mesh, report) = run(grid(), "P.y += sin(P.x * 3.0) * 0.2;", 0.0, 2);
+        assert_eq!(report.error, None);
+        assert!((mesh.vertices[2].y - 3f32.sin() * 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn primitive_and_detail_domains() {
+        let (mesh, report) = run(grid(), "@Cd = {1, 0, 0}; f@area = @primnum;", 0.0, 1);
+        assert_eq!(report.error, None);
+        assert_eq!(mesh.point_attributes["prim:Cd"].len(), 8 * 3);
+        assert_eq!(mesh.point_attributes["prim:area"][7], 7.0);
+        let (mesh, report) = run(grid(), "for (int i = 0; i < 5; i++) addpoint(0, set(i, 2, 0));", 0.0, 0);
+        assert_eq!(report.error, None);
+        assert_eq!(mesh.vertices.len(), 14);
+    }
+
+    #[test]
+    fn geometry_edits_are_applied_after_the_run() {
+        // Removing the centre point removes the 6 triangles that use it.
+        let (mesh, report) = run(grid(), "if (@ptnum == 4) removepoint(0, @ptnum);", 0.0, 2);
+        assert_eq!(report.error, None);
+        assert_eq!((mesh.vertices.len(), mesh.indices.len()), (8, 2));
+        assert!(mesh.indices.iter().flatten().all(|&p| p < 8));
+        // setpointattrib with "add" accumulates writes from every element.
+        let (mesh, _) = run(grid(), "setpointattrib(0, \"hits\", 0, 1, \"add\");", 0.0, 2);
+        assert_eq!(mesh.point_attributes["hits"][0], 9.0);
+        let (mesh, _) = run(grid(), "int a = addpoint(0, {0, 1, 0}); addprim(0, \"poly\", 0, 1, a);", 0.0, 0);
+        assert_eq!((mesh.vertices.len(), mesh.indices.len()), (10, 9));
+    }
+
+    #[test]
+    fn neighbours_and_input_reads() {
+        assert_eq!(output("printf(\"%d %d\\n\", neighbourcount(0, 4), neighbourcount(0, 0));"), "6 2");
+        assert_eq!(output("printf(\"%g %d\\n\", point(0, \"P\", 8), nearpoint(0, {0.9, 0, 0.9}));"), "{1, 0, 1} 8");
+        assert_eq!(output("printf(\"%g\\n\", getbbox_size(0));"), "{2, 0, 2}");
+    }
+
+    #[test]
+    fn rand_and_noise_follow_the_assignment_type() {
+        let (mesh, report) = run(grid(), "@Cd = rand(@ptnum); f@n = noise(@P * 1.3);", 0.0, 2);
+        assert_eq!(report.error, None);
+        let cd = &mesh.point_attributes["Cd"];
+        assert!(cd[0] != cd[1] || cd[1] != cd[2], "vector rand gives distinct channels");
+        assert!(mesh.point_attributes["n"].iter().all(|n| (0.0..=1.0).contains(n)));
+    }
+
+    #[test]
+    fn compile_errors_have_line_numbers() {
+        let e = error("float a = 1\nfloat b = 2;");
+        assert!(e.starts_with("line 1") && e.contains("expected ';'"), "{e}");
+        assert!(error("int x = 1;\nx = y + 1;").starts_with("line 2, col 5: unknown variable 'y'"));
+        assert!(error("foo(1);").contains("unknown function 'foo'"));
+        assert!(error("break;").contains("'break' outside a loop"));
+        assert!(error("@ptnum = 3;").contains("read-only"));
+        assert!(error("float a = dot({1,0,0});").contains("expects 2 argument(s)"));
+        assert!(error("if (1) { float a = 1;").contains("missing '}'"));
+    }
+
+    #[test]
+    fn runtime_errors_stop_and_keep_the_input() {
+        let (mesh, report) = run(grid(), "int i = 0;\nwhile (1) { i++; }", 0.0, 2);
+        assert!(report.error.unwrap().contains("infinite loop"));
+        assert_eq!(mesh.vertices, grid().vertices);
+        assert!(error("int f(int n) { return f(n + 1); }\nf(0);").contains("nested function calls"));
+        assert!(error("string s = \"a\";\nfloat x = s * 2;").starts_with("line 2"));
+        assert!(error("error(\"custom %d\", 4);").contains("custom 4"));
+    }
+
+    #[test]
+    fn every_listed_builtin_is_implemented() {
+        let input = grid();
+        let normals = input.compute_normals();
+        let program = compile("").unwrap();
+        let mut rt = Runtime {
+            prog: &program,
+            input: &input,
+            normals: &normals,
+            out: input.clone(),
+            domain: Domain::Point,
+            count: 9,
+            keys: Vec::new(),
+            elem: 0,
+            time: 0.0,
+            time_inc: 1.0 / 24.0,
+            pending: Pending::default(),
+            steps: 0,
+            depth: 0,
+            log: Vec::new(),
+            partial_line: String::new(),
+            neighbours: None,
+            point_prims: None,
+        };
+        for (name, min, ..) in BUILTINS {
+            if MUTATING.contains(name) {
+                continue;
+            }
+            let args = vec![Value::Int(0); *min];
+            if let Err(e) = rt.builtin(name, &args, false) {
+                assert!(!e.contains("not implemented"), "{name}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn examples_compile_and_run() {
+        for (label, domain, code) in EXAMPLES {
+            let (_, report) = run(grid(), code, 0.5, *domain);
+            assert_eq!(report.error, None, "example '{label}'");
+        }
+    }
+
+    #[test]
+    fn time_globals_and_missing_attribute_warnings() {
+        let (mesh, report) = run_timed(grid(), "@P.y += 2.0 * @TimeInc; f@f = @Frame;", 1.0, 0.25, 2);
+        assert_eq!(report.error, None);
+        assert_eq!(mesh.vertices[0].y, 0.5);
+        assert_eq!(mesh.point_attributes["f"][0], 25.0);
+        assert!(report.output.is_empty(), "{:?}", report.output);
+        let (_, report) = run(grid(), "@P.y += @speedd;", 0.0, 2);
+        assert!(report.output.iter().any(|l| l.contains("@speedd does not exist")), "{:?}", report.output);
+        assert!(error("@TimeInc = 1;").contains("read-only"));
+    }
+
+}

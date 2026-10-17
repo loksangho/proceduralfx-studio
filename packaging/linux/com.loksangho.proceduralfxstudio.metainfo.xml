@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.loksangho.proceduralfxstudio</id>
+  <name>ProceduralFX Studio</name>
+  <summary>Node-based procedural modelling, simulation and rendering</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <developer id="com.loksangho">
+    <name>Lok Sang Ho</name>
+  </developer>
+  <description>
+    <p>
+      ProceduralFX Studio builds geometry from networks of nodes: modelling,
+      VEX wrangles, volumes, pyro, FLIP, RBD and SOP solvers, a USD stage
+      context, keyframe animation, and MoonRay rendering.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.loksangho.proceduralfxstudio.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-17"/>
+  </releases>
+</component>

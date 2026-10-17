@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "./proceduralfx_studio.sh": true,
+        "mktemp": true,
+        "command": true,
+        "exit": true,
+        "\"$MR\"": true,
+        "tee": true,
+        "true": true,
+        "/bin/bash": true,
+        "strings": true
+    }
+}

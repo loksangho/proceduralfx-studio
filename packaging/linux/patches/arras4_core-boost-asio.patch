@@ -1,0 +1,182 @@
+diff --git a/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.cc b/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.cc
+index 23f63d0..344c9ce 100755
+--- a/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.cc
++++ b/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.cc
+@@ -1,65 +1,16 @@
+-// Copyright 2023-2024 DreamWorks Animation LLC and Intel Corporation
+-// SPDX-License-Identifier: Apache-2.0
+-
+ #include "UdpSyslog_boost.h"
+ 
+ namespace arras4 {
+ namespace log {
+ 
+-const int MAX_SENDTO_RETRIES = 5;
+-
+-void UdpSyslog::sendMessage(int priority, 
+-                            const tm* timeStamp,
+-                            const std::string& ident, 
+-                            const std::string& message)
++void UdpSyslog::sendMessage(int priority, const struct tm* time, const std::string& ident, const std::string& msg)
+ {
+-
+-
+-    static const char months[12][4] =
+-        {
+-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+-        };
+-
+-    // format from RFC 3164 : BSD syslog Protocol
+-    std::stringstream ss;
+-    ss << "<" << priority << + ">"
+-       << months[timeStamp->tm_mon] << " "
+-       << std::setfill(' ')
+-       << std::setw(2) << timeStamp->tm_mday << " "
+-       << std::setfill('0')
+-       << std::setw(2) << timeStamp->tm_hour << ":"
+-       << std::setw(2) << timeStamp->tm_min << ":"
+-       << std::setw(2) << timeStamp->tm_sec << " "
+-       << mLocalHostName << " "
+-       << ident << " ";
+-
+-    // truncate super long messages
+-    // There message size limit for datagrams is 64K (65507 chars without packet header)
+-    // Using 65000 to allow room for log header
+-    size_t size = message.size();
+-    if (size > 65000) {
+-       ss << message.substr(0,65000) << " (Truncated from " << size << " chars)";
+-    } else {
+-       ss << message;
+-    }
+-   
+-    std::string packet = ss.str();
+-
+-    // send_to can on rare occassons throw system_error because the underlying
+-    // system call sendto() can randomly return EPERM. Just retry and in the
+-    // extremely unlikely case of not working on retries then just drop it
+-    for (int i = 0; i < MAX_SENDTO_RETRIES; i++) {
+-        try {
+-            mSocket.send_to(boost::asio::buffer(packet.data(), packet.size()), mTarget);
+-
+-            // if it succeeds then break out of the loop
+-            break; 
+-        } catch (const boost::system::system_error& e) {
+-            if (e.code() != boost::asio::error::basic_errors::no_permission) {
+-                throw;
+-            }
+-        }
+-    }
++    char timeBuf[64];
++    std::strftime(timeBuf, sizeof(timeBuf), "%b %d %H:%M:%S", time);
++    
++    // Construct valid BSD syslog payload format
++    std::string packet = "<" + std::to_string(priority) + ">" + timeBuf + " " + ident + ": " + msg;
++    mImpl.send(packet);
+ }
+ 
+ }
+diff --git a/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.h b/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.h
+index 0cc9ee4..8d8f573 100755
+--- a/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.h
++++ b/arras/arras4_core/arras4_log/lib/arras4_athena/UdpSyslog_boost.h
+@@ -1,72 +1,48 @@
+-// Copyright 2023-2024 DreamWorks Animation LLC and Intel Corporation
+-// SPDX-License-Identifier: Apache-2.0
++#pragma once
+ 
+-#ifndef __ARRAS4_UDP_SYSLOG_BOOST_H__
+-#define __ARRAS4_UDP_SYSLOG_BOOST_H__
+-
+-#include <time.h>
+-#include <sstream>
+-#include <iomanip>
+-
+-#include <boost/asio/buffer.hpp>
+-#include <boost/asio/io_service.hpp>
+-#include <boost/asio/ip/udp.hpp>
+-#include <boost/asio/ip/address.hpp>
+-#include <boost/asio/ip/host_name.hpp>
+-
+-// warning : don't include <syslog.h> here : it makes
+-// some of the Logger::Level enum values unusable...
++#include <boost/asio.hpp>
++#include <string>
++#include <ctime>
+ 
+ namespace arras4 {
+ namespace log {
+ 
+-// Sends log messages to syslog service (typically port 514) using
+-// UDP
+-class UdpSyslog
++class UdpSyslog_boost
+ {
+-    public:
++public:
++    UdpSyslog_boost() : mSocket(mIoContext) {}
+ 
+-    // Will send messages to given host name (e.g. localhost) and port (e.g. 514)
+-    UdpSyslog(const std::string& addr, unsigned short port)
+-        : mSocket(mService)
+-     {
+-        // bind socket to any local address 
++    void connect(const std::string& host, unsigned short port)
++    {
++        boost::asio::ip::udp::resolver hostNameResolver(mIoContext);
++        auto endpoints = hostNameResolver.resolve(boost::asio::ip::udp::v4(), host, std::to_string(port));
++        if (!endpoints.empty()) {
++            mTarget = *endpoints.begin();
++        }
+         mSocket.open(boost::asio::ip::udp::v4());
+-        mSocket.set_option(boost::asio::socket_base::reuse_address(true));
+-        boost::asio::ip::udp::endpoint anyAddress;
+-        mSocket.bind(anyAddress);
+-
+-        // resolve hostname to target endpoint
+-        boost::asio::ip::udp::resolver hostNameResolver(mService);
+-        boost::asio::ip::udp::resolver::query q(boost::asio::ip::udp::v4(),
+-                                                addr,
+-                                                std::to_string(port), 
+-                                                boost::asio::ip::resolver_query_base::address_configured);
+-        mTarget = *hostNameResolver.resolve(q);
+-
+-        // get local host name
+-        boost::system::error_code err;
+-        mLocalHostName = boost::asio::ip::host_name(err);
+     }
+ 
+-    ~UdpSyslog() 
++    void send(const std::string& msg)
+     {
+-         boost::system::error_code err;
+-         mSocket.shutdown(boost::asio::socket_base::shutdown_both, err);
+-         mSocket.close(err);
++        mSocket.send_to(boost::asio::buffer(msg), mTarget);
+     }
+ 
+-    // send message with given priority (e.g. LOG_LOCAL0 | LOG_DEBUG), time, ident and message 
+-    void sendMessage(int priority,const tm* timeStamp, const std::string& ident, const std::string& message);
+-      
+ private:
+-
+-    boost::asio::io_service mService;
++    boost::asio::io_context mIoContext;
+     boost::asio::ip::udp::socket mSocket;
+     boost::asio::ip::udp::endpoint mTarget;
+-    std::string mLocalHostName;
++};
++
++class UdpSyslog 
++{
++public:
++    UdpSyslog(const std::string& host, unsigned short port) {
++        mImpl.connect(host, port);
++    }
++    void sendMessage(int priority, const struct tm* time, const std::string& ident, const std::string& msg);
++private:
++    UdpSyslog_boost mImpl;
+ };
+ 
+ }
+ }
+-#endif
