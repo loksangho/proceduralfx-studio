@@ -272,19 +272,31 @@ modules:
         - --share=network
     config-opts:
       - -DCMAKE_BUILD_TYPE=Release
-      - -DOpenImageIO_BUILD_MISSING_DEPS=all
+      # Only the two required header libraries are fetched; optional format
+      # plugins MoonRay doesn't need are switched off rather than built.
+      - -DOpenImageIO_BUILD_MISSING_DEPS=fmt;Robinmap
       - -DOIIO_BUILD_TESTS=OFF
       - -DOIIO_BUILD_TOOLS=OFF
       - -DOIIO_BUILD_DOCS=OFF
       - -DUSE_PYTHON=OFF
       - -DUSE_QT=OFF
       # No FFmpeg: keeps the Linux build free of the GPL codecs.
-      - -DUSE_FFMPEG=OFF
-      - -DUSE_OPENCV=OFF
-      - -DUSE_OPENVDB=OFF
-      - -DUSE_PTEX=OFF
-      - -DUSE_LIBRAW=OFF
-      - -DUSE_DCMTK=OFF
+      - -DENABLE_FFmpeg=OFF
+      - -DENABLE_libuhdr=OFF
+      - -DENABLE_JXL=OFF
+      - -DENABLE_OpenCV=OFF
+      - -DENABLE_DCMTK=OFF
+      - -DENABLE_GIF=OFF
+      - -DENABLE_Libheif=OFF
+      - -DENABLE_LibRaw=OFF
+      - -DENABLE_OpenJPEG=OFF
+      - -DENABLE_OpenVDB=OFF
+      - -DENABLE_Ptex=OFF
+      - -DENABLE_WebP=OFF
+      - -DENABLE_R3DSDK=OFF
+      - -DENABLE_Nuke=OFF
+      - -DENABLE_Qt5=OFF
+      - -DENABLE_Qt6=OFF
     sources:
       - type: archive
         url: https://github.com/AcademySoftwareFoundation/OpenImageIO/archive/refs/tags/v3.0.10.0.tar.gz
