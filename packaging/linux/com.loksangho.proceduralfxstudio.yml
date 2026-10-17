@@ -374,8 +374,14 @@ modules:
       # (e.g. CPUID.h uses std::uint64_t/std::tuple without <cstdint>/<tuple>);
       # GCC 15 doesn't, so include them up front. GCC 15's <cpuid.h> also
       # dropped the Xeon Phi bits (CPUID leaf 7 EBX bits 26/27) CPUID.h tests.
-      cxxflags: -include cstdint -include cstring -include string -include tuple
-        -include limits -include memory -include stdexcept -include algorithm
+      cxxflags: -include cstdint -include cstddef -include cstdio -include cstdlib
+        -include cstring -include cmath -include climits -include string
+        -include tuple -include utility -include limits -include memory
+        -include stdexcept -include algorithm -include functional -include array
+        -include vector -include map -include set -include unordered_map
+        -include unordered_set -include iterator -include sstream -include iomanip
+        -include iostream -include atomic -include mutex -include thread
+        -include chrono -include optional
         -Dbit_AVX512PF=0x04000000 -Dbit_AVX512ER=0x08000000
     build-commands:
       # Unix Makefiles, not Ninja: MoonRay's DSO rules declare some generated
