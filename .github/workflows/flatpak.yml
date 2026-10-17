@@ -44,6 +44,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The in-app updater compares the release tag with the version built into
+      # the app, so a v* tag must match Cargo.toml.
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+
       - name: Install flatpak-builder
         run: |
           sudo apt-get update

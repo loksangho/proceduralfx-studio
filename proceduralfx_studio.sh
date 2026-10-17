@@ -139,7 +139,9 @@ if [[ ${1-} == "package-macos" ]]; then
   fi
 
   # Also writes Info.plist and signs the bundle (SIGN_IDENTITY, default ad-hoc).
-  python3 scripts/bundle_app_libs.py "$APP_DIR"
+  # The app's version (Info.plist and the updater) comes from Cargo.toml.
+  APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" \
+    python3 scripts/bundle_app_libs.py "$APP_DIR"
 
   # Copy the app to other Macs via this zip: ditto keeps symlinks and code
   # signatures intact, which Finder copies or plain zip/cp can break.

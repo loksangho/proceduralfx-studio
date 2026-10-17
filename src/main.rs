@@ -21,6 +21,7 @@ mod render_viewer;
 mod anim;
 mod fileio;
 mod sims;
+mod updater;
 mod usd;
 mod vex;
 mod volume;
@@ -5419,6 +5420,7 @@ struct ProceduralFxStudioApp {
     cancelled_simulation_key: String,
     simulation_cancel: Option<Arc<AtomicBool>>,
     moonray_rx: Option<Receiver<RenderOutcome>>,
+    updater: updater::Updater,
     moonray_render_requested: bool,
     // Embedded MoonRay defaults and settings
     moonray_default_executable: String,
@@ -5592,6 +5594,7 @@ impl Default for ProceduralFxStudioApp {
             cancelled_simulation_key: String::new(),
             simulation_cancel: None,
             moonray_rx: None,
+            updater: updater::Updater::new(),
             moonray_render_requested: false,
             moonray_default_executable: detected_moonray,
             moonray_default_arguments: default_mr_args,
@@ -6411,6 +6414,8 @@ impl ProceduralFxStudioApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Help", |ui| self.updater.menu(ui));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.updater.indicator(ui));
         });
 
         ui.horizontal(|ui| {
@@ -11029,6 +11034,10 @@ impl eframe::App for ProceduralFxStudioApp {
 
         self.begin_animation_frame(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+        self.updater.poll(ctx);
+        if self.updater.show(ctx) == updater::UpdaterAction::SaveScene {
+            self.save_scene_dialog();
+        }
 
         self.poll_moonray_render();
         self.advance_sequence();

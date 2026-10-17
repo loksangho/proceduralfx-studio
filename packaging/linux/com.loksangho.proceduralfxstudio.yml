@@ -20,6 +20,8 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri
   - --filesystem=home
+  # Lets the in-app updater install a downloaded release bundle via the host's flatpak.
+  - --talk-name=org.freedesktop.Flatpak
   # MoonRay runtime environment (see moonray scripts/setup.sh).
   - --env=RDL2_DSO_PATH=/app/rdl2dso
   - --env=REZ_MOONRAY_ROOT=/app
