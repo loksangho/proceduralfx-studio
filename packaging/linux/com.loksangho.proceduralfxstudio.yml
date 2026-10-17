@@ -424,6 +424,12 @@ modules:
           - rm -f cmake_modules/cmake/FindTBB.cmake
           # rats is the render regression suite (LFS test images); not needed.
           - sed -i 's/^add_subdirectory(rats)/# &/' CMakeLists.txt
+          # objcopy embeds the sample tables with 1-byte alignment, and
+          # ppd_lens is an odd size, so later tables start at odd addresses;
+          # GCC 15's vectorised copies then fault (SIGSEGV at load time).
+          - sed -i 's/--output-target=elf64-x86-64/& --set-section-alignment .data=64/'
+              moonray/moonray/lib/rendering/pbr/CMakeLists.txt
+          - grep -q 'set-section-alignment' moonray/moonray/lib/rendering/pbr/CMakeLists.txt
 
   # Some CMake projects install into /app/lib64; the runtime linker path and the
   # app's build script only use /app/lib, so fold lib64 into it.
