@@ -379,6 +379,7 @@ modules:
           -DBOOST_PYTHON_COMPONENT_NAME=python$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])')
           -DABI_VERSION=0
           -DBUILD_QT_APPS=OFF
+          -DMOONRAY_USE_OPTIX=OFF
           -DBUILD_TESTING=OFF
           -DARRASCORE_BUILD_TESTING=OFF
           -DMCRTCOMPUTATION_BUILD_TESTING=OFF
