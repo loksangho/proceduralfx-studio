@@ -374,7 +374,14 @@ modules:
       # (e.g. CPUID.h uses std::uint64_t/std::tuple without <cstdint>/<tuple>);
       # GCC 15 doesn't, so include them up front. GCC 15's <cpuid.h> also
       # dropped the Xeon Phi bits (CPUID leaf 7 EBX bits 26/27) CPUID.h tests.
-      cxxflags: -include cstdint -include cstddef -include cstdio -include cstdlib
+      #
+      # The flags are overridden rather than appended: the SDK defaults add
+      # -D_GLIBCXX_ASSERTIONS and -D_FORTIFY_SOURCE=3, which MoonRay is never
+      # built with upstream and which abort renders (SIGABRT in renderTiles).
+      cflags-override: true
+      cflags: -O2 -pipe -g
+      cxxflags-override: true
+      cxxflags: -O2 -pipe -g -include cstdint -include cstddef -include cstdio -include cstdlib
         -include cstring -include cmath -include climits -include string
         -include tuple -include utility -include limits -include memory
         -include stdexcept -include algorithm -include functional -include array
