@@ -81,17 +81,24 @@ fn build_usd_bridge() {
             root.display()
         );
     }
-    let python = std::env::var_os("USD_PYTHON_INCLUDE").map(std::path::PathBuf::from).or_else(|| {
-        ["python3.15-config", "python3-config"].into_iter().find_map(|config| {
-            let output = std::process::Command::new(config).arg("--includes").output().ok()?;
-            String::from_utf8(output.stdout)
-                .ok()?
-                .split_whitespace()
-                .filter_map(|flag| flag.strip_prefix("-I"))
-                .map(std::path::PathBuf::from)
-                .find(|dir| dir.join("pyconfig.h").exists())
-        })
-    });
+    // All of python-config's include dirs: on Debian-style layouts pyconfig.h
+    // lives in a separate per-arch directory from the other headers.
+    let python: Vec<std::path::PathBuf> = match std::env::var_os("USD_PYTHON_INCLUDE") {
+        Some(dir) => vec![dir.into()],
+        None => ["python3.15-config", "python3-config"]
+            .into_iter()
+            .find_map(|config| {
+                let output = std::process::Command::new(config).arg("--includes").output().ok()?;
+                let dirs: Vec<std::path::PathBuf> = String::from_utf8(output.stdout)
+                    .ok()?
+                    .split_whitespace()
+                    .filter_map(|flag| flag.strip_prefix("-I"))
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                dirs.iter().any(|dir| dir.join("pyconfig.h").exists()).then_some(dirs)
+            })
+            .unwrap_or_default(),
+    };
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -100,8 +107,8 @@ fn build_usd_bridge() {
         .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-deprecated-declarations")
         .flag_if_supported("-Wno-unused-parameter");
-    if let Some(python) = python {
-        build.include(python);
+    for dir in python {
+        build.include(dir);
     }
     if let Ok(tbb) = pkg_config::Config::new().cargo_metadata(false).probe("tbb") {
         for path in tbb.include_paths {
