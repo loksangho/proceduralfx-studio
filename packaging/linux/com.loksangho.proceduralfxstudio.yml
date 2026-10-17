@@ -27,6 +27,9 @@ finish-args:
 build-options:
   env:
     CMAKE_PREFIX_PATH: /app
+    # The SDK's CMake 4 rejects projects declaring cmake_minimum_required < 3.5
+    # (c-blosc, jsoncpp, OpenSubdiv, parts of MoonRay...).
+    CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 cleanup:
   - /include
   - /lib/cmake
