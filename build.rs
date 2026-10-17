@@ -44,6 +44,9 @@ fn main() {
         build.include(&include);
         println!("cargo:rustc-link-search=native={}", lib.display());
         println!("cargo:rustc-link-lib=openvdb");
+        // OpenVDB's headers reference Imath's half tables directly; ELF linkers
+        // don't resolve those through libopenvdb, so link Imath too.
+        let _ = pkg_config::Config::new().probe("Imath");
     } else {
         let openvdb = pkg_config::Config::new().probe("openvdb").unwrap_or_else(|error| {
             panic!(
