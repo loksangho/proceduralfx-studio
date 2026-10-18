@@ -20,15 +20,20 @@ use rfd::FileDialog;
 mod render_viewer;
 mod anim;
 mod boolean;
+mod crowd;
 mod envlight;
 mod fileio;
+mod fracture;
 mod groom;
 mod groups;
+mod muscle;
 mod paint;
 mod raster;
 mod sims;
+mod shading;
 mod sops;
 mod terrain;
+mod textures;
 mod updater;
 mod vellum;
 mod usd;
@@ -36,6 +41,7 @@ mod vex;
 mod vexmath;
 mod volume;
 mod vop;
+mod whitewater;
 use render_viewer::{reveal_in_file_browser, RenderViewer};
 
 thread_local! {
@@ -821,6 +827,8 @@ fn write_render_volume(mesh: &Mesh, index: usize) -> Result<RenderVolume, String
         extinction: detail("volume_extinction").unwrap_or(1.0),
         albedo: [0.85; 3],
         emission: emission.map(|_| detail("volume_emission").unwrap_or(1.0)),
+        emission_tint: [1.0; 3],
+        anisotropy: 0.3,
     };
     #[cfg(feature = "native-openvdb")]
     {
@@ -1653,9 +1661,14 @@ fn segment_mesh_hit(start: Vec3, end: Vec3, mesh: &Mesh) -> Option<(Vec3, Vec3, 
     best
 }
 
+// FLIP fluid: a stepped simulation like the other solvers, so playing forward
+// only computes new frames (and the Whitewater Solver can follow it frame by
+// frame). Each frame takes enough substeps to keep the step under `max_dt`.
+#[allow(clippy::too_many_arguments)]
 fn node_flip(
+    key: u64,
     emitter: Mesh,
-    collider: Mesh,
+    collider: impl FnOnce() -> Mesh,
     particle_count: usize,
     grid_resolution: usize,
     flip_ratio: f32,
@@ -1674,7 +1687,7 @@ fn node_flip(
     let extent = hi.sub(lo);
     let max_extent = extent.x.max(extent.y).max(extent.z).max(0.1);
     let cell_size = max_extent / resolution as f32;
-    let collider_bounds = collider.bounds();
+    let init = || {
     let mut particles = Vec::with_capacity(max_particles);
     let point_inside = |point: Vec3| {
         let mut crossings = 0usize;
@@ -1733,21 +1746,26 @@ fn node_flip(
         });
     }
 
-    let steps = ((time / max_dt.max(0.001)).ceil() as usize)
-        .saturating_mul(substeps.clamp(1, 8))
-        .min(240)
-        .max(1);
-    let step_dt = (time / steps as f32).max(0.0);
+    particles
+    };
+    let frame = 1.0 / sims::SIM_FPS;
+    let per_frame = ((frame / max_dt.max(0.001)).ceil() as usize).saturating_mul(substeps.clamp(1, 8)).clamp(1, 64);
+    let step_dt = frame / per_frame as f32;
+    let mut collider = Some(collider);
+    let mut collider_mesh: Option<(Mesh, Option<(Vec3, Vec3)>)> = None;
     let blend = flip_ratio.clamp(0.0, 1.0);
     let grid_len = resolution * resolution * resolution;
     let grid_index = |x: usize, y: usize, z: usize| (z * resolution + y) * resolution + x;
     let u_index = |x: usize, y: usize, z: usize| (z * resolution + y) * (resolution + 1) + x;
     let v_index = |x: usize, y: usize, z: usize| (z * (resolution + 1) + y) * resolution + x;
     let w_index = |x: usize, y: usize, z: usize| (z * resolution + y) * resolution + x;
-    for _ in 0..steps {
-        if flip_cancelled() {
-            return Mesh::default();
-        }
+    let step = |particles: &mut Vec<FlipParticle>, _at: usize| {
+        let (collider, collider_bounds) = collider_mesh.get_or_insert_with(|| {
+            let mesh = collider.take().map(|c| c()).unwrap_or_default();
+            let bounds = mesh.bounds();
+            (mesh, bounds)
+        });
+        let (collider, collider_bounds) = (&*collider, *collider_bounds);
         let mut u = vec![0.0; (resolution + 1) * resolution * resolution];
         let mut v = vec![0.0; resolution * (resolution + 1) * resolution];
         let mut w = vec![0.0; resolution * resolution * (resolution + 1)];
@@ -1755,7 +1773,7 @@ fn node_flip(
         let mut vw = vec![0.0; v.len()];
         let mut ww = vec![0.0; w.len()];
         let mut fluid = vec![false; grid_len];
-        for particle in &particles {
+        for particle in particles.iter() {
             let x = ((particle.position.x - lo.x) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
             let y = ((particle.position.y - lo.y) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
             let z = ((particle.position.z - lo.z) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
@@ -1858,11 +1876,8 @@ fn node_flip(
                 }
             }
         }
-        for particle in &mut particles {
+        for particle in particles.iter_mut() {
             let previous_position = particle.position;
-            if flip_cancelled() {
-                return Mesh::default();
-            }
             let x = ((particle.position.x - lo.x) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
             let y = ((particle.position.y - lo.y) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
             let z = ((particle.position.z - lo.z) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
@@ -1895,7 +1910,7 @@ fn node_flip(
                 // collider AABB or a closed-volume test here: an open-top
                 // container must let particles leave through its missing top.
                 if let Some((surface, face_normal, _)) =
-                    segment_mesh_hit(previous_position, particle.position, &collider)
+                    segment_mesh_hit(previous_position, particle.position, collider)
                 {
                     let epsilon = cell_size * 0.08;
                     let outward = if particle.velocity.dot(face_normal) >= 0.0 {
@@ -1952,12 +1967,14 @@ fn node_flip(
                 }
             }
         }
-    }
-    Mesh {
-        vertices: particles.into_iter().map(|particle| particle.position).collect(),
+    };
+    // Positions with velocity `v` (the Whitewater Solver reads it).
+    let output = |particles: &Vec<FlipParticle>| Mesh {
+        vertices: particles.iter().map(|particle| particle.position).collect(),
         indices: Vec::new(),
-        point_attributes: HashMap::new(),
-    }
+        point_attributes: HashMap::from([("v".to_owned(), particles.iter().flat_map(|p| [p.velocity.x, p.velocity.y, p.velocity.z]).collect())]),
+    };
+    sims::run(key, sims::step_count(time, per_frame), per_frame * 12, init, Clone::clone, Clone::clone, step, output)
 }
 
 fn node_extrude(mesh: Mesh, dist: f32, inset: f32, mode: usize) -> Mesh {
@@ -2908,6 +2925,9 @@ struct RenderVolume {
     extinction: f32,
     albedo: [f32; 3],
     emission: Option<f32>,
+    // Pyro Shader settings: emission colour multiplier and scattering anisotropy.
+    emission_tint: [f32; 3],
+    anisotropy: f32,
 }
 
 struct SequenceJob {
@@ -2989,6 +3009,8 @@ enum NodeKind {
         substeps: usize,
         seed: usize,
     },
+    // Spray, foam and bubbles from a FLIP fluid. Input 1: fluid particles (with v), input 2: optional collider.
+    WhitewaterSolver(whitewater::WhitewaterSettings),
     ParticleSurface { radius: f32, join_distance: f32, resolution: usize, smoothing: usize },
     Extrude { dist: f32, inset: f32, mode: usize },
     Clip { axis: usize, offset: f32, invert: bool },
@@ -3049,6 +3071,16 @@ enum NodeKind {
     Scatter(sops::ScatterSettings),
     // Union / intersection / subtraction of two closed meshes.
     Boolean(boolean::BooleanSettings),
+    // Breaks a closed mesh into concrete, glass or wood pieces (with `piece` for RBD).
+    MaterialFracture(fracture::FractureSettings),
+    // Agents walking with steering. Inputs: start points, optional ground, optional obstacles.
+    CrowdSolver(crowd::CrowdSettings),
+    // A muscle body from origin to insertion (or along input curve), with animatable activation.
+    Muscle(muscle::MuscleSettings),
+    // Jiggle (secondary motion) on animated muscles; tendon tips stay pinned.
+    MuscleSolver(muscle::JiggleSettings),
+    // Moves skin (input 1) with the muscles under it (input 2) relative to frame 0.
+    MuscleSkin(muscle::SkinSettings),
     // Heightfield terrain: a grid plus nodes that shape its heights.
     Terrain(terrain::TerrainSettings),
     TerrainNoise(terrain::NoiseSettings),
@@ -3097,6 +3129,12 @@ enum NodeKind {
     Geometry { material: Option<NodeId> },
     // MAT-level MoonRay material; kind indexes MATERIAL_NAMES. `value` is specular (diffuse), IOR (glass) or intensity (emissive).
     Material { kind: usize, color: [f32; 3], roughness: f32, value: f32 },
+    // MAT shaders: Principled, Toon, Hair or Pyro (volume), with presets.
+    Shader(shading::Values),
+    // MAT container of shader nodes wired into a Surface Output.
+    MaterialBuilder,
+    // One node inside a Material Builder.
+    ShaderNode(shading::ShaderNode),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3146,7 +3184,7 @@ impl NodeKind {
     }
 
     fn is_material(&self) -> bool {
-        matches!(self, NodeKind::Material { .. })
+        matches!(self, NodeKind::Material { .. } | NodeKind::Shader(_) | NodeKind::MaterialBuilder)
     }
 
     fn is_render(&self) -> bool {
@@ -3185,6 +3223,17 @@ impl NodeKind {
             ]),
             NodeKind::Transform { .. } => XFORM_NAMES.iter().enumerate().map(|(i, n)| (ChannelTarget::Param(i), n.to_string())).collect(),
             NodeKind::Material { .. } => named(&[(1, "color.r"), (2, "color.g"), (3, "color.b"), (4, "roughness"), (5, "value")]),
+            NodeKind::Muscle(_) => named(&[
+                (0, "origin.x"),
+                (1, "origin.y"),
+                (2, "origin.z"),
+                (3, "insertion.x"),
+                (4, "insertion.y"),
+                (5, "insertion.z"),
+                (6, "radius"),
+                (10, "activation"),
+            ]),
+            NodeKind::CrowdSolver(_) => named(&[(0, "speed"), (7, "goal.x"), (8, "goal.y"), (9, "goal.z"), (10, "goal_weight")]),
             NodeKind::Wrangle { .. } | NodeKind::MoonRayRender { .. } | NodeKind::AttributeVop { .. } | NodeKind::Vop(_) => Vec::new(),
             other => (0..other.params().len()).map(|i| (ChannelTarget::Param(i), format!("parm{i}"))).collect(),
         }
@@ -3208,6 +3257,8 @@ impl NodeKind {
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
+            NodeKind::Shader(v) => v.textures.clone(),
+            NodeKind::ShaderNode(n) => n.texts.clone(),
             _ => Vec::new(),
         }
     }
@@ -3239,19 +3290,29 @@ impl NodeKind {
                 next(&mut g.expression);
             }
             NodeKind::Vop(v) => next(&mut v.name),
+            NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
+            NodeKind::ShaderNode(n) => n.texts.iter_mut().for_each(|t| next(t)),
             _ => {}
         }
     }
 
     // Nodes whose network lives in their children: Geometry objects and SOP Solvers.
     fn is_container(&self) -> bool {
-        matches!(self, NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. })
+        matches!(self, NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder)
     }
 
     fn is_solver(&self) -> bool {
         matches!(
             self,
-            NodeKind::Particles { .. } | NodeKind::Flip { .. } | NodeKind::Pyro(_) | NodeKind::RbdSolver(_) | NodeKind::VellumSolver(_) | NodeKind::SopSolver { .. }
+            NodeKind::Particles { .. }
+                | NodeKind::Flip { .. }
+                | NodeKind::WhitewaterSolver(_)
+                | NodeKind::CrowdSolver(_)
+                | NodeKind::MuscleSolver(_)
+                | NodeKind::Pyro(_)
+                | NodeKind::RbdSolver(_)
+                | NodeKind::VellumSolver(_)
+                | NodeKind::SopSolver { .. }
         )
     }
 
@@ -3259,6 +3320,9 @@ impl NodeKind {
     fn menu_name(&self) -> String {
         match self {
             NodeKind::Vop(v) => v.def().label.to_owned(),
+            NodeKind::Shader(v) => v.name().to_owned(),
+            NodeKind::ShaderNode(n) => n.def().label.to_owned(),
+            NodeKind::MaterialFracture(f) => format!("material_fracture ({})", fracture::MATERIALS[f.material.min(2)]),
             other => other.name().to_owned(),
         }
     }
@@ -3266,6 +3330,7 @@ impl NodeKind {
     fn menu_help(&self) -> Option<&'static str> {
         match self {
             NodeKind::Vop(v) => Some(v.def().help),
+            NodeKind::ShaderNode(n) => Some(n.def().help),
             _ => None,
         }
     }
@@ -3276,6 +3341,8 @@ impl NodeKind {
             NodeKind::SolverInput { index: 0 } => format!("Prev_Frame{id}"),
             NodeKind::SolverInput { .. } => format!("Input_1·{id}"),
             NodeKind::Vop(v) => v.label(id),
+            NodeKind::Shader(v) => format!("{}{id}", v.name().to_lowercase().replace(' ', "_")),
+            NodeKind::ShaderNode(n) => n.label(id),
             _ => format!("{}{id}", self.name()),
         }
     }
@@ -3407,6 +3474,7 @@ impl NodeKind {
                         substeps: 2,
                         seed: 11,
                     },
+                    NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings::defaults()),
                     NodeKind::Pyro(sims::PyroSettings::default()),
                     NodeKind::RbdSolver(sims::RbdSettings::default()),
                     NodeKind::VellumSolver(vellum::VellumSettings::defaults(0)),
@@ -3460,6 +3528,22 @@ impl NodeKind {
                     NodeKind::Switch { index: 0 },
                     NodeKind::Merge,
                     NodeKind::Null,
+                ],
+            ),
+            (
+                "Destruction",
+                (0..fracture::MATERIALS.len()).map(|m| NodeKind::MaterialFracture(fracture::FractureSettings::defaults(m))).collect(),
+            ),
+            (
+                "Crowds",
+                vec![NodeKind::CrowdSolver(crowd::CrowdSettings::defaults())],
+            ),
+            (
+                "Muscles",
+                vec![
+                    NodeKind::Muscle(muscle::MuscleSettings::defaults()),
+                    NodeKind::MuscleSolver(muscle::JiggleSettings::defaults()),
+                    NodeKind::MuscleSkin(muscle::SkinSettings::defaults()),
                 ],
             ),
             (
@@ -3529,6 +3613,16 @@ impl NodeKind {
                 ],
             ),
             (
+                "Shaders",
+                vec![
+                    NodeKind::Shader(shading::Values::new(shading::Table::Principled)),
+                    NodeKind::Shader(shading::Values::new(shading::Table::Toon)),
+                    NodeKind::Shader(shading::Values::new(shading::Table::Hair)),
+                    NodeKind::Shader(shading::Values::new(shading::Table::Pyro)),
+                    NodeKind::MaterialBuilder,
+                ],
+            ),
+            (
                 "Render",
                 vec![NodeKind::MoonRayRender {
                     executable: "moonray".into(),
@@ -3541,6 +3635,15 @@ impl NodeKind {
                 }],
             ),
         ];
+        // Shader presets, one menu per kind of material.
+        for (category, range) in shading::PRESET_CATEGORIES {
+            all.push((category, range.clone().map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Principled, i))).collect()));
+        }
+        all.push(("Toon & Hair Presets", (1..shading::TOON_PRESETS.len()).map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Toon, i)))
+            .chain((1..shading::HAIR_PRESETS.len()).map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Hair, i)))).collect()));
+        all.push(("Volume Presets", (1..shading::PYRO_PRESETS.len()).map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Pyro, i))).collect()));
+        // Material Builder nodes (only shown inside a Material Builder).
+        all.push((shading::CATEGORY, (0..shading::SHADER_OPS.len()).map(|op| NodeKind::ShaderNode(shading::ShaderNode::new(op))).collect()));
         // VOP networks: one menu per category (only shown inside an Attribute VOP).
         all.extend(vop::CATEGORIES.iter().map(|category| {
             (*category, (0..vop::OPS.len()).filter(|&op| vop::OPS[op].category == *category).map(|op| NodeKind::Vop(vop::VopNode::new(op))).collect())
@@ -3585,6 +3688,7 @@ impl NodeKind {
             NodeKind::Jitter { .. } => "jitter",
             NodeKind::Particles { .. } => "particles",
             NodeKind::Flip { .. } => "flip",
+            NodeKind::WhitewaterSolver(_) => "whitewater_solver",
             NodeKind::ParticleSurface { .. } => "particle_surface",
             NodeKind::Extrude { .. } => "extrude",
             NodeKind::Clip { .. } => "clip",
@@ -3619,6 +3723,11 @@ impl NodeKind {
             NodeKind::Normal(_) => "normal",
             NodeKind::Scatter(_) => "scatter",
             NodeKind::Boolean(_) => "boolean",
+            NodeKind::MaterialFracture(_) => "material_fracture",
+            NodeKind::CrowdSolver(_) => "crowd_solver",
+            NodeKind::Muscle(_) => "muscle",
+            NodeKind::MuscleSolver(_) => "muscle_solver",
+            NodeKind::MuscleSkin(_) => "muscle_skin",
             NodeKind::Terrain(_) => "terrain",
             NodeKind::TerrainNoise(_) => "terrain_noise",
             NodeKind::TerrainErode(_) => "terrain_erode",
@@ -3635,6 +3744,14 @@ impl NodeKind {
             NodeKind::Switch { .. } => "switch",
             NodeKind::Geometry { .. } => "geometry",
             NodeKind::Material { kind, .. } => MATERIAL_NAMES[(*kind).min(MATERIAL_NAMES.len() - 1)],
+            NodeKind::Shader(v) => match v.table {
+                shading::Table::Principled => "principled_shader",
+                shading::Table::Toon => "toon_shader",
+                shading::Table::Hair => "hair_shader",
+                shading::Table::Pyro => "pyro_shader",
+            },
+            NodeKind::MaterialBuilder => "material_builder",
+            NodeKind::ShaderNode(_) => "shader_node",
         }
     }
 
@@ -3651,8 +3768,11 @@ impl NodeKind {
             | NodeKind::Tube { .. } => 0,
             NodeKind::Terrain(_) => 0,
             NodeKind::Boolean(_) => 2,
+            NodeKind::CrowdSolver(_) => 3,
+            NodeKind::MuscleSkin(_) => 2,
             NodeKind::Particles { .. } => 2,
             NodeKind::Flip { .. } => 2,
+            NodeKind::WhitewaterSolver(_) => 2,
             NodeKind::Pyro(_) | NodeKind::RbdSolver(_) | NodeKind::VellumSolver(_) => 2,
             NodeKind::HairGenerate(_) | NodeKind::HairDeform(_) => 2,
             NodeKind::SopSolver { .. } => 1,
@@ -3670,6 +3790,8 @@ impl NodeKind {
             NodeKind::MoonRayRender { .. } => 0,
             NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::Geometry { .. } | NodeKind::Material { .. } => 0,
             NodeKind::EnvironmentLight { .. } => 0,
+            NodeKind::Shader(_) | NodeKind::MaterialBuilder => 0,
+            NodeKind::ShaderNode(n) => n.def().inputs.len(),
             _ => 1,
         }
     }
@@ -3792,6 +3914,7 @@ impl NodeKind {
                     *along_normals as u8 as f32,
                 ]
             }
+            NodeKind::WhitewaterSolver(w) => w.to_params(),
             NodeKind::Flip {
                 particle_count,
                 grid_resolution,
@@ -3874,6 +3997,23 @@ impl NodeKind {
             }
             NodeKind::Scatter(s) => vec![s.count as f32, s.seed as f32, s.relax_iterations as f32, s.volume as u8 as f32],
             NodeKind::Boolean(s) => vec![s.operation as f32, s.mode as f32, s.resolution as f32],
+            NodeKind::MaterialFracture(s) => vec![
+                s.material as f32,
+                s.pieces as f32,
+                s.seed as f32,
+                s.impact[0],
+                s.impact[1],
+                s.impact[2],
+                s.rings as f32,
+                s.spokes as f32,
+                s.grain_axis as f32,
+                s.splinter,
+                s.separate,
+            ],
+            NodeKind::CrowdSolver(s) => s.to_params(),
+            NodeKind::Muscle(s) => s.to_params(),
+            NodeKind::MuscleSolver(s) => vec![s.stiffness, s.damping, s.smoothing as f32, s.substeps as f32],
+            NodeKind::MuscleSkin(s) => vec![s.falloff, s.influences as f32],
             NodeKind::Terrain(s) => vec![s.size[0], s.size[1], s.resolution as f32],
             NodeKind::TerrainNoise(s) => vec![
                 s.kind as f32,
@@ -3957,6 +4097,9 @@ impl NodeKind {
             NodeKind::Material { kind, color, roughness, value } => {
                 vec![*kind as f32, color[0], color[1], color[2], *roughness, *value]
             }
+            NodeKind::Shader(v) => v.to_params(),
+            NodeKind::MaterialBuilder => vec![],
+            NodeKind::ShaderNode(n) => n.to_params(),
         }
     }
     fn from_params(name: &str, p: &[f32]) -> Option<NodeKind> {
@@ -4040,6 +4183,7 @@ impl NodeKind {
                     along_normals: or(12, 0.0) > 0.5,
                 }
             }
+            "whitewater_solver" => NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings::from_params(p)),
             "flip" => NodeKind::Flip {
                 particle_count: u(0).clamp(1, 100_000),
                 grid_resolution: u(1).clamp(16, 128),
@@ -4171,6 +4315,26 @@ impl NodeKind {
                 mode: u(1).min(boolean::MODES.len() - 1),
                 resolution: u(2).clamp(16, 400),
             }),
+            "material_fracture" => NodeKind::MaterialFracture(fracture::FractureSettings {
+                material: u(0).min(fracture::MATERIALS.len() - 1),
+                pieces: u(1).clamp(2, 500),
+                seed: u(2) as u32,
+                impact: v3(3),
+                rings: u(6).clamp(1, 20),
+                spokes: u(7).clamp(3, 64),
+                grain_axis: u(8).min(2),
+                splinter: g(9).max(1.0),
+                separate: g(10).max(0.0),
+            }),
+            "crowd_solver" => NodeKind::CrowdSolver(crowd::CrowdSettings::from_params(p)),
+            "muscle" => NodeKind::Muscle(muscle::MuscleSettings::from_params(p)),
+            "muscle_solver" => NodeKind::MuscleSolver(muscle::JiggleSettings {
+                stiffness: g(0).max(0.0),
+                damping: g(1).max(0.0),
+                smoothing: u(2).min(50),
+                substeps: u(3).clamp(1, 16),
+            }),
+            "muscle_skin" => NodeKind::MuscleSkin(muscle::SkinSettings { falloff: g(0).max(1e-4), influences: u(1).clamp(1, 16) }),
             "terrain" => NodeKind::Terrain(terrain::TerrainSettings { size: [g(0).max(1e-3), g(1).max(1e-3)], resolution: u(2).clamp(2, 2048) }),
             "terrain_noise" => NodeKind::TerrainNoise(terrain::NoiseSettings {
                 kind: u(0).min(terrain::NOISE_TYPES.len() - 1),
@@ -4281,6 +4445,12 @@ impl NodeKind {
                 roughness: g(4).clamp(0.0, 1.0),
                 value: g(5).max(0.0),
             },
+            "principled_shader" => NodeKind::Shader(shading::Values::from_params(shading::Table::Principled, p)),
+            "toon_shader" => NodeKind::Shader(shading::Values::from_params(shading::Table::Toon, p)),
+            "hair_shader" => NodeKind::Shader(shading::Values::from_params(shading::Table::Hair, p)),
+            "pyro_shader" => NodeKind::Shader(shading::Values::from_params(shading::Table::Pyro, p)),
+            "material_builder" => NodeKind::MaterialBuilder,
+            "shader_node" => NodeKind::ShaderNode(shading::ShaderNode::from_params(p)),
             _ => return None,
         })
     }
@@ -4417,6 +4587,9 @@ impl Graph {
             if !node.bypass {
                 let name = match node.kind {
                     NodeKind::Flip { .. } => Some("FLIP"),
+                    NodeKind::WhitewaterSolver(_) => Some("Whitewater"),
+                    NodeKind::CrowdSolver(_) => Some("Crowd"),
+                    NodeKind::MuscleSolver(_) => Some("Muscle"),
                     NodeKind::Pyro(_) => Some("Pyro"),
                     NodeKind::RbdSolver(_) => Some("RBD"),
                     NodeKind::VellumSolver(_) => Some("Vellum"),
@@ -4658,10 +4831,22 @@ impl Graph {
                 Some(NodeKind::Geometry { material: Some(m) }) => self.nodes.get(m).map(|n| &n.kind),
                 _ => None,
             };
-            if let Some(NodeKind::Material { color, .. }) = material {
+            let _ = material;
+            let material = match self.nodes.get(id).map(|n| &n.kind) {
+                Some(NodeKind::Geometry { material: Some(m) }) => self.material_preview(*m),
+                _ => None,
+            };
+            if let Some((color, texture, uses_cd)) = material {
                 let coloured = mesh.point_attributes.keys().any(|k| k == "Cd" || k.ends_with(":Cd"));
-                if !coloured && !mesh.indices.is_empty() {
+                if !(coloured && uses_cd) && !mesh.indices.is_empty() {
+                    mesh.point_attributes.remove("Cd");
                     mesh.point_attributes.insert("prim:Cd".into(), color.repeat(mesh.indices.len()));
+                }
+                // Image textures show in the viewport like UV Quick Shade.
+                if let Some(texture) = texture {
+                    if let Ok(shaded) = sops::uv_quickshade(&mesh, &texture) {
+                        mesh = shaded;
+                    }
                 }
             }
             merged = Some(match merged {
@@ -4951,8 +5136,82 @@ impl Graph {
         stage
     }
 
+    // The Surface Output a Material Builder renders: its display node, else its first one.
+    fn builder_output(&self, builder: NodeId) -> Option<NodeId> {
+        let is_output = |id: &NodeId| matches!(self.nodes.get(id).map(|n| &n.kind), Some(NodeKind::ShaderNode(n)) if n.op == shading::SURFACE_OUTPUT);
+        self.display_of(builder).filter(is_output).or_else(|| {
+            let mut outputs: Vec<NodeId> = self.children(builder).into_iter().filter(is_output).collect();
+            outputs.sort_unstable();
+            outputs.first().copied()
+        })
+    }
+
+    fn builder_nodes(&self, builder: NodeId) -> HashMap<NodeId, shading::ShaderNode> {
+        self.children(builder)
+            .into_iter()
+            .filter_map(|child| match &self.nodes.get(&child)?.kind {
+                NodeKind::ShaderNode(n) if !self.nodes[&child].bypass => Some((child, n.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // What the viewport shows for a MAT node: (colour, image texture, whether point Cd is used).
+    fn material_preview(&self, material: NodeId) -> Option<([f32; 3], Option<String>, bool)> {
+        match &self.nodes.get(&material)?.kind {
+            NodeKind::Material { color, .. } => Some((*color, None, true)),
+            NodeKind::Shader(v) => {
+                let texture = (v.table == shading::Table::Principled && !v.texture(0).is_empty()).then(|| v.texture(0).to_owned());
+                Some((v.viewport_color(), texture, v.table == shading::Table::Principled && v.flag("use_point_color")))
+            }
+            NodeKind::MaterialBuilder => {
+                let nodes = self.builder_nodes(material);
+                let output = self.builder_output(material)?;
+                let (colour, texture) = shading::builder_preview(&nodes, |to, slot| self.input_of(to, slot), output);
+                Some((colour, texture, false))
+            }
+            _ => None,
+        }
+    }
+
     // Adds a UsdPreviewSurface Material prim for a MAT network node; returns its path.
     fn material_prim(&self, stage: &mut usd::Stage, material: NodeId) -> Option<String> {
+        let surface = match &self.nodes.get(&material)?.kind {
+            NodeKind::Shader(v) if v.table == shading::Table::Principled => Some(v.clone()),
+            NodeKind::MaterialBuilder => self.builder_output(material).and_then(|o| match &self.nodes.get(&o)?.kind {
+                NodeKind::ShaderNode(n) => Some(n.surface.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        if let Some(v) = surface {
+            let path = format!("/materials/mat{material}");
+            let prim = stage.define(&path, "Material");
+            prim.material_node = Some(material);
+            let attrs = &mut prim.attrs;
+            let (colour, _, _) = self.material_preview(material)?;
+            attrs.insert("diffuseColor".into(), usd::AttrValue::Vec3(colour));
+            attrs.insert("roughness".into(), usd::AttrValue::Float(v.float("roughness")));
+            attrs.insert("metallic".into(), usd::AttrValue::Float(v.float("metallic")));
+            attrs.insert("ior".into(), usd::AttrValue::Float(v.float("ior")));
+            attrs.insert("clearcoat".into(), usd::AttrValue::Float(v.float("clearcoat")));
+            let opacity = v.float("opacity") * (1.0 - 0.8 * v.float("transmission"));
+            if opacity < 1.0 {
+                attrs.insert("opacity".into(), usd::AttrValue::Float(opacity));
+            }
+            if v.float("emission_intensity") > 0.0 {
+                attrs.insert("emissiveColor".into(), usd::AttrValue::Vec3(v.color("emission_color").map(|c| c * v.float("emission_intensity"))));
+            }
+            return Some(path);
+        }
+        if let Some((colour, _, _)) = self.material_preview(material).filter(|_| !matches!(self.nodes[&material].kind, NodeKind::Material { .. })) {
+            // Toon, hair and pyro shaders reach USD as their colour.
+            let path = format!("/materials/mat{material}");
+            let prim = stage.define(&path, "Material");
+            prim.material_node = Some(material);
+            prim.attrs.insert("diffuseColor".into(), usd::AttrValue::Vec3(colour));
+            return Some(path);
+        }
         let NodeKind::Material { kind, color, roughness, value } = self.nodes.get(&material)?.kind else {
             return None;
         };
@@ -5058,6 +5317,9 @@ impl Graph {
                 | NodeKind::Ripple { .. }
                 | NodeKind::Particles { .. }
                 | NodeKind::Flip { .. }
+                | NodeKind::WhitewaterSolver(_)
+                | NodeKind::CrowdSolver(_)
+                | NodeKind::MuscleSolver(_)
                 | NodeKind::Cache { .. }
                 | NodeKind::Pyro(_)
                 | NodeKind::RbdSolver(_)
@@ -5289,8 +5551,9 @@ impl Graph {
                     substeps,
                     seed,
                 } => node_flip(
+                    self.sim_key(id),
                     input(0, cache),
-                    input(1, cache),
+                    || self.cook_fresh(self.input_of(id, 1), 0.0),
                     *particle_count,
                     *grid_resolution,
                     *flip_ratio,
@@ -5301,6 +5564,14 @@ impl Graph {
                     *seed,
                     time,
                 ),
+                NodeKind::WhitewaterSolver(settings) => {
+                    let (fluid, collider) = (self.input_of(id, 0), self.input_of(id, 1));
+                    if fluid.is_none() {
+                        self.report(id, Err("connect a FLIP fluid to input 1".to_owned()))
+                    } else {
+                        whitewater::whitewater(self.sim_key(id), settings, time, |t| self.cook_fresh(fluid, t), || self.cook_fresh(collider, 0.0))
+                    }
+                }
                 NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
                     node_particle_surface(
                         input(0, cache),
@@ -5382,7 +5653,13 @@ impl Graph {
                     }
                 }
                 NodeKind::MoonRayRender { .. } => input(0, cache),
-                NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::EnvironmentLight { .. } | NodeKind::Material { .. } => Mesh::default(),
+                NodeKind::Camera { .. }
+                | NodeKind::Light { .. }
+                | NodeKind::EnvironmentLight { .. }
+                | NodeKind::Material { .. }
+                | NodeKind::Shader(_)
+                | NodeKind::MaterialBuilder
+                | NodeKind::ShaderNode(_) => Mesh::default(),
                 NodeKind::Geometry { .. } => match self.display_of(id) {
                     Some(display) => self.xform_at(id, time).apply(self.cook(display, time, cache)),
                     None => Mesh::default(),
@@ -5446,6 +5723,32 @@ impl Graph {
                         boolean::boolean(&input(0, cache), &input(1, cache), settings)
                     };
                     self.report(id, result)
+                }
+                NodeKind::MaterialFracture(settings) => self.report(id, fracture::fracture(&input(0, cache), settings)),
+                NodeKind::CrowdSolver(settings) => {
+                    let (start, ground, obstacles) = (self.input_of(id, 0), self.input_of(id, 1), self.input_of(id, 2));
+                    if start.is_none() {
+                        self.report(id, Err("connect start points to input 1 (for example Scatter on a grid)".to_owned()))
+                    } else {
+                        crowd::crowd(
+                            self.sim_key(id),
+                            settings,
+                            time,
+                            || self.cook_fresh(start, 0.0),
+                            || self.cook_fresh(ground, 0.0),
+                            || self.cook_fresh(obstacles, 0.0),
+                        )
+                    }
+                }
+                NodeKind::Muscle(settings) => self.report(id, muscle::muscle(&input(0, cache), settings)),
+                NodeKind::MuscleSolver(settings) => {
+                    let source = self.input_of(id, 0);
+                    muscle::jiggle(self.sim_key(id), settings, time, |t| self.cook_fresh(source, t))
+                }
+                NodeKind::MuscleSkin(settings) => {
+                    let muscles = self.input_of(id, 1);
+                    let rest = self.cook_fresh(muscles, 0.0);
+                    self.report(id, muscle::skin(&input(0, cache), &rest, &input(1, cache), settings))
                 }
                 NodeKind::Terrain(settings) => terrain::terrain(settings),
                 NodeKind::TerrainNoise(settings) => self.report(id, terrain::terrain_noise(&input(0, cache), settings)),
@@ -5925,6 +6228,80 @@ const SCENE_FILE: &str = "scene.pfs";
 const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
 // Returns the MoonRay class name and its RDLA definition for a MAT node's settings.
+// One parameter of a shader table: a slider, colour swatch or checkbox.
+fn shader_param_ui(ui: &mut egui::Ui, param: &shading::Param, slot: &mut [f32]) -> bool {
+    match param.kind {
+        shading::Kind::Float(min, max) => {
+            let log = min >= 0.0 && max / min.max(0.01) >= 1000.0;
+            ui.add(egui::Slider::new(&mut slot[0], min..=max).logarithmic(log).text(param.label)).changed()
+        }
+        shading::Kind::Color => {
+            ui.horizontal(|ui| {
+                let mut rgb = [slot[0], slot[1], slot[2]];
+                let changed = ui.color_edit_button_rgb(&mut rgb).changed();
+                slot.copy_from_slice(&rgb);
+                ui.label(param.label);
+                changed
+            })
+            .inner
+        }
+        shading::Kind::Toggle => {
+            let mut on = slot[0] > 0.5;
+            let changed = ui.checkbox(&mut on, param.label).changed();
+            slot[0] = on as u8 as f32;
+            changed
+        }
+    }
+}
+
+// Preset menu, textures and the grouped parameters of a shader.
+fn shader_values_ui(ui: &mut egui::Ui, values: &mut shading::Values) -> bool {
+    let mut c = false;
+    let presets = values.table.presets();
+    let mut preset = values.preset;
+    egui::ComboBox::from_label("Preset").selected_text(presets[preset.min(presets.len() - 1)].0).height(400.0).show_ui(ui, |ui| {
+        for (i, (name, _)) in presets.iter().enumerate() {
+            ui.selectable_value(&mut preset, i, *name);
+        }
+    });
+    if preset != values.preset {
+        values.apply_preset(preset);
+        c = true;
+    }
+    if values.table == shading::Table::Principled {
+        for (label, text) in shading::PRINCIPLED_TEXTURES.iter().zip(values.textures.iter_mut()) {
+            ui.horizontal(|ui| {
+                ui.label(*label);
+                c |= ui.add(egui::TextEdit::singleline(text).desired_width(160.0)).changed();
+                if ui.button("…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "exr", "tif", "tiff", "hdr", "tx"]).pick_file() {
+                        *text = path.to_string_lossy().into_owned();
+                        c = true;
+                    }
+                }
+            });
+        }
+    }
+    let mut at = 0;
+    let mut group = "";
+    for param in values.table.params() {
+        if param.group != group {
+            group = param.group;
+            ui.separator();
+            ui.label(egui::RichText::new(group).strong());
+        }
+        let width = param.width();
+        c |= shader_param_ui(ui, param, &mut values.values[at..at + width]);
+        at += width;
+    }
+    c
+}
+
+// Points the renderer draws as spheres (Whitewater output), not left out like other point clouds.
+fn renders_points(mesh: &Mesh) -> bool {
+    mesh.indices.is_empty() && !mesh.vertices.is_empty() && mesh.point_attributes.get(whitewater::RENDER_POINTS).is_some_and(|v| v.first() == Some(&1.0))
+}
+
 fn rdla_material(name: &str, kind: usize, color: [f32; 3], roughness: f32, value: f32) -> (&'static str, String) {
     let rgb = |c: [f32; 3]| format!("Rgb({:.4}, {:.4}, {:.4})", c[0], c[1], c[2]);
     let (class, attrs) = match kind {
@@ -7852,6 +8229,10 @@ impl ProceduralFxStudioApp {
                     && self.context != context
                 {
                     self.context = context;
+                    // An open network belongs to its own context (a Material Builder to MAT).
+                    if self.network().is_some_and(|id| self.graph.nodes.get(&id).is_some_and(|n| n.context != context)) {
+                        self.current_network = None;
+                    }
                     self.selected = None;
                     self.dirty = true;
                 }
@@ -8781,8 +9162,35 @@ impl ProceduralFxStudioApp {
                 writeln!(f, "        {},", i).map_err(|e| e.to_string())?;
             }
             writeln!(f, "    }},") .map_err(|e| e.to_string())?;
+            // UVs per face-vertex (in the swapped winding) for image textures.
+            if let Some(uvs) = sops::corner_uvs(mesh) {
+                writeln!(f, "    [\"uv_list\"] = {{") .map_err(|e| e.to_string())?;
+                for uv in &uvs {
+                    for k in [0, 2, 1] {
+                        writeln!(f, "        Vec2({:.6}, {:.6}),", uv[k][0], uv[k][1]).map_err(|e| e.to_string())?;
+                    }
+                }
+                writeln!(f, "    }},") .map_err(|e| e.to_string())?;
+            }
+            // Cd as user data, for shaders that read point colour (rate guessed from the count).
+            let cd = mesh
+                .point_attributes
+                .get("Cd")
+                .filter(|c| c.len() == mesh.vertices.len() * 3)
+                .or_else(|| mesh.point_attributes.get("prim:Cd").filter(|c| c.len() == mesh.indices.len() * 3));
+            if cd.is_some() {
+                writeln!(f, "    [\"primitive_attributes\"] = {{ UserData(\"/scene/objects/mesh{index}_Cd\") }},") .map_err(|e| e.to_string())?;
+            }
             writeln!(f, "    [\"is_subd\"] = false") .map_err(|e| e.to_string())?;
             writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
+            if let Some(cd) = cd {
+                let mut body = format!("UserData(\"/scene/objects/mesh{index}_Cd\") {{\n    [\"color_key\"] = \"Cd\",\n    [\"color_values_0\"] = {{\n");
+                for c in cd.chunks(3) {
+                    body.push_str(&format!("        Rgb({:.4}, {:.4}, {:.4}),\n", c[0], c[1], c[2]));
+                }
+                body.push_str("    }\n}\n\n");
+                f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+            }
         }
 
         // Hair and other curves: linear RdlCurveGeometry, radius from the width attribute.
@@ -8812,6 +9220,24 @@ impl ProceduralFxStudioApp {
             f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
         }
 
+        // Whitewater and other marked points: spheres of radius pscale.
+        for (index, (mesh, _)) in parts.iter().enumerate() {
+            if !renders_points(mesh) {
+                continue;
+            }
+            let pscale = mesh.point_attributes.get("pscale").filter(|p| p.len() == mesh.vertices.len());
+            let mut body = format!("RdlPointGeometry(\"/scene/objects/points{index}\") {{\n    [\"vertex_list_0\"] = {{\n");
+            for v in &mesh.vertices {
+                body.push_str(&format!("        Vec3({:.6}, {:.6}, {:.6}),\n", v.x, v.y, -v.z));
+            }
+            body.push_str("    },\n    [\"radius_list\"] = {\n");
+            for i in 0..mesh.vertices.len() {
+                body.push_str(&format!("        {:.6},\n", pscale.map_or(0.01, |p| p[i]).max(1e-5)));
+            }
+            body.push_str("    }\n}\n\n");
+            f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        }
+
         // Fog volumes: VdbGeometry reading the written .vdb, shaded by VdbVolume.
         for (index, vol) in scene.volumes.iter().enumerate() {
             writeln!(f, "VdbGeometry(\"/scene/volumes/volume{index}\") {{") .map_err(|e| e.to_string())?;
@@ -8827,8 +9253,9 @@ impl ProceduralFxStudioApp {
             writeln!(f, "VdbVolume(\"/scene/volumes/shader{index}\") {{") .map_err(|e| e.to_string())?;
             writeln!(f, "    [\"opacity_gain_mult\"] = Rgb({0:.5}, {0:.5}, {0:.5}),", vol.extinction) .map_err(|e| e.to_string())?;
             writeln!(f, "    [\"color_mult\"] = Rgb({:.4}, {:.4}, {:.4}),", vol.albedo[0], vol.albedo[1], vol.albedo[2]) .map_err(|e| e.to_string())?;
-            writeln!(f, "    [\"incandescence_gain_mult\"] = Rgb({0:.4}, {0:.4}, {0:.4}),", emission) .map_err(|e| e.to_string())?;
-            writeln!(f, "    [\"anisotropy\"] = 0.3") .map_err(|e| e.to_string())?;
+            let tint = vol.emission_tint.map(|t| t * emission);
+            writeln!(f, "    [\"incandescence_gain_mult\"] = Rgb({:.4}, {:.4}, {:.4}),", tint[0], tint[1], tint[2]) .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"anisotropy\"] = {:.4}", vol.anisotropy) .map_err(|e| e.to_string())?;
             writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
         }
 
@@ -8843,6 +9270,9 @@ impl ProceduralFxStudioApp {
                 }
                 if groom::has_curves(mesh) && !groom::curves(mesh).is_empty() {
                     refs.push(format!("RdlCurveGeometry(\"/scene/objects/curves{index}\")"));
+                }
+                if renders_points(mesh) {
+                    refs.push(format!("RdlPointGeometry(\"/scene/objects/points{index}\")"));
                 }
                 refs
             })
@@ -8910,6 +9340,32 @@ impl ProceduralFxStudioApp {
                 _ => None,
             };
             let reference = match (material, node) {
+                (_, Some((id, NodeKind::Shader(v)))) if v.table != shading::Table::Pyro => {
+                    let name = format!("/scene/materials/mat{id}");
+                    let mut objects = String::new();
+                    let (class, body) = match v.table {
+                        shading::Table::Toon => shading::toon_rdla(&name, v),
+                        shading::Table::Hair => shading::hair_rdla(&name, v),
+                        _ => shading::principled_rdla(&name, v, &HashMap::new(), &mut objects),
+                    };
+                    if !written.contains(&id) {
+                        written.push(id);
+                        write!(f, "{objects}{body}\n") .map_err(|e| e.to_string())?;
+                    }
+                    format!("{class}(\"{name}\")")
+                }
+                (_, Some((id, NodeKind::MaterialBuilder))) => {
+                    let name = format!("/scene/materials/mat{id}");
+                    let output = self.graph.builder_output(id).ok_or("Material Builder: add a Surface Output node inside it")?;
+                    let nodes = self.graph.builder_nodes(id);
+                    let (class, text) = shading::compile_builder(&name, &nodes, |to, slot| self.graph.input_of(to, slot), output)
+                        .map_err(|e| format!("Material Builder {}: {e}", self.graph.nodes[&id].kind.label(id)))?;
+                    if !written.contains(&id) {
+                        written.push(id);
+                        write!(f, "{text}\n") .map_err(|e| e.to_string())?;
+                    }
+                    format!("{class}(\"{name}\")")
+                }
                 (_, Some((id, NodeKind::Material { kind, color, roughness, value }))) => {
                     let name = format!("/scene/materials/mat{id}");
                     let (class, body) = rdla_material(&name, *kind, *color, *roughness, *value);
@@ -9056,7 +9512,7 @@ impl ProceduralFxStudioApp {
 
     // Parent assigned to nodes created in the visible network.
     fn view_parent(&self) -> Option<NodeId> {
-        if self.context == AppContext::Obj { self.network() } else { None }
+        self.network().filter(|id| self.graph.nodes.get(id).is_some_and(|n| n.context == self.context))
     }
 
     // Nodes cooked into the viewport: the open geometry's display, else every top-level geometry.
@@ -9070,9 +9526,17 @@ impl ProceduralFxStudioApp {
         }
     }
 
+    // Opens `network` (None: the top level). The editor takes the context its nodes
+    // live in: OBJ for geometry networks, MAT for a Material Builder; going back to
+    // the top stays in the context of the network being left.
     fn enter_network(&mut self, network: Option<NodeId>) {
+        let context_of = |id: NodeId| self.graph.nodes.get(&id).map(|n| n.context);
+        self.context = match network {
+            Some(id) => context_of(id),
+            None => self.network().and_then(context_of),
+        }
+        .unwrap_or(AppContext::Obj);
         self.current_network = network;
-        self.context = AppContext::Obj;
         self.selected = None;
         self.graph_pan = egui::Vec2::ZERO;
         self.clear_component_selection();
@@ -9088,6 +9552,9 @@ impl ProceduralFxStudioApp {
         let in_vop = self
             .network()
             .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. })));
+        let in_builder = self
+            .network()
+            .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::MaterialBuilder)));
         let context = self.context;
         NodeKind::templates()
             .into_iter()
@@ -9095,6 +9562,8 @@ impl ProceduralFxStudioApp {
                 let kinds: Vec<NodeKind> = kinds
                     .into_iter()
                     .filter(|k| match context {
+                        // Inside a Material Builder only shader nodes; shader nodes nowhere else.
+                        AppContext::Mat if in_builder => matches!(k, NodeKind::ShaderNode(_)),
                         AppContext::Mat => k.is_material(),
                         AppContext::Out => k.is_render(),
                         AppContext::Stage => k.is_lop(),
@@ -9193,7 +9662,7 @@ impl ProceduralFxStudioApp {
         active
             .into_iter()
             .map(|id| (self.graph.cook(id, time, &mut cache), material_of(id)))
-            .filter(|(mesh, _)| !mesh.indices.is_empty() || volume::is_volume(mesh) || groom::has_curves(mesh))
+            .filter(|(mesh, _)| !mesh.indices.is_empty() || volume::is_volume(mesh) || groom::has_curves(mesh) || renders_points(mesh))
             .collect()
     }
 
@@ -9213,7 +9682,17 @@ impl ProceduralFxStudioApp {
                     // Level sets render as their surface.
                     parts.push((volume::to_polygons(&grid, 0.0), material));
                 } else {
-                    volumes.push(write_render_volume(&mesh, index)?);
+                    let mut volume = write_render_volume(&mesh, index)?;
+                    if let PartMaterial::Node(m) = material {
+                        if let Some(NodeKind::Shader(v)) = self.graph.nodes.get(&m).map(|n| &n.kind).filter(|k| matches!(k, NodeKind::Shader(v) if v.table == shading::Table::Pyro)) {
+                            volume.extinction *= v.float("smoke_density");
+                            volume.albedo = v.color("smoke_color");
+                            volume.emission = volume.emission.map(|e| e * v.float("fire_intensity"));
+                            volume.emission_tint = v.color("fire_color");
+                            volume.anisotropy = v.float("anisotropy");
+                        }
+                    }
+                    volumes.push(volume);
                 }
             }
             return Ok(RenderScene { parts, lights: self.scene_lights(), environment: None, camera: None, volumes });
@@ -9503,6 +9982,15 @@ impl ProceduralFxStudioApp {
             }
             self.graph.connect(bind, export, 0);
             self.status = "Attribute VOP created: double-click it to build its network (bind P → export P)".into();
+        }
+        if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::MaterialBuilder)) {
+            let output = self.graph.add(NodeKind::ShaderNode(shading::ShaderNode::new(shading::SURFACE_OUTPUT)), egui::pos2(40.0, 240.0));
+            if let Some(n) = self.graph.nodes.get_mut(&output) {
+                n.context = AppContext::Mat;
+                n.parent = Some(id);
+            }
+            self.graph.set_display(output);
+            self.status = "Material Builder created: double-click it and wire texture nodes into the Surface Output".into();
             return;
         }
         if !matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::SopSolver { .. })) {
@@ -9529,6 +10017,7 @@ impl ProceduralFxStudioApp {
                     NodeKind::Add { .. }
                         | NodeKind::Particles { .. }
                                 | NodeKind::Flip { .. }
+                        | NodeKind::WhitewaterSolver(_)
                         | NodeKind::Cache { .. }
                 );
                 let id = self.graph.add(kind, pos);
@@ -9557,6 +10046,7 @@ impl ProceduralFxStudioApp {
                     NodeKind::Add { .. }
                         | NodeKind::Particles { .. }
                                 | NodeKind::Flip { .. }
+                        | NodeKind::WhitewaterSolver(_)
                         | NodeKind::Cache { .. }
                 );
                 let id = self.graph.add(kind, pos);
@@ -10121,7 +10611,8 @@ impl ProceduralFxStudioApp {
             .nodes
             .iter()
             .filter(|(_, n)| n.kind.is_material())
-            .map(|(mid, n)| (*mid, format!("{}{}", n.kind.name(), mid)))
+            .filter(|(_, n)| n.parent.is_none())
+            .map(|(mid, n)| (*mid, n.kind.label(*mid)))
             .collect();
         material_ids.sort_unstable();
         // An Attribute VOP's generated code and its Parameter VOPs' defaults.
@@ -10143,7 +10634,8 @@ impl ProceduralFxStudioApp {
         let is_object = node.kind.is_object();
         ui.heading(match &node.kind {
             NodeKind::Vop(v) => format!("{} · {}", v.def().label, v.label(id)),
-            kind => format!("{}{}", kind.name(), id),
+            NodeKind::ShaderNode(n) => format!("{} · {}", n.def().label, n.label(id)),
+            kind => kind.label(id),
         });
         let mut c = false;
         ui.horizontal(|ui| {
@@ -10259,6 +10751,42 @@ impl ProceduralFxStudioApp {
                     c = true;
                 }
                 ui.small("Double-click the node to enter; press U in the network to go back up.");
+            }
+            NodeKind::Shader(values) => {
+                ui.small(match values.table {
+                    shading::Table::Principled => "Physically based surface (MoonRay DwaBaseMaterial). Assign it from a Geometry node.",
+                    shading::Table::Toon => "Cel-shaded surface with banded shadows and a toon highlight (DwaToonMaterial).",
+                    shading::Table::Hair => "For hair and fur curves from Hair Generate (HairMaterial_v3).",
+                    shading::Table::Pyro => "For Pyro and other fog volumes: smoke colour and density, fire brightness and tint.",
+                });
+                c |= shader_values_ui(ui, values);
+            }
+            NodeKind::MaterialBuilder => {
+                ui.small("Build a material from texture nodes: double-click to enter, then wire Image Texture, Noise, Mix… into the Surface Output's inputs.");
+            }
+            NodeKind::ShaderNode(node) => {
+                ui.small(node.def().help);
+                if node.op == shading::SURFACE_OUTPUT {
+                    ui.small("Connected inputs replace the values below.");
+                    c |= shader_values_ui(ui, &mut node.surface);
+                } else {
+                    let labels = node.def().texts;
+                    for (label, text) in labels.iter().zip(node.texts.iter_mut()) {
+                        ui.horizontal(|ui| {
+                            ui.label(*label);
+                            c |= ui.text_edit_singleline(text).changed();
+                            if *label == "File" && ui.button("…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "exr", "tif", "tiff", "hdr", "tx"]).pick_file() {
+                                    *text = path.to_string_lossy().into_owned();
+                                    c = true;
+                                }
+                            }
+                        });
+                    }
+                    for (param, slot) in node.param_mut() {
+                        c |= shader_param_ui(ui, param, slot);
+                    }
+                }
             }
             NodeKind::Material { kind, color, roughness, value } => {
                 ui.label("MoonRay material. Assign it from a Geometry node.");
@@ -10668,6 +11196,25 @@ impl ProceduralFxStudioApp {
                 c |= ui.add(egui::Slider::new(substeps, 1..=8).text("Substeps")).changed();
                 c |= ui.add(egui::Slider::new(seed, 0..=9999).text("Seed")).changed();
                 ui.small("Input 1: emitter surface • Input 2: optional static collider.");
+            }
+            NodeKind::WhitewaterSolver(w) => {
+                ui.small("Spray, foam and bubbles where the fluid input splashes. Input 1: FLIP fluid • Input 2: optional collider. Writes `type` and spray/foam/bubble groups; renders as small spheres.");
+                c |= ui.add(egui::Slider::new(&mut w.max_particles, 0..=2_000_000).logarithmic(true).text("Max particles")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.emission_rate, 0.0..=10_000.0).logarithmic(true).text("Emission rate")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.trapped_air, 0.0..=4.0).text("Trapped air")).on_hover_text("Emission where fluid collides or tears apart").changed();
+                c |= ui.add(egui::Slider::new(&mut w.wave_crest, 0.0..=4.0).text("Wave crests")).on_hover_text("Emission from breaking crests").changed();
+                c |= ui.add(egui::Slider::new(&mut w.min_speed, 0.0..=10.0).text("Min speed")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.max_speed, 0.1..=30.0).text("Full emission speed")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.lifespan, 0.05..=10.0).text("Foam lifespan (s)")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.spray_drag, 0.0..=5.0).text("Spray drag")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.bubble_buoyancy, 0.0..=10.0).text("Bubble buoyancy")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.bubble_drag, 0.0..=1.0).text("Bubble drag")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.spray_neighbours, 0..=50).text("Spray below (neighbours)")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.bubble_neighbours, 1..=100).text("Bubbles above (neighbours)")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.gravity, -30.0..=10.0).text("Gravity")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.particle_size, 0.0005..=0.2).logarithmic(true).text("Particle size")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.substeps, 1..=8).text("Substeps")).changed();
+                c |= ui.add(egui::Slider::new(&mut w.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
                 ui.label("Voxel particle-fluid surface");
@@ -11138,6 +11685,106 @@ impl ProceduralFxStudioApp {
                 } else {
                     ui.small("Exact keeps sharp edges. Use Volume for very dense or leaky meshes.");
                 }
+            }
+            NodeKind::MaterialFracture(set) => {
+                ui.small("Breaks a closed mesh into pieces for the RBD Solver. Pieces get `piece`; cut faces are in the `inside` group, the original surface in `outside`.");
+                egui::ComboBox::from_label("Material").selected_text(fracture::MATERIALS[set.material.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in fracture::MATERIALS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.material, value, *label).changed();
+                    }
+                });
+                match set.material {
+                    1 => {
+                        ui.horizontal(|ui| {
+                            ui.label("Impact point");
+                            for k in 0..3 {
+                                c |= ui.add(egui::DragValue::new(&mut set.impact[k]).speed(0.01)).changed();
+                            }
+                        });
+                        c |= ui.add(egui::Slider::new(&mut set.rings, 1..=20).text("Crack rings")).changed();
+                        c |= ui.add(egui::Slider::new(&mut set.spokes, 3..=64).text("Radial cracks")).changed();
+                    }
+                    m => {
+                        c |= ui.add(egui::Slider::new(&mut set.pieces, 2..=500).logarithmic(true).text("Pieces")).changed();
+                        if m == 2 {
+                            ui.horizontal(|ui| {
+                                ui.label("Grain along");
+                                for (value, label) in sops::AXES.iter().enumerate() {
+                                    c |= ui.selectable_value(&mut set.grain_axis, value, *label).changed();
+                                }
+                            });
+                            c |= ui.add(egui::Slider::new(&mut set.splinter, 1.0..=20.0).text("Splinter length")).changed();
+                        }
+                    }
+                }
+                c |= ui.add(egui::Slider::new(&mut set.separate, 0.0..=1.0).text("Explode view")).on_hover_text("Moves pieces apart to see the cracks").changed();
+                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+            }
+            NodeKind::CrowdSolver(set) => {
+                ui.small("Input 1: start points (e.g. Scatter on a grid) • Input 2: optional ground to walk on • Input 3: optional obstacles.");
+                ui.horizontal(|ui| {
+                    ui.label("Display");
+                    for (value, label) in crowd::DISPLAYS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.display, value, *label).changed();
+                    }
+                });
+                c |= ui.add(egui::Slider::new(&mut set.speed, 0.0..=10.0).text("Walk speed")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.speed_variance, 0.0..=1.0).text("Speed variance")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.turn_rate, 1.0..=720.0).text("Turn rate°/s")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.personal_space, 0.05..=5.0).text("Personal space")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.separation, 0.0..=10.0).text("Separation")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.alignment, 0.0..=5.0).text("Alignment")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.cohesion, 0.0..=5.0).text("Cohesion")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.wander, 0.0..=5.0).text("Wander")).changed();
+                ui.horizontal(|ui| {
+                    ui.label("Goal");
+                    for k in 0..3 {
+                        c |= ui.add(egui::DragValue::new(&mut set.goal[k]).speed(0.1)).changed();
+                    }
+                });
+                c |= ui.add(egui::Slider::new(&mut set.goal_weight, 0.0..=10.0).text("Goal strength")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.avoid_distance, 0.0..=10.0).text("Obstacle look-ahead")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.agent_height, 0.1..=5.0).text("Agent height")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+            }
+            NodeKind::Muscle(set) => {
+                ui.small("A muscle from origin to insertion, or along a curve connected to input 1. Animate Activation to flex it.");
+                for (label, point) in [("Origin", &mut set.origin), ("Insertion", &mut set.insertion)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        for k in 0..3 {
+                            c |= ui.add(egui::DragValue::new(&mut point[k]).speed(0.01)).changed();
+                        }
+                    });
+                }
+                egui::ComboBox::from_label("Shape").selected_text(muscle::PROFILES[set.profile.min(1)]).show_ui(ui, |ui| {
+                    for (value, label) in muscle::PROFILES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.profile, value, *label).changed();
+                    }
+                });
+                c |= ui.add(egui::Slider::new(&mut set.radius, 0.005..=2.0).logarithmic(true).text("Belly radius")).changed();
+                if set.profile == 1 {
+                    c |= ui.add(egui::Slider::new(&mut set.flatness, 1.0..=10.0).text("Flatness")).changed();
+                    c |= ui.add(egui::Slider::new(&mut set.twist, -180.0..=180.0).text("Twist°")).changed();
+                }
+                c |= ui.add(egui::Slider::new(&mut set.tendon, 0.0..=0.45).text("Tendon length")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.activation, 0.0..=1.0).text("Activation")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.contraction, 0.0..=0.8).text("Max contraction")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.segments, 2..=128).text("Segments")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.sides, 3..=64).text("Sides")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.id, 0..=999).text("Muscle id")).changed();
+            }
+            NodeKind::MuscleSolver(set) => {
+                ui.small("Jiggle on animated muscles (flexing or moved by their bones). The origin and insertion tips stay pinned.");
+                c |= ui.add(egui::Slider::new(&mut set.stiffness, 1.0..=2000.0).logarithmic(true).text("Firmness")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.damping, 0.0..=50.0).text("Damping")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.smoothing, 0..=50).text("Coherence")).on_hover_text("Higher wobbles more as one body").changed();
+                c |= ui.add(egui::Slider::new(&mut set.substeps, 1..=16).text("Substeps")).changed();
+            }
+            NodeKind::MuscleSkin(set) => {
+                ui.small("Input 1: skin • Input 2: muscles (animated). The skin follows how the muscles move from frame 0.");
+                c |= ui.add(egui::Slider::new(&mut set.falloff, 0.001..=5.0).logarithmic(true).text("Reach")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.influences, 1..=16).text("Influences")).changed();
             }
             NodeKind::Terrain(set) => {
                 ui.small("A flat heightfield grid. Shape it with Terrain Noise, Erode and Terrace.");
@@ -11686,9 +12333,10 @@ impl ProceduralFxStudioApp {
     // ---------------- Network editor ----------------
     fn node_editor(&mut self, ui: &mut egui::Ui) {
         let view_parent = self.view_parent();
-        if self.context == AppContext::Obj {
+        if self.context == AppContext::Obj || self.network().is_some() {
+            let root = if self.context == AppContext::Mat { "MAT" } else { "OBJ" };
             ui.horizontal(|ui| {
-                if ui.selectable_label(self.network().is_none(), "OBJ").clicked() && self.network().is_some() {
+                if ui.selectable_label(self.network().is_none(), root).clicked() && self.network().is_some() {
                     self.enter_network(None);
                 }
                 if let Some(open) = self.network() {
@@ -11881,6 +12529,10 @@ impl ProceduralFxStudioApp {
                         Some((input_name, default)) => ip_resp.on_hover_text(format!("{input_name} (unconnected: {default})")),
                         None => ip_resp,
                     },
+                    NodeKind::ShaderNode(n) => match n.def().inputs.get(slot) {
+                        Some((input_name, ..)) => ip_resp.on_hover_text(*input_name),
+                        None => ip_resp,
+                    },
                     _ => ip_resp,
                 };
                 if ip_resp.clicked() {
@@ -11945,7 +12597,7 @@ impl ProceduralFxStudioApp {
                     egui::Color32::from_rgb(120, 230, 120),
                 );
             }
-            if let NodeKind::Material { color, .. } = &node.kind {
+            if let Some((color, ..)) = node.kind.is_material().then(|| self.graph.material_preview(id)).flatten() {
                 let swatch = egui::Color32::from_rgb(
                     (color[0].clamp(0.0, 1.0) * 255.0) as u8,
                     (color[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -12946,6 +13598,7 @@ impl ProceduralFxStudioApp {
                 NodeKind::Add { .. }
                     | NodeKind::Particles { .. }
                         | NodeKind::Flip { .. }
+                    | NodeKind::WhitewaterSolver(_)
                     | NodeKind::Cache { .. }
             ));
         let point_color = view_display_node
@@ -14303,6 +14956,14 @@ mod scene_file_tests {
             NodeKind::UvTransform(sops::UvTransformSettings { translate: [1.0, 2.0], rotate: 30.0, scale: [0.5, 0.5], pivot: [0.5, 0.5] }),
             NodeKind::UvQuickShade { file: "/textures/grid.png".into() },
             NodeKind::Boolean(boolean::BooleanSettings { operation: 1, mode: 1, resolution: 90 }),
+            NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 33, splinter: 7.0, ..fracture::FractureSettings::defaults(2) }),
+            NodeKind::CrowdSolver(crowd::CrowdSettings { goal: [1.0, 2.0, 3.0], display: 0, ..crowd::CrowdSettings::defaults() }),
+            NodeKind::Muscle(muscle::MuscleSettings { activation: 0.4, profile: 1, ..muscle::MuscleSettings::defaults() }),
+            NodeKind::MuscleSolver(muscle::JiggleSettings { stiffness: 77.0, ..muscle::JiggleSettings::defaults() }),
+            NodeKind::MuscleSkin(muscle::SkinSettings { falloff: 0.7, influences: 3 }),
+            NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings { lifespan: 3.5, ..whitewater::WhitewaterSettings::defaults() }),
+            NodeKind::Shader(shading::Values::preset(shading::Table::Principled, 5)),
+            NodeKind::Shader(shading::Values::preset(shading::Table::Pyro, 2)),
             NodeKind::Terrain(terrain::TerrainSettings { size: [12.0, 7.0], resolution: 300 }),
             NodeKind::TerrainNoise(terrain::NoiseSettings { kind: 3, blend: 2, offset: [1.0, -2.0], use_mask: true, ..terrain::NoiseSettings::defaults() }),
             NodeKind::TerrainErode(terrain::ErodeSettings { droplets: 1234, talus_angle: 33.0, ..terrain::ErodeSettings::defaults() }),
@@ -15019,5 +15680,307 @@ mod pane_tests {
         app.apply_pane_requests(&mut dock);
         assert_eq!(tabs(&dock), tabs(&default_layout()));
         assert!(app.popped.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shader_render_tests {
+    use super::*;
+
+    // A lit quad with UVs and point colour, facing the default camera.
+    fn panel() -> Mesh {
+        let grid = node_grid(2.0, 2.0, 6, 6);
+        let mut mesh = sops::uv_texture(&grid, &sops::UvTextureSettings { projection: 0, axis: 1, scale: [1.0, 1.0], offset: [0.0, 0.0] });
+        let cd: Vec<f32> = mesh.vertices.iter().flat_map(|v| [0.5 + v.x * 0.25, 0.3, 0.5 - v.z * 0.25]).collect();
+        mesh.point_attributes.insert("Cd".into(), cd);
+        mesh
+    }
+
+    // An app whose graph holds a Principled shader, a Toon shader and a builder network.
+    fn shaded_app() -> (ProceduralFxStudioApp, NodeId, NodeId, NodeId) {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let mut gold = shading::Values::preset(shading::Table::Principled, shading::PRINCIPLED_PRESETS.iter().position(|p| p.0 == "Gold").unwrap());
+        gold.set("use_point_color", [1.0, 0.0, 0.0]);
+        let principled = app.graph.add(NodeKind::Shader(gold), egui::pos2(0.0, 0.0));
+        let toon = app.graph.add(NodeKind::Shader(shading::Values::preset(shading::Table::Toon, 1)), egui::pos2(0.0, 0.0));
+        let builder = app.graph.add(NodeKind::MaterialBuilder, egui::pos2(0.0, 0.0));
+        let child = |app: &mut ProceduralFxStudioApp, op: usize| {
+            let id = app.graph.add(NodeKind::ShaderNode(shading::ShaderNode::new(op)), egui::pos2(0.0, 0.0));
+            let n = app.graph.nodes.get_mut(&id).unwrap();
+            n.context = AppContext::Mat;
+            n.parent = Some(builder);
+            id
+        };
+        let output = child(&mut app, shading::SURFACE_OUTPUT);
+        let noise = child(&mut app, 4);
+        let cells = child(&mut app, 5);
+        let mix = child(&mut app, 8);
+        let hsv = child(&mut app, 9);
+        app.graph.connect(noise, mix, 0);
+        app.graph.connect(cells, mix, 2);
+        app.graph.connect(mix, hsv, 0);
+        app.graph.connect(hsv, output, 0);
+        app.graph.connect(cells, output, 1);
+        (app, principled, toon, builder)
+    }
+
+    #[test]
+    fn shaders_and_builders_export_to_rdla() {
+        let (app, principled, toon, builder) = shaded_app();
+        let scene = RenderScene {
+            parts: vec![(panel(), PartMaterial::Node(principled)), (panel(), PartMaterial::Node(toon)), (panel(), PartMaterial::Node(builder))],
+            lights: app.scene_lights(),
+            environment: None,
+            camera: None,
+            volumes: Vec::new(),
+        };
+        let path = std::env::temp_dir().join(format!("pfx_shaders_{}.rdla", std::process::id()));
+        app.export_scene_rdla(&path, &scene, 64, 48, 4).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&format!("DwaBaseMaterial(\"/scene/materials/mat{principled}\") {{")));
+        assert!(text.contains(&format!("[\"albedo\"] = bind(AttributeMap(\"/scene/materials/mat{principled}_point_color\"))")));
+        assert!(text.contains(&format!("DwaToonMaterial(\"/scene/materials/mat{toon}\") {{")));
+        assert!(text.contains("NoiseMap_v2(") && text.contains("BlendMap(") && text.contains("ColorCorrectHsvMap("));
+        assert!(text.contains("[\"uv_list\"] = {") && text.contains("UserData(\"/scene/objects/mesh0_Cd\") {"));
+        // Each part's layer entry uses its own material.
+        assert!(text.contains(&format!("DwaBaseMaterial(\"/scene/materials/mat{builder}\")}}").replace("}", "")) || text.contains(&format!("DwaBaseMaterial(\"/scene/materials/mat{builder}\"), LightSet")));
+        // The viewport shows each material's colour.
+        let gold = app.graph.material_preview(principled).unwrap();
+        assert!(gold.0[0] > 0.9 && gold.2, "gold uses Cd: {gold:?}");
+        assert!(app.graph.material_preview(builder).is_some());
+        // Saving keeps shader nodes and the builder's network.
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        for (id, node) in &app.graph.nodes {
+            assert_eq!(format!("{:?}", loaded.nodes[id].kind), format!("{:?}", node.kind));
+            assert_eq!(loaded.nodes[id].parent, node.parent);
+        }
+    }
+
+    // Renders every shader in MoonRay: `cargo test --release -- --ignored every_shader_renders`.
+    #[test]
+    #[ignore]
+    fn every_shader_renders_in_moonray() {
+        let dir = std::env::temp_dir();
+        let texture = dir.join("pfx_shader_texture.png");
+        image::RgbImage::from_fn(32, 32, |x, y| if (x / 8 + y / 8) % 2 == 0 { image::Rgb([230, 60, 40]) } else { image::Rgb([40, 60, 230]) }).save(&texture).unwrap();
+        let (mut app, ..) = shaded_app();
+        let mut materials: Vec<NodeId> = app.graph.nodes.iter().filter(|(_, n)| n.kind.is_material()).map(|(id, _)| *id).collect();
+        for table in [shading::Table::Principled, shading::Table::Toon, shading::Table::Hair] {
+            for i in 0..table.presets().len() {
+                materials.push(app.graph.add(NodeKind::Shader(shading::Values::preset(table, i)), egui::pos2(0.0, 0.0)));
+            }
+        }
+        let mut textured = shading::Values::new(shading::Table::Principled);
+        textured.textures = vec![texture.to_string_lossy().into_owned(), texture.to_string_lossy().into_owned(), String::new()];
+        materials.push(app.graph.add(NodeKind::Shader(textured), egui::pos2(0.0, 0.0)));
+        // A builder using every other node type, including an image and a normal map.
+        let builder = app.graph.add(NodeKind::MaterialBuilder, egui::pos2(0.0, 0.0));
+        let file = texture.to_string_lossy().into_owned();
+        let mut child = |op: usize| {
+            let mut node = shading::ShaderNode::new(op);
+            node.texts.iter_mut().for_each(|t| *t = file.clone());
+            if op == 3 {
+                node.texts[0] = "Cd".into();
+            }
+            let id = app.graph.add(NodeKind::ShaderNode(node), egui::pos2(0.0, 0.0));
+            let n = app.graph.nodes.get_mut(&id).unwrap();
+            n.context = AppContext::Mat;
+            n.parent = Some(builder);
+            id
+        };
+        let (output, image, normal, attribute, checker, ramp, mix) = (child(0), child(1), child(2), child(3), child(6), child(7), child(8));
+        app.graph.connect(image, mix, 0);
+        app.graph.connect(attribute, mix, 1);
+        app.graph.connect(checker, ramp, 0);
+        app.graph.connect(ramp, mix, 2);
+        app.graph.connect(mix, output, 0);
+        app.graph.connect(normal, output, 10);
+        materials.push(builder);
+        app.render_camera = RenderCamera::Viewport;
+        for material in materials {
+            let scene = RenderScene { parts: vec![(panel(), PartMaterial::Node(material))], lights: app.scene_lights(), environment: None, camera: None, volumes: Vec::new() };
+            let rdla = dir.join("pfx_shader.rdla");
+            let exr = dir.join("pfx_shader.exr");
+            let _ = std::fs::remove_file(&exr);
+            app.export_scene_rdla(&rdla, &scene, 48, 36, 4).unwrap();
+            let run = Command::new("native/moonray/macos/moonray")
+                .env("RDL2_DSO_PATH", "/Users/loksangho/moonray/build/rdl2dso")
+                .args(["-in", rdla.to_str().unwrap(), "-out", exr.to_str().unwrap()])
+                .output()
+                .unwrap();
+            let label = app.graph.nodes[&material].kind.label(material);
+            let log = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+            assert!(run.status.success(), "{label}: {log}");
+            for bad in ["Error", "ERROR", "does not exist", "no attribute", "Unknown"] {
+                assert!(!log.contains(bad), "{label}: {log}");
+            }
+            let render = image::open(&exr).unwrap().to_rgb32f();
+            let lit = render.pixels().map(|p| p[0] + p[1] + p[2]).fold(0.0f32, f32::max);
+            println!("{label}: brightest {lit:.3}");
+            assert!(lit > 0.01, "{label} rendered black");
+        }
+    }
+}
+
+#[cfg(test)]
+mod whitewater_node_tests {
+    use super::*;
+
+    fn flip() -> NodeKind {
+        NodeKind::Flip { particle_count: 3000, grid_resolution: 24, flip_ratio: 0.95, viscosity: 0.1, gravity: -9.8, max_dt: 0.02, substeps: 1, seed: 3 }
+    }
+
+    #[test]
+    fn flip_steps_from_its_cache_and_feeds_whitewater() {
+        let mut g = Graph::default();
+        g.next_id += 9300;
+        let emitter = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let lift = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0, 1.0, 1.0] }, egui::pos2(0.0, 0.0));
+        let fluid = g.add(flip(), egui::pos2(0.0, 0.0));
+        let white = g.add(NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings { emission_rate: 3000.0, min_speed: 0.2, ..whitewater::WhitewaterSettings::defaults() }), egui::pos2(0.0, 0.0));
+        g.connect(emitter, lift, 0);
+        g.connect(lift, fluid, 0);
+        g.connect(fluid, white, 0);
+        sims::clear_all();
+        let a = g.cook(fluid, 0.5, &mut HashMap::new());
+        assert_eq!(a.vertices.len(), 3000);
+        assert_eq!(a.point_attributes["v"].len(), 3000 * 3);
+        // The fluid (which sits on its domain floor, the emitter's bottom) is moving.
+        let speed: f32 = a.point_attributes["v"].chunks(3).map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()).sum::<f32>() / 3000.0;
+        assert!(speed.is_finite() && speed > 0.1, "mean speed {speed}");
+        let b = g.cook(fluid, 1.0, &mut HashMap::new());
+        sims::clear_all();
+        let fresh = g.cook(fluid, 1.0, &mut HashMap::new());
+        assert_eq!(b.vertices, fresh.vertices, "cached stepping matches a fresh run");
+        assert!(g.time_dependent(white));
+        let out = g.cook(white, 1.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&white).cloned()).is_none());
+        assert!(!out.vertices.is_empty(), "the splash should make whitewater");
+        assert!(renders_points(&out));
+        let loaded = Graph::deserialize(&g.serialize());
+        assert_eq!(format!("{:?}", loaded.nodes[&white].kind), format!("{:?}", g.nodes[&white].kind));
+        // Without a fluid input it says what's missing.
+        let lonely = g.add(NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings::defaults()), egui::pos2(0.0, 0.0));
+        g.cook(lonely, 1.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&lonely).cloned()).unwrap().contains("FLIP"));
+    }
+
+    #[test]
+    #[ignore]
+    fn whitewater_points_render_in_moonray() {
+        let mut mesh = Mesh::default();
+        for i in 0..200 {
+            mesh.vertices.push(Vec3::new(hash01(i, 1) - 0.5, hash01(i, 2) - 0.5, hash01(i, 3) - 0.5));
+        }
+        mesh.point_attributes.insert("pscale".into(), vec![0.03; 200]);
+        mesh.point_attributes.insert(whitewater::RENDER_POINTS.into(), vec![1.0]);
+        let mut app = ProceduralFxStudioApp::default();
+        app.render_camera = RenderCamera::Viewport;
+        let scene = RenderScene { parts: vec![(mesh, PartMaterial::Default)], lights: app.scene_lights(), environment: None, camera: None, volumes: Vec::new() };
+        let dir = std::env::temp_dir();
+        let (rdla, exr) = (dir.join("pfx_points.rdla"), dir.join("pfx_points.exr"));
+        app.export_scene_rdla(&rdla, &scene, 64, 48, 4).unwrap();
+        let run = Command::new("native/moonray/macos/moonray")
+            .env("RDL2_DSO_PATH", "/Users/loksangho/moonray/build/rdl2dso")
+            .args(["-in", rdla.to_str().unwrap(), "-out", exr.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let log = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+        assert!(run.status.success() && !log.contains("Error"), "{log}");
+        let render = image::open(&exr).unwrap().to_rgb32f();
+        let lit = render.pixels().filter(|p| p[0] + p[1] + p[2] > 0.05).count();
+        assert!(lit > 50, "{lit} lit pixels");
+    }
+}
+
+#[cfg(test)]
+mod fx_node_tests {
+    use super::*;
+
+    #[test]
+    fn fractured_pieces_feed_rbd_and_crowds_and_muscles_cook() {
+        let mut g = Graph::default();
+        g.next_id += 9500;
+        let cube = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let frac = g.add(NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 8, ..fracture::FractureSettings::defaults(0) }), egui::pos2(0.0, 0.0));
+        g.connect(cube, frac, 0);
+        let pieces = g.cook(frac, 0.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&frac).cloned()).is_none());
+        let count = pieces.point_attributes["piece"].iter().fold(0.0f32, |m, p| m.max(*p)) as usize + 1;
+        assert!(count >= 4, "{count} pieces");
+
+        // Crowd: agents from a few points, walking.
+        let starts = g.add(NodeKind::Add { count: 6, spacing: 1.0, layout: 2 }, egui::pos2(0.0, 0.0));
+        let crowd_node = g.add(NodeKind::CrowdSolver(crowd::CrowdSettings::defaults()), egui::pos2(0.0, 0.0));
+        g.connect(starts, crowd_node, 0);
+        assert!(g.time_dependent(crowd_node));
+        sims::clear_all();
+        let a = g.cook(crowd_node, 1.0, &mut HashMap::new());
+        let b = g.cook(crowd_node, 2.0, &mut HashMap::new());
+        assert!(!a.indices.is_empty() && a.vertices != b.vertices);
+        assert_eq!(a.point_attributes["prim:agent"].len(), a.indices.len());
+
+        // Muscles: flexing (activation keyframed) drives the jiggle solver and the skin.
+        let m = g.add(NodeKind::Muscle(muscle::MuscleSettings::defaults()), egui::pos2(0.0, 0.0));
+        let target = ChannelId { node: m, target: ChannelTarget::Param(10) };
+        let mut channel = anim::Channel::default();
+        channel.set_key(0.0, 0.0);
+        channel.set_key(1.0, 1.0);
+        g.channels.insert(target, channel);
+        let solver = g.add(NodeKind::MuscleSolver(muscle::JiggleSettings::defaults()), egui::pos2(0.0, 0.0));
+        g.connect(m, solver, 0);
+        assert!(g.time_dependent(solver));
+        // A skin tube around the muscle (y 0..1), however the Tube node centres itself.
+        let tube = g.add(NodeKind::Tube { r_bot: 0.16, r_top: 0.16, height: 1.0, rows: 8, cols: 16, caps: false }, egui::pos2(0.0, 0.0));
+        let tube_mesh = g.cook(tube, 0.0, &mut HashMap::new());
+        let (lo, _) = tube_mesh.bounds().unwrap();
+        let skin_src = g.add(NodeKind::Transform { t: [0.0, -lo.y, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        g.connect(tube, skin_src, 0);
+        let skin = g.add(NodeKind::MuscleSkin(muscle::SkinSettings::defaults()), egui::pos2(0.0, 0.0));
+        g.connect(skin_src, skin, 0);
+        g.connect(solver, skin, 1);
+        let rest = g.cook(skin, 0.0, &mut HashMap::new());
+        let flexed = g.cook(skin, 1.5, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&skin).cloned()).is_none(), "{:?}", node_errors(|e| e.get(&skin).cloned()));
+        assert_eq!(rest.vertices.len(), flexed.vertices.len());
+        assert!(rest.vertices.iter().zip(&flexed.vertices).any(|(a, b)| a.sub(*b).length() > 1e-3), "skin should move as the muscle flexes");
+    }
+}
+
+#[cfg(test)]
+mod material_builder_ui_tests {
+    use super::*;
+
+    #[test]
+    fn inside_a_material_builder_only_shader_nodes_are_offered() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        app.context = AppContext::Mat;
+        app.apply(Action::Add(NodeKind::MaterialBuilder, egui::pos2(0.0, 0.0)));
+        let builder = app.selected.unwrap();
+        app.apply(Action::Enter(builder));
+        assert_eq!(app.context, AppContext::Mat, "the builder's network is a MAT network");
+        assert_eq!(app.view_parent(), Some(builder));
+        let menus = app.templates_for_view();
+        assert_eq!(menus.iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec![shading::CATEGORY]);
+        assert!(menus.iter().flat_map(|(_, k)| k).all(|k| matches!(k, NodeKind::ShaderNode(_))));
+        assert_eq!(menus[0].1.len(), shading::SHADER_OPS.len());
+        // The Surface Output made with the builder is in the network shown, and new nodes join it.
+        let shown: Vec<NodeId> = app.graph.nodes.iter().filter(|(_, n)| n.context == app.context && n.parent == app.view_parent()).map(|(id, _)| *id).collect();
+        assert_eq!(shown.len(), 1);
+        assert!(matches!(&app.graph.nodes[&shown[0]].kind, NodeKind::ShaderNode(n) if n.op == shading::SURFACE_OUTPUT));
+        app.apply(Action::Add(NodeKind::ShaderNode(shading::ShaderNode::new(4)), egui::pos2(0.0, 0.0)));
+        let noise = app.selected.unwrap();
+        assert_eq!((app.graph.nodes[&noise].context, app.graph.nodes[&noise].parent), (AppContext::Mat, Some(builder)));
+        // Up goes back to the top of MAT, with materials (not shader nodes) on offer.
+        app.enter_network(None);
+        assert_eq!((app.context, app.network()), (AppContext::Mat, None));
+        let top = app.templates_for_view();
+        assert!(top.iter().flat_map(|(_, k)| k).all(|k| k.is_material()));
+        // Switching to OBJ from inside the builder leaves it.
+        app.apply(Action::Enter(builder));
+        app.context = AppContext::Obj;
+        assert_eq!(app.view_parent(), None);
     }
 }
