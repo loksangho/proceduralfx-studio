@@ -7,8 +7,9 @@
 //   combustion, vorticity confinement and turbulence).
 // - RBD: rigid bodies on rapier, a Bullet-style solver.
 // - SOP solver: repeatedly cooks a sub-network on the previous step's output.
+// - Particles: point emitter with gravity, drag and static-collider bounces.
 
-use super::{flip_cancelled, Mesh, Vec3};
+use super::{flip_cancelled, hash01, Mesh, Vec3};
 use crate::vex::perlin3;
 use rapier3d::math::{Pose, Vector as RVec};
 use rapier3d::prelude::{ColliderBuilder, PhysicsWorld, RigidBodyBuilder, RigidBodyHandle};
@@ -101,7 +102,7 @@ fn put_entry<S: Send + 'static, P: Send + 'static>(key: u64, entry: Entry<S, P>)
 // The live state is taken out of the cache while stepping, so long simulations never hold the lock.
 // A cancelled cook keeps its progress and returns an empty mesh.
 #[allow(clippy::too_many_arguments)]
-fn run<S: Send + 'static, P: Send + 'static>(
+pub(crate) fn run<S: Send + 'static, P: Send + 'static>(
     key: u64,
     target: usize,
     checkpoint_every: usize,
@@ -1281,5 +1282,329 @@ mod tests {
         assert_eq!(PyroSettings::from_params(&pyro.to_params()), pyro);
         let rbd = RbdSettings { shape: 2, ground: false, spin: [0.0, 3.0, 0.0], ..RbdSettings::default() };
         assert_eq!(RbdSettings::from_params(&rbd.to_params()), rbd);
+    }
+}
+
+// ============================================================================
+// Particles
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParticleSettings {
+    // Most particles alive at once.
+    pub max_particles: usize,
+    // Particles born per second.
+    pub rate: f32,
+    pub lifetime: f32,
+    pub speed: f32,
+    // Width of the emission cone (0 = straight along the emission direction).
+    pub spread: f32,
+    pub gravity: f32,
+    pub drag: f32,
+    // Fraction of normal speed kept when bouncing off the collider.
+    pub bounce: f32,
+    // Fraction of tangential speed lost on each collision.
+    pub friction: f32,
+    // Collision radius of each particle.
+    pub radius: f32,
+    pub substeps: usize,
+    // Emit along the source's surface normals instead of straight up.
+    pub along_normals: bool,
+    pub seed: u32,
+}
+
+#[derive(Clone, Default)]
+struct ParticleState {
+    p: Vec<Vec3>,
+    v: Vec<Vec3>,
+    age: Vec<f32>,
+    life: Vec<f32>,
+    id: Vec<u32>,
+    next_id: u32,
+    // Fractional births carried over between steps.
+    pending: f32,
+}
+
+// Where new particles are born: area-weighted triangles, else points, else the origin.
+struct Emitter {
+    mesh: Mesh,
+    // Cumulative triangle areas for area-weighted sampling.
+    cumulative: Vec<f32>,
+}
+
+impl Emitter {
+    fn new(mesh: Mesh) -> Self {
+        let mut total = 0.0;
+        let cumulative = mesh
+            .indices
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| mesh.vertices[i]);
+                total += b.sub(a).cross(c.sub(a)).length() * 0.5;
+                total
+            })
+            .collect();
+        Emitter { mesh, cumulative }
+    }
+
+    // A birth position, emission normal and inherited velocity for particle `id`.
+    fn sample(&self, id: u32, seed: u32) -> (Vec3, Vec3, Vec3) {
+        let r = |k: u32| hash01(id.wrapping_mul(13).wrapping_add(k), seed);
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let total = self.cumulative.last().copied().unwrap_or(0.0);
+        if total > 0.0 {
+            let target = r(1) * total;
+            let t = self.cumulative.partition_point(|&c| c < target).min(self.mesh.indices.len() - 1);
+            let [a, b, c] = self.mesh.indices[t].map(|i| self.mesh.vertices[i]);
+            let (mut u, mut v) = (r(2), r(3));
+            if u + v > 1.0 {
+                u = 1.0 - u;
+                v = 1.0 - v;
+            }
+            let p = a.add(b.sub(a).scale(u)).add(c.sub(a).scale(v));
+            let n = b.sub(a).cross(c.sub(a));
+            let n = if n.length() > 1e-12 { n.normalize() } else { up };
+            return (p, n, Vec3::new(0.0, 0.0, 0.0));
+        }
+        let count = self.mesh.vertices.len();
+        if count > 0 {
+            let i = ((r(1) * count as f32) as usize).min(count - 1);
+            let read = |name: &str| {
+                self.mesh
+                    .point_attributes
+                    .get(name)
+                    .filter(|a| a.len() == count * 3)
+                    .map(|a| Vec3::new(a[i * 3], a[i * 3 + 1], a[i * 3 + 2]))
+            };
+            let n = read("N").filter(|n| n.length() > 1e-12).map(|n| n.normalize()).unwrap_or(up);
+            return (self.mesh.vertices[i], n, read("v").unwrap_or(Vec3::new(0.0, 0.0, 0.0)));
+        }
+        (Vec3::new(0.0, 0.0, 0.0), up, Vec3::new(0.0, 0.0, 0.0))
+    }
+}
+
+// Unit vector inside a cone of half-width ~`spread` around `axis`.
+fn cone_direction(axis: Vec3, spread: f32, a: f32, b: f32) -> Vec3 {
+    let helper = if axis.y.abs() < 0.9 { Vec3::new(0.0, 1.0, 0.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+    let tangent = axis.cross(helper).normalize();
+    let bitangent = axis.cross(tangent);
+    let theta = a * std::f32::consts::TAU;
+    let radial = b.sqrt() * spread;
+    axis.add(tangent.scale(radial * theta.cos())).add(bitangent.scale(radial * theta.sin())).normalize()
+}
+
+fn particle_step(
+    s: &mut ParticleState,
+    set: &ParticleSettings,
+    dt: f32,
+    emitter: &Emitter,
+    collider: Option<&crate::volume::Volume>,
+) {
+    // Age and kill.
+    for age in &mut s.age {
+        *age += dt;
+    }
+    let mut i = 0;
+    while i < s.p.len() {
+        if s.age[i] >= s.life[i] {
+            s.p.swap_remove(i);
+            s.v.swap_remove(i);
+            s.age.swap_remove(i);
+            s.life.swap_remove(i);
+            s.id.swap_remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    // Birth.
+    s.pending += set.rate.max(0.0) * dt;
+    while s.pending >= 1.0 {
+        s.pending -= 1.0;
+        if s.p.len() >= set.max_particles {
+            continue;
+        }
+        let id = s.next_id;
+        s.next_id = s.next_id.wrapping_add(1);
+        let (p, normal, inherited) = emitter.sample(id, set.seed);
+        let axis = if set.along_normals { normal } else { Vec3::new(0.0, 1.0, 0.0) };
+        let r = |k: u32| hash01(id.wrapping_mul(13).wrapping_add(k), set.seed ^ 0x5bd1_e995);
+        let dir = cone_direction(axis, set.spread, r(4), r(5));
+        let speed = set.speed * (0.75 + 0.5 * r(6));
+        s.p.push(p);
+        s.v.push(inherited.add(dir.scale(speed)));
+        s.age.push(0.0);
+        s.life.push(set.lifetime.max(0.01) * (0.8 + 0.4 * r(7)));
+        s.id.push(id);
+    }
+    // Forces, motion and collisions.
+    let keep = (1.0 - set.drag.max(0.0) * dt).max(0.0);
+    for k in 0..s.p.len() {
+        let mut v = s.v[k];
+        v.y += set.gravity * dt;
+        v = v.scale(keep);
+        let mut p = s.p[k].add(v.scale(dt));
+        if let Some(sdf) = collider {
+            let phi = sdf.sample(p);
+            if phi < set.radius {
+                let g = sdf.gradient(p);
+                if g.length() > 1e-6 {
+                    let n = g.normalize();
+                    p = p.add(n.scale(set.radius - phi));
+                    let vn = v.dot(n);
+                    if vn < 0.0 {
+                        let normal = n.scale(vn);
+                        let tangent = v.sub(normal);
+                        v = tangent.scale(1.0 - set.friction.clamp(0.0, 1.0)).sub(normal.scale(set.bounce.clamp(0.0, 1.0)));
+                    }
+                }
+            }
+        }
+        s.p[k] = p;
+        s.v[k] = v;
+    }
+}
+
+fn particle_output(s: &ParticleState) -> Mesh {
+    let mut mesh = Mesh { vertices: s.p.clone(), ..Mesh::default() };
+    mesh.point_attributes.insert("v".into(), s.v.iter().flat_map(|v| [v.x, v.y, v.z]).collect());
+    mesh.point_attributes.insert("age".into(), s.age.clone());
+    mesh.point_attributes.insert("life".into(), s.life.clone());
+    mesh.point_attributes.insert("id".into(), s.id.iter().map(|&i| i as f32).collect());
+    mesh
+}
+
+// Voxel size for a collider's distance field: ~96 voxels across its largest side.
+// A static collider's signed distance field, with distances filled in all the
+// way through (so deep penetrations still get pushed out). Built once per
+// collider shape and shared, since every cook of a solver asks for it again.
+pub(crate) fn collider_field(collider: &Mesh) -> Option<Arc<crate::volume::Volume>> {
+    use std::hash::{Hash, Hasher};
+    let (lo, hi) = collider.bounds().filter(|_| !collider.indices.is_empty())?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for v in &collider.vertices {
+        [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()].hash(&mut hasher);
+    }
+    collider.indices.hash(&mut hasher);
+    let key = hasher.finish();
+    static CACHE: OnceLock<Mutex<VecDeque<(u64, Arc<crate::volume::Volume>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((_, field)) = cache.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return Some(field.clone());
+    }
+    let extent = hi.sub(lo);
+    let voxel = (extent.x.max(extent.y).max(extent.z) / 96.0).max(1e-3);
+    let mut field = crate::volume::from_polygons(collider, voxel, 4.0).ok()?;
+    crate::volume::fill_distances(&mut field);
+    let field = Arc::new(field);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.push_back((key, field.clone()));
+    if cache.len() > 4 {
+        cache.pop_front();
+    }
+    Some(field)
+}
+
+pub fn particles(
+    key: u64,
+    settings: &ParticleSettings,
+    time: f32,
+    animated_source: bool,
+    mut source_at: impl FnMut(f32) -> Mesh,
+    collider: impl FnOnce() -> Mesh,
+) -> Mesh {
+    let substeps = settings.substeps.clamp(1, 8);
+    let dt = 1.0 / (SIM_FPS * substeps as f32);
+    // Built on the first step that actually runs, so cached frames cost nothing.
+    let mut collider = Some(collider);
+    let mut field: Option<Option<Arc<crate::volume::Volume>>> = None;
+    let mut fixed_emitter: Option<Emitter> = None;
+    run(
+        key,
+        step_count(time, substeps),
+        12,
+        ParticleState::default,
+        |state: &ParticleState| state.clone(),
+        |state: &ParticleState| state.clone(),
+        |state, at| {
+            let field = field.get_or_insert_with(|| collider.take().and_then(|c| collider_field(&c())));
+            let emitter = if animated_source {
+                fixed_emitter.insert(Emitter::new(source_at(at as f32 * dt)))
+            } else {
+                fixed_emitter.get_or_insert_with(|| Emitter::new(source_at(0.0)))
+            };
+            particle_step(state, settings, dt, emitter, field.as_deref());
+        },
+        particle_output,
+    )
+}
+
+#[cfg(test)]
+mod particle_tests {
+    use super::*;
+
+    fn settings() -> ParticleSettings {
+        ParticleSettings {
+            max_particles: 500,
+            rate: 200.0,
+            lifetime: 10.0,
+            speed: 0.0,
+            spread: 0.0,
+            gravity: -9.8,
+            drag: 0.0,
+            bounce: 0.5,
+            friction: 0.0,
+            radius: 0.02,
+            substeps: 2,
+            along_normals: false,
+            seed: 1,
+        }
+    }
+
+    fn quad(y: f32, size: f32) -> Mesh {
+        let mut mesh = Mesh::default();
+        mesh.vertices = vec![
+            Vec3::new(-size, y, -size),
+            Vec3::new(size, y, -size),
+            Vec3::new(size, y, size),
+            Vec3::new(-size, y, size),
+        ];
+        mesh.indices = vec![[0, 2, 1], [0, 3, 2]];
+        mesh
+    }
+
+    #[test]
+    fn emits_from_source_and_lands_on_collider() {
+        clear_all();
+        let source = quad(1.0, 0.5);
+        let ground = quad(0.0, 3.0);
+        let out = particles(9001, &settings(), 3.0, false, |_| source.clone(), || ground.clone());
+        assert!(!out.vertices.is_empty());
+        assert!(out.vertices.len() <= 500);
+        // Everything was born on the source square and has fallen onto the ground.
+        for p in &out.vertices {
+            assert!(p.x.abs() <= 0.5 + 1e-3 && p.z.abs() <= 0.5 + 1e-3, "{p:?} left the source footprint");
+            assert!(p.y > -0.05 && p.y < 0.3, "{p:?} should rest on the ground");
+        }
+        assert_eq!(out.point_attributes["v"].len(), out.vertices.len() * 3);
+        assert_eq!(out.point_attributes["age"].len(), out.vertices.len());
+    }
+
+    #[test]
+    fn falls_freely_without_collider() {
+        clear_all();
+        let out = particles(9002, &settings(), 1.0, false, |_| Mesh::default(), Mesh::default);
+        // Emitted at the origin with no collider: the oldest particle has fallen ~g/2 * t^2.
+        let lowest = out.vertices.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        assert!(lowest < -4.0, "lowest particle at {lowest}");
+    }
+
+    #[test]
+    fn scrubbing_back_reproduces_the_same_frame() {
+        clear_all();
+        let source = quad(1.0, 0.5);
+        let first = particles(9003, &settings(), 0.5, false, |_| source.clone(), Mesh::default);
+        let _later = particles(9003, &settings(), 2.0, false, |_| source.clone(), Mesh::default);
+        let again = particles(9003, &settings(), 0.5, false, |_| source.clone(), Mesh::default);
+        assert_eq!(first.vertices, again.vertices);
     }
 }

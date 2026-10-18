@@ -58,6 +58,37 @@ impl Volume {
         self.values[self.at(x, y, z)]
     }
 
+    // Trilinear value at a world position; outside the grid reads the background.
+    pub fn sample(&self, p: Vec3) -> f32 {
+        let g = [(p.x - self.origin.x) / self.voxel, (p.y - self.origin.y) / self.voxel, (p.z - self.origin.z) / self.voxel];
+        if (0..3).any(|a| !(g[a] >= 0.0 && g[a] <= (self.dims[a] - 1) as f32)) {
+            return self.background;
+        }
+        let mut base = [0usize; 3];
+        let mut frac = [0.0f32; 3];
+        for a in 0..3 {
+            let i = (g[a].floor() as usize).min(self.dims[a].saturating_sub(2));
+            base[a] = i;
+            frac[a] = g[a] - i as f32;
+        }
+        let [x, y, z] = base;
+        let [fx, fy, fz] = frac;
+        let v = |dx: usize, dy: usize, dz: usize| self.get((x + dx).min(self.dims[0] - 1), (y + dy).min(self.dims[1] - 1), (z + dz).min(self.dims[2] - 1));
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        lerp(
+            lerp(lerp(v(0, 0, 0), v(1, 0, 0), fx), lerp(v(0, 1, 0), v(1, 1, 0), fx), fy),
+            lerp(lerp(v(0, 0, 1), v(1, 0, 1), fx), lerp(v(0, 1, 1), v(1, 1, 1), fx), fy),
+            fz,
+        )
+    }
+
+    // Central-difference gradient (unnormalised) at a world position.
+    pub fn gradient(&self, p: Vec3) -> Vec3 {
+        let h = self.voxel * 0.5;
+        let d = |o: Vec3| self.sample(p.add(o)) - self.sample(p.sub(o));
+        Vec3::new(d(Vec3::new(h, 0.0, 0.0)), d(Vec3::new(0.0, h, 0.0)), d(Vec3::new(0.0, 0.0, h))).scale(1.0 / (2.0 * h))
+    }
+
     pub fn active_count(&self) -> usize {
         self.values.iter().filter(|v| self.is_active(**v)).count()
     }
@@ -246,7 +277,7 @@ pub fn decode_voxels(mesh: &Mesh) -> Result<(Vec<([i64; 3], f32)>, Class, f32, V
     Ok((voxels, class, voxel, origin, background))
 }
 
-fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+pub(crate) fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     // Ericson, Real-Time Collision Detection 5.1.5.
     let (ab, ac, ap) = (b.sub(a), c.sub(a), p.sub(a));
     let (d1, d2) = (ab.dot(ap), ac.dot(ap));
@@ -358,6 +389,57 @@ pub fn from_polygons(mesh: &Mesh, voxel: f32, band: f32) -> Result<Volume, Strin
 }
 
 // Shifts the surface outward (positive) or inward by `distance` world units.
+// Narrow-band level sets only know distances near the surface; this fills in
+// approximate distances everywhere (a two-pass 3-4-5 style chamfer transform),
+// keeping each voxel's inside/outside sign, so a point that ends up deep inside
+// a collider still sees a gradient pointing back out.
+pub fn fill_distances(volume: &mut Volume) {
+    let [nx, ny, nz] = volume.dims;
+    if nx * ny * nz == 0 {
+        return;
+    }
+    let known = volume.background * 0.999;
+    let mut d: Vec<f32> = volume.values.iter().map(|v| if v.abs() < known { v.abs() } else { f32::INFINITY }).collect();
+    let h = volume.voxel;
+    let (d1, d2, d3) = (h, h * std::f32::consts::SQRT_2, h * 3f32.sqrt());
+    let at = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
+    // Neighbours visited before the current voxel in the forward scan order.
+    let mut back: Vec<(i32, i32, i32, f32)> = Vec::new();
+    for dz in -1i32..=1 {
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let earlier = dz < 0 || (dz == 0 && (dy < 0 || (dy == 0 && dx < 0)));
+                if earlier {
+                    let n = dx.abs() + dy.abs() + dz.abs();
+                    back.push((dx, dy, dz, [0.0, d1, d2, d3][n as usize]));
+                }
+            }
+        }
+    }
+    for pass in 0..2 {
+        let order: Box<dyn Iterator<Item = usize>> = if pass == 0 { Box::new(0..nx * ny * nz) } else { Box::new((0..nx * ny * nz).rev()) };
+        let sign = if pass == 0 { 1 } else { -1 };
+        for i in order {
+            let (x, y, z) = (i % nx, (i / nx) % ny, i / (nx * ny));
+            let mut best = d[i];
+            for &(dx, dy, dz, w) in &back {
+                let (qx, qy, qz) = (x as i32 + dx * sign, y as i32 + dy * sign, z as i32 + dz * sign);
+                if qx < 0 || qy < 0 || qz < 0 || qx >= nx as i32 || qy >= ny as i32 || qz >= nz as i32 {
+                    continue;
+                }
+                best = best.min(d[at(qx as usize, qy as usize, qz as usize)] + w);
+            }
+            d[i] = best;
+        }
+    }
+    for (v, dist) in volume.values.iter_mut().zip(d) {
+        if dist.is_finite() {
+            *v = if *v < 0.0 { -dist } else { dist };
+        }
+    }
+    volume.background = volume.values.iter().fold(volume.background, |m, v| m.max(v.abs()));
+}
+
 pub fn offset(volume: &mut Volume, distance: f32) {
     if volume.class == Class::LevelSet {
         for v in &mut volume.values {
@@ -532,6 +614,28 @@ mod tests {
         assert!(centre_value < 0.0);
         let rebuilt = to_polygons(&back, 0.0);
         assert!((signed_volume(&rebuilt).abs() - 4.18879).abs() < 0.3);
+    }
+
+    #[test]
+    fn filled_distances_reach_deep_inside() {
+        // A closed box of side 2: from_polygons only knows distances near its faces.
+        let mut mesh = Mesh::default();
+        for k in 0..8 {
+            mesh.vertices.push(Vec3::new((k & 1) as f32 * 2.0 - 1.0, ((k >> 1) & 1) as f32 * 2.0 - 1.0, ((k >> 2) & 1) as f32 * 2.0 - 1.0));
+        }
+        for f in [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]] {
+            mesh.indices.push([f[0], f[1], f[2]]);
+            mesh.indices.push([f[0], f[2], f[3]]);
+        }
+        let mut sdf = from_polygons(&mesh, 0.05, 3.0).unwrap();
+        let centre = Vec3::new(0.0, 0.0, 0.0);
+        assert!(sdf.gradient(centre).length() < 1e-3, "narrow band: no gradient deep inside");
+        fill_distances(&mut sdf);
+        assert!((sdf.sample(centre) + 1.0).abs() < 0.12, "centre is ~1 inside: {}", sdf.sample(centre));
+        let p = Vec3::new(0.0, 0.6, 0.0);
+        assert!((sdf.sample(p) + 0.4).abs() < 0.08, "{}", sdf.sample(p));
+        assert!(sdf.gradient(p).y > 0.5, "the gradient points out through the nearest face");
+        assert!(sdf.sample(Vec3::new(0.0, 1.1, 0.0)) > 0.0, "outside stays positive");
     }
 
     #[test]

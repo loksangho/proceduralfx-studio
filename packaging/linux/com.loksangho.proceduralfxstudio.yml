@@ -16,6 +16,8 @@ sdk-extensions:
 command: proceduralfx-studio
 finish-args:
   - --share=ipc
+  # The in-app updater checks GitHub Releases and downloads updates.
+  - --share=network
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri

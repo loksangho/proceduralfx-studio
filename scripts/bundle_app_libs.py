@@ -198,6 +198,8 @@ def write_info_plist(app: Path, executable: str, min_macos: str):
         "LSMinimumSystemVersion": min_macos,
         "NSHighResolutionCapable": True,
     }
+    if (app / "Contents" / "Resources" / "ProceduralFxStudio.icns").exists():
+        plist["CFBundleIconFile"] = "ProceduralFxStudio"
     with open(app / "Contents" / "Info.plist", "wb") as f:
         plistlib.dump(plist, f)
 
@@ -206,6 +208,11 @@ def main():
     app = Path(sys.argv[1]).resolve()
     resources = app / "Contents" / "Resources"
     macos = app / "Contents" / "MacOS"
+    # App icon (packaging/logo, generated from proceduralfx-studio.svg).
+    icon = Path(__file__).resolve().parent.parent / "packaging" / "logo" / "ProceduralFxStudio.icns"
+    if icon.exists():
+        resources.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(icon, resources / icon.name)
     bundler = Bundler(app)
 
     # DSOs are symlinks into the MoonRay build tree; replace them with real copies.

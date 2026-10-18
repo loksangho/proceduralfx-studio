@@ -274,13 +274,7 @@ struct Prefs {
 
 impl Prefs {
     fn path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let base = if cfg!(target_os = "macos") {
-            home?.join("Library/Application Support/ProceduralFX Studio")
-        } else {
-            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".config")))?.join("proceduralfx-studio")
-        };
-        Some(base.join("updater.cfg"))
+        Some(crate::app_config_dir()?.join("updater.cfg"))
     }
 
     fn parse(text: &str) -> Self {

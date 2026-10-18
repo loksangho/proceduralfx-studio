@@ -19,9 +19,16 @@ use rfd::FileDialog;
 
 mod render_viewer;
 mod anim;
+mod envlight;
 mod fileio;
+mod groom;
+mod groups;
+mod paint;
+mod raster;
 mod sims;
+mod sops;
 mod updater;
+mod vellum;
 mod usd;
 mod vex;
 mod volume;
@@ -618,6 +625,13 @@ fn node_attribute_delete(mut mesh: Mesh, attribute: usize) -> Mesh {
     mesh
 }
 
+// Advice from a node's last cook that isn't an error (e.g. a setup that can't move), shown in its panel.
+fn node_notes<R>(f: impl FnOnce(&mut HashMap<NodeId, String>) -> R) -> R {
+    static NOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<NodeId, String>>> = std::sync::OnceLock::new();
+    let mut notes = NOTES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut notes)
+}
+
 // Latest cook error of each node (file, USD and volume nodes), shown in its parameter panel.
 fn node_errors<R>(f: impl FnOnce(&mut HashMap<NodeId, String>) -> R) -> R {
     static ERRORS: std::sync::OnceLock<std::sync::Mutex<HashMap<NodeId, String>>> = std::sync::OnceLock::new();
@@ -869,8 +883,8 @@ fn write_vdb_file(mesh: &Mesh, path: &str) -> Result<(), String> {
     }
 }
 
-fn node_wrangle(mesh: Mesh, code: &str, time: f32, domain: usize) -> Mesh {
-    vex::run_wrangle(mesh, code, time, SOLVER_TIME_INC.with(|inc| inc.get()), domain)
+fn node_wrangle(mesh: Mesh, code: &str, time: f32, domain: usize, mask: Option<&[bool]>) -> Mesh {
+    vex::run_wrangle(mesh, code, time, SOLVER_TIME_INC.with(|inc| inc.get()), domain, mask)
 }
 
 fn encode_text(text: &str) -> String {
@@ -1499,49 +1513,6 @@ fn node_jitter(mut mesh: Mesh, amp: f32, seed: u32) -> Mesh {
         let dy = (hash01(i as u32 * 3 + 1, seed) - 0.5) * 2.0 * amp;
         let dz = (hash01(i as u32 * 3 + 2, seed) - 0.5) * 2.0 * amp;
         *v = v.add(Vec3::new(dx, dy, dz));
-    }
-    mesh
-}
-
-fn node_particles(
-    count: usize,
-    emission_rate: f32,
-    lifetime: f32,
-    speed: f32,
-    spread: f32,
-    gravity: f32,
-    seed: usize,
-    time: f32,
-) -> Mesh {
-    let count = count.min(50_000);
-    let lifetime = lifetime.max(0.01);
-    let emission_rate = emission_rate.max(0.01);
-    let cycle = count as f32 / emission_rate;
-    let mut mesh = Mesh::default();
-    mesh.vertices.reserve(count);
-    for i in 0..count {
-        let birth = i as f32 / emission_rate;
-        let age = (time + cycle - birth.rem_euclid(cycle)).rem_euclid(lifetime);
-        let seed = seed as u32;
-        let theta = hash01(i as u32 * 11 + 1, seed) * std::f32::consts::TAU;
-        let radial = hash01(i as u32 * 11 + 2, seed) * spread;
-        let upward = (1.0 - radial * 0.5).max(0.05);
-        let direction = Vec3::new(
-            radial * theta.cos(),
-            upward,
-            radial * theta.sin(),
-        ).normalize();
-        let velocity = direction.scale(speed * (0.75 + hash01(i as u32 * 11 + 3, seed) * 0.5));
-        let wobble = Vec3::new(
-            (age * 3.1 + i as f32).sin(),
-            (age * 2.3 + i as f32 * 0.7).cos(),
-            (age * 2.7 + i as f32 * 1.3).sin(),
-        ).scale(0.08 * spread);
-        mesh.vertices.push(velocity.scale(age).add(Vec3::new(
-            0.0,
-            0.5 * gravity * age * age,
-            0.0,
-        )).add(wobble));
     }
     mesh
 }
@@ -2582,6 +2553,109 @@ fn resolve_executable(executable: &str) -> Option<PathBuf> {
     None
 }
 
+// The window and Dock icon, from packaging/logo.
+fn app_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../packaging/logo/icon-256.png")).expect("bundled icon").to_rgba8();
+    egui::IconData { width: image.width(), height: image.height(), rgba: image.into_raw() }
+}
+
+// The image a UV Quick Shade file shows ("" = the built-in checker), loaded once.
+fn quickshade_texture(file: &str) -> Arc<raster::Texture> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<raster::Texture>>>> = std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(file.to_owned())
+        .or_insert_with(|| {
+            let loaded = (!file.is_empty()).then(|| image::open(file).ok()).flatten().map(|img| {
+                let img = img.thumbnail(1024, 1024).to_rgba8();
+                raster::Texture { width: img.width() as usize, height: img.height() as usize, pixels: img.pixels().map(|p| p.0).collect() }
+            });
+            Arc::new(loaded.unwrap_or_else(|| {
+                let size = 256;
+                raster::Texture { width: size, height: size, pixels: sops::checker_image(size) }
+            }))
+        })
+        .clone()
+}
+
+// The viewport's rasterized surfaces, uploaded into one reused texture.
+fn viewport_texture(ctx: &egui::Context, image: egui::ColorImage) -> egui::TextureHandle {
+    static TEXTURE: std::sync::OnceLock<std::sync::Mutex<Option<egui::TextureHandle>>> = std::sync::OnceLock::new();
+    let mut slot = TEXTURE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_mut() {
+        Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+        None => *slot = Some(ctx.load_texture("viewport-surfaces", image, egui::TextureOptions::LINEAR)),
+    }
+    slot.clone().expect("set above")
+}
+
+// Per-user settings folder (recent files, updater preferences).
+pub(crate) fn app_config_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        Some(home?.join("Library/Application Support/ProceduralFX Studio"))
+    } else {
+        let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".config")))?;
+        Some(base.join("proceduralfx-studio"))
+    }
+}
+
+const MAX_RECENT_SCENES: usize = 10;
+
+fn recent_scenes_file() -> Option<PathBuf> {
+    Some(app_config_dir()?.join("recent_scenes.txt"))
+}
+
+fn load_recent_scenes() -> Vec<PathBuf> {
+    recent_scenes_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|text| parse_recent_scenes(&text))
+        .unwrap_or_default()
+}
+
+fn parse_recent_scenes(text: &str) -> Vec<PathBuf> {
+    let mut list: Vec<PathBuf> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let path = PathBuf::from(line);
+        if !list.contains(&path) && list.len() < MAX_RECENT_SCENES {
+            list.push(path);
+        }
+    }
+    list
+}
+
+// Moves `path` to the front of the recent list.
+fn push_recent_scene(list: &mut Vec<PathBuf>, path: PathBuf) {
+    list.retain(|p| p != &path);
+    list.insert(0, path);
+    list.truncate(MAX_RECENT_SCENES);
+}
+
+fn save_recent_scenes(list: &[PathBuf]) {
+    let Some(file) = recent_scenes_file() else { return };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text: String = list.iter().map(|p| format!("{}\n", p.display())).collect();
+    let _ = std::fs::write(file, text);
+}
+
+// Writes via a temporary file so a failed save never leaves a half-written scene.
+fn write_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".saving");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+const SHORTCUT_OPEN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+const SHORTCUT_SAVE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+const SHORTCUT_SAVE_AS: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::S);
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
@@ -2844,6 +2918,8 @@ enum NodeKind {
     Peak { dist: f32 },
     Ripple { freq: f32, amp: f32, speed: f32 },
     Jitter { amp: f32, seed: usize },
+    // Point particles. Input 1: optional source geometry (emits from its
+    // surface or points; the origin when unconnected), input 2: optional static collider.
     Particles {
         count: usize,
         emission_rate: f32,
@@ -2852,6 +2928,12 @@ enum NodeKind {
         spread: f32,
         gravity: f32,
         seed: usize,
+        drag: f32,
+        bounce: f32,
+        friction: f32,
+        radius: f32,
+        substeps: usize,
+        along_normals: bool,
     },
     Flip {
         particle_count: usize,
@@ -2905,8 +2987,32 @@ enum NodeKind {
     Switch { index: usize },
     // Smoke and fire on a voxel grid. Input 1: source geometry, input 2: optional static collider.
     Pyro(sims::PyroSettings),
+    // Groom. Hair Guides: input 1 is the skin mesh.
+    HairGuides(groom::GuideSettings),
+    // Shapes guide (or hair) curves from input 1.
+    GuideProcess(groom::ProcessSettings),
+    // Dense hair. Input 1: skin, input 2: guides.
+    HairGenerate(groom::HairSettings),
+    // Moves hair with an animated skin. Input 1: hair or guides, input 2: skin.
+    HairDeform(groom::DeformSettings),
     // Rigid bodies (rapier, Bullet-style). Input 1: pieces, input 2: optional static collider.
     RbdSolver(sims::RbdSettings),
+    // XPBD cloth, hair, softbody or grains. Input 1: geometry, input 2: optional static collider.
+    VellumSolver(vellum::VellumSettings),
+    // Writes N on points or vertices.
+    Normal(sops::NormalSettings),
+    // Points on (or inside) the input's surface.
+    Scatter(sops::ScatterSettings),
+    // UV projection, transform and viewport texture display.
+    UvTexture(sops::UvTextureSettings),
+    UvTransform(sops::UvTransformSettings),
+    UvQuickShade { file: String },
+    // Object-level HDRI environment light (MoonRay EnvLight); also lights and backs the viewport.
+    EnvironmentLight { file: String, color: [f32; 3], intensity: f32, rotation: f32, visible: bool },
+    // Makes a named point or primitive group.
+    GroupCreate(groups::GroupCreateSettings),
+    // A float point attribute painted in the viewport (one stored value per input point).
+    AttributePaint { attribute: String, values: Vec<f32>, settings: paint::PaintSettings },
     // Container whose network is cooked once per step on the previous step's output (Prev_Frame).
     SopSolver { substeps: usize },
     // Inside a SOP Solver network: 0 = Prev_Frame, 1 = Input_1 (the solver's input at the step time).
@@ -2936,9 +3042,49 @@ enum NodeKind {
     Material { kind: usize, color: [f32; 3], roughness: f32, value: f32 },
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum GroupSupport {
+    None,
+    // Cooks on everything, then restores what changed outside the group.
+    Restrict,
+    // The node uses the group itself (wrangle, blast, scatter, groom roots).
+    Native,
+    // Vellum: the group's points are pinned.
+    Pin,
+}
+
 impl NodeKind {
+    fn group_support(&self) -> GroupSupport {
+        match self {
+            NodeKind::Transform { .. }
+            | NodeKind::Noise { .. }
+            | NodeKind::Taper { .. }
+            | NodeKind::Twist { .. }
+            | NodeKind::Bend { .. }
+            | NodeKind::Smooth { .. }
+            | NodeKind::Peak { .. }
+            | NodeKind::Ripple { .. }
+            | NodeKind::Jitter { .. }
+            | NodeKind::AttributeCreate { .. }
+            | NodeKind::AttributeRandomize { .. }
+            | NodeKind::Normal(_)
+            | NodeKind::UvTexture(_)
+            | NodeKind::UvTransform(_)
+            | NodeKind::AttributePaint { .. }
+            | NodeKind::GuideProcess(_)
+            | NodeKind::HairDeform(_) => GroupSupport::Restrict,
+            NodeKind::Wrangle { .. }
+            | NodeKind::Blast { .. }
+            | NodeKind::Scatter(_)
+            | NodeKind::HairGuides(_)
+            | NodeKind::HairGenerate(_) => GroupSupport::Native,
+            NodeKind::VellumSolver(_) => GroupSupport::Pin,
+            _ => GroupSupport::None,
+        }
+    }
+
     fn is_object(&self) -> bool {
-        matches!(self, NodeKind::Geometry { .. } | NodeKind::Camera { .. } | NodeKind::Light { .. })
+        matches!(self, NodeKind::Geometry { .. } | NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::EnvironmentLight { .. })
     }
 
     fn is_material(&self) -> bool {
@@ -2974,6 +3120,7 @@ impl NodeKind {
                 (0, "tx"), (1, "ty"), (2, "tz"), (3, "rx"), (4, "ry"), (5, "rz"),
                 (6, "color.r"), (7, "color.g"), (8, "color.b"), (9, "intensity"),
             ]),
+            NodeKind::EnvironmentLight { .. } => named(&[(0, "color.r"), (1, "color.g"), (2, "color.b"), (3, "intensity"), (4, "ry")]),
             NodeKind::Camera { .. } => named(&[
                 (0, "tx"), (1, "ty"), (2, "tz"), (3, "rx"), (4, "ry"), (5, "rz"),
                 (6, "focal"), (7, "near"), (9, "pan.x"), (10, "pan.y"), (11, "zoom"),
@@ -2996,7 +3143,12 @@ impl NodeKind {
             NodeKind::LopTransform { pattern, .. } | NodeKind::LopMaterial { pattern, .. } | NodeKind::LopPrune { pattern, .. } => {
                 vec![pattern.clone()]
             }
-            NodeKind::LopExport { file } | NodeKind::FileImport { file } | NodeKind::FileExport { file } => vec![file.clone()],
+            NodeKind::LopExport { file } | NodeKind::FileImport { file } | NodeKind::FileExport { file } | NodeKind::UvQuickShade { file } => {
+                vec![file.clone()]
+            }
+            NodeKind::AttributePaint { attribute, .. } => vec![attribute.clone()],
+            NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
+            NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
             _ => Vec::new(),
         }
     }
@@ -3018,7 +3170,15 @@ impl NodeKind {
                 next(path);
             }
             NodeKind::LopTransform { pattern, .. } | NodeKind::LopMaterial { pattern, .. } | NodeKind::LopPrune { pattern, .. } => next(pattern),
-            NodeKind::LopExport { file } | NodeKind::FileImport { file } | NodeKind::FileExport { file } => next(file),
+            NodeKind::LopExport { file } | NodeKind::FileImport { file } | NodeKind::FileExport { file } | NodeKind::UvQuickShade { file } => {
+                next(file)
+            }
+            NodeKind::AttributePaint { attribute, .. } => next(attribute),
+            NodeKind::EnvironmentLight { file, .. } => next(file),
+            NodeKind::GroupCreate(g) => {
+                next(&mut g.name);
+                next(&mut g.expression);
+            }
             _ => {}
         }
     }
@@ -3029,7 +3189,10 @@ impl NodeKind {
     }
 
     fn is_solver(&self) -> bool {
-        matches!(self, NodeKind::Particles { .. } | NodeKind::Flip { .. } | NodeKind::Pyro(_) | NodeKind::RbdSolver(_) | NodeKind::SopSolver { .. })
+        matches!(
+            self,
+            NodeKind::Particles { .. } | NodeKind::Flip { .. } | NodeKind::Pyro(_) | NodeKind::RbdSolver(_) | NodeKind::VellumSolver(_) | NodeKind::SopSolver { .. }
+        )
     }
 
     // Title shown on the node in the network editor.
@@ -3091,6 +3254,7 @@ impl NodeKind {
                         intensity: 0.9,
                         kind: 0,
                     },
+                    NodeKind::EnvironmentLight { file: String::new(), color: [1.0; 3], intensity: 1.0, rotation: 0.0, visible: true },
                 ],
             ),
             (
@@ -3114,6 +3278,32 @@ impl NodeKind {
                 ],
             ),
             (
+                "Groom",
+                vec![
+                    NodeKind::HairGuides(groom::GuideSettings {
+                        count: 200,
+                        length: 0.6,
+                        length_variance: 0.2,
+                        segments: 8,
+                        droop: 0.3,
+                        seed: 1,
+                    }),
+                    NodeKind::GuideProcess(groom::ProcessSettings { op: 1, amount: 0.5, frequency: 2.0, seed: 1 }),
+                    NodeKind::HairGenerate(groom::HairSettings {
+                        count: 5000,
+                        segments: 8,
+                        clump: 0.3,
+                        length_variance: 0.15,
+                        frizz: 0.2,
+                        width_root: 0.004,
+                        width_tip: 0.001,
+                        seed: 1,
+                    }),
+                    NodeKind::HairDeform(groom::DeformSettings { rest_frame: 1.0 }),
+                    NodeKind::AttributePaint { attribute: "density".into(), values: Vec::new(), settings: paint::PaintSettings::default() },
+                ],
+            ),
+            (
                 "Solvers",
                 vec![
                     NodeKind::Particles {
@@ -3124,6 +3314,12 @@ impl NodeKind {
                         spread: 0.35,
                         gravity: -1.5,
                         seed: 1,
+                        drag: 0.0,
+                        bounce: 0.4,
+                        friction: 0.1,
+                        radius: 0.02,
+                        substeps: 2,
+                        along_normals: false,
                     },
                     NodeKind::Flip {
                         particle_count: 20_000,
@@ -3137,6 +3333,7 @@ impl NodeKind {
                     },
                     NodeKind::Pyro(sims::PyroSettings::default()),
                     NodeKind::RbdSolver(sims::RbdSettings::default()),
+                    NodeKind::VellumSolver(vellum::VellumSettings::defaults(0)),
                     NodeKind::SopSolver { substeps: 1 },
                     NodeKind::SolverInput { index: 0 },
                     NodeKind::SolverInput { index: 1 },
@@ -3180,6 +3377,7 @@ impl NodeKind {
                     NodeKind::Extrude { dist: 0.2, inset: 0.2, mode: 0 },
                     NodeKind::Clip { axis: 1, offset: 0.0, invert: false },
                     NodeKind::Blast { component: 1, indices: Vec::new(), invert: false },
+                    NodeKind::Scatter(sops::ScatterSettings { count: 1000, seed: 1, relax_iterations: 5, volume: false }),
                     NodeKind::Cache { cache_id: 1, mode: 1 },
                     NodeKind::Reverse,
                     NodeKind::Switch { index: 0 },
@@ -3194,6 +3392,33 @@ impl NodeKind {
                     NodeKind::AttributeRandomize { attribute: 1, amount: 0.25, seed: 1 },
                     NodeKind::AttributeDelete { attribute: 1 },
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 0 },
+                    NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
+                    NodeKind::AttributePaint { attribute: "mask".into(), values: Vec::new(), settings: paint::PaintSettings::default() },
+                ],
+            ),
+            (
+                "Groups",
+                vec![NodeKind::GroupCreate(groups::GroupCreateSettings {
+                    name: "group1".into(),
+                    domain: groups::GroupDomain::Points,
+                    method: 0,
+                    bbox_min: [-1.0, -1.0, -1.0],
+                    bbox_max: [1.0, 1.0, 1.0],
+                    percent: 50.0,
+                    seed: 1,
+                    direction: [0.0, 1.0, 0.0],
+                    spread: 30.0,
+                    expression: "@P.y>0".into(),
+                    combine: 0,
+                    invert: false,
+                })],
+            ),
+            (
+                "UV",
+                vec![
+                    NodeKind::UvTexture(sops::UvTextureSettings { projection: 3, axis: 1, scale: [1.0, 1.0], offset: [0.0, 0.0] }),
+                    NodeKind::UvTransform(sops::UvTransformSettings { translate: [0.0; 2], rotate: 0.0, scale: [1.0; 2], pivot: [0.5; 2] }),
+                    NodeKind::UvQuickShade { file: String::new() },
                 ],
             ),
             (
@@ -3267,8 +3492,13 @@ impl NodeKind {
             NodeKind::MoonRayRender { .. } => "moonray_render",
             NodeKind::Camera { .. } => "camera",
             NodeKind::Light { .. } => "light",
+            NodeKind::EnvironmentLight { .. } => "environment_light",
             NodeKind::Reverse => "reverse",
             NodeKind::Pyro(_) => "pyro",
+            NodeKind::HairGuides(_) => "hair_guides",
+            NodeKind::GuideProcess(_) => "guide_process",
+            NodeKind::HairGenerate(_) => "hair_generate",
+            NodeKind::HairDeform(_) => "hair_deform",
             NodeKind::LopSopImport { .. } => "sop_import",
             NodeKind::LopReference { .. } => "usd_reference",
             NodeKind::LopPrimitive { .. } => "usd_primitive",
@@ -3280,6 +3510,14 @@ impl NodeKind {
             NodeKind::LopMerge => "usd_merge",
             NodeKind::LopExport { .. } => "usd_export",
             NodeKind::RbdSolver(_) => "rbd_solver",
+            NodeKind::VellumSolver(_) => "vellum_solver",
+            NodeKind::Normal(_) => "normal",
+            NodeKind::Scatter(_) => "scatter",
+            NodeKind::UvTexture(_) => "uv_texture",
+            NodeKind::UvTransform(_) => "uv_transform",
+            NodeKind::UvQuickShade { .. } => "uv_quickshade",
+            NodeKind::AttributePaint { .. } => "attribute_paint",
+            NodeKind::GroupCreate(_) => "group_create",
             NodeKind::SopSolver { .. } => "sop_solver",
             NodeKind::SolverInput { .. } => "solver_input",
             NodeKind::Switch { .. } => "switch",
@@ -3299,9 +3537,10 @@ impl NodeKind {
             | NodeKind::Sphere { .. }
             | NodeKind::Torus { .. }
             | NodeKind::Tube { .. } => 0,
-            NodeKind::Particles { .. } => 0,
+            NodeKind::Particles { .. } => 2,
             NodeKind::Flip { .. } => 2,
-            NodeKind::Pyro(_) | NodeKind::RbdSolver(_) => 2,
+            NodeKind::Pyro(_) | NodeKind::RbdSolver(_) | NodeKind::VellumSolver(_) => 2,
+            NodeKind::HairGenerate(_) | NodeKind::HairDeform(_) => 2,
             NodeKind::SopSolver { .. } => 1,
             NodeKind::SolverInput { .. } => 0,
             NodeKind::LopMerge => 2,
@@ -3314,6 +3553,7 @@ impl NodeKind {
             NodeKind::Wrangle { .. } => 1,
             NodeKind::MoonRayRender { .. } => 0,
             NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::Geometry { .. } | NodeKind::Material { .. } => 0,
+            NodeKind::EnvironmentLight { .. } => 0,
             _ => 1,
         }
     }
@@ -3352,6 +3592,7 @@ impl NodeKind {
                 NodeKind::MoonRayRender { .. } => egui::Color32::from_rgb(100, 150, 210),
                 NodeKind::Camera { .. } => egui::Color32::from_rgb(80, 180, 220),
                 NodeKind::Light { .. } => egui::Color32::from_rgb(240, 180, 70),
+                NodeKind::EnvironmentLight { .. } => egui::Color32::from_rgb(235, 200, 110),
                 _ => egui::Color32::from_rgb(80, 140, 210),
             },
         }
@@ -3402,7 +3643,21 @@ impl NodeKind {
             NodeKind::Peak { dist } => vec![*dist],
             NodeKind::Ripple { freq, amp, speed } => vec![*freq, *amp, *speed],
             NodeKind::Jitter { amp, seed } => vec![*amp, *seed as f32],
-            NodeKind::Particles { count, emission_rate, lifetime, speed, spread, gravity, seed } => {
+            NodeKind::Particles {
+                count,
+                emission_rate,
+                lifetime,
+                speed,
+                spread,
+                gravity,
+                seed,
+                drag,
+                bounce,
+                friction,
+                radius,
+                substeps,
+                along_normals,
+            } => {
                 vec![
                     *count as f32,
                     *emission_rate,
@@ -3411,6 +3666,12 @@ impl NodeKind {
                     *spread,
                     *gravity,
                     *seed as f32,
+                    *drag,
+                    *bounce,
+                    *friction,
+                    *radius,
+                    *substeps as f32,
+                    *along_normals as u8 as f32,
                 ]
             }
             NodeKind::Flip {
@@ -3447,7 +3708,7 @@ impl NodeKind {
                 vec![*voxel_size, *padding as f32, *operation as f32, *iterations as f32, *output as f32]
             }
             NodeKind::ConvertVdb { mode, iso } => vec![*mode as f32, *iso],
-            NodeKind::FileImport { .. } | NodeKind::FileExport { .. } => vec![],
+            NodeKind::FileImport { .. } | NodeKind::FileExport { .. } | NodeKind::UvQuickShade { .. } => vec![],
             NodeKind::MoonRayRender { .. } => vec![],
             NodeKind::Camera { position, rotation, focal, near, orthographic, pan, zoom } => {
                 [position.to_vec(), rotation.to_vec(), vec![*focal, *near, *orthographic as u8 as f32, pan[0], pan[1], *zoom]].concat()
@@ -3458,7 +3719,60 @@ impl NodeKind {
             NodeKind::Switch { index } => vec![*index as f32],
             NodeKind::Reverse => vec![],
             NodeKind::Pyro(settings) => settings.to_params(),
+            NodeKind::HairGuides(s) => {
+                vec![s.count as f32, s.length, s.length_variance, s.segments as f32, s.droop, s.seed as f32]
+            }
+            NodeKind::GuideProcess(s) => vec![s.op as f32, s.amount, s.frequency, s.seed as f32],
+            NodeKind::HairDeform(s) => vec![s.rest_frame],
+            NodeKind::HairGenerate(s) => vec![
+                s.count as f32,
+                s.segments as f32,
+                s.clump,
+                s.length_variance,
+                s.frizz,
+                s.width_root,
+                s.width_tip,
+                s.seed as f32,
+            ],
             NodeKind::RbdSolver(settings) => settings.to_params(),
+            NodeKind::Normal(s) => vec![s.domain as f32, s.cusp_angle, s.weighting as f32, s.reverse as u8 as f32],
+            NodeKind::GroupCreate(g) => {
+                let mut p = vec![(g.domain == groups::GroupDomain::Prims) as u8 as f32, g.method as f32];
+                p.extend(g.bbox_min);
+                p.extend(g.bbox_max);
+                p.extend([g.percent, g.seed as f32]);
+                p.extend(g.direction);
+                p.extend([g.spread, g.combine as f32, g.invert as u8 as f32]);
+                p
+            }
+            NodeKind::EnvironmentLight { color, intensity, rotation, visible, .. } => {
+                vec![color[0], color[1], color[2], *intensity, *rotation, *visible as u8 as f32]
+            }
+            // Brush settings, then every painted value.
+            NodeKind::AttributePaint { values, settings: s, .. } => {
+                let mut p = vec![s.value, s.default, s.radius, s.strength, s.mode as f32, s.visualize as u8 as f32];
+                p.extend_from_slice(values);
+                p
+            }
+            NodeKind::Scatter(s) => vec![s.count as f32, s.seed as f32, s.relax_iterations as f32, s.volume as u8 as f32],
+            NodeKind::UvTexture(s) => vec![s.projection as f32, s.axis as f32, s.scale[0], s.scale[1], s.offset[0], s.offset[1]],
+            NodeKind::UvTransform(s) => vec![s.translate[0], s.translate[1], s.rotate, s.scale[0], s.scale[1], s.pivot[0], s.pivot[1]],
+            NodeKind::VellumSolver(s) => vec![
+                s.kind as f32,
+                s.stretch_stiffness,
+                s.bend_stiffness,
+                s.shape_stiffness,
+                s.mass,
+                s.thickness,
+                s.gravity,
+                s.damping,
+                s.friction,
+                s.substeps as f32,
+                s.iterations as f32,
+                s.ground as u8 as f32,
+                s.self_collision as u8 as f32,
+                s.pin_to_animation as u8 as f32,
+            ],
             NodeKind::SopSolver { substeps } => vec![*substeps as f32],
             NodeKind::LopSopImport { geometry, .. } => vec![geometry.map_or(-1.0, |g| g as f32)],
             NodeKind::LopReference { sublayer, .. } => vec![*sublayer as u8 as f32],
@@ -3537,15 +3851,24 @@ impl NodeKind {
             "peak" => NodeKind::Peak { dist: g(0) },
             "ripple" => NodeKind::Ripple { freq: g(0), amp: g(1), speed: g(2) },
             "jitter" => NodeKind::Jitter { amp: g(0), seed: u(1) },
-            "particles" => NodeKind::Particles {
-                count: u(0).clamp(1, 50_000),
-                emission_rate: g(1).max(0.01),
-                lifetime: g(2).max(0.01),
-                speed: g(3),
-                spread: g(4).max(0.0),
-                gravity: g(5),
-                seed: u(6),
-            },
+            "particles" => {
+                let or = |i: usize, default: f32| p.get(i).copied().unwrap_or(default);
+                NodeKind::Particles {
+                    count: u(0).clamp(1, 50_000),
+                    emission_rate: g(1).max(0.01),
+                    lifetime: g(2).max(0.01),
+                    speed: g(3),
+                    spread: g(4).max(0.0),
+                    gravity: g(5),
+                    seed: u(6),
+                    drag: or(7, 0.0).max(0.0),
+                    bounce: or(8, 0.4).clamp(0.0, 1.0),
+                    friction: or(9, 0.1).clamp(0.0, 1.0),
+                    radius: or(10, 0.02).max(0.0),
+                    substeps: (or(11, 2.0).max(1.0) as usize).min(8),
+                    along_normals: or(12, 0.0) > 0.5,
+                }
+            }
             "flip" => NodeKind::Flip {
                 particle_count: u(0).clamp(1, 100_000),
                 grid_resolution: u(1).clamp(16, 128),
@@ -3601,7 +3924,111 @@ impl NodeKind {
             },
             "reverse" => NodeKind::Reverse,
             "pyro" => NodeKind::Pyro(sims::PyroSettings::from_params(p)),
+            "hair_guides" => NodeKind::HairGuides(groom::GuideSettings {
+                count: u(0).clamp(1, 20_000),
+                length: g(1).max(0.0),
+                length_variance: g(2).clamp(0.0, 1.0),
+                segments: u(3).clamp(1, 64),
+                droop: g(4).max(0.0),
+                seed: u(5) as u32,
+            }),
+            "guide_process" => NodeKind::GuideProcess(groom::ProcessSettings {
+                op: u(0).min(groom::GUIDE_OPS.len() - 1),
+                amount: g(1),
+                frequency: g(2),
+                seed: u(3) as u32,
+            }),
+            "hair_deform" => NodeKind::HairDeform(groom::DeformSettings { rest_frame: p.first().copied().unwrap_or(1.0) }),
+            "hair_generate" => NodeKind::HairGenerate(groom::HairSettings {
+                count: u(0).clamp(1, 200_000),
+                segments: u(1).clamp(1, 64),
+                clump: g(2).clamp(0.0, 1.0),
+                length_variance: g(3).clamp(0.0, 1.0),
+                frizz: g(4).max(0.0),
+                width_root: g(5).max(0.0),
+                width_tip: g(6).max(0.0),
+                seed: u(7) as u32,
+            }),
             "rbd_solver" => NodeKind::RbdSolver(sims::RbdSettings::from_params(p)),
+            "group_create" => NodeKind::GroupCreate(groups::GroupCreateSettings {
+                name: "group1".into(),
+                domain: if g(0) > 0.5 { groups::GroupDomain::Prims } else { groups::GroupDomain::Points },
+                method: u(1).min(groups::CREATE_METHODS.len() - 1),
+                bbox_min: v3(2),
+                bbox_max: v3(5),
+                percent: g(8),
+                seed: u(9) as u32,
+                direction: v3(10),
+                spread: g(13),
+                expression: String::new(),
+                combine: u(14).min(groups::COMBINE_MODES.len() - 1),
+                invert: g(15) > 0.5,
+            }),
+            "environment_light" => NodeKind::EnvironmentLight {
+                file: String::new(),
+                color: v3(0),
+                intensity: g(3).max(0.0),
+                rotation: g(4),
+                visible: p.get(5).is_none_or(|v| *v > 0.5),
+            },
+            "attribute_paint" => NodeKind::AttributePaint {
+                attribute: "density".into(),
+                values: p.get(6..).map(<[f32]>::to_vec).unwrap_or_default(),
+                settings: paint::PaintSettings {
+                    value: g(0),
+                    default: g(1),
+                    radius: g(2).clamp(1.0, 2000.0),
+                    strength: g(3).clamp(0.0, 1.0),
+                    mode: u(4).min(paint::PAINT_MODES.len() - 1),
+                    visualize: g(5) > 0.5,
+                },
+            },
+            "normal" => NodeKind::Normal(sops::NormalSettings {
+                domain: u(0).min(1),
+                cusp_angle: g(1).clamp(0.0, 180.0),
+                weighting: u(2).min(sops::NORMAL_WEIGHTS.len() - 1),
+                reverse: g(3) > 0.5,
+            }),
+            "scatter" => NodeKind::Scatter(sops::ScatterSettings {
+                count: u(0).clamp(1, 1_000_000),
+                seed: u(1) as u32,
+                relax_iterations: u(2).min(50),
+                volume: g(3) > 0.5,
+            }),
+            "uv_texture" => NodeKind::UvTexture(sops::UvTextureSettings {
+                projection: u(0).min(sops::UV_PROJECTIONS.len() - 1),
+                axis: u(1).min(2),
+                scale: [g(2), g(3)],
+                offset: [g(4), g(5)],
+            }),
+            "uv_transform" => NodeKind::UvTransform(sops::UvTransformSettings {
+                translate: [g(0), g(1)],
+                rotate: g(2),
+                scale: [g(3), g(4)],
+                pivot: [g(5), g(6)],
+            }),
+            "uv_quickshade" => NodeKind::UvQuickShade { file: String::new() },
+            "vellum_solver" => {
+                let kind = u(0).min(vellum::VELLUM_TYPES.len() - 1);
+                let d = vellum::VellumSettings::defaults(kind);
+                let or = |i: usize, default: f32| p.get(i).copied().unwrap_or(default);
+                NodeKind::VellumSolver(vellum::VellumSettings {
+                    kind,
+                    stretch_stiffness: or(1, d.stretch_stiffness).max(1e-3),
+                    bend_stiffness: or(2, d.bend_stiffness).max(1e-3),
+                    shape_stiffness: or(3, d.shape_stiffness).clamp(0.0, 1.0),
+                    mass: or(4, d.mass).max(1e-4),
+                    thickness: or(5, d.thickness).max(1e-4),
+                    gravity: or(6, d.gravity),
+                    damping: or(7, d.damping).max(0.0),
+                    friction: or(8, d.friction).clamp(0.0, 1.0),
+                    substeps: (or(9, d.substeps as f32).max(1.0) as usize).min(100),
+                    iterations: (or(10, d.iterations as f32).max(1.0) as usize).min(200),
+                    ground: or(11, d.ground as u8 as f32) > 0.5,
+                    self_collision: or(12, d.self_collision as u8 as f32) > 0.5,
+                    pin_to_animation: or(13, d.pin_to_animation as u8 as f32) > 0.5,
+                })
+            }
             "sop_solver" => NodeKind::SopSolver { substeps: u(0).clamp(1, 16) },
             "sop_import" => NodeKind::LopSopImport { geometry: p.first().filter(|v| **v >= 0.0).map(|v| *v as NodeId), path: "/geo".into() },
             "usd_reference" => NodeKind::LopReference { file: String::new(), path: "/ref".into(), sublayer: g(0) != 0.0 },
@@ -3651,6 +4078,8 @@ struct Node {
     parent: Option<NodeId>,
     // Object-level transform of Geometry objects (scale, then rotate, then translate).
     xform: ObjectXform,
+    // The group the node applies to (Houdini's Group parameter); empty = everything.
+    group: groups::NodeGroup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3746,7 +4175,7 @@ impl Graph {
     fn add(&mut self, kind: NodeKind, pos: egui::Pos2) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.insert(id, Node { kind, pos, bypass: false, context: AppContext::Obj, parent: None, xform: ObjectXform::default() });
+        self.nodes.insert(id, Node { kind, pos, bypass: false, context: AppContext::Obj, parent: None, xform: ObjectXform::default(), group: groups::NodeGroup::default() });
         id
     }
 
@@ -4281,6 +4710,14 @@ impl Graph {
         Some(path)
     }
 
+    // The input restricted to the node's group of primitives (all of it when there's no group).
+    fn group_prims(&self, mesh: &Mesh, group: &groups::NodeGroup) -> Result<Mesh, String> {
+        match groups::prim_mask(mesh, group)? {
+            Some(prims) => Ok(groups::only_prims(mesh, &prims)),
+            None => Ok(mesh.clone()),
+        }
+    }
+
     // Cooks `node` at `time` with its own cache (solvers cook inputs at other times than the frame).
     fn cook_fresh(&self, node: Option<NodeId>, time: f32) -> Mesh {
         node.map(|n| self.cook(n, time, &mut HashMap::new())).unwrap_or_default()
@@ -4318,6 +4755,7 @@ impl Graph {
         }
         let Some(node) = self.nodes.get(&id) else { return };
         format!("{:?}", node.kind).hash(hasher);
+        format!("{:?}", node.group).hash(hasher);
         node.bypass.hash(hasher);
         let mut inputs: Vec<&Link> = self.links.iter().filter(|l| l.to == id).collect();
         inputs.sort_by_key(|l| l.slot);
@@ -4346,6 +4784,7 @@ impl Graph {
                 | NodeKind::Cache { .. }
                 | NodeKind::Pyro(_)
                 | NodeKind::RbdSolver(_)
+                | NodeKind::VellumSolver(_)
                 | NodeKind::SopSolver { .. }
                 | NodeKind::SolverInput { .. }
         ))
@@ -4475,7 +4914,20 @@ impl Graph {
                 NodeKind::AttributeDelete { attribute } => {
                     node_attribute_delete(input(0, cache), *attribute)
                 }
-                NodeKind::Wrangle { code, domain } => node_wrangle(input(0, cache), code, time, *domain),
+                NodeKind::Wrangle { code, domain } => {
+                    let source = input(0, cache);
+                    // Points (2) and primitives (1) run on the group's members; vertices on its primitives'.
+                    let mask = match *domain {
+                        2 => groups::point_mask(&source, &node.group),
+                        1 => groups::prim_mask(&source, &node.group),
+                        3 => groups::prim_mask(&source, &node.group).map(|m| m.map(|m| m.iter().flat_map(|&b| [b; 3]).collect())),
+                        _ => Ok(None),
+                    };
+                    match mask {
+                        Ok(mask) => node_wrangle(source, code, time, *domain, mask.as_deref()),
+                        Err(e) => self.report(id, Err(e)),
+                    }
+                }
                 NodeKind::Merge => node_merge(input(0, cache), input(1, cache)),
                 NodeKind::Null => input(0, cache),
                 NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
@@ -4494,16 +4946,39 @@ impl Graph {
                     spread,
                     gravity,
                     seed,
-                } => node_particles(
-                    *count,
-                    *emission_rate,
-                    *lifetime,
-                    *speed,
-                    *spread,
-                    *gravity,
-                    *seed,
-                    time,
-                ),
+                    drag,
+                    bounce,
+                    friction,
+                    radius,
+                    substeps,
+                    along_normals,
+                } => {
+                    let settings = sims::ParticleSettings {
+                        max_particles: *count,
+                        rate: *emission_rate,
+                        lifetime: *lifetime,
+                        speed: *speed,
+                        spread: *spread,
+                        gravity: *gravity,
+                        drag: *drag,
+                        bounce: *bounce,
+                        friction: *friction,
+                        radius: *radius,
+                        substeps: *substeps,
+                        along_normals: *along_normals,
+                        seed: *seed as u32,
+                    };
+                    let (source, collider) = (self.input_of(id, 0), self.input_of(id, 1));
+                    let animated = source.is_some_and(|s| self.time_dependent(s));
+                    sims::particles(
+                        self.sim_key(id),
+                        &settings,
+                        time,
+                        animated,
+                        |t| self.cook_fresh(source, t),
+                        || self.cook_fresh(collider, 0.0),
+                    )
+                }
                 NodeKind::Flip {
                     particle_count,
                     grid_resolution,
@@ -4539,6 +5014,21 @@ impl Graph {
                     node_extrude(input(0, cache), *dist, *inset, *mode)
                 }
                 NodeKind::Clip { axis, offset, invert } => node_clip(input(0, cache), *axis, *offset, *invert),
+                NodeKind::Blast { component, indices, invert } if !node.group.is_empty() => {
+                    // Blast deletes the node's group (points or primitives).
+                    let source = input(0, cache);
+                    let as_points = groups::guess_domain(&source, &node.group.pattern) == groups::GroupDomain::Points && node.group.kind != 2 || node.group.kind == 1;
+                    let mask = if as_points { groups::point_mask(&source, &node.group) } else { groups::prim_mask(&source, &node.group) };
+                    let _ = (component, indices);
+                    match mask {
+                        Ok(Some(mask)) => {
+                            let chosen: Vec<usize> = mask.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect();
+                            self.report(id, Ok(node_blast(source, if as_points { 0 } else { 1 }, &chosen, *invert)))
+                        }
+                        Ok(None) => source,
+                        Err(e) => self.report(id, Err(e)),
+                    }
+                }
                 NodeKind::Blast { component, indices, invert } => {
                     node_blast(input(0, cache), *component, indices, *invert)
                 }
@@ -4592,7 +5082,7 @@ impl Graph {
                     }
                 }
                 NodeKind::MoonRayRender { .. } => input(0, cache),
-                NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::Material { .. } => Mesh::default(),
+                NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::EnvironmentLight { .. } | NodeKind::Material { .. } => Mesh::default(),
                 NodeKind::Geometry { .. } => match self.display_of(id) {
                     Some(display) => self.xform_at(id, time).apply(self.cook(display, time, cache)),
                     None => Mesh::default(),
@@ -4617,6 +5107,85 @@ impl Graph {
                         time,
                         animated,
                         |t| self.cook_fresh(source, t),
+                        || self.cook_fresh(collider, 0.0),
+                    )
+                }
+                NodeKind::HairGuides(settings) => match self.group_prims(&input(0, cache), &node.group) {
+                    Ok(skin) => groom::hair_guides(&skin, settings),
+                    Err(e) => self.report(id, Err(e)),
+                },
+                NodeKind::GuideProcess(settings) => groom::guide_process(&input(0, cache), settings),
+                NodeKind::HairGenerate(settings) => match self.group_prims(&input(0, cache), &node.group) {
+                    Ok(skin) => groom::hair_generate(&skin, &input(1, cache), settings),
+                    Err(e) => self.report(id, Err(e)),
+                },
+                NodeKind::HairDeform(settings) => {
+                    // The groom and skin at the rest frame, and the skin now.
+                    let rest_time = (settings.rest_frame - 1.0) / sims::SIM_FPS;
+                    let (hair, skin) = (self.input_of(id, 0), self.input_of(id, 1));
+                    let result = if skin.is_none() {
+                        Err("connect the animated skin to input 2".to_owned())
+                    } else {
+                        groom::hair_deform(&self.cook_fresh(hair, rest_time), &self.cook_fresh(skin, rest_time), &input(1, cache))
+                    };
+                    self.report(id, result)
+                }
+                NodeKind::Normal(settings) => sops::normal(&input(0, cache), settings),
+                NodeKind::GroupCreate(settings) => self.report(id, groups::group_create(&input(0, cache), settings)),
+                NodeKind::AttributePaint { attribute, values, settings } => {
+                    self.report(id, paint::attribute_paint(&input(0, cache), attribute, values, settings))
+                }
+                NodeKind::Scatter(settings) => {
+                    let result = self.group_prims(&input(0, cache), &node.group).and_then(|surface| sops::scatter(&surface, settings));
+                    self.report(id, result)
+                }
+                NodeKind::UvTexture(settings) => sops::uv_texture(&input(0, cache), settings),
+                NodeKind::UvTransform(settings) => self.report(id, sops::uv_transform(&input(0, cache), settings)),
+                NodeKind::UvQuickShade { file } => self.report(id, sops::uv_quickshade(&input(0, cache), file)),
+                NodeKind::VellumSolver(settings) => {
+                    let (geometry, collider) = (self.input_of(id, 0), self.input_of(id, 1));
+                    let animated = geometry.is_some_and(|g| self.time_dependent(g));
+                    // A setup that can't move is the usual "Vellum does nothing": say why.
+                    let start = self.cook_fresh(geometry, 0.0);
+                    let lowest = start.vertices.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                    let note = if geometry.is_none() {
+                        Some("connect the cloth, hair or softbody geometry to input 1".to_owned())
+                    } else if settings.ground && lowest <= settings.thickness + 1e-4 {
+                        Some(format!(
+                            "the geometry starts on the ground plane (lowest point y = {lowest:.3}), so it can't fall. \
+                             Move it above y = 0, or turn off Ground plane to use only the collider."
+                        ))
+                    } else {
+                        None
+                    };
+                    node_notes(|notes| match note {
+                        Some(n) => {
+                            notes.insert(id, n);
+                        }
+                        None => {
+                            notes.remove(&id);
+                        }
+                    });
+                    // The node's group is pinned (on top of any f@pin).
+                    let pin_group = node.group.clone();
+                    let pinned = |mut mesh: Mesh| -> Mesh {
+                        if let Ok(Some(mask)) = groups::point_mask(&mesh, &pin_group) {
+                            let pin = mesh.point_attributes.entry("pin".into()).or_insert_with(|| vec![0.0; mask.len()]);
+                            pin.resize(mask.len(), 0.0);
+                            for (p, m) in pin.iter_mut().zip(mask) {
+                                if m {
+                                    *p = 1.0;
+                                }
+                            }
+                        }
+                        mesh
+                    };
+                    vellum::vellum(
+                        self.sim_key(id),
+                        settings,
+                        time,
+                        animated,
+                        |t| pinned(self.cook_fresh(geometry, t)),
                         || self.cook_fresh(collider, 0.0),
                     )
                 }
@@ -4647,6 +5216,17 @@ impl Graph {
             }
         };
         let mut out = out;
+        // Houdini-style Group: only the group's points/primitives keep this node's changes.
+        if !node.bypass && !node.group.is_empty() && node.kind.group_support() == GroupSupport::Restrict {
+            let source = input(0, cache);
+            match (groups::point_mask(&source, &node.group), groups::prim_mask(&source, &node.group)) {
+                (Ok(Some(points)), Ok(Some(prims))) => {
+                    groups::restrict_to_group(&source, &mut out, &points, &prims);
+                }
+                (Err(e), _) | (_, Err(e)) => out = self.report(id, Err(e)),
+                _ => {}
+            }
+        }
         out.ensure_builtin_ids();
         cache.insert(id, out.clone());
         out
@@ -4654,7 +5234,7 @@ impl Graph {
 
     // ---- scene file / undo snapshot format ----
     fn serialize(&self) -> String {
-        let mut s = String::from("mhip 2\n");
+        let mut s = String::from("pfs 2\n");
         let mut ids: Vec<_> = self.nodes.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
@@ -4732,6 +5312,12 @@ impl Graph {
                 s += &format!("xform {id} {}\n", values.join(" "));
             }
         }
+        for id in self.nodes.keys().copied().collect::<std::collections::BTreeSet<_>>() {
+            let group = &self.nodes[&id].group;
+            if !group.is_empty() {
+                s += &format!("group {id} {} {}\n", group.kind, encode_text(&group.pattern));
+            }
+        }
         let mut displays: Vec<_> = self.displays.iter().collect();
         displays.sort_unstable();
         for (container, display) in displays {
@@ -4756,7 +5342,8 @@ impl Graph {
         let mut legacy_display: Option<NodeId> = None;
         let mut parents: Vec<(NodeId, NodeId)> = Vec::new();
         let mut xforms: Vec<(NodeId, ObjectXform)> = Vec::new();
-        let is_v2 = text.lines().next().is_some_and(|l| l.trim() == "mhip 2");
+        // "pfs 2"; older files say "mhip 2" (same format) or "mhip 1".
+        let is_v2 = text.lines().next().is_some_and(|l| matches!(l.trim(), "pfs 2" | "mhip 2"));
         for line in text.lines() {
             let t: Vec<&str> = line.split_whitespace().collect();
             match t.as_slice() {
@@ -4793,6 +5380,7 @@ impl Graph {
                                     context: ctx,
                                     parent: None,
                                     xform: ObjectXform::default(),
+                                    group: groups::NodeGroup::default(),
                                 },
                             );
                             g.next_id = g.next_id.max(id + 1);
@@ -4855,6 +5443,7 @@ impl Graph {
                                     context: ctx,
                                     parent: None,
                                     xform: ObjectXform::default(),
+                                    group: groups::NodeGroup::default(),
                                 },
                             );
                             g.next_id = g.next_id.max(id + 1);
@@ -4882,7 +5471,7 @@ impl Graph {
                     ) {
                         g.nodes.insert(
                             id,
-                            Node { kind, pos: egui::pos2(x, y), bypass: *bp == "1", context: ctx, parent: None, xform: ObjectXform::default() },
+                            Node { kind, pos: egui::pos2(x, y), bypass: *bp == "1", context: ctx, parent: None, xform: ObjectXform::default(), group: groups::NodeGroup::default() },
                         );
                         g.next_id = g.next_id.max(id + 1);
                     }
@@ -4890,6 +5479,13 @@ impl Graph {
                 ["link", a, b, s] => {
                     if let (Ok(from), Ok(to), Ok(slot)) = (a.parse(), b.parse(), s.parse()) {
                         g.links.push(Link { from, to, slot });
+                    }
+                }
+                ["group", id, kind, pattern] => {
+                    if let (Ok(id), Some(pattern)) = (id.parse::<usize>(), decode_text(pattern)) {
+                        if let Some(node) = g.nodes.get_mut(&id) {
+                            node.group = groups::NodeGroup { pattern, kind: kind.parse::<u8>().unwrap_or(0).min(2) };
+                        }
                     }
                 }
                 ["parent", id, parent] => {
@@ -4994,7 +5590,10 @@ impl Graph {
 
 const NODE_W: f32 = 140.0;
 const NODE_H: f32 = 40.0;
-const SCENE_FILE: &str = "scene.mhip";
+// Scene files are .pfs (ProceduralFX Studio); .mhip is the old name, still opened.
+const SCENE_EXTENSION: &str = "pfs";
+const SCENE_FILE: &str = "scene.pfs";
+const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
 // Returns the MoonRay class name and its RDLA definition for a MAT node's settings.
 fn rdla_material(name: &str, kind: usize, color: [f32; 3], roughness: f32, value: f32) -> (&'static str, String) {
@@ -5339,6 +5938,14 @@ fn sheet_cell(mesh: &Mesh, normals: &[Vec3], source: &SheetSource, row: usize) -
     }
 }
 
+struct GroupPick {
+    node: NodeId,
+    domain: groups::GroupDomain,
+    // The node's input, whose element numbers the group refers to.
+    input: Mesh,
+    previous_mode: SelectionMode,
+}
+
 struct ProceduralFxStudioApp {
     graph: Graph,
     selected: Option<NodeId>,
@@ -5421,6 +6028,22 @@ struct ProceduralFxStudioApp {
     simulation_cancel: Option<Arc<AtomicBool>>,
     moonray_rx: Option<Receiver<RenderOutcome>>,
     updater: updater::Updater,
+    // The file Save writes to; None until the scene is opened or saved as.
+    scene_path: Option<PathBuf>,
+    recent_scenes: Vec<PathBuf>,
+    window_title: String,
+    // Viewport drags paint the selected Attribute Paint node instead of orbiting.
+    paint_active: bool,
+    paint_fill: Option<NodeId>,
+    // Group names on a node's input, for its Group menu: (node, point groups, primitive groups).
+    group_choices: Option<(NodeId, Vec<String>, Vec<String>)>,
+    group_choices_request: Option<NodeId>,
+    // Picking a node's group in the viewport: the viewport shows the node's input meanwhile.
+    group_pick: Option<GroupPick>,
+    group_pick_request: Option<NodeId>,
+    // Some(true) accepts the pick, Some(false) cancels it.
+    group_pick_finish: Option<bool>,
+    group_pick_domain: Option<groups::GroupDomain>,
     moonray_render_requested: bool,
     // Embedded MoonRay defaults and settings
     moonray_default_executable: String,
@@ -5509,6 +6132,7 @@ impl Default for ProceduralFxStudioApp {
             egui::pos2(240.0, 20.0),
         );
         let g = std::fs::read_to_string(SCENE_FILE)
+            .or_else(|_| std::fs::read_to_string(LEGACY_SCENE_FILE))
             .ok()
             .map(|scene| Graph::deserialize(&scene))
             .filter(|scene| !scene.nodes.is_empty())
@@ -5595,6 +6219,17 @@ impl Default for ProceduralFxStudioApp {
             simulation_cancel: None,
             moonray_rx: None,
             updater: updater::Updater::new(),
+            scene_path: None,
+            recent_scenes: load_recent_scenes(),
+            window_title: String::new(),
+            paint_active: false,
+            paint_fill: None,
+            group_choices: None,
+            group_choices_request: None,
+            group_pick: None,
+            group_pick_request: None,
+            group_pick_finish: None,
+            group_pick_domain: None,
             moonray_render_requested: false,
             moonray_default_executable: detected_moonray,
             moonray_default_arguments: default_mr_args,
@@ -6292,11 +6927,47 @@ impl ProceduralFxStudioApp {
             ui.strong("ProceduralFX Studio");
             ui.separator();
             ui.menu_button("File", |ui| {
-                if ui.button("Open scene…").clicked() {
+                let menu_ctx = ui.ctx().clone();
+                let shortcut = |s: &egui::KeyboardShortcut| menu_ctx.format_shortcut(s);
+                if ui.add(egui::Button::new("Open…").shortcut_text(shortcut(&SHORTCUT_OPEN))).clicked() {
                     self.open_scene_dialog();
                     ui.close();
                 }
-                if ui.button("Save scene…").clicked() {
+                ui.add_enabled_ui(!self.recent_scenes.is_empty(), |ui| {
+                    ui.menu_button("Open Recent", |ui| {
+                        let mut chosen = None;
+                        for path in &self.recent_scenes {
+                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                            let button = ui
+                                .add_enabled(path.exists(), egui::Button::new(name))
+                                .on_hover_text(path.display().to_string())
+                                .on_disabled_hover_text(format!("{} (not found)", path.display()));
+                            if button.clicked() {
+                                chosen = Some(path.clone());
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear Recent").clicked() {
+                            self.recent_scenes.clear();
+                            save_recent_scenes(&self.recent_scenes);
+                            ui.close();
+                        }
+                        if let Some(path) = chosen {
+                            self.open_scene(path);
+                            ui.close();
+                        }
+                    });
+                });
+                ui.separator();
+                let save_hover = match &self.scene_path {
+                    Some(path) => format!("Save to {}", path.display()),
+                    None => "Choose where to save this scene".to_owned(),
+                };
+                if ui.add(egui::Button::new("Save").shortcut_text(shortcut(&SHORTCUT_SAVE))).on_hover_text(save_hover).clicked() {
+                    self.save_scene();
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Save As…").shortcut_text(shortcut(&SHORTCUT_SAVE_AS))).clicked() {
                     self.save_scene_dialog();
                     ui.close();
                 }
@@ -6489,29 +7160,84 @@ impl ProceduralFxStudioApp {
     }
 
     fn open_scene_dialog(&mut self) {
-        let Some(path) = FileDialog::new().add_filter("ProceduralFX Scene", &["mhip", "json"]).pick_file() else {
-            self.status = "Load canceled".into();
-            return;
-        };
+        let mut dialog = FileDialog::new().add_filter("ProceduralFX Scene", &[SCENE_EXTENSION, "mhip", "json"]);
+        if let Some(dir) = self.scene_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        match dialog.pick_file() {
+            Some(path) => self.open_scene(path),
+            None => self.status = "Load canceled".into(),
+        }
+    }
+
+    fn open_scene(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
             Ok(s) => {
                 self.undo.push(self.last_state.clone());
                 self.load_state(s);
                 self.status = format!("Loaded {}", path.display());
+                push_recent_scene(&mut self.recent_scenes, path.clone());
+                save_recent_scenes(&self.recent_scenes);
+                self.scene_path = Some(path);
             }
-            Err(e) => self.status = format!("Load failed: {e}"),
+            Err(e) => {
+                self.status = format!("Load failed: {e}");
+                if !path.exists() {
+                    self.recent_scenes.retain(|p| p != &path);
+                    save_recent_scenes(&self.recent_scenes);
+                }
+            }
+        }
+    }
+
+    // Saves to the current scene file, or asks where to save if there isn't one yet.
+    fn save_scene(&mut self) {
+        match self.scene_path.clone() {
+            // An old .mhip scene is saved as .pfs beside it; the original is left alone.
+            Some(path) if path.extension().is_some_and(|e| e == "mhip") => self.write_scene(path.with_extension(SCENE_EXTENSION)),
+            Some(path) => self.write_scene(path),
+            None => self.save_scene_dialog(),
         }
     }
 
     fn save_scene_dialog(&mut self) {
-        let Some(path) = FileDialog::new().set_file_name("scene.mhip").add_filter("ProceduralFX Scene", &["mhip"]).save_file() else {
-            self.status = "Save canceled".into();
-            return;
+        let name = self.scene_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        // Saving an old .mhip scene writes a .pfs next to it.
+        let name = name.map(|n| match n.strip_suffix(".mhip") {
+            Some(stem) => format!("{stem}.{SCENE_EXTENSION}"),
+            None => n,
+        });
+        let mut dialog = FileDialog::new().set_file_name(name.as_deref().unwrap_or(SCENE_FILE)).add_filter("ProceduralFX Scene", &[SCENE_EXTENSION]);
+        if let Some(dir) = self.scene_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        match dialog.save_file() {
+            Some(path) => self.write_scene(path),
+            None => self.status = "Save canceled".into(),
+        }
+    }
+
+    fn write_scene(&mut self, path: PathBuf) {
+        match write_file_atomically(&path, &self.graph.serialize()) {
+            Ok(()) => {
+                self.status = format!("Saved {}", path.display());
+                push_recent_scene(&mut self.recent_scenes, path.clone());
+                save_recent_scenes(&self.recent_scenes);
+                self.scene_path = Some(path);
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let title = match self.scene_path.as_ref().and_then(|p| p.file_name()) {
+            Some(name) => format!("{} — ProceduralFX Studio", name.to_string_lossy()),
+            None => "ProceduralFX Studio".to_owned(),
         };
-        self.status = match std::fs::write(&path, self.graph.serialize()) {
-            Ok(_) => format!("Saved {}", path.display()),
-            Err(e) => format!("Save failed: {e}"),
-        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
     }
 
     fn render_settings_window(&mut self, ctx: &egui::Context) {
@@ -7272,6 +7998,9 @@ impl ProceduralFxStudioApp {
         // The viewport is left-handed and MoonRay right-handed, so z is mirrored
         // here and in the camera, and triangle winding is swapped to match.
         for (index, (mesh, _)) in parts.iter().enumerate() {
+            if mesh.indices.is_empty() {
+                continue;
+            }
             writeln!(f, "RdlMeshGeometry(\"/scene/objects/mesh{index}\") {{") .map_err(|e| e.to_string())?;
             writeln!(f, "    [\"vertex_list_0\"] = {{") .map_err(|e| e.to_string())?;
             for vertex in &mesh.vertices {
@@ -7301,6 +8030,33 @@ impl ProceduralFxStudioApp {
             writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
         }
 
+        // Hair and other curves: linear RdlCurveGeometry, radius from the width attribute.
+        for (index, (mesh, _)) in parts.iter().enumerate() {
+            let curves = groom::curves(mesh);
+            if curves.is_empty() {
+                continue;
+            }
+            let width = mesh.point_attributes.get("width").filter(|w| w.len() == mesh.vertices.len());
+            let mut body = format!("RdlCurveGeometry(\"/scene/objects/curves{index}\") {{\n    [\"curve_type\"] = 0,\n    [\"vertex_list_0\"] = {{\n");
+            for range in &curves {
+                for v in &mesh.vertices[range.clone()] {
+                    body.push_str(&format!("        Vec3({:.7}, {:.7}, {:.7}),\n", v.x, v.y, -v.z));
+                }
+            }
+            body.push_str("    },\n    [\"curves_vertex_count\"] = {\n");
+            for range in &curves {
+                body.push_str(&format!("        {},\n", range.len()));
+            }
+            body.push_str("    },\n    [\"radius_list\"] = {\n");
+            for range in &curves {
+                for i in range.clone() {
+                    body.push_str(&format!("        {:.6},\n", width.map_or(0.005, |w| w[i] * 0.5).max(1e-5)));
+                }
+            }
+            body.push_str("    }\n}\n\n");
+            f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        }
+
         // Fog volumes: VdbGeometry reading the written .vdb, shaded by VdbVolume.
         for (index, vol) in scene.volumes.iter().enumerate() {
             writeln!(f, "VdbGeometry(\"/scene/volumes/volume{index}\") {{") .map_err(|e| e.to_string())?;
@@ -7321,9 +8077,24 @@ impl ProceduralFxStudioApp {
             writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
         }
 
+        // Each part renders as a mesh, curves, or both.
+        let part_geometry: Vec<Vec<String>> = parts
+            .iter()
+            .enumerate()
+            .map(|(index, (mesh, _))| {
+                let mut refs = Vec::new();
+                if !mesh.indices.is_empty() {
+                    refs.push(format!("RdlMeshGeometry(\"/scene/objects/mesh{index}\")"));
+                }
+                if groom::has_curves(mesh) && !groom::curves(mesh).is_empty() {
+                    refs.push(format!("RdlCurveGeometry(\"/scene/objects/curves{index}\")"));
+                }
+                refs
+            })
+            .collect();
         writeln!(f, "GeometrySet(\"/scene/geometrysets/GeometrySet1\") {{") .map_err(|e| e.to_string())?;
-        for index in 0..parts.len() {
-            writeln!(f, "    RdlMeshGeometry(\"/scene/objects/mesh{index}\"),") .map_err(|e| e.to_string())?;
+        for geometry in part_geometry.iter().flatten() {
+            writeln!(f, "    {geometry},") .map_err(|e| e.to_string())?;
         }
         for index in 0..scene.volumes.len() {
             writeln!(f, "    VdbGeometry(\"/scene/volumes/volume{index}\"),") .map_err(|e| e.to_string())?;
@@ -7415,10 +8186,27 @@ impl ProceduralFxStudioApp {
             layer_materials.push(reference);
         }
 
+        // An HDRI environment light replaces the uniform ambient environment below.
+        let hdri = self.environment_light();
+        if let Some((file, color, rotation, visible)) = &hdri {
+            envlight::load(file).map_err(|e| format!("Environment light: {e}"))?;
+            let r = envlight::rotation_rows(*rotation);
+            let m = format!(
+                "Mat4({:.6},{:.6},{:.6},0, {:.6},{:.6},{:.6},0, {:.6},{:.6},{:.6},0, 0,0,0,1)",
+                r[0].x, r[0].y, r[0].z, r[1].x, r[1].y, r[1].z, r[2].x, r[2].y, r[2].z
+            );
+            writeln!(f, "EnvLight(\"/scene/lights/hdri\") {{") .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"texture\"] = \"{}\",", file.replace('\\', "/").replace('"', "\\\"")) .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"color\"] = Rgb({:.4}, {:.4}, {:.4}),", color[0], color[1], color[2]) .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"visible_in_camera\"] = {},", if *visible { 1 } else { 0 }) .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"node_xform\"] = blur({m}, {m})") .map_err(|e| e.to_string())?;
+            writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
+            light_names.push("EnvLight(\"/scene/lights/hdri\")".to_string());
+        }
         // The viewport's ambient term becomes a dim environment light (decoded from sRGB).
         let ambient = self.ambient_light.max(0.0).powf(2.2);
         let environment: [f32; 3] = std::array::from_fn(|i| opts.background[i] + scene.environment.map_or(0.0, |e| e[i]) + ambient);
-        if environment.iter().any(|c| *c > 0.0) {
+        if hdri.is_none() && environment.iter().any(|c| *c > 0.0) {
             writeln!(f, "EnvLight(\"/scene/lights/env\") {{") .map_err(|e| e.to_string())?;
             writeln!(f, "    [\"color\"] = Rgb({:.4}, {:.4}, {:.4}),", environment[0], environment[1], environment[2]) .map_err(|e| e.to_string())?;
             writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
@@ -7432,8 +8220,10 @@ impl ProceduralFxStudioApp {
         writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
 
         writeln!(f, "Layer(\"/scene/layers/Layer1\") {{") .map_err(|e| e.to_string())?;
-        for (index, material) in layer_materials.iter().enumerate() {
-            writeln!(f, "    {{RdlMeshGeometry(\"/scene/objects/mesh{index}\"), \"\", {material}, LightSet(\"/scene/lightsets/LightSet1\"), undef(), undef(), undef(), undef()}},") .map_err(|e| e.to_string())?;
+        for (geometry, material) in part_geometry.iter().zip(&layer_materials) {
+            for geometry in geometry {
+                writeln!(f, "    {{{geometry}, \"\", {material}, LightSet(\"/scene/lightsets/LightSet1\"), undef(), undef(), undef(), undef()}},") .map_err(|e| e.to_string())?;
+            }
         }
         for index in 0..scene.volumes.len() {
             writeln!(f, "    {{VdbGeometry(\"/scene/volumes/volume{index}\"), \"\", LightSet(\"/scene/lightsets/LightSet1\"), VdbVolume(\"/scene/volumes/shader{index}\")}},") .map_err(|e| e.to_string())?;
@@ -7563,6 +8353,21 @@ impl ProceduralFxStudioApp {
 
     // (position, travel direction, color, intensity, kind) for every active Light node,
     // or the viewport's default key/fill rig when the scene has none.
+    // The active (first, not bypassed) environment light with a file: (file, color * intensity, rotation, visible).
+    fn environment_light(&self) -> Option<(String, [f32; 3], f32, bool)> {
+        let mut ids: Vec<NodeId> = self.graph.nodes.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().find_map(|id| {
+            let node = &self.graph.nodes[&id];
+            match &node.kind {
+                NodeKind::EnvironmentLight { file, color, intensity, rotation, visible } if !node.bypass && node.parent.is_none() && !file.trim().is_empty() => {
+                    Some((file.trim().to_owned(), color.map(|c| c * intensity), *rotation, *visible))
+                }
+                _ => None,
+            }
+        })
+    }
+
     fn scene_lights(&self) -> Vec<(Vec3, Vec3, [f32; 3], f32, usize)> {
         let mut ids: Vec<NodeId> = self.graph.nodes.keys().copied().collect();
         ids.sort_unstable();
@@ -7585,7 +8390,8 @@ impl ProceduralFxStudioApp {
                 ))
             })
             .collect();
-        if !lights.is_empty() {
+        // Any light, including an HDRI, replaces the default key/fill rig.
+        if !lights.is_empty() || self.environment_light().is_some() {
             return lights;
         }
         vec![
@@ -7626,7 +8432,7 @@ impl ProceduralFxStudioApp {
         active
             .into_iter()
             .map(|id| (self.graph.cook(id, time, &mut cache), material_of(id)))
-            .filter(|(mesh, _)| !mesh.indices.is_empty() || volume::is_volume(mesh))
+            .filter(|(mesh, _)| !mesh.indices.is_empty() || volume::is_volume(mesh) || groom::has_curves(mesh))
             .collect()
     }
 
@@ -7713,6 +8519,10 @@ impl ProceduralFxStudioApp {
     }
 
     fn rebuild_graph(&mut self) {
+        // While picking a group the viewport keeps showing the node's input.
+        if self.group_pick.is_some() {
+            return;
+        }
         self.cook_generation += 1;
         let t0 = Instant::now();
         // Static nodes stay cached until the network changes; only
@@ -8039,6 +8849,20 @@ impl ProceduralFxStudioApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        // File shortcuts work even while a text field (e.g. VEX code) has focus.
+        // Save As is consumed first so Cmd+Shift+S isn't taken as Cmd+S.
+        let (open, save, save_as) = ctx.input_mut(|i| {
+            let save_as = i.consume_shortcut(&SHORTCUT_SAVE_AS);
+            (i.consume_shortcut(&SHORTCUT_OPEN), i.consume_shortcut(&SHORTCUT_SAVE), save_as)
+        });
+        if save_as {
+            self.save_scene_dialog();
+        } else if save {
+            self.save_scene();
+        }
+        if open {
+            self.open_scene_dialog();
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -8109,6 +8933,73 @@ impl ProceduralFxStudioApp {
         {
             self.create_blast_from_selection();
         }
+    }
+
+    // Shows the node's input and selects its current group, ready for picking.
+    fn start_group_pick(&mut self, id: NodeId) {
+        let Some(node) = self.graph.nodes.get(&id) else { return };
+        let (group, support) = (node.group.clone(), node.kind.group_support());
+        let mut input = self.graph.input_of(id, 0).map(|i| self.graph.cook(i, self.time, &mut HashMap::new())).unwrap_or_default();
+        let domain = match group.kind {
+            1 => groups::GroupDomain::Points,
+            2 => groups::GroupDomain::Prims,
+            // Nodes that work on primitives (scatter, groom roots, blast) start with primitives.
+            _ if group.is_empty() && support == GroupSupport::Native && !matches!(node.kind, NodeKind::Wrangle { .. }) => groups::GroupDomain::Prims,
+            _ => groups::guess_domain(&input, &group.pattern),
+        };
+        let current: Vec<usize> = if group.is_empty() {
+            Vec::new()
+        } else {
+            groups::evaluate(&input, &group.pattern, domain).map(|m| m.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect()).unwrap_or_default()
+        };
+        if let Some(object) = self.graph.enclosing_geometry(id) {
+            input = self.graph.xform_at(object, self.time).apply(input);
+        }
+        self.clear_component_selection();
+        let previous_mode = self.selection_mode;
+        match domain {
+            groups::GroupDomain::Points => {
+                self.selection_mode = SelectionMode::Vertex;
+                self.selected_vertices = current;
+            }
+            groups::GroupDomain::Prims => {
+                self.selection_mode = SelectionMode::Triangle;
+                self.selected_triangles = current;
+            }
+        }
+        self.current_mesh = input.clone();
+        self.group_pick = Some(GroupPick { node: id, domain, input, previous_mode });
+        self.status = "Select in the viewport, then press Enter (or ✓) to set the group; Esc cancels".into();
+    }
+
+    // Switches a running pick between points and primitives.
+    fn set_group_pick_domain(&mut self, domain: groups::GroupDomain) {
+        if let Some(pick) = &mut self.group_pick {
+            pick.domain = domain;
+            self.selection_mode = if domain == groups::GroupDomain::Points { SelectionMode::Vertex } else { SelectionMode::Triangle };
+            self.clear_component_selection();
+        }
+    }
+
+    fn finish_group_pick(&mut self, accept: bool) {
+        let Some(pick) = self.group_pick.take() else { return };
+        if accept {
+            let selected = match pick.domain {
+                groups::GroupDomain::Points => self.selected_vertices.clone(),
+                groups::GroupDomain::Prims => self.selected_triangles.clone(),
+            };
+            let pattern = groups::describe(&pick.input, &selected, pick.domain);
+            if let Some(node) = self.graph.nodes.get_mut(&pick.node) {
+                node.group.kind = if pick.domain == groups::GroupDomain::Points { 1 } else { 2 };
+                self.status = if pattern.is_empty() { "Group cleared (nothing selected): the node applies to everything".into() } else { format!("Group set to {pattern}") };
+                node.group.pattern = pattern;
+            }
+        } else {
+            self.status = "Group selection cancelled".into();
+        }
+        self.selection_mode = pick.previous_mode;
+        self.clear_component_selection();
+        self.dirty = true;
     }
 
     fn clear_component_selection(&mut self) {
@@ -8458,6 +9349,8 @@ impl ProceduralFxStudioApp {
             .map(|(mid, n)| (*mid, format!("{}{}", n.kind.name(), mid)))
             .collect();
         material_ids.sort_unstable();
+        // Group names on the node's input, for the Group field's menu (filled in on request).
+        let group_choices = self.group_choices.as_ref().filter(|(for_id, ..)| *for_id == id).map(|(_, p, q)| (p.clone(), q.clone()));
         let Some(node) = self.graph.nodes.get_mut(&id) else {
             return false;
         };
@@ -8476,6 +9369,74 @@ impl ProceduralFxStudioApp {
                 ui.label(if is_display { "● display" } else { "" });
             }
         });
+        let support = node.kind.group_support();
+        if support != GroupSupport::None {
+            ui.horizontal(|ui| {
+                ui.label(if support == GroupSupport::Pin { "Pin group" } else { "Group" });
+                c |= ui
+                    .add(egui::TextEdit::singleline(&mut node.group.pattern).hint_text("everything").desired_width(150.0))
+                    .on_hover_text("Names (a b), wildcards (side*), numbers (0-10 20-40:2), expressions (@P.y>0), ^name to exclude, !name for everything else")
+                    .changed();
+                let menu = ui.menu_button("▾", |ui| {
+                    match &group_choices {
+                        None => {
+                            ui.weak("Reading groups…");
+                        }
+                        Some((points, prims)) if points.is_empty() && prims.is_empty() => {
+                            ui.weak("The input has no groups (make one with Group Create)");
+                        }
+                        Some((points, prims)) => {
+                            for (list, label) in [(points, "Point groups"), (prims, "Primitive groups")] {
+                                if list.is_empty() {
+                                    continue;
+                                }
+                                ui.strong(label);
+                                for name in list {
+                                    if ui.button(name).clicked() {
+                                        node.group.pattern = name.clone();
+                                        c = true;
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                if menu.inner.is_some() {
+                    self.group_choices_request = Some(id);
+                }
+                let picking = self.group_pick.as_ref().is_some_and(|p| p.node == id);
+                if !picking && ui.button("⬚ Select").on_hover_text("Pick the group's points or primitives in the viewport").clicked() {
+                    self.group_pick_request = Some(id);
+                }
+                egui::ComboBox::from_id_salt("group_type").selected_text(groups::GROUP_TYPES[node.group.kind.min(2) as usize]).width(110.0).show_ui(ui, |ui| {
+                    for (value, label) in groups::GROUP_TYPES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut node.group.kind, value as u8, *label).changed();
+                    }
+                });
+            });
+            if let Some(pick) = self.group_pick.as_ref().filter(|p| p.node == id) {
+                let picked = match pick.domain {
+                    groups::GroupDomain::Points => self.selected_vertices.len(),
+                    groups::GroupDomain::Prims => self.selected_triangles.len(),
+                };
+                let domain = pick.domain;
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(255, 210, 90), format!("Selecting: {picked}"));
+                    for (d, label) in [(groups::GroupDomain::Points, "Points"), (groups::GroupDomain::Prims, "Primitives")] {
+                        if ui.selectable_label(domain == d, label).clicked() && domain != d {
+                            self.group_pick_domain = Some(d);
+                        }
+                    }
+                    if ui.button("✓ Accept").clicked() {
+                        self.group_pick_finish = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.group_pick_finish = Some(false);
+                    }
+                });
+            }
+        }
         ui.separator();
 
         match &mut node.kind {
@@ -8771,16 +9732,35 @@ impl ProceduralFxStudioApp {
                 spread,
                 gravity,
                 seed,
+                drag,
+                bounce,
+                friction,
+                radius,
+                substeps,
+                along_normals,
             } => {
-                ui.label("Animated point-particle emitter");
-                c |= ui.add(egui::Slider::new(count, 1..=50_000).logarithmic(true).text("Particles")).changed();
-                c |= ui.add(egui::Slider::new(emission_rate, 1.0..=10_000.0).logarithmic(true).text("Emission rate")).changed();
+                ui.small("Input 1: optional source (emits from its surface, or its points; the origin when unconnected) • Input 2: optional static collider.");
+                ui.strong("Emission");
+                c |= ui.add(egui::Slider::new(count, 1..=50_000).logarithmic(true).text("Max particles")).changed();
+                c |= ui.add(egui::Slider::new(emission_rate, 1.0..=10_000.0).logarithmic(true).text("Birth rate (per second)")).changed();
                 c |= ui.add(egui::Slider::new(lifetime, 0.1..=20.0).text("Lifetime")).changed();
                 c |= ui.add(egui::Slider::new(speed, 0.0..=20.0).text("Speed")).changed();
                 c |= ui.add(egui::Slider::new(spread, 0.0..=2.0).text("Spread")).changed();
+                c |= ui
+                    .checkbox(along_normals, "Emit along source normals")
+                    .on_hover_text("Off: particles head up (+Y). Points inherit their v attribute either way.")
+                    .changed();
+                ui.strong("Forces");
                 c |= ui.add(egui::Slider::new(gravity, -20.0..=10.0).text("Gravity")).changed();
+                c |= ui.add(egui::Slider::new(drag, 0.0..=5.0).text("Drag")).changed();
+                ui.strong("Collisions");
+                c |= ui.add(egui::Slider::new(bounce, 0.0..=1.0).text("Bounce")).changed();
+                c |= ui.add(egui::Slider::new(friction, 0.0..=1.0).text("Friction")).changed();
+                c |= ui.add(egui::Slider::new(radius, 0.0..=0.5).text("Particle radius")).changed();
+                ui.strong("Solver");
+                c |= ui.add(egui::Slider::new(substeps, 1..=8).text("Substeps")).changed();
                 c |= ui.add(egui::Slider::new(seed, 0..=9999).text("Seed")).changed();
-                ui.small("Particles display automatically when this node is the active output.");
+                ui.small("Outputs points with v, age, life and id attributes.");
             }
             NodeKind::Flip {
                 particle_count,
@@ -9025,6 +10005,55 @@ impl ProceduralFxStudioApp {
                     .changed();
                 ui.label("Adds shared-edge subdivisions until the target is reached.");
             }
+            NodeKind::HairGuides(set) => {
+                ui.small("Input 1: skin mesh. Grows guide curves from its surface along the normals.");
+                c |= ui.add(egui::Slider::new(&mut set.count, 1..=20_000).logarithmic(true).text("Guides")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.length, 0.0..=5.0).text("Length")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.length_variance, 0.0..=1.0).text("Length variance")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.segments, 1..=64).text("Segments")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.droop, 0.0..=3.0).text("Droop")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+            }
+            NodeKind::GuideProcess(set) => {
+                ui.small("Shapes the guide curves from input 1. Chain several to combine operations.");
+                egui::ComboBox::from_label("Operation").selected_text(groom::GUIDE_OPS[set.op.min(groom::GUIDE_OPS.len() - 1)]).show_ui(ui, |ui| {
+                    for (i, label) in groom::GUIDE_OPS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.op, i, *label).changed();
+                    }
+                });
+                let (amount_label, range) = match set.op {
+                    0 => ("Length", 0.0..=5.0),
+                    1 => ("Bend", 0.0..=5.0),
+                    2 => ("Frizz", 0.0..=2.0),
+                    3 => ("Curl radius", 0.0..=2.0),
+                    _ => ("Smoothing", 0.0..=2.0),
+                };
+                c |= ui.add(egui::Slider::new(&mut set.amount, range).text(amount_label)).changed();
+                if matches!(set.op, 2 | 3) {
+                    let label = if set.op == 2 { "Frequency" } else { "Turns per unit length" };
+                    c |= ui.add(egui::Slider::new(&mut set.frequency, 0.0..=20.0).text(label)).changed();
+                    c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                }
+            }
+            NodeKind::HairDeform(set) => {
+                ui.small("Input 1: hair or guides • Input 2: animated skin. Each strand moves with the skin under its root.");
+                c |= ui
+                    .add(egui::DragValue::new(&mut set.rest_frame).speed(1.0).range(-10_000.0..=100_000.0).prefix("Rest frame "))
+                    .on_hover_text("The frame the hair was groomed on. The skin must keep the same topology at every frame.")
+                    .changed();
+            }
+            NodeKind::HairGenerate(set) => {
+                ui.small("Input 1: skin • Input 2: guides. Interpolates dense hair from the three nearest guides.");
+                c |= ui.add(egui::Slider::new(&mut set.count, 1..=200_000).logarithmic(true).text("Hairs")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.segments, 1..=64).text("Segments")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.clump, 0.0..=1.0).text("Clumping")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.length_variance, 0.0..=1.0).text("Length variance")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.frizz, 0.0..=2.0).text("Frizz")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.width_root, 0.0..=0.05).text("Root width")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.width_tip, 0.0..=0.05).text("Tip width")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                ui.small("Merge the result with the skin to render both.");
+            }
             NodeKind::Pyro(set) => {
                 ui.heading("Pyro Solver");
                 ui.small("Smoke and fire on a voxel grid. Input 1: source (closed mesh or points, pscale sets point radius) • Input 2: optional collider (closed mesh).");
@@ -9066,6 +10095,238 @@ impl ProceduralFxStudioApp {
                 c |= vec3_ui(ui, "Wind", &mut set.wind, 0.05);
                 c |= ui.add(egui::Slider::new(&mut set.opacity, 0.0..=4.0).text("Display opacity")).changed();
                 ui.small("Output: points with density, temperature, flame, Cd, Alpha and pscale, drawn as soft volume splats. Edits restart the simulation.");
+            }
+            NodeKind::GroupCreate(set) => {
+                ui.horizontal(|ui| {
+                    ui.label("Group name");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.name).desired_width(140.0)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Type");
+                    c |= ui.selectable_value(&mut set.domain, groups::GroupDomain::Points, "Points").changed();
+                    c |= ui.selectable_value(&mut set.domain, groups::GroupDomain::Prims, "Primitives").changed();
+                });
+                egui::ComboBox::from_label("Method").selected_text(groups::CREATE_METHODS[set.method.min(3)]).show_ui(ui, |ui| {
+                    for (value, label) in groups::CREATE_METHODS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.method, value, *label).changed();
+                    }
+                });
+                match set.method {
+                    0 => {
+                        c |= vec3_ui(ui, "Min", &mut set.bbox_min, 0.05);
+                        c |= vec3_ui(ui, "Max", &mut set.bbox_max, 0.05);
+                    }
+                    1 => {
+                        c |= ui.add(egui::Slider::new(&mut set.percent, 0.0..=100.0).text("Percent")).changed();
+                        c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                    }
+                    2 => {
+                        c |= vec3_ui(ui, "Direction", &mut set.direction, 0.05);
+                        c |= ui.add(egui::Slider::new(&mut set.spread, 0.0..=180.0).text("Spread angle")).changed();
+                    }
+                    _ => {
+                        c |= ui.add(egui::TextEdit::singleline(&mut set.expression).hint_text("@P.y>0  0-10  other ^skip").desired_width(220.0)).changed();
+                    }
+                }
+                egui::ComboBox::from_label("Combine").selected_text(groups::COMBINE_MODES[set.combine.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in groups::COMBINE_MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.combine, value, *label).changed();
+                    }
+                });
+                c |= ui.checkbox(&mut set.invert, "Invert").changed();
+                ui.small("Stored as a 0/1 attribute (group:name / prim:group:name); use the name in any node's Group field.");
+            }
+            NodeKind::EnvironmentLight { file, color, intensity, rotation, visible } => {
+                ui.heading("Environment Light");
+                ui.small("Lights the scene from a lat-long HDRI (.exr or .hdr), in MoonRay and the viewport.");
+                ui.horizontal(|ui| {
+                    c |= ui.add(egui::TextEdit::singleline(file).hint_text("/path/to/sky.exr").desired_width(220.0)).changed();
+                    if ui.button("Browse…").clicked() {
+                        if let Some(chosen) = FileDialog::new().add_filter("HDRI", &["exr", "hdr", "png", "jpg", "jpeg", "tif", "tiff"]).pick_file() {
+                            *file = chosen.to_string_lossy().into_owned();
+                            c = true;
+                        }
+                    }
+                });
+                if !file.is_empty() {
+                    if let Err(e) = envlight::load(file) {
+                        ui.colored_label(egui::Color32::from_rgb(230, 110, 90), e);
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    c |= ui.color_edit_button_rgb(color).changed();
+                });
+                c |= ui.add(egui::Slider::new(intensity, 0.0..=10.0).text("Intensity")).changed();
+                c |= ui.add(egui::Slider::new(rotation, -180.0..=180.0).text("Rotate (Y°)")).changed();
+                c |= ui.checkbox(visible, "Visible in camera (background)").changed();
+            }
+            NodeKind::AttributePaint { attribute, values, settings: set } => {
+                let painting = self.paint_active;
+                if ui
+                    .selectable_label(painting, if painting { "🖌 Painting — drag in the viewport (Ctrl erases)" } else { "🖌 Paint in viewport" })
+                    .on_hover_text("While on, dragging in the viewport paints instead of orbiting. Right/middle drag still pans.")
+                    .clicked()
+                {
+                    self.paint_active = !painting;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Attribute");
+                    c |= ui.add(egui::TextEdit::singleline(attribute).desired_width(110.0)).changed();
+                    egui::ComboBox::from_id_salt("paint_presets").selected_text("Groom ▾").show_ui(ui, |ui| {
+                        for name in paint::GROOM_ATTRIBUTES {
+                            if ui.selectable_label(attribute == name, name).clicked() {
+                                *attribute = name.to_owned();
+                                c = true;
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    for (value, label) in paint::PAINT_MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.mode, value, *label).changed();
+                    }
+                });
+                c |= ui.add(egui::Slider::new(&mut set.value, -2.0..=4.0).text("Paint value")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.default, -2.0..=4.0).text("Default (unpainted)")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.radius, 2.0..=400.0).logarithmic(true).text("Brush radius (px)")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.strength, 0.01..=1.0).text("Strength")).changed();
+                c |= ui.checkbox(&mut set.visualize, "Show as colour (Cd)").changed();
+                ui.horizontal(|ui| {
+                    if ui.button("Fill with paint value").clicked() {
+                        // Needs the input's point count; done at the start of the next frame.
+                        self.paint_fill = Some(id);
+                    }
+                    if ui.button("Clear").clicked() {
+                        values.clear();
+                        c = true;
+                    }
+                });
+                ui.small(format!(
+                    "{} painted point(s). The groom reads density, length, clump, frizz and mask from the skin.",
+                    values.len()
+                ));
+            }
+            NodeKind::Normal(set) => {
+                ui.horizontal(|ui| {
+                    ui.label("Add normals to");
+                    for (value, label) in sops::NORMAL_DOMAINS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.domain, value, *label).changed();
+                    }
+                });
+                if set.domain == 1 {
+                    c |= ui
+                        .add(egui::Slider::new(&mut set.cusp_angle, 0.0..=180.0).text("Cusp angle"))
+                        .on_hover_text("Faces meeting at a sharper angle than this keep a hard edge")
+                        .changed();
+                }
+                egui::ComboBox::from_label("Weighting").selected_text(sops::NORMAL_WEIGHTS[set.weighting.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in sops::NORMAL_WEIGHTS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.weighting, value, *label).changed();
+                    }
+                });
+                c |= ui.checkbox(&mut set.reverse, "Reverse normals").changed();
+                ui.small("The viewport shades with these normals (vertex N, then point N).");
+            }
+            NodeKind::Scatter(set) => {
+                ui.small("Scatters points on the input's surface, or inside it when it's a closed mesh. Points get N, pscale and sourceprim.");
+                c |= ui.add(egui::Slider::new(&mut set.count, 1..=1_000_000).logarithmic(true).text("Points")).changed();
+                c |= ui.checkbox(&mut set.volume, "Fill the inside (closed meshes)").changed();
+                c |= ui.add(egui::Slider::new(&mut set.relax_iterations, 0..=50).text("Relax iterations")).on_hover_text("Spreads the points out evenly").changed();
+                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+            }
+            NodeKind::UvTexture(set) => {
+                egui::ComboBox::from_label("Projection").selected_text(sops::UV_PROJECTIONS[set.projection.min(3)]).show_ui(ui, |ui| {
+                    for (value, label) in sops::UV_PROJECTIONS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.projection, value, *label).changed();
+                    }
+                });
+                if matches!(set.projection, 0 | 1) {
+                    ui.horizontal(|ui| {
+                        ui.label(if set.projection == 0 { "Project along" } else { "Cylinder axis" });
+                        for (value, label) in sops::AXES.iter().enumerate() {
+                            c |= ui.selectable_value(&mut set.axis, value, *label).changed();
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Scale");
+                    c |= ui.add(egui::DragValue::new(&mut set.scale[0]).speed(0.01)).changed();
+                    c |= ui.add(egui::DragValue::new(&mut set.scale[1]).speed(0.01)).changed();
+                    ui.label("Offset");
+                    c |= ui.add(egui::DragValue::new(&mut set.offset[0]).speed(0.01)).changed();
+                    c |= ui.add(egui::DragValue::new(&mut set.offset[1]).speed(0.01)).changed();
+                });
+                ui.small("Writes vertex:uv. Follow with UV Quick Shade to see them.");
+            }
+            NodeKind::UvTransform(set) => {
+                for (label, value) in [("Translate", &mut set.translate), ("Scale", &mut set.scale), ("Pivot", &mut set.pivot)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        c |= ui.add(egui::DragValue::new(&mut value[0]).speed(0.01)).changed();
+                        c |= ui.add(egui::DragValue::new(&mut value[1]).speed(0.01)).changed();
+                    });
+                }
+                c |= ui.add(egui::Slider::new(&mut set.rotate, -180.0..=180.0).text("Rotate")).changed();
+            }
+            NodeKind::UvQuickShade { file } => {
+                ui.small("Shows a texture on the UVs in the viewport. Leave the file empty for a checker grid.");
+                ui.horizontal(|ui| {
+                    c |= ui.add(egui::TextEdit::singleline(file).hint_text("checker grid").desired_width(220.0)).changed();
+                    if ui.button("Browse…").clicked() {
+                        if let Some(chosen) = FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg", "tga", "bmp", "exr", "tif", "tiff"]).pick_file() {
+                            *file = chosen.to_string_lossy().into_owned();
+                            c = true;
+                        }
+                    }
+                    if !file.is_empty() && ui.button("Clear").clicked() {
+                        file.clear();
+                        c = true;
+                    }
+                });
+            }
+            NodeKind::VellumSolver(set) => {
+                ui.heading("Vellum Solver");
+                ui.small("Input 1: geometry (a mesh for cloth/softbody, curves for hair, points for grains) • Input 2: optional static collider. Pin points with f@pin = 1; hair roots are pinned automatically.");
+                ui.horizontal(|ui| {
+                    ui.label("Type");
+                    for (value, label) in vellum::VELLUM_TYPES.iter().enumerate() {
+                        if ui.selectable_label(set.kind == value, *label).clicked() && set.kind != value {
+                            // Switching type loads that type's typical settings.
+                            *set = vellum::VellumSettings::defaults(value);
+                            c = true;
+                        }
+                    }
+                });
+                ui.strong("Constraints");
+                if set.kind != 3 {
+                    c |= ui.add(egui::Slider::new(&mut set.stretch_stiffness, 1.0..=1e8).logarithmic(true).text("Stretch stiffness")).changed();
+                }
+                if matches!(set.kind, 0 | 1) {
+                    c |= ui.add(egui::Slider::new(&mut set.bend_stiffness, 1e-3..=1e5).logarithmic(true).text("Bend stiffness")).changed();
+                }
+                if set.kind == 2 {
+                    c |= ui.add(egui::Slider::new(&mut set.shape_stiffness, 0.0..=1.0).text("Shape stiffness")).changed();
+                }
+                c |= ui.add(egui::Slider::new(&mut set.mass, 1e-3..=100.0).logarithmic(true).text("Mass per point")).changed();
+                let thickness_label = if set.kind == 3 { "Grain radius (pscale overrides)" } else { "Thickness" };
+                c |= ui.add(egui::Slider::new(&mut set.thickness, 1e-3..=0.5).logarithmic(true).text(thickness_label)).changed();
+                ui.strong("Forces and collisions");
+                c |= ui.add(egui::Slider::new(&mut set.gravity, -30.0..=10.0).text("Gravity")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.damping, 0.0..=5.0).text("Damping")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.friction, 0.0..=1.0).text("Friction")).changed();
+                c |= ui.checkbox(&mut set.ground, "Ground plane (y = 0)").changed();
+                c |= ui.checkbox(&mut set.self_collision, "Self collision").on_hover_text("Point-based: keeps points apart by their thickness").changed();
+                c |= ui
+                    .checkbox(&mut set.pin_to_animation, "Pins follow animation")
+                    .on_hover_text("Pinned points track the animated input (e.g. hair roots on a moving head)")
+                    .changed();
+                ui.strong("Solver");
+                c |= ui
+                    .add(egui::Slider::new(&mut set.substeps, 1..=100).text("Substeps"))
+                    .on_hover_text("Raise this first if cloth stretches: small steps converge better than extra iterations")
+                    .changed();
+                c |= ui.add(egui::Slider::new(&mut set.iterations, 1..=200).text("Constraint iterations")).changed();
             }
             NodeKind::RbdSolver(set) => {
                 ui.heading("RBD Bullet Solver");
@@ -9400,6 +10661,9 @@ impl ProceduralFxStudioApp {
         }
         if let Some(error) = node_errors(|errors| errors.get(&id).cloned()) {
             ui.colored_label(egui::Color32::from_rgb(240, 110, 110), format!("✖ {error}"));
+        }
+        if let Some(note) = node_notes(|notes| notes.get(&id).cloned()) {
+            ui.colored_label(egui::Color32::from_rgb(240, 190, 90), format!("⚠ {note}"));
         }
         if self.graph.nodes.get(&id).is_some_and(|n| n.kind.is_solver()) {
             ui.add_space(4.0);
@@ -9835,7 +11099,10 @@ impl ProceduralFxStudioApp {
                 }
             });
         }
-        if response.dragged_by(egui::PointerButton::Primary) && !box_select_modifier && self.gizmo_drag.is_none() {
+        let paint_node = self
+            .selected
+            .filter(|id| self.paint_active && matches!(self.graph.nodes.get(id).map(|n| &n.kind), Some(NodeKind::AttributePaint { .. })));
+        if response.dragged_by(egui::PointerButton::Primary) && !box_select_modifier && self.gizmo_drag.is_none() && paint_node.is_none() {
             self.cam_rot_y += response.drag_delta().x * 0.01;
             self.cam_rot_x = (self.cam_rot_x + response.drag_delta().y * 0.01).clamp(-1.55, 1.55);
         }
@@ -9871,6 +11138,41 @@ impl ProceduralFxStudioApp {
         let ortho_half_h = half_h / ortho_scale;
         let rect_min = response.rect.min;
         let rect_max = response.rect.max;
+        // HDRI background: the environment along each view ray, on a coarse grid.
+        if let Some((file, scale, rotation, true)) = self.environment_light() {
+            if let Ok(map) = envlight::load(&file) {
+                let view_dir = |pos: egui::Pos2| -> Vec3 {
+                    let (rx, ry, rrz) = if self.orthographic {
+                        (0.0, 0.0, 1.0)
+                    } else {
+                        ((pos.x - center.x) / focal, -(pos.y - center.y) / focal, 1.0)
+                    };
+                    // Undo the viewport rotation (inverse of to_cam).
+                    let y = ry * cos_x + rrz * sin_x;
+                    let rz = -ry * sin_x + rrz * cos_x;
+                    Vec3::new(rx * cos_y + rz * sin_y, y, -rx * sin_y + rz * cos_y).normalize()
+                };
+                let tone = |v: f32| ((v / (1.0 + v)).powf(1.0 / 2.2) * 255.0).clamp(0.0, 255.0) as u8;
+                let cell = 16.0;
+                let (cols, rows) = ((response.rect.width() / cell).ceil() as usize + 1, (response.rect.height() / cell).ceil() as usize + 1);
+                let mut sky = egui::epaint::Mesh::default();
+                for j in 0..rows {
+                    for i in 0..cols {
+                        let pos = egui::pos2(rect_min.x + i as f32 * cell, rect_min.y + j as f32 * cell);
+                        let l = map.radiance(view_dir(pos), rotation);
+                        sky.colored_vertex(pos, egui::Color32::from_rgb(tone(l[0] * scale[0]), tone(l[1] * scale[1]), tone(l[2] * scale[2])));
+                    }
+                }
+                for j in 0..rows - 1 {
+                    for i in 0..cols - 1 {
+                        let a = (j * cols + i) as u32;
+                        sky.add_triangle(a, a + 1, a + cols as u32);
+                        sky.add_triangle(a + 1, a + cols as u32 + 1, a + cols as u32);
+                    }
+                }
+                painter.add(egui::Shape::mesh(sky));
+            }
+        }
         let gizmo_center = response.rect.right_top() + egui::vec2(-54.0, 54.0);
         let gizmo_clicked = response.clicked()
             && response.interact_pointer_pos().is_some_and(|p| {
@@ -9939,6 +11241,39 @@ impl ProceduralFxStudioApp {
                 egui::pos2(center.x + c.x / c.z * focal, center.y - c.y / c.z * focal)
             }
         };
+
+        // Attribute Paint brush: dabs while dragging, applied to the node after drawing.
+        let mut pending_paint: Option<(NodeId, Vec<f32>)> = None;
+        if let (Some(id), Some(hover)) = (paint_node, response.hover_pos()) {
+            if let Some(NodeKind::AttributePaint { values, settings, .. }) = self.graph.nodes.get(&id).map(|n| &n.kind) {
+                painter.circle_stroke(hover, settings.radius, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 90)));
+                if response.dragged_by(egui::PointerButton::Primary) || response.clicked() {
+                    // Paint on the node's own points, placed where the viewport shows them.
+                    let mut points = self.graph.cook(id, self.time, &mut HashMap::new());
+                    if let Some(object) = self.graph.enclosing_geometry(id) {
+                        points = self.graph.xform_at(object, self.time).apply(points);
+                    }
+                    let facing = paint::facing(&points, to_cam);
+                    let screen: Vec<Option<(f32, f32)>> = points
+                        .vertices
+                        .iter()
+                        .zip(&facing)
+                        .map(|(p, front)| {
+                            let c = to_cam(*p);
+                            (*front && c.z > near_plane).then(|| project_cam(c)).map(|s| (s.x, s.y))
+                        })
+                        .collect();
+                    let mut brush = settings.clone();
+                    if ctx.input(|i| i.modifiers.command) {
+                        brush.mode = 1;
+                    }
+                    let mut updated = paint::values_for(values, points.vertices.len(), settings.default);
+                    if paint::dab(&mut updated, &points, &screen, (hover.x, hover.y), &brush) {
+                        pending_paint = Some((id, updated));
+                    }
+                }
+            }
+        }
 
         // 3D camera-space frustum line clipper
         let clip_line_frustum_3d = |mut p1: Vec3, mut p2: Vec3| -> Option<(Vec3, Vec3)> {
@@ -10104,6 +11439,20 @@ impl ProceduralFxStudioApp {
             }
         }
 
+        if let Some(pick) = &self.group_pick {
+            let (count, what) = match pick.domain {
+                groups::GroupDomain::Points => (self.selected_vertices.len(), "points"),
+                groups::GroupDomain::Prims => (self.selected_triangles.len(), "primitives"),
+            };
+            let name = self.graph.nodes.get(&pick.node).map_or(String::new(), |n| format!("{}{}", n.kind.name(), pick.node));
+            painter.text(
+                response.rect.center_top() + egui::vec2(0.0, 14.0),
+                egui::Align2::CENTER_TOP,
+                format!("Group for {name}: {count} {what} selected — Shift-drag to box select · Enter to accept · Esc to cancel"),
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgb(255, 210, 90),
+            );
+        }
         let mesh = &self.current_mesh;
         let projected: Vec<Option<(egui::Pos2, f32)>> = mesh
             .vertices
@@ -10329,11 +11678,23 @@ impl ProceduralFxStudioApp {
                 }
             }
         }
-        let vertex_normals = mesh.compute_normals();
+        // Stored normals (Normal node) shade the surface; otherwise they're computed.
+        let corner_normals = sops::corner_normals(mesh);
+        // UV Quick Shade: the texture and each triangle corner's UV.
+        let quickshade = sops::quickshade_file(mesh).and_then(|file| sops::corner_uvs(mesh).map(|uvs| (quickshade_texture(&file), uvs)));
+        let textured = quickshade.is_some() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals);
         let ambient = self.ambient_light.clamp(0.0, 1.0);
         let lights = self.scene_lights();
+        let environment = self.environment_light().and_then(|(file, scale, rotation, _)| envlight::load(&file).ok().map(|map| (map, scale, rotation)));
         let illumination = |normal: Vec3, point: Vec3| -> [f32; 3] {
             let mut rgb = [ambient; 3];
+            // Image-based diffuse light from the HDRI.
+            if let Some((map, scale, rotation)) = &environment {
+                let e = map.diffuse(normal, *rotation);
+                for c in 0..3 {
+                    rgb[c] += e[c] * scale[c];
+                }
+            }
             for (position, direction, color, intensity, kind) in &lights {
                 let to_light = if *kind == 1 {
                     (*position).sub(point).normalize()
@@ -10356,8 +11717,11 @@ impl ProceduralFxStudioApp {
 
         struct Poly {
             pts: [egui::Pos2; 3],
-            z: f32,
+            // Camera-space depth of each corner, for the depth buffer.
+            depth: [f32; 3],
             colors: [egui::Color32; 3],
+            // Texture coordinates when the mesh is quick-shaded.
+            uv: Option<[egui::Pos2; 3]>,
         }
         let cd = mesh.point_attributes.get("Cd");
         let cd_color = |index: usize| -> Option<egui::Color32> {
@@ -10472,11 +11836,19 @@ impl ProceduralFxStudioApp {
                     (f32::from(base.b()) * light[2]).clamp(0.0, 255.0) as u8,
                 )
             };
-            let colors = [
-                lit_color(0, v0, vertex_normals[tri[0]]),
-                lit_color(1, v1, vertex_normals[tri[1]]),
-                lit_color(2, v2, vertex_normals[tri[2]]),
-            ];
+            let corner_n = corner_normals[tri_index];
+            let colors = if textured {
+                // White, lit; the texture supplies the colour.
+                let lit = |point: Vec3, normal: Vec3| {
+                    let n = if self.render_mode == RenderMode::FlatShaded { face_normal } else { normal };
+                    let l = illumination(n, point);
+                    egui::Color32::from_rgb((255.0 * l[0]).min(255.0) as u8, (255.0 * l[1]).min(255.0) as u8, (255.0 * l[2]).min(255.0) as u8)
+                };
+                [lit(v0, corner_n[0]), lit(v1, corner_n[1]), lit(v2, corner_n[2])]
+            } else {
+                [lit_color(0, v0, corner_n[0]), lit_color(1, v1, corner_n[1]), lit_color(2, v2, corner_n[2])]
+            };
+            let uv = quickshade.as_ref().filter(|_| textured).map(|(_, uvs)| uvs[tri_index].map(|c| egui::pos2(c[0], 1.0 - c[1])));
             let camera_triangle = [to_cam(v0), to_cam(v1), to_cam(v2)];
             let clipped = clip_triangle(camera_triangle);
             if clipped.len() < 3 {
@@ -10492,11 +11864,10 @@ impl ProceduralFxStudioApp {
                     continue;
                 }
                 queue.push(Poly {
+                    // Near-plane clipped pieces fall back to untextured shading.
+                    uv: if clipped.len() == 3 { uv } else { None },
                     pts: [a, b, c],
-                    // Draw a triangle only after all geometry that can be
-                    // behind its farthest point. Average depth is unstable
-                    // on displaced surfaces and causes painter-order streaks.
-                    z: (first.z + clipped[i].z + clipped[i + 1].z) / 3.0,
+                    depth: [first.z, clipped[i].z, clipped[i + 1].z],
                     colors: if clipped.len() == 3 {
                         colors
                     } else {
@@ -10510,25 +11881,49 @@ impl ProceduralFxStudioApp {
                 });
             }
         }
-        queue.sort_by(|p, q| q.z.partial_cmp(&p.z).unwrap_or(std::cmp::Ordering::Equal));
-
-        let wire = match self.render_mode {
-            RenderMode::Wireframe => egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 220, 120)),
-            RenderMode::ShadedWireframe => egui::Stroke::new(1.0, egui::Color32::from_black_alpha(110)),
-            _ => egui::Stroke::NONE,
+        // Surfaces and wireframe go through a depth buffer (see raster.rs), at the
+        // screen's pixel density, then onto the viewport as one image.
+        let wire: Option<[u8; 4]> = match self.render_mode {
+            RenderMode::Wireframe => Some([80, 220, 120, 255]),
+            RenderMode::ShadedWireframe => Some([0, 0, 0, 110]),
+            _ => None,
         };
-        for p in queue {
-            let mut mesh = egui::epaint::Mesh::default();
-            for i in 0..3 {
-                mesh.colored_vertex(p.pts[i], p.colors[i]);
+        if !queue.is_empty() {
+            const MAX_PIXELS: f32 = 2.5e6;
+            let size = response.rect.size();
+            let mut scale = ctx.pixels_per_point();
+            if size.x * size.y * scale * scale > MAX_PIXELS {
+                scale = (MAX_PIXELS / (size.x * size.y)).sqrt();
             }
-            mesh.add_triangle(0, 1, 2);
-            painter.add(egui::Shape::mesh(mesh));
-            if wire != egui::Stroke::NONE {
-                painter.line_segment([p.pts[0], p.pts[1]], wire);
-                painter.line_segment([p.pts[1], p.pts[2]], wire);
-                painter.line_segment([p.pts[2], p.pts[0]], wire);
-            }
+            let (w, h) = ((size.x * scale).round().max(1.0) as usize, (size.y * scale).round().max(1.0) as usize);
+            let mut raster = raster::Raster::new(w, h, self.orthographic);
+            let to_pixel = |p: egui::Pos2, z: f32| raster::ScreenVertex { x: (p.x - rect_min.x) * scale, y: (p.y - rect_min.y) * scale, z };
+            let rgb = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
+            let texture = quickshade.as_ref().map(|(texture, _)| texture.clone());
+            // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
+            let triangles: Vec<raster::Triangle> = if self.render_mode == RenderMode::Wireframe {
+                Vec::new()
+            } else {
+                queue
+                    .iter()
+                    .map(|p| raster::Triangle {
+                        v: [0, 1, 2].map(|k| to_pixel(p.pts[k], p.depth[k])),
+                        rgb: p.colors.map(rgb),
+                        uv: p.uv.zip(texture.as_deref()).map(|(uv, t)| (uv.map(|c| [c.x, c.y]), t)),
+                    })
+                    .collect()
+            };
+            let lines: Vec<raster::Line> = match wire {
+                Some(colour) => queue
+                    .iter()
+                    .flat_map(|p| [(0, 1), (1, 2), (2, 0)].map(|(a, b)| raster::Line { a: to_pixel(p.pts[a], p.depth[a]), b: to_pixel(p.pts[b], p.depth[b]), rgba: colour }))
+                    .collect(),
+                None => Vec::new(),
+            };
+            raster.draw(&triangles, &lines);
+            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], raster.color.as_flattened());
+            let texture = viewport_texture(ctx, image);
+            painter.image(texture.id(), response.rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         }
 
         let view_display = self.view_displays().first().copied();
@@ -10564,7 +11959,29 @@ impl ProceduralFxStudioApp {
                 }
             }
         }
+        // Hair and other curves (see groom.rs) are drawn as lines, not loose points.
+        let curve_ranges = groom::curves(mesh);
+        for range in &curve_ranges {
+            for i in range.clone() {
+                if let Some(is_referenced) = referenced.get_mut(i) {
+                    *is_referenced = true;
+                }
+            }
+        }
         let has_unreferenced_points = referenced.iter().any(|&is_referenced| !is_referenced);
+        if !curve_ranges.is_empty() {
+            // Dense grooms are thinned for display; every curve still renders.
+            const MAX_DRAWN_CURVES: usize = 8_000;
+            let stride = curve_ranges.len().div_ceil(MAX_DRAWN_CURVES).max(1);
+            let hair = egui::Color32::from_rgb(200, 165, 115);
+            for range in curve_ranges.iter().step_by(stride) {
+                let line: Vec<egui::Pos2> = range.clone().filter_map(|i| projected[i].map(|p| p.0)).collect();
+                if line.len() >= 2 {
+                    let colour = cd_color(range.start).unwrap_or(hair);
+                    painter.add(egui::Shape::line(line, egui::Stroke::new(1.0, colour)));
+                }
+            }
+        }
         // Volume points (Pyro output) carry Alpha and pscale: draw them as soft,
         // back-to-front splats sized in world units instead of opaque dots.
         let point_count = mesh.vertices.len();
@@ -10946,6 +12363,13 @@ impl ProceduralFxStudioApp {
         if clear_selection_on_miss {
             self.clear_component_selection();
         }
+        if let Some((id, painted)) = pending_paint {
+            if let Some(NodeKind::AttributePaint { values, .. }) = self.graph.nodes.get_mut(&id).map(|n| &mut n.kind) {
+                *values = painted;
+                self.dirty = true;
+                ctx.request_repaint();
+            }
+        }
     }
 
     // The selected object the gizmo edits, as a transform (lights and cameras have no scale).
@@ -11035,9 +12459,41 @@ impl eframe::App for ProceduralFxStudioApp {
         self.begin_animation_frame(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         self.updater.poll(ctx);
-        if self.updater.show(ctx) == updater::UpdaterAction::SaveScene {
-            self.save_scene_dialog();
+        if let Some(id) = self.group_pick_request.take() {
+            self.start_group_pick(id);
         }
+        if let Some(domain) = self.group_pick_domain.take() {
+            self.set_group_pick_domain(domain);
+        }
+        if let Some(accept) = self.group_pick_finish.take() {
+            self.finish_group_pick(accept);
+        }
+        if self.group_pick.is_some() {
+            let (enter, escape) = ctx.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if enter || escape {
+                self.finish_group_pick(enter);
+            }
+            // Picking is tied to the node it was started from.
+            if self.group_pick.as_ref().is_some_and(|p| Some(p.node) != self.selected) {
+                self.finish_group_pick(false);
+            }
+        }
+        if let Some(id) = self.group_choices_request.take() {
+            let input = self.graph.input_of(id, 0).map(|i| self.graph.cook(i, self.time, &mut HashMap::new())).unwrap_or_default();
+            let (points, prims) = groups::names(&input);
+            self.group_choices = Some((id, points, prims));
+        }
+        if let Some(id) = self.paint_fill.take() {
+            let count = self.graph.input_of(id, 0).map_or(0, |i| self.graph.cook(i, self.time, &mut HashMap::new()).vertices.len());
+            if let Some(NodeKind::AttributePaint { values, settings, .. }) = self.graph.nodes.get_mut(&id).map(|n| &mut n.kind) {
+                *values = vec![settings.value; count];
+                self.dirty = true;
+            }
+        }
+        if self.updater.show(ctx) == updater::UpdaterAction::SaveScene {
+            self.save_scene();
+        }
+        self.update_window_title(ctx);
 
         self.poll_moonray_render();
         self.advance_sequence();
@@ -11346,7 +12802,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
-            .with_title("ProceduralFX Studio"),
+            .with_title("ProceduralFX Studio")
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -11469,9 +12926,9 @@ mod tests {
 
     #[test]
     fn spreadsheet_lists_attributes_created_by_a_wrangle() {
-        let mesh = node_wrangle(quad(), "@Cd = {1, 0, 0}; f@mass = 2.5; i@group = @ptnum;", 0.0, 2);
-        let mesh = node_wrangle(mesh, "f@area = 0.5;", 0.0, 1);
-        let mesh = node_wrangle(mesh, "i@count = npoints(0);", 0.0, 0);
+        let mesh = node_wrangle(quad(), "@Cd = {1, 0, 0}; f@mass = 2.5; i@group = @ptnum;", 0.0, 2, None);
+        let mesh = node_wrangle(mesh, "f@area = 0.5;", 0.0, 1, None);
+        let mesh = node_wrangle(mesh, "i@count = npoints(0);", 0.0, 0, None);
         let headers = |domain| sheet_columns(&mesh, domain).into_iter().map(|c| c.header).collect::<Vec<_>>();
         let points = headers(SheetDomain::Points);
         for expected in ["#", "P.x", "N.z", "Cd.r", "Cd.b", "group", "mass"] {
@@ -11908,3 +13365,495 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod scene_file_tests {
+    use super::*;
+
+    #[test]
+    fn recent_scenes_dedupe_and_cap() {
+        let text = "/a.pfs\n\n/b.pfs\n/a.pfs\n".to_owned() + &(0..20).map(|i| format!("/s{i}.pfs\n")).collect::<String>();
+        let list = parse_recent_scenes(&text);
+        assert_eq!(list.len(), MAX_RECENT_SCENES);
+        assert_eq!(list[0], PathBuf::from("/a.pfs"));
+        assert_eq!(list[1], PathBuf::from("/b.pfs"));
+
+        let mut list = vec![PathBuf::from("/a.pfs"), PathBuf::from("/b.pfs")];
+        push_recent_scene(&mut list, PathBuf::from("/b.pfs"));
+        assert_eq!(list, vec![PathBuf::from("/b.pfs"), PathBuf::from("/a.pfs")]);
+    }
+
+    #[test]
+    fn old_particle_nodes_load_with_defaults() {
+        let old = NodeKind::from_params("particles", &[2000.0, 400.0, 4.0, 2.0, 0.35, -1.5, 1.0]).unwrap();
+        let NodeKind::Particles { bounce, friction, radius, substeps, along_normals, drag, .. } = old else { panic!() };
+        assert_eq!((bounce, friction, radius, substeps, along_normals, drag), (0.4, 0.1, 0.02, 2, false, 0.0));
+        let round_trip = NodeKind::from_params("particles", &old.params()).unwrap();
+        assert_eq!(format!("{round_trip:?}"), format!("{old:?}"));
+    }
+
+    #[test]
+    fn new_nodes_survive_save_and_load() {
+        let mut g = Graph::default();
+        let painted = g.add(
+            NodeKind::AttributePaint {
+                attribute: "clump".into(),
+                values: vec![0.0, 0.25, 1.0],
+                settings: paint::PaintSettings { value: 0.8, default: 0.1, radius: 55.0, strength: 0.3, mode: 2, visualize: false },
+            },
+            egui::pos2(0.0, 0.0),
+        );
+        let kinds = [
+            NodeKind::VellumSolver(vellum::VellumSettings { iterations: 33, ..vellum::VellumSettings::defaults(1) }),
+            NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 45.0, weighting: 2, reverse: true }),
+            NodeKind::Scatter(sops::ScatterSettings { count: 77, seed: 4, relax_iterations: 2, volume: true }),
+            NodeKind::UvTexture(sops::UvTextureSettings { projection: 1, axis: 2, scale: [2.0, 3.0], offset: [0.1, 0.2] }),
+            NodeKind::UvTransform(sops::UvTransformSettings { translate: [1.0, 2.0], rotate: 30.0, scale: [0.5, 0.5], pivot: [0.5, 0.5] }),
+            NodeKind::UvQuickShade { file: "/textures/grid.png".into() },
+        ];
+        let ids: Vec<NodeId> = kinds.iter().cloned().map(|k| g.add(k, egui::pos2(0.0, 0.0))).collect();
+        let loaded = Graph::deserialize(&g.serialize());
+        assert_eq!(format!("{:?}", loaded.nodes[&painted].kind), format!("{:?}", g.nodes[&painted].kind));
+        for id in ids {
+            assert_eq!(format!("{:?}", loaded.nodes[&id].kind), format!("{:?}", g.nodes[&id].kind));
+        }
+    }
+
+    #[test]
+    fn vellum_node_cooks_cloth_falling_onto_the_ground() {
+        let mut g = Graph::default();
+        let grid = g.add(NodeKind::Grid { size: 2.0, res: 8 }, egui::pos2(0.0, 0.0));
+        let lift = g.add(NodeKind::Wrangle { code: "@P.y += 1.0;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        let cloth = g.add(NodeKind::VellumSolver(vellum::VellumSettings::defaults(0)), egui::pos2(0.0, 0.0));
+        g.connect(grid, lift, 0);
+        g.connect(lift, cloth, 0);
+        sims::clear_all();
+        let start = g.cook(cloth, 0.0, &mut HashMap::new());
+        let later = g.cook(cloth, 1.5, &mut HashMap::new());
+        assert!(start.vertices.iter().all(|p| (p.y - 1.0).abs() < 1e-5));
+        assert!(later.vertices.iter().all(|p| p.y < 0.2 && p.y > -1e-3), "lies on the ground");
+        assert_eq!(later.indices, start.indices);
+    }
+
+    // The reported setup: a 4 x 4 grid (20 x 20 points) at y = 0 over a 1.5 box whose top is at y = -0.92.
+    fn cloth_over_box(ground: bool) -> (Graph, NodeId, NodeId) {
+        let mut g = Graph::default();
+        // Distinct node ids per variant: node notes are shared by tests running in parallel.
+        g.next_id = if ground { 500 } else { 600 };
+        let grid = g.add(NodeKind::Grid { size: 4.0, res: 20 }, egui::pos2(0.0, 0.0));
+        let cloth = g.add(NodeKind::VellumSolver(vellum::VellumSettings { ground, ..vellum::VellumSettings::defaults(0) }), egui::pos2(0.0, 0.0));
+        let block = g.add(NodeKind::Box { size: 1.5, div: 4 }, egui::pos2(0.0, 0.0));
+        let lower = g.add(NodeKind::Transform { t: [0.0, -1.67, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        g.connect(grid, cloth, 0);
+        g.connect(block, lower, 0);
+        g.connect(lower, cloth, 1);
+        (g, grid, cloth)
+    }
+
+    #[test]
+    fn vellum_cloth_drapes_over_a_lowered_box() {
+        sims::clear_all();
+        let (g, grid, cloth) = cloth_over_box(false);
+        let rest = g.cook(grid, 0.0, &mut HashMap::new());
+        let out = g.cook(cloth, 3.0, &mut HashMap::new());
+        let centre = (0..rest.vertices.len()).min_by(|&a, &b| (rest.vertices[a].x.abs() + rest.vertices[a].z.abs()).total_cmp(&(rest.vertices[b].x.abs() + rest.vertices[b].z.abs()))).unwrap();
+        assert!((out.vertices[centre].y + 0.90).abs() < 0.03, "rests on the box top: {:?}", out.vertices[centre]);
+        assert!(out.vertices.iter().all(|p| !(p.x.abs() < 0.74 && p.z.abs() < 0.74 && p.y < -0.93 && p.y > -2.4)), "nothing inside the box");
+        let stretch = rest
+            .indices
+            .iter()
+            .flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])])
+            .map(|(a, b)| (out.vertices[a].sub(out.vertices[b]).length() / rest.vertices[a].sub(rest.vertices[b]).length() - 1.0).abs())
+            .fold(0.0, f32::max);
+        assert!(stretch < 0.08, "max stretch {:.1}%", stretch * 100.0);
+        assert!(out.vertices.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) < -2.0, "the sides hang down");
+        assert!(node_notes(|n| n.get(&cloth).cloned()).is_none());
+    }
+
+    #[test]
+    fn vellum_explains_geometry_resting_on_the_ground() {
+        sims::clear_all();
+        let (g, _, cloth) = cloth_over_box(true);
+        let out = g.cook(cloth, 1.0, &mut HashMap::new());
+        // It stays on the ground, without being launched off it...
+        assert!(out.vertices.iter().all(|p| (p.y - 0.02).abs() < 1e-3), "{:?}", out.vertices[0]);
+        // ...and the node says why it doesn't fall.
+        assert!(node_notes(|n| n.get(&cloth).cloned()).is_some_and(|n| n.contains("ground plane")));
+    }
+
+    #[test]
+    fn atomic_save_replaces_file() {
+        let path = std::env::temp_dir().join(format!("pfx_atomic_{}.pfs", std::process::id()));
+        write_file_atomically(&path, "first").unwrap();
+        write_file_atomically(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert!(!PathBuf::from(format!("{}.saving", path.display())).exists());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod groom_render_tests {
+    use super::*;
+
+    fn skin() -> Mesh {
+        let mut mesh = Mesh::default();
+        mesh.vertices = vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, 1.0)];
+        mesh.indices = vec![[0, 2, 1], [0, 3, 2]];
+        mesh
+    }
+
+    fn groomed(with_hair: bool) -> Mesh {
+        let skin = skin();
+        if !with_hair {
+            return skin;
+        }
+        let guides = groom::hair_guides(&skin, &groom::GuideSettings { count: 30, length: 0.8, length_variance: 0.2, segments: 6, droop: 0.4, seed: 2 });
+        let hair = groom::hair_generate(
+            &skin,
+            &guides,
+            &groom::HairSettings { count: 3000, segments: 6, clump: 0.3, length_variance: 0.1, frizz: 0.2, width_root: 0.02, width_tip: 0.01, seed: 4 },
+        );
+        node_merge(skin, hair)
+    }
+
+    fn export(path: &std::path::Path, mesh: Mesh) -> String {
+        let app = ProceduralFxStudioApp::default();
+        let scene = RenderScene { parts: vec![(mesh, PartMaterial::Default)], lights: app.scene_lights(), environment: None, camera: None, volumes: Vec::new() };
+        app.export_scene_rdla(path, &scene, 160, 120, 4).unwrap();
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn hair_exports_as_curve_geometry() {
+        let path = std::env::temp_dir().join(format!("pfx_hair_{}.rdla", std::process::id()));
+        let text = export(&path, groomed(true));
+        assert!(text.contains("RdlMeshGeometry(\"/scene/objects/mesh0\") {"));
+        assert!(text.contains("RdlCurveGeometry(\"/scene/objects/curves0\") {"));
+        assert_eq!(text.matches("{RdlCurveGeometry(\"/scene/objects/curves0\")").count(), 1, "curves are in the layer");
+        // Hair alone has no triangles: no mesh object is written for it.
+        let text = export(&path, groom::hair_guides(&skin(), &groom::GuideSettings { count: 3, length: 1.0, length_variance: 0.0, segments: 2, droop: 0.0, seed: 1 }));
+        assert!(!text.contains("RdlMeshGeometry"));
+        assert!(text.contains("[\"curves_vertex_count\"] = {\n        3,\n        3,\n        3,\n    }"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hair_deform_node_follows_an_animated_skin() {
+        let mut g = Graph::default();
+        let grid = g.add(NodeKind::Grid { size: 2.0, res: 6 }, egui::pos2(0.0, 0.0));
+        // The skin rises one unit per second.
+        let skin = g.add(NodeKind::Wrangle { code: "@P.y += @Time;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        let guides = g.add(
+            NodeKind::HairGuides(groom::GuideSettings { count: 20, length: 0.5, length_variance: 0.0, segments: 4, droop: 0.0, seed: 1 }),
+            egui::pos2(0.0, 0.0),
+        );
+        let deform = g.add(NodeKind::HairDeform(groom::DeformSettings { rest_frame: 1.0 }), egui::pos2(0.0, 0.0));
+        g.connect(grid, skin, 0);
+        g.connect(skin, guides, 0);
+        g.connect(guides, deform, 0);
+        g.connect(skin, deform, 1);
+        assert!(g.time_dependent(deform));
+        let rest = g.cook(deform, 0.0, &mut HashMap::new());
+        let later = g.cook(deform, 1.5, &mut HashMap::new());
+        assert!(!rest.vertices.is_empty());
+        assert_eq!(rest.vertices.len(), later.vertices.len());
+        for (a, b) in rest.vertices.iter().zip(&later.vertices) {
+            assert!((b.y - a.y - 1.5).abs() < 1e-3 && (b.x - a.x).abs() < 1e-3, "{a:?} -> {b:?}");
+        }
+        // Without a skin the node reports an error instead of cooking.
+        let lonely = g.add(NodeKind::HairDeform(groom::DeformSettings { rest_frame: 1.0 }), egui::pos2(0.0, 0.0));
+        g.connect(guides, lonely, 0);
+        assert!(g.cook(lonely, 0.0, &mut HashMap::new()).vertices.is_empty());
+        assert!(node_errors(|e| e.get(&lonely).cloned()).is_some_and(|e| e.contains("input 2")));
+    }
+
+    // Renders with the bundled MoonRay: `cargo test -- --ignored hair_renders_in_moonray`.
+    #[test]
+    #[ignore]
+    fn hair_renders_in_moonray() {
+        let moonray = std::path::Path::new("native/moonray/macos/moonray");
+        let dir = std::env::temp_dir();
+        let render = |hair: bool| {
+            let rdla = dir.join(format!("pfx_hair_render_{hair}.rdla"));
+            let exr = dir.join(format!("pfx_hair_render_{hair}.exr"));
+            export(&rdla, groomed(hair));
+            let status = Command::new(moonray)
+                .env("RDL2_DSO_PATH", std::env::var("RDL2_DSO_PATH").unwrap_or("/Users/loksangho/moonray/build/rdl2dso".into()))
+                .args(["-in", rdla.to_str().unwrap(), "-out", exr.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+            image::open(&exr).unwrap().to_rgb32f()
+        };
+        let (bare, hairy) = (render(false), render(true));
+        let changed = bare.pixels().zip(hairy.pixels()).filter(|(a, b)| (0..3).any(|c| (a[c] - b[c]).abs() > 0.02)).count();
+        println!("{changed} of {} pixels changed by the hair", bare.pixels().len());
+        assert!(changed > bare.pixels().len() / 50);
+    }
+}
+
+#[cfg(test)]
+mod envlight_render_tests {
+    use super::*;
+
+    // Checks the viewport's HDRI mapping against MoonRay: `cargo test -- --ignored hdri_matches_moonray`.
+    #[test]
+    #[ignore]
+    fn hdri_matches_moonray() {
+        let dir = std::env::temp_dir();
+        // Each pixel's colour encodes its own image coordinates: R = u, G = v.
+        let (w, h) = (256u32, 128u32);
+        let mut img = image::Rgb32FImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.25]);
+        }
+        let hdri = dir.join("pfx_uv_sky.exr");
+        image::DynamicImage::ImageRgb32F(img).save(&hdri).unwrap();
+        for (rot_x, rot_y, env_rotation) in [(0.3f32, 0.7f32, 0.0f32), (-0.2, 2.2, 0.0), (0.4, 0.7, 50.0)] {
+            let mut app = ProceduralFxStudioApp::default();
+            app.graph = Graph::default();
+            app.graph.add(
+                NodeKind::EnvironmentLight { file: hdri.to_string_lossy().into_owned(), color: [1.0; 3], intensity: 1.0, rotation: env_rotation, visible: true },
+                egui::pos2(0.0, 0.0),
+            );
+            app.render_camera = RenderCamera::Viewport;
+            (app.cam_rot_x, app.cam_rot_y) = (rot_x, rot_y);
+            app.ambient_light = 0.0;
+            // MoonRay only uses lights through a layer's geometry, so add a speck far out of view.
+            let speck = Mesh {
+                vertices: vec![Vec3::new(0.0, -900.0, 0.0), Vec3::new(0.001, -900.0, 0.0), Vec3::new(0.0, -900.0, 0.001)],
+                indices: vec![[0, 1, 2]],
+                ..Mesh::default()
+            };
+            let scene = RenderScene { parts: vec![(speck, PartMaterial::Default)], lights: app.scene_lights(), environment: None, camera: None, volumes: Vec::new() };
+            let rdla = dir.join("pfx_uv_sky.rdla");
+            let exr = dir.join("pfx_uv_sky_render.exr");
+            app.export_scene_rdla(&rdla, &scene, 64, 48, 4).unwrap();
+            let run = Command::new("native/moonray/macos/moonray")
+                .env("RDL2_DSO_PATH", "/Users/loksangho/moonray/build/rdl2dso")
+                .args(["-in", rdla.to_str().unwrap(), "-out", exr.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+            let render = image::open(&exr).unwrap().to_rgb32f();
+            let centre = render.get_pixel(32, 24);
+            // The viewport's forward ray (inverse of to_cam for the screen centre).
+            let forward = Vec3::new(rot_x.cos() * rot_y.sin(), rot_x.sin(), rot_x.cos() * rot_y.cos());
+            let (u, v) = envlight::uv_of(forward, env_rotation);
+            println!("rot ({rot_x}, {rot_y}) env {env_rotation}: moonray ({:.3}, {:.3}) viewport ({u:.3}, {v:.3})", centre[0], centre[1]);
+            assert!((centre[0] - u).abs() < 0.03 && (centre[1] - v).abs() < 0.03);
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_node_tests {
+    use super::*;
+
+    fn group_create(name: &str, domain: groups::GroupDomain, expression: &str) -> NodeKind {
+        NodeKind::GroupCreate(groups::GroupCreateSettings {
+            name: name.into(),
+            domain,
+            method: 3,
+            bbox_min: [0.0; 3],
+            bbox_max: [0.0; 3],
+            percent: 0.0,
+            seed: 0,
+            direction: [0.0, 1.0, 0.0],
+            spread: 0.0,
+            expression: expression.into(),
+            combine: 0,
+            invert: false,
+        })
+    }
+
+    // Grid -> Group Create (points with x > 0 as "right") -> `node`, with `pattern` as its group.
+    fn chain(node: NodeKind, pattern: &str) -> (Graph, NodeId, NodeId) {
+        let mut g = Graph::default();
+        let grid = g.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
+        let make = g.add(group_create("right", groups::GroupDomain::Points, "@P.x>0.01"), egui::pos2(0.0, 0.0));
+        let target = g.add(node, egui::pos2(0.0, 0.0));
+        g.connect(grid, make, 0);
+        g.connect(make, target, 0);
+        g.nodes.get_mut(&target).unwrap().group = groups::NodeGroup { pattern: pattern.into(), kind: 0 };
+        (g, make, target)
+    }
+
+    #[test]
+    fn deformers_and_wrangles_only_touch_their_group() {
+        let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, "right");
+        let before = g.cook(make, 0.0, &mut HashMap::new());
+        let after = g.cook(transform, 0.0, &mut HashMap::new());
+        for (a, b) in before.vertices.iter().zip(&after.vertices) {
+            assert_eq!(b.y, if a.x > 0.01 { 1.0 } else { 0.0 }, "{a:?}");
+        }
+        // Wrangle: runs on the group's points only.
+        let (g, make, wrangle) = chain(NodeKind::Wrangle { code: "f@hit = 1; @P.y = 2;".into(), domain: 2 }, "^right");
+        let before = g.cook(make, 0.0, &mut HashMap::new());
+        let after = g.cook(wrangle, 0.0, &mut HashMap::new());
+        for (i, (a, b)) in before.vertices.iter().zip(&after.vertices).enumerate() {
+            let inside = a.x <= 0.01;
+            assert_eq!(b.y, if inside { 2.0 } else { 0.0 });
+            assert_eq!(after.point_attributes["hit"][i], if inside { 1.0 } else { 0.0 });
+        }
+        // VEX group functions.
+        let (g, _, tag) = chain(NodeKind::Wrangle { code: "i@r = inpointgroup(0, \"right\", @ptnum); setpointgroup(0, \"tagged\", @ptnum, @P.z > 0);".into(), domain: 2 }, "");
+        let out = g.cook(tag, 0.0, &mut HashMap::new());
+        for (i, p) in out.vertices.iter().enumerate() {
+            assert_eq!(out.point_attributes["r"][i], (p.x > 0.01) as u8 as f32);
+            assert_eq!(out.point_attributes["group:tagged"][i], (p.z > 0.0) as u8 as f32);
+        }
+        // A bad group is an error on the node.
+        let (g, _, bad) = chain(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] }, "nosuchgroup");
+        assert!(g.cook(bad, 0.0, &mut HashMap::new()).vertices.is_empty());
+        assert!(node_errors(|e| e.get(&bad).cloned()).is_some_and(|e| e.contains("nosuchgroup")));
+    }
+
+    #[test]
+    fn blast_scatter_and_vellum_use_groups() {
+        // Blast a primitive group.
+        let mut g = Graph::default();
+        let grid = g.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
+        let make = g.add(group_create("top", groups::GroupDomain::Prims, "@P.z>0"), egui::pos2(0.0, 0.0));
+        let blast = g.add(NodeKind::Blast { component: 0, indices: Vec::new(), invert: false }, egui::pos2(0.0, 0.0));
+        g.connect(grid, make, 0);
+        g.connect(make, blast, 0);
+        g.nodes.get_mut(&blast).unwrap().group = groups::NodeGroup { pattern: "top".into(), kind: 0 };
+        let full = g.cook(make, 0.0, &mut HashMap::new());
+        let blasted = g.cook(blast, 0.0, &mut HashMap::new());
+        assert_eq!(blasted.indices.len(), full.indices.len() / 2);
+        // Scatter only on that group.
+        let scatter = g.add(NodeKind::Scatter(sops::ScatterSettings { count: 200, seed: 3, relax_iterations: 0, volume: false }), egui::pos2(0.0, 0.0));
+        g.connect(make, scatter, 0);
+        g.nodes.get_mut(&scatter).unwrap().group = groups::NodeGroup { pattern: "top".into(), kind: 0 };
+        let points = g.cook(scatter, 0.0, &mut HashMap::new());
+        assert_eq!(points.vertices.len(), 200);
+        // Every point lies within the group's primitives (lowest z among their corners).
+        let top = &full.point_attributes["prim:group:top"];
+        let lowest = full.indices.iter().zip(top).filter(|(_, t)| **t > 0.5).flat_map(|(tri, _)| tri.map(|i| full.vertices[i].z)).fold(f32::INFINITY, f32::min);
+        assert!(lowest > -0.5);
+        assert!(points.vertices.iter().all(|p| p.z >= lowest - 1e-5));
+        // Vellum pins its group: the right half stays, the rest falls.
+        let (mut g, _, cloth) = chain(NodeKind::VellumSolver(vellum::VellumSettings { ground: false, ..vellum::VellumSettings::defaults(0) }), "right");
+        g.nodes.get_mut(&cloth).unwrap().group.kind = 1;
+        sims::clear_all();
+        let out = g.cook(cloth, 1.0, &mut HashMap::new());
+        let rest = g.cook(cloth, 0.0, &mut HashMap::new());
+        for (a, b) in rest.vertices.iter().zip(&out.vertices) {
+            if a.x > 0.01 {
+                assert!(a.sub(*b).length() < 1e-5, "pinned point moved");
+            }
+        }
+        assert!(out.vertices.iter().any(|p| p.y < -0.2), "the free half falls");
+    }
+
+    #[test]
+    fn picking_a_group_in_the_viewport() {
+        let mut app = ProceduralFxStudioApp::default();
+        let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, "right");
+        app.graph = g;
+        app.selected = Some(transform);
+        app.start_group_pick(transform);
+        let input = app.graph.cook(make, 0.0, &mut HashMap::new());
+        // The viewport shows the node's input, with its current group selected.
+        assert_eq!(app.current_mesh.vertices, input.vertices);
+        let right: Vec<usize> = (0..input.vertices.len()).filter(|&i| input.vertices[i].x > 0.01).collect();
+        assert_eq!(app.selected_vertices, right);
+        assert!(app.selection_mode == SelectionMode::Vertex);
+        app.rebuild_graph();
+        assert_eq!(app.current_mesh.vertices, input.vertices, "the display is paused while picking");
+        // Pick points 0-3 and accept.
+        app.selected_vertices = vec![3, 1, 0, 2];
+        app.finish_group_pick(true);
+        assert!(app.group_pick.is_none());
+        let group = &app.graph.nodes[&transform].group;
+        assert_eq!(group.pattern, "0-3");
+        assert_eq!(group.kind, 1);
+        let out = app.graph.cook(transform, 0.0, &mut HashMap::new());
+        for (i, p) in out.vertices.iter().enumerate() {
+            assert_eq!(p.y, if i <= 3 { 1.0 } else { 0.0 });
+        }
+        // Primitives, then cancel: the group is left as it was.
+        app.start_group_pick(transform);
+        app.set_group_pick_domain(groups::GroupDomain::Prims);
+        assert!(app.selection_mode == SelectionMode::Triangle);
+        app.selected_triangles = vec![0, 1];
+        app.finish_group_pick(false);
+        assert_eq!(app.graph.nodes[&transform].group.pattern, "0-3");
+        // Accepting primitives writes a primitive group.
+        app.start_group_pick(transform);
+        app.set_group_pick_domain(groups::GroupDomain::Prims);
+        app.selected_triangles = vec![4, 5];
+        app.finish_group_pick(true);
+        assert_eq!(app.graph.nodes[&transform].group, groups::NodeGroup { pattern: "4-5".into(), kind: 2 });
+    }
+
+    #[test]
+    fn groups_are_saved_with_the_scene() {
+        let (g, make, target) = chain(NodeKind::Noise { freq: 1.0, amp: 0.2 }, "right ^0-3");
+        let mut g = g;
+        g.nodes.get_mut(&target).unwrap().group.kind = 1;
+        let loaded = Graph::deserialize(&g.serialize());
+        assert_eq!(loaded.nodes[&target].group, groups::NodeGroup { pattern: "right ^0-3".into(), kind: 1 });
+        assert_eq!(format!("{:?}", loaded.nodes[&make].kind), format!("{:?}", g.nodes[&make].kind));
+    }
+}
+
+#[cfg(test)]
+mod raster_view_tests {
+    use super::*;
+
+    // Renders a cone like the viewport does, for checking by eye:
+    // `PFX_ROTX=-0.45 PFX_WIRE=1 cargo test -- --ignored cone_renders_with_depth --nocapture`.
+    #[test]
+    #[ignore]
+    fn cone_renders_with_depth() {
+        let mesh = node_cone(1.0, 2.0, 1, 32, true);
+        let rot_x: f32 = std::env::var("PFX_ROTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.35);
+        let (rot_y, zoom, focal) = (0.6f32, 6.0f32, 900.0f32);
+        let (sin_x, cos_x) = rot_x.sin_cos();
+        let (sin_y, cos_y) = rot_y.sin_cos();
+        let target = Vec3::new(0.0, 0.5, 0.0);
+        let to_cam = |p: Vec3| {
+            let v = p.sub(target);
+            let rx = v.x * cos_y - v.z * sin_y;
+            let rz = v.x * sin_y + v.z * cos_y;
+            Vec3::new(rx, v.y * cos_x - rz * sin_x, v.y * sin_x + rz * cos_x + zoom)
+        };
+        let (w, h) = (640usize, 560usize);
+        let mut r = raster::Raster::new(w, h, false);
+        let normals = mesh.compute_normals();
+        let light = Vec3::new(0.4, 0.8, -0.5).normalize();
+        let project = |p: Vec3| {
+            let c = to_cam(p);
+            raster::ScreenVertex { x: w as f32 / 2.0 + c.x / c.z * focal, y: h as f32 / 2.0 - c.y / c.z * focal, z: c.z }
+        };
+        let wire = std::env::var("PFX_WIRE").is_ok();
+        for tri in &mesh.indices {
+            // The base cap (all corners on the lowest plane) in red, to see where it shows.
+            let cap = tri.iter().all(|&i| (mesh.vertices[i].y - mesh.bounds().unwrap().0.y).abs() < 1e-4);
+            let shade = tri.map(|i| {
+                let l = 0.15 + 0.8 * normals[i].dot(light).max(0.0);
+                if cap { [l.max(0.4), 0.1, 0.1] } else { [l; 3] }
+            });
+            r.triangle(tri.map(|i| project(mesh.vertices[i])), shade, None);
+        }
+        if wire {
+            for tri in &mesh.indices {
+                for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+                    r.line(project(mesh.vertices[tri[a]]), project(mesh.vertices[tri[b]]), [0, 0, 0, 110]);
+                }
+            }
+        }
+        // A 4x crop of the base, to inspect.
+        let full = image::RgbaImage::from_raw(w as u32, h as u32, r.color.as_flattened().to_vec()).unwrap();
+        let crop = image::imageops::crop_imm(&full, 200, 470, 240, 70).to_image();
+        image::imageops::resize(&crop, 960, 280, image::imageops::FilterType::Nearest).save(std::env::temp_dir().join("pfx_cone_crop.png")).unwrap();
+        let out = std::env::temp_dir().join("pfx_cone_depth.png");
+        image::RgbaImage::from_raw(w as u32, h as u32, r.color.as_flattened().to_vec()).unwrap().save(&out).unwrap();
+        println!("wrote {}", out.display());
+    }
+}
+
+

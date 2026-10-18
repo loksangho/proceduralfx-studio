@@ -677,6 +677,8 @@ enum Expr {
     Step(Box<Place>, i32, bool),
     Member(Box<Expr>, usize),
     Index(Box<Expr>, Box<Expr>),
+    // a[start:end:step], each part optional.
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>),
     // Name, arguments, assignable argument places (array-mutating builtins), vector return context.
     Builtin(&'static str, Vec<Expr>, Vec<Option<Place>>, bool),
     // User function index, arguments, argument places written back (VEX passes by reference).
@@ -791,6 +793,7 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("lerp", 3, 3, "Math", "lerp(a, b, t)"),
     ("smooth", 3, 3, "Math", "smooth(edge0, edge1, x)"),
     ("smoothstep", 3, 3, "Math", "smoothstep(edge0, edge1, x)"),
+    ("select", 3, 3, "Math", "select(condition, a, b)"),
     ("set", 1, 3, "Vector", "set(x, y, z)"),
     ("vector", 1, 3, "Vector", "vector(x) / vector(x, y, z)"),
     ("length", 1, 1, "Vector", "length(v)"),
@@ -811,6 +814,9 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("random", 1, 2, "Random", "random(seed [, seed2])"),
     ("noise", 1, 3, "Random", "noise(pos) Perlin noise in 0..1 (vector when assigned to a vector)"),
     ("snoise", 1, 3, "Random", "snoise(pos) signed Perlin noise in -1..1"),
+    ("curlnoise", 1, 1, "Random", "curlnoise(pos) swirling, divergence-free noise vector"),
+    ("sample_direction_uniform", 1, 1, "Random", "sample_direction_uniform(u) unit vector from u.x, u.y in 0..1"),
+    ("sample_sphere_uniform", 1, 1, "Random", "sample_sphere_uniform(u) point inside the unit sphere from u in 0..1"),
     ("int", 1, 1, "Conversion", "int(x)"),
     ("float", 1, 1, "Conversion", "float(x)"),
     ("string", 1, 1, "Conversion", "string(x)"),
@@ -845,6 +851,9 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("sum", 1, 1, "Array", "sum(array)"),
     ("find", 2, 2, "Array", "find(array | string, value) index or -1"),
     ("isvalidindex", 2, 2, "Array", "isvalidindex(array, index)"),
+    ("slice", 3, 4, "Array", "slice(array | string, start, end [, step]); also a[start:end:step]"),
+    ("reorder", 2, 2, "Array", "reorder(array, indices) e.g. reorder(a, argsort(a))"),
+    ("uniquevals", 1, 1, "Array", "uniquevals(array) sorted, without duplicates"),
     ("npoints", 1, 1, "Geometry", "npoints(0)"),
     ("nprimitives", 1, 1, "Geometry", "nprimitives(0)"),
     ("nvertices", 1, 1, "Geometry", "nvertices(0)"),
@@ -853,6 +862,10 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("vertex", 3, 3, "Geometry", "vertex(0, \"name\", vtxnum)"),
     ("detail", 2, 2, "Geometry", "detail(0, \"name\")"),
     ("haspointattrib", 2, 2, "Geometry", "haspointattrib(0, \"name\")"),
+    ("inpointgroup", 3, 3, "Geometry", "inpointgroup(0, \"group\", ptnum)"),
+    ("inprimgroup", 3, 3, "Geometry", "inprimgroup(0, \"group\", primnum)"),
+    ("setpointgroup", 4, 4, "Geometry", "setpointgroup(0, \"group\", ptnum, 1 | 0)"),
+    ("setprimgroup", 4, 4, "Geometry", "setprimgroup(0, \"group\", primnum, 1 | 0)"),
     ("hasprimattrib", 2, 2, "Geometry", "hasprimattrib(0, \"name\")"),
     ("setpointattrib", 4, 5, "Geometry", "setpointattrib(0, \"name\", ptnum, value [, \"set\"|\"add\"|\"min\"|\"max\"|\"mult\"])"),
     ("setprimattrib", 4, 5, "Geometry", "setprimattrib(0, \"name\", primnum, value [, mode])"),
@@ -872,7 +885,24 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("getbbox_center", 1, 1, "Geometry", "getbbox_center(0)"),
     ("getbbox_size", 1, 1, "Geometry", "getbbox_size(0)"),
     ("relpointbbox", 2, 2, "Geometry", "relpointbbox(0, pos) position within the bounds, 0..1"),
+    ("xyzdist", 2, 4, "Geometry", "xyzdist(0, pos [, prim, uv]) distance to the surface; prim and uv are outputs"),
+    ("minpos", 2, 2, "Geometry", "minpos(0, pos) closest position on the surface"),
+    ("intersect", 5, 5, "Geometry", "intersect(0, origin, dir, hitpos, hituv) hit prim or -1; |dir| is the max distance"),
+    ("pcfind", 5, 5, "Point cloud", "pcfind(0, \"P\", pos, radius, maxpts) nearest point numbers"),
+    ("pcopen", 5, 5, "Point cloud", "pcopen(0, \"P\", pos, radius, maxpts) returns a handle"),
+    ("pcnumfound", 1, 1, "Point cloud", "pcnumfound(handle)"),
+    ("pcfilter", 2, 2, "Point cloud", "pcfilter(handle, \"name\") distance-weighted average of an attribute"),
+    ("pciterate", 1, 1, "Point cloud", "while (pciterate(handle)) { ... } visits each found point"),
+    ("pcimport", 3, 3, "Point cloud", "pcimport(handle, \"name\", value) reads the current point (also \"point.number\", \"point.distance\")"),
+    ("pcclose", 1, 1, "Point cloud", "pcclose(handle)"),
 ];
+
+// Builtins that write results into some arguments, as VEX's pass-by-reference outputs.
+const OUT_PARAMS: [(&str, &[usize]); 3] = [("xyzdist", &[2, 3]), ("intersect", &[3, 4]), ("pcimport", &[2])];
+
+fn out_params(name: &str) -> &'static [usize] {
+    OUT_PARAMS.iter().find(|(n, _)| *n == name).map_or(&[], |(_, outs)| outs)
+}
 
 // Builtins that modify their first (array) argument in place.
 const MUTATING: [&str; 7] = ["push", "append", "pop", "insert", "removeindex", "removevalue", "resize"];
@@ -1469,9 +1499,21 @@ impl Parser {
                 };
                 e = Expr::Member(Box::new(e), index);
             } else if self.eat("[") {
-                let index = self.expression()?;
-                self.expect("]", "to close the index")?;
-                e = Expr::Index(Box::new(e), Box::new(index));
+                let start = if self.at(":") { None } else { Some(Box::new(self.expression()?)) };
+                if self.eat(":") {
+                    let end = if self.at(":") || self.at("]") { None } else { Some(Box::new(self.expression()?)) };
+                    let step = if self.eat(":") && !self.at("]") { Some(Box::new(self.expression()?)) } else { None };
+                    self.expect("]", "to close the slice")?;
+                    e = Expr::Slice(Box::new(e), start, end, step);
+                } else {
+                    let index = start.ok_or_else(|| VexError {
+                        line: self.line(),
+                        col: 0,
+                        message: "expected an index inside [ ]".into(),
+                    })?;
+                    self.expect("]", "to close the index")?;
+                    e = Expr::Index(Box::new(e), index);
+                }
             } else if self.at("++") || self.at("--") {
                 let delta = if self.at("++") { 1 } else { -1 };
                 let place = self.place_of(&e, start)?;
@@ -1576,6 +1618,21 @@ impl Parser {
             return Self::err_at(token, format!("'{name}' expects {expected} argument(s), got {}", args.len()));
         }
         let mut places = Vec::new();
+        let outs = out_params(static_name);
+        if !outs.is_empty() {
+            for (i, arg) in args.iter().enumerate() {
+                let place = if outs.contains(&i) {
+                    Some(to_place(arg).ok_or_else(|| VexError {
+                        line: token.line,
+                        col: token.col,
+                        message: format!("argument {} of '{name}' is an output and must be a variable", i + 1),
+                    })?)
+                } else {
+                    None
+                };
+                places.push(place);
+            }
+        }
         if MUTATING.contains(&static_name) {
             let place = to_place(&args[0]).ok_or_else(|| VexError {
                 line: token.line,
@@ -1727,6 +1784,10 @@ struct Runtime<'a> {
     partial_line: String,
     neighbours: Option<Vec<Vec<usize>>>,
     point_prims: Option<Vec<Vec<usize>>>,
+    point_grid: Option<PointGrid>,
+    // pcopen handles for the current element (cleared when the element changes).
+    pc_handles: Vec<PcHandle>,
+    pc_elem: usize,
 }
 
 fn vec3(v: [f32; 3]) -> Vec3 {
@@ -2101,6 +2162,231 @@ fn sort_values(items: &[Value]) -> R<Vec<usize>> {
     Ok(order)
 }
 
+// a[start:end:step] with Python semantics (negative indices count from the end).
+fn slice_value(base: &Value, start: Option<i32>, end: Option<i32>, step: i32) -> R<Value> {
+    if step == 0 {
+        return Err("slice step cannot be 0".into());
+    }
+    let pick = |len: usize| -> Vec<usize> {
+        let len = len as i64;
+        let clamp = |i: Option<i32>, default: i64, lo: i64, hi: i64| match i {
+            Some(i) => {
+                let i = i as i64;
+                (if i < 0 { i + len } else { i }).clamp(lo, hi)
+            }
+            None => default,
+        };
+        let mut out = Vec::new();
+        if step > 0 {
+            let (mut i, end) = (clamp(start, 0, 0, len), clamp(end, len, 0, len));
+            while i < end {
+                out.push(i as usize);
+                i += step as i64;
+            }
+        } else {
+            let (mut i, end) = (clamp(start, len - 1, -1, len - 1), clamp(end, -1, -1, len - 1));
+            while i > end {
+                out.push(i as usize);
+                i += step as i64;
+            }
+        }
+        out
+    };
+    match base {
+        Value::Arr(items) => Ok(Value::Arr(Rc::new(pick(items.len()).into_iter().map(|i| items[i].clone()).collect()))),
+        Value::Str(s) => {
+            let chars: Vec<char> = s.chars().collect();
+            Ok(Value::Str(pick(chars.len()).into_iter().map(|i| chars[i]).collect::<String>().into()))
+        }
+        other => Err(format!("cannot slice a {}", other.type_name())),
+    }
+}
+
+// Uniform hash grid over the input points, for nearpoint(s) and pcfind/pcopen.
+struct PointGrid {
+    cell: f32,
+    cells: HashMap<[i32; 3], Vec<usize>>,
+    lo: [i32; 3],
+    hi: [i32; 3],
+}
+
+impl PointGrid {
+    fn new(points: &[Vec3]) -> Self {
+        let mut grid = PointGrid { cell: 1.0, cells: HashMap::new(), lo: [0; 3], hi: [0; 3] };
+        let Some(first) = points.first() else { return grid };
+        let (mut lo, mut hi) = (*first, *first);
+        for p in points {
+            lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        let extent = hi.sub(lo);
+        // About one point per occupied cell for evenly spread points.
+        grid.cell = (extent.x.max(extent.y).max(extent.z) / (points.len() as f32).cbrt()).max(1e-5);
+        grid.lo = grid.key(lo);
+        grid.hi = grid.key(hi);
+        for (i, p) in points.iter().enumerate() {
+            grid.cells.entry(grid.key(*p)).or_default().push(i);
+        }
+        grid
+    }
+
+    fn key(&self, p: Vec3) -> [i32; 3] {
+        [p.x, p.y, p.z].map(|c| (c / self.cell).floor().clamp(-1e9, 1e9) as i32)
+    }
+
+    fn brute(points: &[Vec3], p: Vec3, radius: f32) -> Vec<(usize, f32)> {
+        points.iter().enumerate().map(|(i, v)| (i, v.sub(p).length())).filter(|(_, d)| *d <= radius).collect()
+    }
+
+    // Points within `radius` of `p`, nearest first, at most `limit`.
+    fn within(&self, points: &[Vec3], p: Vec3, radius: f32, limit: usize) -> Vec<(usize, f32)> {
+        let mut found = if !radius.is_finite() {
+            Self::brute(points, p, radius)
+        } else {
+            let (a, b) = (self.key(p.sub(Vec3::new(radius, radius, radius))), self.key(p.add(Vec3::new(radius, radius, radius))));
+            let (a, b) = ([0, 1, 2].map(|i| a[i].max(self.lo[i])), [0, 1, 2].map(|i| b[i].min(self.hi[i])));
+            let span: i64 = (0..3).map(|i| (b[i] as i64 - a[i] as i64 + 1).max(0)).product();
+            if span > self.cells.len() as i64 * 2 {
+                Self::brute(points, p, radius)
+            } else {
+                let mut found = Vec::new();
+                for z in a[2]..=b[2] {
+                    for y in a[1]..=b[1] {
+                        for x in a[0]..=b[0] {
+                            for &i in self.cells.get(&[x, y, z]).map_or(&[][..], Vec::as_slice) {
+                                let d = points[i].sub(p).length();
+                                if d <= radius {
+                                    found.push((i, d));
+                                }
+                            }
+                        }
+                    }
+                }
+                found
+            }
+        };
+        found.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal).then(x.0.cmp(&y.0)));
+        found.truncate(limit);
+        found
+    }
+
+    // Nearest point within `max`, searching rings of cells outward from `p`.
+    fn nearest(&self, points: &[Vec3], p: Vec3, max: f32) -> Option<(usize, f32)> {
+        if points.is_empty() {
+            return None;
+        }
+        let c = self.key(p);
+        let rings = (0..3).map(|i| (c[i] - self.lo[i]).abs().max((c[i] - self.hi[i]).abs())).max().unwrap_or(0);
+        let mut best: Option<(usize, f32)> = None;
+        for k in 0..=rings {
+            if (2 * k as i64 + 1).pow(3) > points.len() as i64 * 8 {
+                // Very sparse or far away: a direct scan is cheaper.
+                return Self::brute(points, p, max)
+                    .into_iter()
+                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal).then(x.0.cmp(&y.0)));
+            }
+            for z in c[2] - k..=c[2] + k {
+                for y in c[1] - k..=c[1] + k {
+                    for x in c[0] - k..=c[0] + k {
+                        if (x - c[0]).abs() != k && (y - c[1]).abs() != k && (z - c[2]).abs() != k {
+                            continue;
+                        }
+                        for &i in self.cells.get(&[x, y, z]).map_or(&[][..], Vec::as_slice) {
+                            let d = points[i].sub(p).length();
+                            if d <= max && best.is_none_or(|(bi, bd)| d < bd || (d == bd && i < bi)) {
+                                best = Some((i, d));
+                            }
+                        }
+                    }
+                }
+            }
+            // Anything in a later ring is at least k cells away.
+            if best.is_some_and(|(_, d)| d <= k as f32 * self.cell) || k as f32 * self.cell > max {
+                break;
+            }
+        }
+        best
+    }
+}
+
+struct PcHandle {
+    found: Vec<(usize, f32)>,
+    radius: f32,
+    next: usize,
+    current: Option<usize>,
+}
+
+struct SurfaceHit {
+    prim: usize,
+    position: Vec3,
+    // Parametric coordinates: position = (1-u-v)*p0 + u*p1 + v*p2.
+    uv: [f32; 2],
+}
+
+fn barycentric_uv(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> [f32; 2] {
+    let (e1, e2, d) = (b.sub(a), c.sub(a), p.sub(a));
+    let (d11, d12, d22) = (e1.dot(e1), e1.dot(e2), e2.dot(e2));
+    let (d1, d2) = (d.dot(e1), d.dot(e2));
+    let denom = d11 * d22 - d12 * d12;
+    if denom.abs() < 1e-20 {
+        return [0.0, 0.0];
+    }
+    [(d22 * d1 - d12 * d2) / denom, (d11 * d2 - d12 * d1) / denom]
+}
+
+// Closest point on any triangle of `mesh`; points only, the nearest point.
+fn closest_on_surface(mesh: &Mesh, p: Vec3) -> Option<SurfaceHit> {
+    if mesh.indices.is_empty() {
+        let (i, _) = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.sub(p).length()))
+            .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))?;
+        // No primitives: the nearest point, with no prim to report.
+        return Some(SurfaceHit { prim: usize::MAX, position: mesh.vertices[i], uv: [0.0, 0.0] });
+    }
+    let mut best: Option<(f32, SurfaceHit)> = None;
+    for (prim, tri) in mesh.indices.iter().enumerate() {
+        let [a, b, c] = tri.map(|i| mesh.vertices[i]);
+        let q = crate::volume::closest_on_triangle(p, a, b, c);
+        let d = q.sub(p).length();
+        if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            best = Some((d, SurfaceHit { prim, position: q, uv: barycentric_uv(q, a, b, c) }));
+        }
+    }
+    best.map(|(_, hit)| hit)
+}
+
+// First triangle hit by the segment origin..origin+dir (Moller-Trumbore).
+fn ray_hit(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<SurfaceHit> {
+    let mut best: Option<(f32, SurfaceHit)> = None;
+    for (prim, tri) in mesh.indices.iter().enumerate() {
+        let [a, b, c] = tri.map(|i| mesh.vertices[i]);
+        let (e1, e2) = (b.sub(a), c.sub(a));
+        let h = dir.cross(e2);
+        let det = e1.dot(h);
+        if det.abs() < 1e-12 {
+            continue;
+        }
+        let s = origin.sub(a);
+        let u = s.dot(h) / det;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let q = s.cross(e1);
+        let v = dir.dot(q) / det;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let t = e2.dot(q) / det;
+        if (0.0..=1.0).contains(&t) && best.as_ref().is_none_or(|(bt, _)| t < *bt) {
+            best = Some((t, SurfaceHit { prim, position: origin.add(dir.scale(t)), uv: [u, v] }));
+        }
+    }
+    best.map(|(_, hit)| hit)
+}
+
 fn int_array(values: impl IntoIterator<Item = usize>) -> Value {
     Value::Arr(Rc::new(values.into_iter().map(|i| Value::Int(i as i32)).collect()))
 }
@@ -2379,6 +2665,17 @@ impl<'a> Runtime<'a> {
                 let index = self.eval(index, fr)?.int()?;
                 index_read(&base, index)?
             }
+            Expr::Slice(a, start, end, step) => {
+                let base = self.eval(a, fr)?;
+                let mut part = |e: &'a Option<Box<Expr>>| -> R<Option<i32>> {
+                    match e {
+                        Some(e) => Ok(Some(self.eval(e, fr)?.int()?)),
+                        None => Ok(None),
+                    }
+                };
+                let (start, end, step) = (part(start)?, part(end)?, part(step)?);
+                slice_value(&base, start, end, step.unwrap_or(1))?
+            }
             Expr::Builtin(name, args, places, want_vec) => self.call_builtin(*name, args, places, *want_vec, fr)?,
             Expr::Call(index, args, places) => self.call_user(*index, args, places, fr)?,
         })
@@ -2479,6 +2776,15 @@ impl<'a> Runtime<'a> {
         for arg in args {
             values.push(self.eval(arg, fr)?);
         }
+        if !out_params(name).is_empty() {
+            let (result, outputs) = self.builtin_with_outputs(name, &values).map_err(|e| format!("{name}(): {e}"))?;
+            for (i, value) in outputs {
+                if let Some(Some(place)) = places.get(i) {
+                    self.write_place(place, value, fr)?;
+                }
+            }
+            return Ok(result);
+        }
         self.builtin(name, &values, want_vec).map_err(|e| if name == "error" { e } else { format!("{name}(): {e}") })
     }
 
@@ -2560,6 +2866,70 @@ impl<'a> Runtime<'a> {
             (Domain::Vertex, "P") => Value::Vec(arr3(mesh.vertices[mesh.indices[index / 3][index % 3]])),
             _ => read_storage(mesh, &format!("{}{name}", domain.prefix()), index, count, hint),
         }
+    }
+
+    fn grid(&mut self) -> &PointGrid {
+        let input = self.input;
+        self.point_grid.get_or_insert_with(|| PointGrid::new(&input.vertices))
+    }
+
+    fn pc_handle(&self, handle: &Value) -> R<&PcHandle> {
+        let index = handle.int()?;
+        usize::try_from(index).ok().and_then(|i| self.pc_handles.get(i)).ok_or_else(|| format!("{index} is not an open point cloud handle"))
+    }
+
+    fn pc_handle_mut(&mut self, handle: &Value) -> R<&mut PcHandle> {
+        let index = handle.int()?;
+        usize::try_from(index).ok().and_then(|i| self.pc_handles.get_mut(i)).ok_or_else(|| format!("{index} is not an open point cloud handle"))
+    }
+
+    // Builtins with output arguments: the result plus (argument index, value) to write back.
+    fn builtin_with_outputs(&mut self, name: &str, a: &[Value]) -> R<(Value, Vec<(usize, Value)>)> {
+        Ok(match name {
+            "xyzdist" => {
+                let p = vec3(a[1].vec()?);
+                match closest_on_surface(self.input, p) {
+                    Some(hit) => (
+                        Value::Float(hit.position.sub(p).length()),
+                        vec![
+                            (2, Value::Int(if hit.prim == usize::MAX { -1 } else { hit.prim as i32 })),
+                            (3, Value::Vec([hit.uv[0], hit.uv[1], 0.0])),
+                        ],
+                    ),
+                    None => (Value::Float(-1.0), vec![(2, Value::Int(-1))]),
+                }
+            }
+            "intersect" => {
+                let origin = vec3(a[1].vec()?);
+                let dir = vec3(a[2].vec()?);
+                match ray_hit(self.input, origin, dir) {
+                    Some(hit) => (
+                        Value::Int(hit.prim as i32),
+                        vec![(3, Value::Vec(arr3(hit.position))), (4, Value::Vec([hit.uv[0], hit.uv[1], 0.0]))],
+                    ),
+                    None => (Value::Int(-1), vec![(3, Value::Vec(arr3(origin.add(dir))))]),
+                }
+            }
+            "pcimport" => {
+                let attr = a[1].string()?;
+                let current = {
+                    let handle = self.pc_handle(&a[0])?;
+                    handle.current.map(|i| handle.found[i])
+                };
+                match current {
+                    Some((pt, distance)) => {
+                        let value = match &*attr {
+                            "point.number" => Value::Int(pt as i32),
+                            "point.distance" => Value::Float(distance),
+                            _ => self.input_attr(Domain::Point, &attr, pt as i32),
+                        };
+                        (Value::Int(1), vec![(2, value)])
+                    }
+                    None => (Value::Int(0), Vec::new()),
+                }
+            }
+            other => return Err(format!("{other} has no outputs")),
+        })
     }
 
     fn neighbour_lists(&mut self) -> &Vec<Vec<usize>> {
@@ -2813,6 +3183,21 @@ impl<'a> Runtime<'a> {
                 let attr = a[1].string()?;
                 Int((matches!(&*attr, "P" | "N") || self.input.point_attributes.contains_key(&*attr)) as i32)
             }
+            "inpointgroup" | "inprimgroup" => {
+                let (domain, key) = if name == "inpointgroup" {
+                    (Domain::Point, format!("group:{}", a[1].string()?))
+                } else {
+                    (Domain::Prim, format!("group:{}", a[1].string()?))
+                };
+                Int((self.input_attr(domain, &key, a[2].int()?).num().unwrap_or(0.0) > 0.5) as i32)
+            }
+            "setpointgroup" | "setprimgroup" => {
+                let domain = if name == "setpointgroup" { Domain::Point } else { Domain::Prim };
+                let index = index_of(&a[2])?;
+                let on = Value::Float(if a[3].truthy() { 1.0 } else { 0.0 });
+                self.pending.writes.push((domain, format!("group:{}", a[1].string()?), index, on, write_mode(None)?));
+                Int(index as i32)
+            }
             "hasprimattrib" => Int(self.input.point_attributes.contains_key(&format!("prim:{}", a[1].string()?)) as i32),
             "setpointattrib" | "setprimattrib" => {
                 let domain = if name == "setpointattrib" { Domain::Point } else { Domain::Prim };
@@ -2868,24 +3253,147 @@ impl<'a> Runtime<'a> {
             "nearpoint" => {
                 let p = vec3(a[1].vec()?);
                 let max = a.get(2).map(Value::num).transpose()?.unwrap_or(f32::INFINITY);
-                let nearest = self
-                    .input
-                    .vertices
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (i, v.sub(p).length()))
-                    .filter(|(_, d)| *d <= max)
-                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
-                Int(nearest.map_or(-1, |(i, _)| i as i32))
+                let input = self.input;
+                Int(self.grid().nearest(&input.vertices, p, max).map_or(-1, |(i, _)| i as i32))
             }
             "nearpoints" => {
                 let p = vec3(a[1].vec()?);
                 let max = a[2].num()?;
                 let limit = a.get(3).map(Value::int).transpose()?.map_or(usize::MAX, |n| n.max(0) as usize);
-                let mut found: Vec<(usize, f32)> =
-                    self.input.vertices.iter().enumerate().map(|(i, v)| (i, v.sub(p).length())).filter(|(_, d)| *d <= max).collect();
-                found.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
-                int_array(found.into_iter().take(limit).map(|(i, _)| i))
+                let input = self.input;
+                int_array(self.grid().within(&input.vertices, p, max, limit).into_iter().map(|(i, _)| i))
+            }
+            "pcfind" | "pcopen" => {
+                let channel = a[1].string()?;
+                if &*channel != "P" {
+                    return Err(format!("only the \"P\" channel is supported, got \"{channel}\""));
+                }
+                let p = vec3(a[2].vec()?);
+                let radius = a[3].num()?.max(0.0);
+                let limit = a[4].int()?.max(0) as usize;
+                let input = self.input;
+                let found = self.grid().within(&input.vertices, p, radius, limit);
+                if name == "pcfind" {
+                    int_array(found.into_iter().map(|(i, _)| i))
+                } else {
+                    if self.pc_elem != self.elem {
+                        self.pc_handles.clear();
+                        self.pc_elem = self.elem;
+                    }
+                    self.pc_handles.push(PcHandle { found, radius, next: 0, current: None });
+                    Int(self.pc_handles.len() as i32 - 1)
+                }
+            }
+            "pcnumfound" => Int(self.pc_handle(&a[0])?.found.len() as i32),
+            "pcclose" => Int(1),
+            "pciterate" => {
+                let handle = self.pc_handle_mut(&a[0])?;
+                if handle.next < handle.found.len() {
+                    handle.current = Some(handle.next);
+                    handle.next += 1;
+                    Int(1)
+                } else {
+                    handle.current = None;
+                    Int(0)
+                }
+            }
+            "pcfilter" => {
+                let attr = a[1].string()?;
+                let (found, radius) = {
+                    let handle = self.pc_handle(&a[0])?;
+                    (handle.found.clone(), handle.radius)
+                };
+                if found.is_empty() {
+                    return Ok(Float(0.0));
+                }
+                // Closer points count more: w = 1 - (d / radius)^2, equal weights when unbounded.
+                let weights: Vec<f32> = found
+                    .iter()
+                    .map(|(_, d)| if radius.is_finite() && radius > 0.0 { (1.0 - (d / radius).powi(2)).max(1e-6) } else { 1.0 })
+                    .collect();
+                let total: f32 = weights.iter().sum();
+                let values: Vec<Value> = found.iter().map(|(pt, _)| self.input_attr(Domain::Point, &attr, *pt as i32)).collect();
+                if values.iter().all(Value::is_vector_like) && values.iter().any(|v| matches!(v, V(_))) {
+                    let mut sum = [0.0f32; 3];
+                    for (v, w) in values.iter().zip(&weights) {
+                        let v = v.vec()?;
+                        for c in 0..3 {
+                            sum[c] += v[c] * w;
+                        }
+                    }
+                    V(sum.map(|c| c / total))
+                } else {
+                    let mut sum = 0.0;
+                    for (v, w) in values.iter().zip(&weights) {
+                        sum += v.num()? * w;
+                    }
+                    Float(sum / total)
+                }
+            }
+            "xyzdist" | "intersect" | "pcimport" => self.builtin_with_outputs(name, a)?.0,
+            "minpos" => match closest_on_surface(self.input, vec3(a[1].vec()?)) {
+                Some(hit) => V(arr3(hit.position)),
+                None => V(a[1].vec()?),
+            },
+            "curlnoise" => {
+                let p = a[0].vec()?;
+                // Curl of a vector potential made of three decorrelated Perlin fields.
+                let e = 1e-2;
+                let field = |c: u32, q: [f32; 3]| perlin3(q, 17 + c);
+                let d = |c: u32, axis: usize| {
+                    let (mut hi, mut lo) = (p, p);
+                    hi[axis] += e;
+                    lo[axis] -= e;
+                    (field(c, hi) - field(c, lo)) / (2.0 * e)
+                };
+                V([d(2, 1) - d(1, 2), d(0, 2) - d(2, 0), d(1, 0) - d(0, 1)])
+            }
+            "sample_direction_uniform" => {
+                let u = a[0].vec()?;
+                let z = 1.0 - 2.0 * u[1].clamp(0.0, 1.0);
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let phi = u[0] * std::f32::consts::TAU;
+                V([r * phi.cos(), r * phi.sin(), z])
+            }
+            "sample_sphere_uniform" => {
+                let u = a[0].vec()?;
+                let z = 1.0 - 2.0 * u[1].clamp(0.0, 1.0);
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let phi = u[0] * std::f32::consts::TAU;
+                let scale = u[2].clamp(0.0, 1.0).cbrt();
+                V([r * phi.cos() * scale, r * phi.sin() * scale, z * scale])
+            }
+            "select" => {
+                if a[0].truthy() {
+                    a[1].clone()
+                } else {
+                    a[2].clone()
+                }
+            }
+            "slice" => {
+                let step = a.get(3).map(Value::int).transpose()?.unwrap_or(1);
+                slice_value(&a[0], Some(a[1].int()?), Some(a[2].int()?), step)?
+            }
+            "reorder" => {
+                let items = a[0].items()?;
+                let order = a[1].items()?;
+                let mut out = Vec::with_capacity(order.len());
+                for i in order.iter() {
+                    let i = i.int()?;
+                    out.push(normalize_index(i, items.len()).map(|i| items[i].clone()).ok_or_else(|| format!("index {i} is out of range"))?);
+                }
+                Value::Arr(Rc::new(out))
+            }
+            "uniquevals" => {
+                let items = a[0].items()?;
+                let order = sort_values(&items)?;
+                let mut out: Vec<Value> = Vec::new();
+                for i in order {
+                    if !out.last().is_some_and(|last| values_equal(last, &items[i])) {
+                        out.push(items[i].clone());
+                    }
+                }
+                Value::Arr(Rc::new(out))
             }
             "neighbours" | "neighbourcount" => {
                 let pt = a[1].int()?;
@@ -3082,9 +3590,10 @@ pub fn check(code: &str) -> Result<(), String> {
 // Runs `code` over every element of `domain` (0 detail, 1 primitives, 2 points, 3 vertices).
 // On any error the input geometry is returned unchanged and the error is reported.
 // `time_inc` is @TimeInc: seconds per frame, or per step inside a SOP Solver.
-pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> Mesh {
+// `mask` limits the run to some elements of the domain (a node's group); None runs on all.
+pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>) -> Mesh {
     let start = Instant::now();
-    let (mesh, mut report) = run_timed(mesh, code, time, time_inc, domain_index);
+    let (mesh, mut report) = run_masked(mesh, code, time, time_inc, domain_index, mask);
     report.millis = start.elapsed().as_secs_f32() * 1000.0;
     if let Ok(mut map) = reports().lock() {
         if map.len() > 256 {
@@ -3101,6 +3610,10 @@ fn run(mesh: Mesh, code: &str, time: f32, domain_index: usize) -> (Mesh, VexRepo
 }
 
 fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> (Mesh, VexReport) {
+    run_masked(mesh, code, time, time_inc, domain_index, None)
+}
+
+fn run_masked(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>) -> (Mesh, VexReport) {
     let program = match compile(code) {
         Ok(program) => program,
         Err(error) => return (mesh, VexReport { error: Some(error.to_string()), ..Default::default() }),
@@ -3132,6 +3645,9 @@ fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usi
         partial_line: String::new(),
         neighbours: None,
         point_prims: None,
+        point_grid: None,
+        pc_handles: Vec::new(),
+        pc_elem: usize::MAX,
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
     let missing: Vec<String> = program
@@ -3153,6 +3669,9 @@ fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usi
     };
     let mut failure = None;
     for elem in 0..count {
+        if mask.is_some_and(|m| !m.get(elem).copied().unwrap_or(true)) {
+            continue;
+        }
         rt.elem = elem;
         let mut frame = Frame { vals: defaults.clone(), types: &program.main.slot_types };
         if let Err(error) = rt.exec_block(&program.main.body, &mut frame) {
@@ -3231,7 +3750,8 @@ Attributes @P @N @Cd @pscale (read/write), @ptnum @primnum @vtxnum @numpt @numpr
            @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel
 Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   M_PI  M_E
 Operators  + - * / %  == != < <= > >=  && || !  ?:  = += -= *= /= %=  ++ --
-           .x .y .z (.r .g .b) on vectors, [i] on arrays/vectors (negative from end)
+           .x .y .z (.r .g .b) on vectors, [i] on arrays/vectors (negative from end),
+           a[start:end:step] slices arrays and strings (a[1:3], a[-2:], a[::-1])
 Control    if (...) {...} else if (...) {...} else {...}
            for (int i = 0; i < 10; i++) {...}   while (...) {...}   do {...} while (...);
            foreach (vector p; pts) {...}   foreach (int i; vector p; pts) {...}
@@ -3264,6 +3784,10 @@ mod tests {
             }
         }
         mesh
+    }
+
+    fn single_point(p: [f32; 3]) -> Mesh {
+        Mesh { vertices: vec![Vec3::new(p[0], p[1], p[2])], ..Mesh::default() }
     }
 
     fn detail(code: &str) -> VexReport {
@@ -3440,6 +3964,9 @@ mod tests {
             partial_line: String::new(),
             neighbours: None,
             point_prims: None,
+            point_grid: None,
+            pc_handles: Vec::new(),
+            pc_elem: usize::MAX,
         };
         for (name, min, ..) in BUILTINS {
             if MUTATING.contains(name) {
@@ -3458,6 +3985,133 @@ mod tests {
             let (_, report) = run(grid(), code, 0.5, *domain);
             assert_eq!(report.error, None, "example '{label}'");
         }
+    }
+
+    #[test]
+    fn array_slicing() {
+        let (mesh, report) = run(
+            grid(),
+            "int a[] = {0, 1, 2, 3, 4, 5};\n\
+             i@n1 = len(a[1:4]); i@first = a[1:4][0];\n\
+             i@n2 = len(a[:-2]); i@last = a[-2:][1];\n\
+             i@rev = a[::-1][0]; i@even = len(a[::2]);\n\
+             i@s = len(slice(a, 0, 6, 3));\n\
+             i@u = len(uniquevals({3, 1, 3, 2, 1}));\n\
+             int r[] = reorder({10, 20, 30}, {2, 0}); i@r0 = r[0];",
+            0.0,
+            2,
+        );
+        assert_eq!(report.error, None);
+        let get = |name: &str| mesh.point_attributes[name][0];
+        assert_eq!((get("n1"), get("first"), get("n2"), get("last")), (3.0, 1.0, 4.0, 5.0));
+        assert_eq!((get("rev"), get("even"), get("s"), get("u"), get("r0")), (5.0, 3.0, 2.0, 3.0, 30.0));
+        assert!(error("int a[] = {1};\nint b[] = a[::0];").contains("step cannot be 0"));
+        assert_eq!(output("printf(\"%s %s\\n\", \"houdini\"[1:4], \"abc\"[::-1]);"), "oud cba");
+    }
+
+    #[test]
+    fn point_grid_matches_brute_force() {
+        let points: Vec<Vec3> = (0..400u32).map(|i| Vec3::new(hash01(i, 1) * 4.0, hash01(i, 2), hash01(i, 3) * 2.0 - 7.0)).collect();
+        let grid = PointGrid::new(&points);
+        for q in 0..60u32 {
+            let p = Vec3::new(hash01(q, 9) * 6.0 - 1.0, hash01(q, 8) * 3.0 - 1.0, hash01(q, 7) * 4.0 - 9.0);
+            for radius in [0.05, 0.3, 1.5, f32::INFINITY] {
+                let mut brute = PointGrid::brute(&points, p, radius);
+                brute.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then(x.0.cmp(&y.0)));
+                brute.truncate(25);
+                assert_eq!(grid.within(&points, p, radius, 25), brute);
+                assert_eq!(grid.nearest(&points, p, radius), brute.first().copied());
+            }
+        }
+    }
+
+    #[test]
+    fn point_clouds() {
+        // 3x3 grid with spacing 1: the centre point has 4 neighbours at distance 1.
+        let (mesh, report) = run(
+            grid(),
+            "int h = pcopen(0, \"P\", @P, 1.01, 10);\n\
+             i@found = pcnumfound(h);\n\
+             v@avg = pcfilter(h, \"P\");\n\
+             float total = 0; int count = 0;\n\
+             while (pciterate(h)) { float d; pcimport(h, \"point.distance\", d); total += d; count++; }\n\
+             f@total = total; i@count = count;\n\
+             i@n = len(pcfind(0, \"P\", @P, 1.01, 3));",
+            0.0,
+            2,
+        );
+        assert_eq!(report.error, None);
+        let centre = mesh.vertices.iter().position(|v| v.x.abs() < 1e-6 && v.z.abs() < 1e-6).unwrap();
+        let attr = |name: &str| mesh.point_attributes[name][centre];
+        assert_eq!((attr("found"), attr("count"), attr("n")), (5.0, 5.0, 3.0));
+        assert!((attr("total") - 4.0).abs() < 1e-5);
+        let avg = &mesh.point_attributes["avg"][centre * 3..centre * 3 + 3];
+        assert!(avg.iter().all(|c| c.abs() < 1e-5), "{avg:?}");
+        assert!(error("int h = pcopen(0, \"Cd\", @P, 1, 4);").contains("\"P\" channel"));
+    }
+
+    #[test]
+    fn surface_queries() {
+        let (mesh, report) = run(
+            grid(),
+            "if (@ptnum == 0) {\n\
+               int prim; vector uv;\n\
+               f@d = xyzdist(0, set(0.2, 3.0, 0.1), prim, uv); i@prim = prim;\n\
+               v@m = minpos(0, set(0.2, 3.0, 0.1));\n\
+               vector hit, huv;\n\
+               i@hitprim = intersect(0, set(0.3, 5, 0.3), set(0, -10, 0), hit, huv); v@hit = hit;\n\
+               i@miss = intersect(0, set(0.3, 5, 0.3), set(0, 1, 0), hit, huv);\n\
+             }",
+            0.0,
+            2,
+        );
+        assert_eq!(report.error, None);
+        let get = |name: &str| mesh.point_attributes[name][0];
+        assert!((get("d") - 3.0).abs() < 1e-5);
+        assert!(get("prim") >= 0.0);
+        let m = &mesh.point_attributes["m"][0..3];
+        assert!((m[0] - 0.2).abs() < 1e-5 && m[1].abs() < 1e-5 && (m[2] - 0.1).abs() < 1e-5, "{m:?}");
+        assert!(get("hitprim") >= 0.0);
+        assert_eq!(get("miss"), -1.0);
+        let hit = &mesh.point_attributes["hit"][0..3];
+        assert!((hit[0] - 0.3).abs() < 1e-5 && hit[1].abs() < 1e-5 && (hit[2] - 0.3).abs() < 1e-5, "{hit:?}");
+        assert!(error("xyzdist(0, {0,0,0}, 1, 2);").contains("must be a variable"));
+    }
+
+    #[test]
+    fn curl_noise_and_sampling() {
+        let (mesh, report) = run(
+            grid(),
+            "v@c = curlnoise(@P * 0.7 + 0.31);\n\
+             v@dir = sample_direction_uniform(set(rand(@ptnum), rand(@ptnum + 7), 0));\n\
+             v@ball = sample_sphere_uniform(set(rand(@ptnum), rand(@ptnum + 7), rand(@ptnum + 3)));\n\
+             f@sel = select(@ptnum > 4, 1.0, 2.0);",
+            0.0,
+            2,
+        );
+        assert_eq!(report.error, None);
+        for i in 0..mesh.vertices.len() {
+            let v = |name: &str| Vec3::new(mesh.point_attributes[name][i * 3], mesh.point_attributes[name][i * 3 + 1], mesh.point_attributes[name][i * 3 + 2]);
+            assert!((v("dir").length() - 1.0).abs() < 1e-4);
+            assert!(v("ball").length() <= 1.0 + 1e-5);
+            assert!(v("c").length() > 0.0);
+        }
+        // Divergence-free: numerical divergence of curlnoise is ~0.
+        let (curl, e) = (|p: [f32; 3]| {
+            let (m, _) = run(single_point(p), "v@c = curlnoise(@P);", 0.0, 2);
+            [m.point_attributes["c"][0], m.point_attributes["c"][1], m.point_attributes["c"][2]]
+        }, 1e-2);
+        let p = [0.37, 1.21, -0.58];
+        let mut div = 0.0;
+        for axis in 0..3 {
+            let (mut hi, mut lo) = (p, p);
+            hi[axis] += e;
+            lo[axis] -= e;
+            div += (curl(hi)[axis] - curl(lo)[axis]) / (2.0 * e);
+        }
+        assert!(div.abs() < 0.05, "divergence {div}");
+        assert_eq!(mesh.point_attributes["sel"][0], 2.0);
+        assert_eq!(mesh.point_attributes["sel"][8], 1.0);
     }
 
     #[test]

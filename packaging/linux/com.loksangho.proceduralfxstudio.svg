@@ -1,8 +1,75 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <rect x="8" y="8" width="112" height="112" rx="24" fill="#1f2430"/>
-  <path d="M40 44 C64 44 64 84 88 84" stroke="#8aa4c8" stroke-width="5" fill="none"/>
-  <path d="M40 44 C64 44 64 44 88 44" stroke="#8aa4c8" stroke-width="5" fill="none"/>
-  <rect x="22" y="32" width="28" height="24" rx="6" fill="#f0a030"/>
-  <rect x="78" y="32" width="28" height="24" rx="6" fill="#4fb3a9"/>
-  <rect x="78" y="72" width="28" height="24" rx="6" fill="#d9605a"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1c2236"/>
+      <stop offset="1" stop-color="#2a1a3f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.72" cy="0.3" r="0.55">
+      <stop offset="0" stop-color="#ff7a4d" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ff7a4d" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wireTop" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#ff5d73"/>
+    </linearGradient>
+    <linearGradient id="wireBottom" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#9b7bff"/>
+    </linearGradient>
+    <linearGradient id="nodeA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffc766"/>
+      <stop offset="1" stop-color="#ff9a3c"/>
+    </linearGradient>
+    <linearGradient id="nodeB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff8a8a"/>
+      <stop offset="1" stop-color="#ff4f7b"/>
+    </linearGradient>
+    <linearGradient id="nodeC" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b79bff"/>
+      <stop offset="1" stop-color="#7d5cf5"/>
+    </linearGradient>
+    <radialGradient id="spark" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff6d6"/>
+      <stop offset="0.45" stop-color="#ffcf6b"/>
+      <stop offset="1" stop-color="#ff7a4d" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- App tile -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#tile)"/>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#glow)"/>
+  <rect x="66" y="66" width="892" height="892" rx="198" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="4"/>
+
+  <!-- Wires -->
+  <path d="M 372 512 C 470 512, 470 330, 600 330" fill="none" stroke="url(#wireTop)" stroke-width="30" stroke-linecap="round"/>
+  <path d="M 372 512 C 470 512, 470 694, 600 694" fill="none" stroke="url(#wireBottom)" stroke-width="30" stroke-linecap="round"/>
+
+  <!-- Nodes -->
+  <rect x="168" y="448" width="204" height="128" rx="34" fill="url(#nodeA)"/>
+  <rect x="600" y="266" width="204" height="128" rx="34" fill="url(#nodeB)"/>
+  <rect x="600" y="630" width="204" height="128" rx="34" fill="url(#nodeC)"/>
+  <!-- Node detail: a dark bar like a node's label strip -->
+  <rect x="200" y="496" width="96" height="32" rx="16" fill="#1c2236" fill-opacity="0.35"/>
+  <rect x="632" y="314" width="96" height="32" rx="16" fill="#1c2236" fill-opacity="0.35"/>
+  <rect x="632" y="678" width="96" height="32" rx="16" fill="#1c2236" fill-opacity="0.35"/>
+  <!-- Ports -->
+  <circle cx="372" cy="512" r="20" fill="#1c2236"/>
+  <circle cx="372" cy="512" r="11" fill="#fff1d6"/>
+  <circle cx="600" cy="330" r="20" fill="#1c2236"/>
+  <circle cx="600" cy="330" r="11" fill="#fff1d6"/>
+  <circle cx="600" cy="694" r="20" fill="#1c2236"/>
+  <circle cx="600" cy="694" r="11" fill="#fff1d6"/>
+
+  <!-- FX: particles streaming off the top node -->
+  <g transform="translate(-28 30)">
+  <circle cx="842" cy="252" r="22" fill="#ffcf6b"/>
+  <circle cx="880" cy="208" r="15" fill="#ff9a5c"/>
+  <circle cx="842" cy="176" r="11" fill="#ff6f7f"/>
+  <circle cx="900" cy="154" r="8" fill="#ffcf6b"/>
+  <circle cx="796" cy="196" r="7" fill="#ff9a5c"/>
+  <circle cx="870" cy="118" r="5" fill="#ff6f7f"/>
+  <!-- Spark -->
+  <circle cx="810" cy="140" r="64" fill="url(#spark)"/>
+  <path d="M 810 92 L 820 130 L 858 140 L 820 150 L 810 188 L 800 150 L 762 140 L 800 130 Z" fill="#fff6d6"/>
+  </g>
 </svg>
