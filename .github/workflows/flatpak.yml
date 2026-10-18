@@ -1,8 +1,16 @@
 name: Flatpak
 
+# Releases build for v* tags. Tag runs can only restore caches saved from the
+# default branch, so main builds (only when the Flatpak recipe or this workflow
+# changes, or when started by hand) keep that shared dependency cache current,
+# and tag runs reuse it to rebuild just the app.
 on:
   push:
-    branches: [main, master]
+    branches: [main]
+    # Path filters apply to branch pushes only; tag pushes always run.
+    paths:
+      - 'packaging/linux/**'
+      - '.github/workflows/flatpak.yml'
     tags: ['v*']
   workflow_dispatch:
 
@@ -88,8 +96,10 @@ jobs:
           flatpak build-bundle repo "$BUNDLE" "$APP_ID" \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
 
+      # Only main's cache can be restored by later runs, so tag runs don't save one
+      # (it would only take space from main's in the 10 GB cache limit).
       - name: Save build cache
-        if: always()
+        if: always() && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: .flatpak-builder
