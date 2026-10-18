@@ -221,6 +221,17 @@ fn stage_mac_update(zip: &Path, current: &Path) -> Result<PathBuf, String> {
     Ok(new_app)
 }
 
+// The sandbox's /tmp is private, so the host's `flatpak install` (run through
+// flatpak-spawn) couldn't see a bundle saved there. The app's cache directory
+// (~/.var/app/<id>/cache) has the same path inside and outside the sandbox.
+fn download_dir(install: &InstallKind) -> PathBuf {
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|d| d.is_absolute());
+    match (install, cache) {
+        (InstallKind::Flatpak { .. }, Some(dir)) if std::fs::create_dir_all(&dir).is_ok() => dir,
+        _ => std::env::temp_dir(),
+    }
+}
+
 fn flatpak_install(bundle: &Path, user: bool) -> Result<(), String> {
     let mut cmd = Command::new("flatpak-spawn");
     cmd.args(["--host", "flatpak", "install", "--reinstall", "--noninteractive", "-y"]);
@@ -383,7 +394,7 @@ impl Updater {
         let ctx = ctx.clone();
         self.state = State::Downloading { release, done: 0, total: asset.size };
         std::thread::spawn(move || {
-            let dest = std::env::temp_dir().join(&asset.name);
+            let dest = download_dir(&install).join(&asset.name);
             let result = download(&asset, &dest, &tx, &cancel).and_then(|()| {
                 let staged = match &install {
                     InstallKind::MacApp(app) => stage_mac_update(&dest, app).map(Some),
