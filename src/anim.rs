@@ -279,11 +279,9 @@ impl GraphEditor {
         self.needs_frame = false;
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context, rows: &mut [ChannelRow], time: f32, time_range: (f32, f32), fps: f32) -> EditorResult {
+    // The editor drawn into `ui` (a dock pane); the caller decides where it lives.
+    pub fn ui_inside(&mut self, ui: &mut egui::Ui, rows: &mut [ChannelRow], time: f32, time_range: (f32, f32), fps: f32) -> EditorResult {
         let mut result = EditorResult { scrub: None, changed: false };
-        if !self.open {
-            return result;
-        }
         // Key selection indexes rows, so a different set of channels clears it.
         let signature: Vec<String> = rows.iter().map(|r| r.label.clone()).collect();
         if signature != self.row_signature {
@@ -294,46 +292,37 @@ impl GraphEditor {
         if self.needs_frame {
             self.fit(rows, time_range);
         }
-        let mut open = self.open;
-        egui::Window::new("Graph Editor")
-            .open(&mut open)
-            .default_size([820.0, 380.0])
-            .min_size([420.0, 220.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                self.toolbar(ui, rows, &mut result);
-                ui.separator();
-                ui.horizontal_top(|ui| {
-                    egui::ScrollArea::vertical().id_salt("graph_channels").max_width(170.0).min_scrolled_height(ui.available_height()).show(ui, |ui| {
-                        ui.set_width(160.0);
-                        if rows.is_empty() {
-                            ui.weak("No animated channels. Select a node and press K or ◆ Key, or turn on Auto Key.");
-                        }
-                        let mut group = "";
-                        for row in rows.iter() {
-                            if row.group != group {
-                                group = &row.group;
-                                ui.strong(group);
+        self.toolbar(ui, rows, &mut result);
+        ui.separator();
+        ui.horizontal_top(|ui| {
+            egui::ScrollArea::vertical().id_salt("graph_channels").max_width(170.0).min_scrolled_height(ui.available_height()).show(ui, |ui| {
+                ui.set_width(160.0);
+                if rows.is_empty() {
+                    ui.weak("No animated channels. Select a node and press K or ◆ Key, or turn on Auto Key.");
+                }
+                let mut group = "";
+                for row in rows.iter() {
+                    if row.group != group {
+                        group = &row.group;
+                        ui.strong(group);
+                    }
+                    let mut visible = !self.hidden.contains(&row.label);
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 2.0, channel_colour(&row.label));
+                        if ui.checkbox(&mut visible, format!("{}  ({})", short_label(&row.label), row.channel.keys.len())).changed() {
+                            if visible {
+                                self.hidden.remove(&row.label);
+                            } else {
+                                self.hidden.insert(row.label.clone());
                             }
-                            let mut visible = !self.hidden.contains(&row.label);
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 2.0, channel_colour(&row.label));
-                                if ui.checkbox(&mut visible, format!("{}  ({})", short_label(&row.label), row.channel.keys.len())).changed() {
-                                    if visible {
-                                        self.hidden.remove(&row.label);
-                                    } else {
-                                        self.hidden.insert(row.label.clone());
-                                    }
-                                }
-                            });
                         }
                     });
-                    ui.separator();
-                    self.canvas(ui, rows, time, fps, &mut result);
-                });
+                }
             });
-        self.open = open;
+            ui.separator();
+            self.canvas(ui, rows, time, fps, &mut result);
+        });
         result
     }
 

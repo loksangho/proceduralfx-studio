@@ -38,6 +38,10 @@ enum Ty {
     FloatArr,
     VecArr,
     StrArr,
+    // vector4 (also quaternions), matrix3 and matrix (4x4); no arrays of these.
+    Vec4,
+    Mat3,
+    Mat4,
 }
 
 impl Ty {
@@ -47,7 +51,7 @@ impl Ty {
             Ty::Float => Ty::FloatArr,
             Ty::Vector => Ty::VecArr,
             Ty::Str => Ty::StrArr,
-            array => array,
+            other => other,
         }
     }
 
@@ -67,6 +71,10 @@ impl Ty {
             Ty::Float => Value::Float(0.0),
             Ty::Vector => Value::Vec([0.0; 3]),
             Ty::Str => Value::Str("".into()),
+            Ty::Vec4 => Value::Vec4([0.0; 4]),
+            // Matrices start as the identity, as in VEX.
+            Ty::Mat3 => Value::Mat3(crate::vexmath::m3_ident()),
+            Ty::Mat4 => Value::Mat4(crate::vexmath::m4_ident()),
             _ => Value::Arr(Rc::new(Vec::new())),
         }
     }
@@ -81,6 +89,9 @@ impl Ty {
             Ty::FloatArr => "float[]",
             Ty::VecArr => "vector[]",
             Ty::StrArr => "string[]",
+            Ty::Vec4 => "vector4",
+            Ty::Mat3 => "matrix3",
+            Ty::Mat4 => "matrix",
         }
     }
 }
@@ -92,6 +103,9 @@ enum Value {
     Vec([f32; 3]),
     Str(Rc<str>),
     Arr(Rc<Vec<Value>>),
+    Vec4([f32; 4]),
+    Mat3([f32; 9]),
+    Mat4([f32; 16]),
 }
 
 impl Default for Value {
@@ -108,6 +122,55 @@ impl Value {
             Value::Vec(_) => "vector",
             Value::Str(_) => "string",
             Value::Arr(_) => "array",
+            Value::Vec4(_) => "vector4",
+            Value::Mat3(_) => "matrix3",
+            Value::Mat4(_) => "matrix",
+        }
+    }
+
+    // The flat components of a vector4 or matrix.
+    fn floats(&self) -> Option<&[f32]> {
+        match self {
+            Value::Vec4(v) => Some(v),
+            Value::Mat3(m) => Some(m),
+            Value::Mat4(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    fn vec4(&self) -> R<[f32; 4]> {
+        match self {
+            Value::Vec4(v) => Ok(*v),
+            Value::Int(_) | Value::Float(_) => Ok([self.num()?; 4]),
+            Value::Vec(v) => Ok([v[0], v[1], v[2], 0.0]),
+            Value::Arr(items) if items.len() == 4 => Ok([items[0].num()?, items[1].num()?, items[2].num()?, items[3].num()?]),
+            other => Err(format!("expected a vector4, got {}", other.type_name())),
+        }
+    }
+
+    fn mat3(&self) -> R<[f32; 9]> {
+        match self {
+            Value::Mat3(m) => Ok(*m),
+            Value::Mat4(m) => Ok(crate::vexmath::m4_to_m3(m)),
+            Value::Int(_) | Value::Float(_) => Ok(crate::vexmath::m3_ident().map(|c| c * self.num().unwrap_or(0.0))),
+            Value::Arr(items) if items.len() == 9 => {
+                let v = items.iter().map(Value::num).collect::<R<Vec<f32>>>()?;
+                Ok(v.try_into().unwrap())
+            }
+            other => Err(format!("expected a matrix3, got {}", other.type_name())),
+        }
+    }
+
+    fn mat4(&self) -> R<[f32; 16]> {
+        match self {
+            Value::Mat4(m) => Ok(*m),
+            Value::Mat3(m) => Ok(crate::vexmath::m3_to_m4(m)),
+            Value::Int(_) | Value::Float(_) => Ok(crate::vexmath::m4_ident().map(|c| c * self.num().unwrap_or(0.0))),
+            Value::Arr(items) if items.len() == 16 => {
+                let v = items.iter().map(Value::num).collect::<R<Vec<f32>>>()?;
+                Ok(v.try_into().unwrap())
+            }
+            other => Err(format!("expected a matrix, got {}", other.type_name())),
         }
     }
 
@@ -118,6 +181,7 @@ impl Value {
             Value::Vec(v) => Ok(v[0]),
             Value::Str(s) => Err(format!("expected a number, got string \"{s}\"")),
             Value::Arr(_) => Err("expected a number, got an array".into()),
+            other => Err(format!("expected a number, got a {}", other.type_name())),
         }
     }
 
@@ -136,6 +200,9 @@ impl Value {
             Value::Arr(items) if items.len() == 3 => Ok([items[0].num()?, items[1].num()?, items[2].num()?]),
             Value::Arr(items) => Err(format!("expected a vector, got an array of {} items", items.len())),
             Value::Str(s) => Err(format!("expected a vector, got string \"{s}\"")),
+            // A vector4 shortens to its first three components, as in VEX.
+            Value::Vec4(v) => Ok([v[0], v[1], v[2]]),
+            other => Err(format!("expected a vector, got a {}", other.type_name())),
         }
     }
 
@@ -169,6 +236,7 @@ impl Value {
             Value::Vec(v) => v.iter().any(|c| *c != 0.0),
             Value::Str(s) => !s.is_empty(),
             Value::Arr(items) => !items.is_empty(),
+            other => other.floats().is_some_and(|f| f.iter().any(|c| *c != 0.0)),
         }
     }
 
@@ -179,6 +247,7 @@ impl Value {
             Value::Vec(v) => format!("{{{}, {}, {}}}", v[0], v[1], v[2]),
             Value::Str(s) => s.to_string(),
             Value::Arr(items) => format!("{{{}}}", items.iter().map(Value::display).collect::<Vec<_>>().join(", ")),
+            other => format!("{{{}}}", other.floats().unwrap_or(&[]).iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")),
         }
     }
 
@@ -190,6 +259,9 @@ impl Value {
             Value::Vec(_) => Value::Vec([0.0; 3]),
             Value::Str(_) => Value::Str("".into()),
             Value::Arr(_) => Value::Arr(Rc::new(Vec::new())),
+            Value::Vec4(_) => Value::Vec4([0.0; 4]),
+            Value::Mat3(_) => Value::Mat3([0.0; 9]),
+            Value::Mat4(_) => Value::Mat4([0.0; 16]),
         }
     }
 
@@ -215,6 +287,9 @@ impl Value {
                 Value::Str(_) => Ok(self),
                 _ => fail(&self),
             },
+            Ty::Vec4 => self.vec4().map(Value::Vec4),
+            Ty::Mat3 => self.mat3().map(Value::Mat3),
+            Ty::Mat4 => self.mat4().map(Value::Mat4),
             _ => {
                 let element = ty.element().expect("array type");
                 let items = match self {
@@ -239,6 +314,9 @@ impl Value {
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
+    if let (Some(x), Some(y)) = (a.floats(), b.floats()) {
+        return x == y;
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Arr(x), Value::Arr(y)) if !(a.is_vector_like() && b.is_vector_like()) => {
@@ -288,6 +366,9 @@ fn binop(op: BinOp, a: Value, b: Value) -> R<Value> {
         }
         _ => {}
     }
+    if a.floats().is_some() || b.floats().is_some() {
+        return matrix_binop(op, &a, &b);
+    }
     if op == Add && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
         return Ok(Value::Str(format!("{}{}", a.display(), b.display()).into()));
     }
@@ -318,6 +399,61 @@ fn binop(op: BinOp, a: Value, b: Value) -> R<Value> {
     Ok(Value::Float(apply(a.num()?, b.num()?)))
 }
 
+// Arithmetic with vector4s and matrices: v * M (row vector), M * v (column),
+// M * M, componentwise + and -, and scaling by numbers.
+fn matrix_binop(op: BinOp, a: &Value, b: &Value) -> R<Value> {
+    use crate::vexmath as vm;
+    use BinOp::*;
+    let scalar = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_));
+    let lanes = |x: &[f32], y: &[f32]| -> Vec<f32> {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| match op {
+                Add => p + q,
+                Sub => p - q,
+                Mul => p * q,
+                Div => if *q == 0.0 { 0.0 } else { p / q },
+                _ => if *q == 0.0 { 0.0 } else { p % q },
+            })
+            .collect()
+    };
+    let same_shape = |x: &[f32]| -> R<Value> {
+        Ok(match x.len() {
+            4 => Value::Vec4(x.try_into().unwrap()),
+            9 => Value::Mat3(x.try_into().unwrap()),
+            _ => Value::Mat4(x.try_into().unwrap()),
+        })
+    };
+    match (a, b) {
+        // Scaling by a number.
+        (m, s) if scalar(s) && m.floats().is_some() => {
+            let k = s.num()?;
+            same_shape(&lanes(m.floats().unwrap(), &vec![k; m.floats().unwrap().len()]))
+        }
+        (s, m) if scalar(s) && m.floats().is_some() && matches!(op, Add | Mul) => {
+            let k = s.num()?;
+            same_shape(&lanes(&vec![k; m.floats().unwrap().len()], m.floats().unwrap()))
+        }
+        (Value::Vec4(x), Value::Vec4(y)) => same_shape(&lanes(x, y)),
+        // Transforming vectors.
+        (v, Value::Mat3(m)) if op == Mul && v.is_vector_like() => Ok(Value::Vec(vm::v_m3(v.vec()?, m))),
+        (v, Value::Mat4(m)) if op == Mul && v.is_vector_like() => Ok(Value::Vec(vm::v_m4(v.vec()?, m))),
+        (Value::Mat3(m), v) if op == Mul && v.is_vector_like() => {
+            Ok(Value::Vec(vm::v_m3(v.vec()?, &vm::transpose::<3>(m).try_into().unwrap())))
+        }
+        (Value::Mat4(m), v) if op == Mul && v.is_vector_like() => {
+            Ok(Value::Vec(vm::v_m4(v.vec()?, &vm::transpose::<4>(m).try_into().unwrap())))
+        }
+        // Matrix products; a matrix3 with a matrix becomes a matrix.
+        (Value::Mat3(x), Value::Mat3(y)) if op == Mul => Ok(Value::Mat3(vm::m3_mul(x, y))),
+        (x @ (Value::Mat3(_) | Value::Mat4(_)), y @ (Value::Mat3(_) | Value::Mat4(_))) if op == Mul => Ok(Value::Mat4(vm::m4_mul(&x.mat4()?, &y.mat4()?))),
+        (x, y) if matches!(op, Add | Sub) && x.floats().map(<[f32]>::len) == y.floats().map(<[f32]>::len) => {
+            same_shape(&lanes(x.floats().unwrap(), y.floats().unwrap()))
+        }
+        _ => Err(format!("cannot combine {} and {} with that operator", a.type_name(), b.type_name())),
+    }
+}
+
 fn normalize_index(i: i32, len: usize) -> Option<usize> {
     let index = if i < 0 { len as i64 + i as i64 } else { i as i64 };
     (index >= 0).then_some(index as usize)
@@ -329,10 +465,19 @@ fn component(v: &Value, c: usize) -> R<Value> {
         Value::Int(_) | Value::Float(_) => Ok(v.clone()),
         Value::Arr(_) => index_read(v, c as i32),
         Value::Str(_) => Err("strings have no .x/.y/.z components".into()),
+        Value::Vec4(x) => Ok(Value::Float(x[c.min(3)])),
+        _ => Err(format!("a {} has no .x/.y/.z components (use getcomp)", v.type_name())),
     }
 }
 
 fn set_component(base: Value, c: usize, f: f32) -> R<Value> {
+    if let Value::Vec4(mut v) = base {
+        v[c.min(3)] = f;
+        return Ok(Value::Vec4(v));
+    }
+    if matches!(base, Value::Mat3(_) | Value::Mat4(_)) {
+        return Err("matrices have no .x/.y/.z components (use setcomp)".into());
+    }
     if matches!(base, Value::Str(_)) {
         return Err("strings have no .x/.y/.z components".into());
     }
@@ -350,6 +495,7 @@ fn index_read(base: &Value, i: i32) -> R<Value> {
             .and_then(|i| items.get(i).cloned())
             .unwrap_or_else(|| items.first().map_or(Value::Int(0), Value::zero_like))),
         Value::Vec(v) => Ok(Value::Float(normalize_index(i, 3).and_then(|i| v.get(i).copied()).unwrap_or(0.0))),
+        Value::Vec4(v) => Ok(Value::Float(normalize_index(i, 4).and_then(|i| v.get(i).copied()).unwrap_or(0.0))),
         Value::Str(s) => Ok(Value::Str(
             normalize_index(i, s.chars().count())
                 .and_then(|i| s.chars().nth(i))
@@ -377,6 +523,11 @@ fn index_write(base: Value, i: i32, v: Value) -> R<(Value, Value)> {
             let index = normalize_index(i, 3).filter(|i| *i < 3).ok_or_else(|| format!("vector index {i} is out of range (0-2)"))?;
             x[index] = v.num()?;
             Ok((Value::Vec(x), v))
+        }
+        Value::Vec4(mut x) => {
+            let index = normalize_index(i, 4).filter(|i| *i < 4).ok_or_else(|| format!("vector4 index {i} is out of range (0-3)"))?;
+            x[index] = v.num()?;
+            Ok((Value::Vec4(x), v))
         }
         other => Err(format!("cannot index a {} with [ ]", other.type_name())),
     }
@@ -472,7 +623,18 @@ fn lex(src: &str) -> Result<Vec<Token>, VexError> {
             out.last().map(|t| &t.tok),
             Some(Tok::Ident(_) | Tok::Attr(..) | Tok::Int(_) | Tok::Float(_) | Tok::P(")") | Tok::P("]"))
         );
-        let tok = if c.is_ascii_digit() || (c == '.' && next.is_ascii_digit() && !after_value) {
+        let tok = if (c == '3' || c == '4') && next == '@' && !after_value {
+            // 3@xform (matrix3) and 4@xform (matrix) attribute bindings.
+            i += 2;
+            let name_start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            if i == name_start {
+                return error(line, col, "expected an attribute name after '@'".into());
+            }
+            Tok::Attr(Some(c), chars[name_start..i].iter().collect())
+        } else if c.is_ascii_digit() || (c == '.' && next.is_ascii_digit() && !after_value) {
             let mut is_float = false;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                 is_float |= chars[i] == '.';
@@ -644,6 +806,7 @@ fn known_hint(name: &str) -> Option<Ty> {
         "P" | "N" | "Cd" | "v" | "up" | "rest" | "scale" | "force" | "accel" | "uv" | "w" => Some(Ty::Vector),
         "ptnum" | "primnum" | "vtxnum" | "numpt" | "numprim" | "numvtx" | "elemnum" | "numelem" | "id" => Some(Ty::Int),
         "Time" | "SimTime" | "TimeInc" | "Frame" | "SimFrame" | "pscale" => Some(Ty::Float),
+        "orient" | "rot" => Some(Ty::Vec4),
         _ => None,
     }
 }
@@ -794,7 +957,16 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("smooth", 3, 3, "Math", "smooth(edge0, edge1, x)"),
     ("smoothstep", 3, 3, "Math", "smoothstep(edge0, edge1, x)"),
     ("select", 3, 3, "Math", "select(condition, a, b)"),
-    ("set", 1, 3, "Vector", "set(x, y, z)"),
+    ("cbrt", 1, 1, "Math", "cbrt(x)"),
+    ("invlerp", 3, 3, "Math", "invlerp(a, b, x) where x is between a and b, 0..1"),
+    ("spline", 3, VARIADIC, "Math", "spline(\"linear\" | \"catrom\" | \"constant\", t, v0, v1, ...)"),
+    ("isnan", 1, 1, "Math", "isnan(x)"),
+    ("isfinite", 1, 1, "Math", "isfinite(x)"),
+    ("ch", 1, 1, "Parameters", "ch(\"name\") a slider on the node (float)"),
+    ("chf", 1, 1, "Parameters", "chf(\"name\") float slider on the node"),
+    ("chi", 1, 1, "Parameters", "chi(\"name\") integer parameter on the node"),
+    ("chv", 1, 1, "Parameters", "chv(\"name\") vector parameter on the node"),
+    ("set", 1, 16, "Vector", "set(x, y, z) / set(x, y, z, w) / set(9 or 16 values) for matrices"),
     ("vector", 1, 3, "Vector", "vector(x) / vector(x, y, z)"),
     ("length", 1, 1, "Vector", "length(v)"),
     ("length2", 1, 1, "Vector", "length2(v)"),
@@ -810,11 +982,36 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("luminance", 1, 1, "Vector", "luminance(color)"),
     ("hsvtorgb", 1, 1, "Vector", "hsvtorgb(hsv)"),
     ("rgbtohsv", 1, 1, "Vector", "rgbtohsv(rgb)"),
+    ("vector4", 1, 4, "Matrix", "vector4(x, y, z, w) / vector4(v)"),
+    ("matrix3", 1, 9, "Matrix", "matrix3(m) / matrix3(9 values) (a matrix becomes its rotation/scale part)"),
+    ("matrix", 1, 16, "Matrix", "matrix(m) / matrix(16 values)"),
+    ("ident", 0, 0, "Matrix", "ident() identity matrix (assign to matrix3 or matrix)"),
+    ("transpose", 1, 1, "Matrix", "transpose(m)"),
+    ("invert", 1, 1, "Matrix", "invert(m)"),
+    ("determinant", 1, 1, "Matrix", "determinant(m)"),
+    ("getcomp", 2, 3, "Matrix", "getcomp(m, row, col) / getcomp(v, i)"),
+    ("setcomp", 3, 4, "Matrix", "setcomp(m, value, row, col) / setcomp(v, value, i)"),
+    ("maketransform", 3, 5, "Matrix", "maketransform(t, r, s) / maketransform(trs, xyz, t, r, s); r in degrees, scale-rotate-translate"),
+    ("translate", 2, 2, "Matrix", "translate(m, t) moves matrix m by t"),
+    ("rotate", 3, 3, "Matrix", "rotate(m, angle, axis) rotates matrix m (radians)"),
+    ("scale", 2, 2, "Matrix", "scale(m, s) scales matrix m"),
+    ("lookat", 2, 3, "Matrix", "lookat(from, to [, up]) matrix3 aiming -Z at the target"),
+    ("quaternion", 1, 2, "Matrix", "quaternion(angle, axis) / quaternion(matrix3) / quaternion(angle * axis)"),
+    ("qrotate", 2, 2, "Matrix", "qrotate(q, v) rotates v by q"),
+    ("qmultiply", 2, 2, "Matrix", "qmultiply(q1, q2) q2 applied first, then q1"),
+    ("qinvert", 1, 1, "Matrix", "qinvert(q)"),
+    ("qconvert", 1, 1, "Matrix", "qconvert(q) quaternion to matrix3"),
+    ("slerp", 3, 3, "Matrix", "slerp(q1, q2, t)"),
+    ("dihedral", 2, 2, "Matrix", "dihedral(a, b) quaternion rotating direction a onto b"),
+    ("eulertoquaternion", 1, 2, "Matrix", "eulertoquaternion(radians [, order]) order 0 XYZ ... 5 ZYX"),
+    ("quaterniontoeuler", 1, 2, "Matrix", "quaterniontoeuler(q [, order]) radians"),
     ("rand", 1, 2, "Random", "rand(seed [, seed2]) (vector when assigned to a vector)"),
     ("random", 1, 2, "Random", "random(seed [, seed2])"),
     ("noise", 1, 3, "Random", "noise(pos) Perlin noise in 0..1 (vector when assigned to a vector)"),
     ("snoise", 1, 3, "Random", "snoise(pos) signed Perlin noise in -1..1"),
     ("curlnoise", 1, 1, "Random", "curlnoise(pos) swirling, divergence-free noise vector"),
+    ("wnoise", 1, 2, "Random", "wnoise(pos [, seed]) Worley/cellular: distance to the nearest feature point"),
+    ("anoise", 1, 1, "Random", "anoise(pos) alligator (ridged, billowy) noise in 0..1"),
     ("sample_direction_uniform", 1, 1, "Random", "sample_direction_uniform(u) unit vector from u.x, u.y in 0..1"),
     ("sample_sphere_uniform", 1, 1, "Random", "sample_sphere_uniform(u) point inside the unit sphere from u in 0..1"),
     ("int", 1, 1, "Conversion", "int(x)"),
@@ -834,6 +1031,15 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("startswith", 2, 2, "String", "startswith(s, prefix)"),
     ("endswith", 2, 2, "String", "endswith(s, suffix)"),
     ("replace", 3, 3, "String", "replace(s, old, new)"),
+    ("strip", 1, 2, "String", "strip(s [, chars]) removes whitespace (or chars) from both ends"),
+    ("lstrip", 1, 2, "String", "lstrip(s [, chars])"),
+    ("rstrip", 1, 2, "String", "rstrip(s [, chars])"),
+    ("match", 2, 2, "String", "match(pattern, s) glob match with * and ?"),
+    ("re_match", 2, 2, "String", "re_match(regex, s) 1 if s matches"),
+    ("re_find", 2, 2, "String", "re_find(regex, s) the first match"),
+    ("re_replace", 3, 3, "String", "re_replace(regex, replacement, s) ($1 for groups)"),
+    ("re_split", 2, 2, "String", "re_split(regex, s)"),
+    ("padzero", 2, 2, "String", "padzero(width, number)"),
     ("split", 1, 2, "String", "split(s [, separators])"),
     ("join", 2, 2, "String", "join(array, separator)"),
     ("array", 0, VARIADIC, "Array", "array(a, b, ...)"),
@@ -885,6 +1091,14 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("getbbox_center", 1, 1, "Geometry", "getbbox_center(0)"),
     ("getbbox_size", 1, 1, "Geometry", "getbbox_size(0)"),
     ("relpointbbox", 2, 2, "Geometry", "relpointbbox(0, pos) position within the bounds, 0..1"),
+    ("primuv", 4, 4, "Geometry", "primuv(0, \"name\", prim, uv) the attribute interpolated inside a primitive"),
+    ("findattribval", 4, 4, "Geometry", "findattribval(0, \"point\" | \"prim\", \"name\", value) first match or -1"),
+    ("idtopoint", 2, 2, "Geometry", "idtopoint(0, id) point with that @id, or -1"),
+    ("primpoint", 3, 3, "Geometry", "primpoint(0, prim, vertex) point at a primitive's vertex"),
+    ("primvertexcount", 2, 2, "Geometry", "primvertexcount(0, prim)"),
+    ("vertexpoint", 2, 2, "Geometry", "vertexpoint(0, linearvertex)"),
+    ("vertexprim", 2, 2, "Geometry", "vertexprim(0, linearvertex)"),
+    ("primintrinsic", 3, 3, "Geometry", "primintrinsic(0, \"measuredarea\" | \"measuredperimeter\", prim)"),
     ("xyzdist", 2, 4, "Geometry", "xyzdist(0, pos [, prim, uv]) distance to the surface; prim and uv are outputs"),
     ("minpos", 2, 2, "Geometry", "minpos(0, pos) closest position on the surface"),
     ("intersect", 5, 5, "Geometry", "intersect(0, origin, dir, hitpos, hituv) hit prim or -1; |dir| is the max distance"),
@@ -898,7 +1112,15 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
 ];
 
 // Builtins that write results into some arguments, as VEX's pass-by-reference outputs.
-const OUT_PARAMS: [(&str, &[usize]); 3] = [("xyzdist", &[2, 3]), ("intersect", &[3, 4]), ("pcimport", &[2])];
+const OUT_PARAMS: [(&str, &[usize]); 7] = [
+    ("xyzdist", &[2, 3]),
+    ("intersect", &[3, 4]),
+    ("pcimport", &[2]),
+    ("translate", &[0]),
+    ("rotate", &[0]),
+    ("scale", &[0]),
+    ("setcomp", &[0]),
+];
 
 fn out_params(name: &str) -> &'static [usize] {
     OUT_PARAMS.iter().find(|(n, _)| *n == name).map_or(&[], |(_, outs)| outs)
@@ -907,7 +1129,7 @@ fn out_params(name: &str) -> &'static [usize] {
 // Builtins that modify their first (array) argument in place.
 const MUTATING: [&str; 7] = ["push", "append", "pop", "insert", "removeindex", "removevalue", "resize"];
 // Builtins whose return type follows the assignment target, as VEX overloads them.
-const VECTOR_CONTEXT: [&str; 4] = ["rand", "random", "noise", "snoise"];
+const VECTOR_CONTEXT: [&str; 5] = ["rand", "random", "noise", "snoise", "anoise"];
 
 fn builtin_info(name: &str) -> Option<&'static (&'static str, usize, usize, &'static str, &'static str)> {
     BUILTINS.iter().find(|b| b.0 == name)
@@ -925,11 +1147,14 @@ fn type_keyword(name: &str) -> Option<Ty> {
         "float" => Some(Ty::Float),
         "vector" => Some(Ty::Vector),
         "string" => Some(Ty::Str),
+        "vector4" => Some(Ty::Vec4),
+        "matrix3" => Some(Ty::Mat3),
+        "matrix" => Some(Ty::Mat4),
         _ => None,
     }
 }
 
-const UNSUPPORTED_TYPES: [&str; 8] = ["vector2", "vector4", "matrix", "matrix2", "matrix3", "dict", "bsdf", "struct"];
+const UNSUPPORTED_TYPES: [&str; 5] = ["vector2", "matrix2", "dict", "bsdf", "struct"];
 const QUALIFIERS: [&str; 3] = ["const", "export", "function"];
 
 struct Parser {
@@ -1033,8 +1258,11 @@ impl Parser {
             Some('f') => Some(Ty::Float),
             Some('i') => Some(Ty::Int),
             Some('v') => Some(Ty::Vector),
+            Some('p') => Some(Ty::Vec4),
+            Some('3') => Some(Ty::Mat3),
+            Some('4') => Some(Ty::Mat4),
             Some('s') => return Self::err_at(token, "string attributes (s@) are not supported yet"),
-            Some(c) => return Self::err_at(token, format!("{c}@ attributes are not supported (use f@, i@ or v@)")),
+            Some(c) => return Self::err_at(token, format!("{c}@ attributes are not supported (use f@, i@, v@, p@, 3@ or 4@)")),
         };
         if let Some(&id) = self.attr_index.get(name) {
             if prefix.is_some() {
@@ -1068,12 +1296,15 @@ impl Parser {
             return Ok(None);
         }
         if UNSUPPORTED_TYPES.contains(&name.as_str()) {
-            return self.error(format!("type '{name}' is not supported (use int, float, vector, string or arrays of them)"));
+            return self.error(format!("type '{name}' is not supported (use int, float, vector, vector4, matrix3, matrix, string, or arrays of int/float/vector/string)"));
         }
         let Some(mut ty) = type_keyword(&name) else {
             return self.error(format!("unknown type '{name}'"));
         };
         if self.at("[") && matches!(self.peek_n(1), Tok::P("]")) {
+            if matches!(ty, Ty::Vec4 | Ty::Mat3 | Ty::Mat4) {
+                return self.error(format!("arrays of {} aren't supported", ty.name()));
+            }
             self.advance();
             self.advance();
             ty = ty.array();
@@ -1270,6 +1501,9 @@ impl Parser {
         loop {
             let mut var_ty = ty;
             if self.eat("[") {
+                if matches!(ty, Ty::Vec4 | Ty::Mat3 | Ty::Mat4) {
+                    return self.error(format!("arrays of {} aren't supported", ty.name()));
+                }
                 if matches!(self.peek(), Tok::Int(_)) {
                     self.advance();
                 }
@@ -1495,7 +1729,8 @@ impl Parser {
                     "x" | "r" | "u" => 0,
                     "y" | "g" | "v" => 1,
                     "z" | "b" => 2,
-                    _ => return Self::err_at(&self.toks[self.pos - 1], format!("unknown component '.{component}' (use .x, .y or .z)")),
+                    "w" | "a" => 3,
+                    _ => return Self::err_at(&self.toks[self.pos - 1], format!("unknown component '.{component}' (use .x, .y, .z or .w)")),
                 };
                 e = Expr::Member(Box::new(e), index);
             } else if self.eat("[") {
@@ -1577,6 +1812,13 @@ impl Parser {
             "M_PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::PI))),
             "M_TWO_PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::TAU))),
             "M_E" => return Ok(Expr::Const(Value::Float(std::f32::consts::E))),
+            // Rotation and transform orders for eulertoquaternion / maketransform.
+            "XFORM_XYZ" | "XFORM_SRT" => return Ok(Expr::Const(Value::Int(0))),
+            "XFORM_XZY" | "XFORM_STR" => return Ok(Expr::Const(Value::Int(1))),
+            "XFORM_YXZ" | "XFORM_RST" => return Ok(Expr::Const(Value::Int(2))),
+            "XFORM_YZX" | "XFORM_RTS" => return Ok(Expr::Const(Value::Int(3))),
+            "XFORM_ZXY" | "XFORM_TSR" => return Ok(Expr::Const(Value::Int(4))),
+            "XFORM_ZYX" | "XFORM_TRS" => return Ok(Expr::Const(Value::Int(5))),
             _ => {}
         }
         if let Some(slot) = self.lookup(&name) {
@@ -1660,6 +1902,21 @@ fn hint_vector(e: &mut Expr) {
         }
         _ => {}
     }
+}
+
+// The ch() parameters `code` uses, in order of first use: (name, kind) with kind
+// 'f' (ch/chf), 'i' (chi) or 'v' (chv).
+pub fn channel_refs(code: &str) -> Vec<(String, char)> {
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| regex::Regex::new(r#"\bch([fiv]?)\s*\(\s*"([^"]+)"\s*\)"#).unwrap());
+    let mut out: Vec<(String, char)> = Vec::new();
+    for cap in pattern.captures_iter(code) {
+        let kind = cap[1].chars().next().unwrap_or('f');
+        if !out.iter().any(|(n, _)| n == &cap[2]) {
+            out.push((cap[2].to_owned(), kind));
+        }
+    }
+    out
 }
 
 pub fn compile(src: &str) -> Result<Program, VexError> {
@@ -1785,6 +2042,8 @@ struct Runtime<'a> {
     neighbours: Option<Vec<Vec<usize>>>,
     point_prims: Option<Vec<Vec<usize>>>,
     point_grid: Option<PointGrid>,
+    // Values of the node's ch() parameters.
+    channels: Option<&'a Channels>,
     // pcopen handles for the current element (cleared when the element changes).
     pc_handles: Vec<PcHandle>,
     pc_elem: usize,
@@ -1812,6 +2071,13 @@ fn read_storage(mesh: &Mesh, key: &str, index: usize, count: usize, hint: Option
         Some(vals) if count > 0 && !vals.is_empty() => {
             let comps = (vals.len() / count).max(1);
             let at = |c: usize| vals.get(index * comps + c).copied().unwrap_or(0.0);
+            // Wide attributes: the width (or the binding's type) decides.
+            match (hint, comps) {
+                (Some(Ty::Vec4), _) | (None, 4) => return Value::Vec4(std::array::from_fn(|c| if c < comps { at(c) } else if c == 3 { 1.0 } else { 0.0 })),
+                (Some(Ty::Mat3), _) | (None, 9) if comps >= 9 => return Value::Mat3(std::array::from_fn(at)),
+                (Some(Ty::Mat4), _) | (None, 16) if comps >= 16 => return Value::Mat4(std::array::from_fn(at)),
+                _ => {}
+            }
             if comps >= 3 {
                 Value::Vec([at(0), at(1), at(2)])
             } else if hint == Some(Ty::Int) {
@@ -1844,7 +2110,12 @@ fn reshape(old: &[f32], count: usize, comps: usize) -> Vec<f32> {
 fn write_storage(mesh: &mut Mesh, key: &str, index: usize, count: usize, v: &Value, hint: Option<Ty>, name: &str) -> R<()> {
     match v {
         Value::Str(_) => return Err(format!("cannot store a string in @{name}: string attributes are not supported yet")),
-        Value::Arr(items) if items.len() != 3 => return Err(format!("cannot store an array in @{name}: array attributes are not supported")),
+        // {..} literals for wide attributes (p@orient = {0, 0, 0, 1}) have that many items.
+        Value::Arr(items)
+            if items.len() != 3 && !matches!((hint, items.len()), (Some(Ty::Vec4), 4) | (Some(Ty::Mat3), 9) | (Some(Ty::Mat4), 16)) =>
+        {
+            return Err(format!("cannot store an array in @{name}: array attributes are not supported"))
+        }
         _ => {}
     }
     if index >= count {
@@ -1855,7 +2126,15 @@ fn write_storage(mesh: &mut Mesh, key: &str, index: usize, count: usize, v: &Val
         .get(key)
         .filter(|vals| count > 0 && !vals.is_empty())
         .map(|vals| (vals.len() / count).max(1));
-    let comps = if v.is_vector_like() || hint == Some(Ty::Vector) || name == "Cd" {
+    let wide = v.floats().map(<[f32]>::len).or(match hint {
+        Some(Ty::Vec4) => Some(4),
+        Some(Ty::Mat3) => Some(9),
+        Some(Ty::Mat4) => Some(16),
+        _ => None,
+    });
+    let comps = if let Some(width) = wide {
+        width
+    } else if v.is_vector_like() || hint == Some(Ty::Vector) || name == "Cd" {
         existing.filter(|c| *c >= 3).unwrap_or(3)
     } else {
         existing.unwrap_or(1)
@@ -1864,11 +2143,14 @@ fn write_storage(mesh: &mut Mesh, key: &str, index: usize, count: usize, v: &Val
     if vals.len() != count * comps {
         *vals = reshape(vals, count, comps);
     }
-    if comps == 1 {
-        vals[index] = v.num()?;
-    } else {
-        vals[index * comps..index * comps + 3].copy_from_slice(&v.vec()?);
-    }
+    let floats: Vec<f32> = match comps {
+        4 => v.vec4()?.to_vec(),
+        9 => v.mat3()?.to_vec(),
+        16 => v.mat4()?.to_vec(),
+        1 => vec![v.num()?],
+        _ => v.vec()?.to_vec(),
+    };
+    vals[index * comps..index * comps + floats.len().min(comps)].copy_from_slice(&floats[..floats.len().min(comps)]);
     Ok(())
 }
 
@@ -2160,6 +2442,65 @@ fn sort_values(items: &[Value]) -> R<Vec<usize>> {
         order.sort_by(|&a, &b| keys[a].partial_cmp(&keys[b]).unwrap_or(std::cmp::Ordering::Equal));
     }
     Ok(order)
+}
+
+// Worley (cellular) noise: distance to the nearest of one random feature point per unit cell.
+fn worley(p: [f32; 3], seed: u32) -> f32 {
+    let cell = p.map(|c| c.floor() as i32);
+    let mut best = f32::INFINITY;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let c = [cell[0] + dx, cell[1] + dy, cell[2] + dz];
+                let h = (c[0] as u32).wrapping_mul(73_856_093) ^ (c[1] as u32).wrapping_mul(19_349_663) ^ (c[2] as u32).wrapping_mul(83_492_791);
+                let feature = [0u32, 1, 2].map(|k| hash01(h.wrapping_add(k * 0x9E37), seed));
+                let d: f32 = (0..3).map(|k| (c[k] as f32 + feature[k] - p[k]).powi(2)).sum::<f32>().sqrt();
+                best = best.min(d);
+            }
+        }
+    }
+    best
+}
+
+// Glob matching with * (any run) and ? (one character).
+fn glob(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti, mut star, mut mark) = (0, 0, None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+fn cached_regex(pattern: &str) -> R<regex::Regex> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<String, regex::Regex>> = std::cell::RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(pattern) {
+            return Ok(re.clone());
+        }
+        let re = regex::Regex::new(pattern).map_err(|e| format!("bad regular expression: {e}"))?;
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(pattern.to_owned(), re.clone());
+        Ok(re)
+    })
 }
 
 // a[start:end:step] with Python semantics (negative indices count from the end).
@@ -2868,6 +3209,10 @@ impl<'a> Runtime<'a> {
         }
     }
 
+    fn channel(&self, name: &str) -> [f32; 3] {
+        self.channels.and_then(|c| c.get(name)).copied().unwrap_or([0.0; 3])
+    }
+
     fn grid(&mut self) -> &PointGrid {
         let input = self.input;
         self.point_grid.get_or_insert_with(|| PointGrid::new(&input.vertices))
@@ -2927,6 +3272,44 @@ impl<'a> Runtime<'a> {
                     }
                     None => (Value::Int(0), Vec::new()),
                 }
+            }
+            "translate" | "rotate" | "scale" => {
+                use crate::vexmath as vm;
+                let matrix = |m: &Value, step: &[f32]| -> R<Value> {
+                    Ok(match m {
+                        Value::Mat3(x) if step.len() == 9 => Value::Mat3(vm::m3_mul(x, &step.try_into().unwrap())),
+                        Value::Mat3(_) => return Err("a matrix3 can't hold a translation (use a matrix)".into()),
+                        other => Value::Mat4(vm::m4_mul(&other.mat4()?, &if step.len() == 9 { vm::m3_to_m4(&step.try_into().unwrap()) } else { step.try_into().unwrap() })),
+                    })
+                };
+                let step: Vec<f32> = match name {
+                    "translate" => vm::translate_m4(a[1].vec()?).to_vec(),
+                    "rotate" => vm::rotation_m3(a[1].num()?, a[2].vec()?).to_vec(),
+                    _ => vm::scale_m3(a[1].vec()?).to_vec(),
+                };
+                if !matches!(a[0], Value::Mat3(_) | Value::Mat4(_)) {
+                    return Err(format!("the first argument must be a matrix3 or matrix variable, got {}", a[0].type_name()));
+                }
+                let updated = matrix(&a[0], &step)?;
+                (Value::Int(0), vec![(0, updated)])
+            }
+            "setcomp" => {
+                let value = a[1].num()?;
+                let updated = match (&a[0], a.len()) {
+                    (Value::Mat3(m), 4) => {
+                        let mut m = *m;
+                        m[(a[2].int()?.clamp(0, 2) * 3 + a[3].int()?.clamp(0, 2)) as usize] = value;
+                        Value::Mat3(m)
+                    }
+                    (Value::Mat4(m), 4) => {
+                        let mut m = *m;
+                        m[(a[2].int()?.clamp(0, 3) * 4 + a[3].int()?.clamp(0, 3)) as usize] = value;
+                        Value::Mat4(m)
+                    }
+                    (v, 3) => index_write(v.clone(), a[2].int()?, Value::Float(value))?.0,
+                    (v, _) => return Err(format!("setcomp on a {} takes a row and a column", v.type_name())),
+                };
+                (Value::Int(0), vec![(0, updated)])
             }
             other => return Err(format!("{other} has no outputs")),
         })
@@ -3023,7 +3406,24 @@ impl<'a> Runtime<'a> {
 
             "set" | "vector" if a.len() == 3 => V([a[0].num()?, a[1].num()?, a[2].num()?]),
             "set" | "vector" if a.len() == 1 => V(a[0].vec()?),
-            "set" | "vector" => return Err("expects 1 or 3 arguments".into()),
+            "set" | "vector4" if a.len() == 4 => Value::Vec4([a[0].num()?, a[1].num()?, a[2].num()?, a[3].num()?]),
+            "set" | "matrix3" if a.len() == 9 => Value::Mat3(std::array::from_fn(|i| a[i].num().unwrap_or(0.0))),
+            "set" | "matrix" if a.len() == 16 => Value::Mat4(std::array::from_fn(|i| a[i].num().unwrap_or(0.0))),
+            "vector4" if a.len() == 1 => Value::Vec4(a[0].vec4()?),
+            "matrix3" if a.len() == 1 => Value::Mat3(a[0].mat3()?),
+            "matrix" if a.len() == 1 => Value::Mat4(a[0].mat4()?),
+            "set" | "vector" => return Err("expects 1, 3, 4, 9 or 16 arguments".into()),
+            "vector4" | "matrix3" | "matrix" => return Err(format!("{name}() takes one value or all its components")),
+            "length" | "normalize" | "normalizesafe" | "length2" | "dot" if matches!(a[0], Value::Vec4(_)) => {
+                let q = a[0].vec4()?;
+                let len2: f32 = q.iter().map(|c| c * c).sum();
+                match name {
+                    "length" => Float(len2.sqrt()),
+                    "length2" => Float(len2),
+                    "dot" => Float(q.iter().zip(a[1].vec4()?).map(|(x, y)| x * y).sum()),
+                    _ => Value::Vec4(crate::vexmath::q_normalize(q)),
+                }
+            }
             "length" => Float(vec3(a[0].vec()?).length()),
             "length2" => {
                 let v = vec3(a[0].vec()?);
@@ -3250,6 +3650,213 @@ impl<'a> Runtime<'a> {
                 }
                 Int(1)
             }
+            // ---- matrices and quaternions ----
+            "ident" => Value::Mat4(crate::vexmath::m4_ident()),
+            "transpose" => match &a[0] {
+                Value::Mat3(m) => Value::Mat3(crate::vexmath::transpose::<3>(m).try_into().unwrap()),
+                other => Value::Mat4(crate::vexmath::transpose::<4>(&other.mat4()?).try_into().unwrap()),
+            },
+            "invert" => match &a[0] {
+                Value::Mat3(m) => Value::Mat3(crate::vexmath::invert(m, 3).map_or([0.0; 9], |v| v.try_into().unwrap())),
+                Value::Mat4(m) => Value::Mat4(crate::vexmath::invert(m, 4).map_or([0.0; 16], |v| v.try_into().unwrap())),
+                other => Float(match other.num()? {
+                    0.0 => 0.0,
+                    x => 1.0 / x,
+                }),
+            },
+            "determinant" => match &a[0] {
+                Value::Mat3(m) => Float(crate::vexmath::det(m, 3)),
+                other => Float(crate::vexmath::det(&other.mat4()?, 4)),
+            },
+            "getcomp" => match (&a[0], a.len()) {
+                (Value::Mat3(m), 3) => Float(m[(a[1].int()?.clamp(0, 2) * 3 + a[2].int()?.clamp(0, 2)) as usize]),
+                (Value::Mat4(m), 3) => Float(m[(a[1].int()?.clamp(0, 3) * 4 + a[2].int()?.clamp(0, 3)) as usize]),
+                (v, _) => index_read(v, a[1].int()?)?,
+            },
+            "maketransform" => {
+                let (trs, xyz, rest) = if a.len() == 5 { (a[0].int()?, a[1].int()?, &a[2..]) } else { (0, 0, a) };
+                if rest.len() != 3 {
+                    return Err("expects (t, r, s) or (trs, xyz, t, r, s)".into());
+                }
+                Value::Mat4(crate::vexmath::make_transform(trs, xyz, rest[0].vec()?, rest[1].vec()?, rest[2].vec()?))
+            }
+            "lookat" => {
+                let up = a.get(2).map(Value::vec).transpose()?.unwrap_or([0.0, 1.0, 0.0]);
+                Value::Mat3(crate::vexmath::lookat(a[0].vec()?, a[1].vec()?, up))
+            }
+            "quaternion" => match (a.len(), &a[0]) {
+                (2, _) => Value::Vec4(crate::vexmath::q_axis_angle(a[0].num()?, a[1].vec()?)),
+                (_, m @ (Value::Mat3(_) | Value::Mat4(_))) => Value::Vec4(crate::vexmath::q_from_m3(&m.mat3()?)),
+                (_, v) => {
+                    // angle * axis
+                    let v = v.vec()?;
+                    let angle = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    Value::Vec4(if angle > 0.0 { crate::vexmath::q_axis_angle(angle, v) } else { [0.0, 0.0, 0.0, 1.0] })
+                }
+            },
+            "qrotate" => V(crate::vexmath::q_rotate(&a[0].vec4()?, a[1].vec()?)),
+            "qmultiply" => Value::Vec4(crate::vexmath::q_mul(&a[0].vec4()?, &a[1].vec4()?)),
+            "qinvert" => Value::Vec4(crate::vexmath::q_invert(&a[0].vec4()?)),
+            "qconvert" => Value::Mat3(crate::vexmath::q_to_m3(&a[0].vec4()?)),
+            "slerp" => Value::Vec4(crate::vexmath::slerp(&a[0].vec4()?, &a[1].vec4()?, a[2].num()?)),
+            "dihedral" => Value::Vec4(crate::vexmath::dihedral(a[0].vec()?, a[1].vec()?)),
+            "eulertoquaternion" => Value::Vec4(crate::vexmath::euler_to_q(a[0].vec()?, a.get(1).map(Value::int).transpose()?.unwrap_or(0))),
+            "quaterniontoeuler" => V(crate::vexmath::q_to_euler(&a[0].vec4()?, a.get(1).map(Value::int).transpose()?.unwrap_or(0))),
+            // ---- noise, maths ----
+            "wnoise" => {
+                let p = a[0].vec()?;
+                let seed = a.get(1).map(Value::int).transpose()?.unwrap_or(0) as u32;
+                Float(worley(p, seed))
+            }
+            "anoise" => {
+                let p = a[0].vec()?;
+                let ridged = |s: u32| -> f32 {
+                    let (mut total, mut amp, mut freq, mut norm) = (0.0, 0.5, 1.0, 0.0);
+                    for octave in 0..4 {
+                        let n = perlin3([p[0] * freq, p[1] * freq, p[2] * freq], s * 7 + octave);
+                        total += amp * (1.0 - n.abs()).powi(2);
+                        norm += amp;
+                        amp *= 0.5;
+                        freq *= 2.03;
+                    }
+                    (total / norm).clamp(0.0, 1.0)
+                };
+                if want_vec { V([ridged(0), ridged(1), ridged(2)]) } else { Float(ridged(0)) }
+            }
+            "cbrt" => per_lane(a, |x| x[0].cbrt())?,
+            "invlerp" => per_lane(a, |x| if (x[1] - x[0]).abs() < 1e-20 { 0.0 } else { (x[2] - x[0]) / (x[1] - x[0]) })?,
+            "isnan" => Int(a[0].num()?.is_nan() as i32),
+            "isfinite" => Int(a[0].num()?.is_finite() as i32),
+            "spline" => {
+                let basis = a[0].string()?;
+                let t = a[1].num()?.clamp(0.0, 1.0);
+                let keys = &a[2..];
+                if keys.is_empty() {
+                    return Err("needs at least one value".into());
+                }
+                let vector = keys.iter().any(Value::is_vector_like);
+                let get = |i: usize| -> R<[f32; 3]> { if vector { keys[i].vec() } else { keys[i].num().map(|f| [f; 3]) } };
+                let lerp = |x: [f32; 3], y: [f32; 3], u: f32| [0, 1, 2].map(|c| x[c] + (y[c] - x[c]) * u);
+                let out = match &*basis {
+                    "constant" => get(((t * keys.len() as f32) as usize).min(keys.len() - 1))?,
+                    "catrom" if keys.len() >= 4 => {
+                        // v0 and the last value only shape the ends; the curve passes v1..v(n-2).
+                        let segments = keys.len() - 3;
+                        let f = t * segments as f32;
+                        let s = (f as usize).min(segments - 1);
+                        let u = f - s as f32;
+                        let (p0, p1, p2, p3) = (get(s)?, get(s + 1)?, get(s + 2)?, get(s + 3)?);
+                        [0, 1, 2].map(|c| {
+                            0.5 * (2.0 * p1[c] + (p2[c] - p0[c]) * u + (2.0 * p0[c] - 5.0 * p1[c] + 4.0 * p2[c] - p3[c]) * u * u
+                                + (3.0 * p1[c] - p0[c] - 3.0 * p2[c] + p3[c]) * u * u * u)
+                        })
+                    }
+                    "linear" | "catrom" => {
+                        if keys.len() == 1 {
+                            get(0)?
+                        } else {
+                            let f = t * (keys.len() - 1) as f32;
+                            let s = (f as usize).min(keys.len() - 2);
+                            lerp(get(s)?, get(s + 1)?, f - s as f32)
+                        }
+                    }
+                    other => return Err(format!("unknown basis \"{other}\" (use \"linear\", \"catrom\" or \"constant\")")),
+                };
+                if vector { V(out) } else { Float(out[0]) }
+            }
+            "ch" | "chf" => Float(self.channel(&a[0].string()?)[0]),
+            "chi" => Int(self.channel(&a[0].string()?)[0].round() as i32),
+            "chv" => V(self.channel(&a[0].string()?)),
+            // ---- strings ----
+            "strip" | "lstrip" | "rstrip" => {
+                let text = a[0].string()?;
+                let chars: Vec<char> = match a.get(1) {
+                    Some(c) => c.string()?.chars().collect(),
+                    None => vec![' ', '\t', '\n', '\r'],
+                };
+                let strip = |c: char| chars.contains(&c);
+                Str(match name {
+                    "lstrip" => text.trim_start_matches(strip),
+                    "rstrip" => text.trim_end_matches(strip),
+                    _ => text.trim_matches(strip),
+                }
+                .into())
+            }
+            "match" => Int(glob(&a[0].string()?, &a[1].string()?) as i32),
+            "re_match" | "re_find" | "re_replace" | "re_split" => {
+                let re = cached_regex(&a[0].string()?)?;
+                match name {
+                    "re_match" => Int(re.is_match(&a[1].string()?) as i32),
+                    "re_find" => Str(re.find(&a[1].string()?).map_or("", |m| m.as_str()).into()),
+                    "re_replace" => Str(re.replace_all(&a[2].string()?, &*a[1].string()?).into_owned().into()),
+                    _ => Value::Arr(Rc::new(re.split(&a[1].string()?).map(|p| Str(p.into())).collect())),
+                }
+            }
+            "padzero" => {
+                let width = a[0].int()?.max(0) as usize;
+                let n = a[1].int()?;
+                Str(if n < 0 { format!("-{:0width$}", -n, width = width.saturating_sub(1)) } else { format!("{n:0width$}") }.into())
+            }
+            // ---- geometry ----
+            "primuv" => {
+                let attr = a[1].string()?;
+                let prim = a[2].int()?;
+                let uv = a[3].vec()?;
+                let Some(tri) = usize::try_from(prim).ok().and_then(|p| self.input.indices.get(p)).copied() else {
+                    return Ok(Float(0.0));
+                };
+                let weights = [1.0 - uv[0] - uv[1], uv[0], uv[1]];
+                let prim_key = format!("prim:{attr}");
+                if &*attr != "P" && self.input.point_attributes.contains_key(&prim_key) {
+                    self.input_attr(Domain::Prim, &attr, prim)
+                } else {
+                    let corners: Vec<Value> = tri.iter().map(|&p| self.input_attr(Domain::Point, &attr, p as i32)).collect();
+                    match &corners[0] {
+                        Value::Vec4(_) => Value::Vec4(std::array::from_fn(|c| corners.iter().zip(weights).map(|(v, w)| v.vec4().map_or(0.0, |q| q[c]) * w).sum())),
+                        v if v.is_vector_like() => V(std::array::from_fn(|c| corners.iter().zip(weights).map(|(v, w)| v.vec().map_or(0.0, |x| x[c]) * w).sum())),
+                        _ => Float(corners.iter().zip(weights).map(|(v, w)| v.num().unwrap_or(0.0) * w).sum()),
+                    }
+                }
+            }
+            "findattribval" | "idtopoint" => {
+                let (domain, attr, value) = if name == "idtopoint" {
+                    (Domain::Point, "id".into(), a[1].clone())
+                } else {
+                    let domain = match &*a[1].string()? {
+                        "point" => Domain::Point,
+                        "prim" | "primitive" => Domain::Prim,
+                        other => return Err(format!("unknown class \"{other}\" (use \"point\" or \"prim\")")),
+                    };
+                    (domain, a[2].string()?, a[3].clone())
+                };
+                let count = domain.count(self.input);
+                // Without an id attribute, a point's id is its number.
+                if name == "idtopoint" && !self.input.point_attributes.contains_key("id") {
+                    let id = value.int()?;
+                    return Ok(Int(if id >= 0 && (id as usize) < count { id } else { -1 }));
+                }
+                Int((0..count).find(|&i| values_equal(&self.input_attr(domain, &attr, i as i32), &value)).map_or(-1, |i| i as i32))
+            }
+            "primpoint" => Int(usize::try_from(a[1].int()?)
+                .ok()
+                .and_then(|p| self.input.indices.get(p))
+                .and_then(|tri| usize::try_from(a[2].int().ok()?).ok().and_then(|v| tri.get(v)))
+                .map_or(-1, |&p| p as i32)),
+            "primvertexcount" => Int(usize::try_from(a[1].int()?).ok().filter(|&p| p < self.input.indices.len()).map_or(0, |_| 3)),
+            "vertexpoint" => Int(usize::try_from(a[1].int()?).ok().and_then(|v| self.input.indices.get(v / 3).map(|t| t[v % 3])).map_or(-1, |p| p as i32)),
+            "vertexprim" => Int(usize::try_from(a[1].int()?).ok().filter(|v| v / 3 < self.input.indices.len()).map_or(-1, |v| (v / 3) as i32)),
+            "primintrinsic" => {
+                let which = a[1].string()?;
+                let Some(tri) = usize::try_from(a[2].int()?).ok().and_then(|p| self.input.indices.get(p)).copied() else {
+                    return Ok(Float(0.0));
+                };
+                let [p0, p1, p2] = tri.map(|i| self.input.vertices[i]);
+                match &*which {
+                    "measuredarea" => Float(p1.sub(p0).cross(p2.sub(p0)).length() * 0.5),
+                    "measuredperimeter" => Float(p1.sub(p0).length() + p2.sub(p1).length() + p0.sub(p2).length()),
+                    other => return Err(format!("unsupported intrinsic \"{other}\" (measuredarea, measuredperimeter)")),
+                }
+            }
             "nearpoint" => {
                 let p = vec3(a[1].vec()?);
                 let max = a.get(2).map(Value::num).transpose()?.unwrap_or(f32::INFINITY);
@@ -3330,7 +3937,7 @@ impl<'a> Runtime<'a> {
                     Float(sum / total)
                 }
             }
-            "xyzdist" | "intersect" | "pcimport" => self.builtin_with_outputs(name, a)?.0,
+            "xyzdist" | "intersect" | "pcimport" | "translate" | "rotate" | "scale" | "setcomp" => self.builtin_with_outputs(name, a)?.0,
             "minpos" => match closest_on_surface(self.input, vec3(a[1].vec()?)) {
                 Some(hit) => V(arr3(hit.position)),
                 None => V(a[1].vec()?),
@@ -3590,10 +4197,13 @@ pub fn check(code: &str) -> Result<(), String> {
 // Runs `code` over every element of `domain` (0 detail, 1 primitives, 2 points, 3 vertices).
 // On any error the input geometry is returned unchanged and the error is reported.
 // `time_inc` is @TimeInc: seconds per frame, or per step inside a SOP Solver.
+// A node's ch() parameter values by name (float, int and vector parameters share it).
+pub type Channels = std::collections::BTreeMap<String, [f32; 3]>;
+
 // `mask` limits the run to some elements of the domain (a node's group); None runs on all.
-pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>) -> Mesh {
+pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>, channels: Option<&Channels>) -> Mesh {
     let start = Instant::now();
-    let (mesh, mut report) = run_masked(mesh, code, time, time_inc, domain_index, mask);
+    let (mesh, mut report) = run_masked(mesh, code, time, time_inc, domain_index, mask, channels);
     report.millis = start.elapsed().as_secs_f32() * 1000.0;
     if let Ok(mut map) = reports().lock() {
         if map.len() > 256 {
@@ -3610,10 +4220,18 @@ fn run(mesh: Mesh, code: &str, time: f32, domain_index: usize) -> (Mesh, VexRepo
 }
 
 fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> (Mesh, VexReport) {
-    run_masked(mesh, code, time, time_inc, domain_index, None)
+    run_masked(mesh, code, time, time_inc, domain_index, None, None)
 }
 
-fn run_masked(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>) -> (Mesh, VexReport) {
+fn run_masked(
+    mesh: Mesh,
+    code: &str,
+    time: f32,
+    time_inc: f32,
+    domain_index: usize,
+    mask: Option<&[bool]>,
+    channels: Option<&Channels>,
+) -> (Mesh, VexReport) {
     let program = match compile(code) {
         Ok(program) => program,
         Err(error) => return (mesh, VexReport { error: Some(error.to_string()), ..Default::default() }),
@@ -3646,6 +4264,7 @@ fn run_masked(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: us
         neighbours: None,
         point_prims: None,
         point_grid: None,
+        channels,
         pc_handles: Vec::new(),
         pc_elem: usize::MAX,
     };
@@ -3745,9 +4364,11 @@ pub const EXAMPLES: &[(&str, usize, &str)] = &[
 ];
 
 pub const SYNTAX_HELP: &str = "\
-Types      int, float, vector, string and arrays: float a[] = {1, 2}; vector[] pts;
+Types      int, float, vector, vector4, matrix3, matrix, string; arrays: float a[] = {1, 2};
+           vector4 q = quaternion(radians(45), {0,1,0});  matrix m = ident();  v * m transforms
 Attributes @P @N @Cd @pscale (read/write), @ptnum @primnum @vtxnum @numpt @numprim
            @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel
+           p@orient (vector4) 3@rot (matrix3) 4@xform (matrix); ch(\"amp\") adds a slider
 Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   M_PI  M_E
 Operators  + - * / %  == != < <= > >=  && || !  ?:  = += -= *= /= %=  ++ --
            .x .y .z (.r .g .b) on vectors, [i] on arrays/vectors (negative from end),
@@ -3965,6 +4586,7 @@ mod tests {
             neighbours: None,
             point_prims: None,
             point_grid: None,
+            channels: None,
             pc_handles: Vec::new(),
             pc_elem: usize::MAX,
         };
@@ -4112,6 +4734,89 @@ mod tests {
         assert!(div.abs() < 0.05, "divergence {div}");
         assert_eq!(mesh.point_attributes["sel"][0], 2.0);
         assert_eq!(mesh.point_attributes["sel"][8], 1.0);
+    }
+
+    #[test]
+    fn matrices_and_transforms() {
+        let out = output(
+            "matrix m = maketransform({1, 2, 3}, {0, 90, 0}, {2, 2, 2});\n\
+             vector p = {1, 0, 0} * m;\n\
+             matrix3 r = ident(); rotate(r, radians(90), {0, 1, 0});\n\
+             vector q = {1, 0, 0} * r;\n\
+             matrix mi = invert(m);\n\
+             vector back = p * mi;\n\
+             matrix t = ident(); translate(t, {5, 0, 0}); scale(t, {2, 2, 2});\n\
+             vector moved = {1, 1, 1} * t;\n\
+             printf(\"%.3f %.3f %.3f | %.3f %.3f | %.3f %.3f %.3f | %.2f | %g %g %g\\n\", p.x, p.y, p.z, q.x, q.z, back.x, back.y, back.z, determinant(m), moved.x, moved.y, moved.z);\n\
+             matrix3 k = ident(); setcomp(k, 7, 1, 2); printf(\"%g %g %g\\n\", getcomp(k, 1, 2), getcomp(transpose(k), 2, 1), getcomp(k, 0, 0));",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        // Scale 2, rotate +X to -Z, then translate by (1, 2, 3).
+        assert_eq!(lines[0], "1.000 2.000 1.000 | -0.000 -1.000 | 1.000 0.000 0.000 | 8.00 | 12 2 2");
+        assert_eq!(lines[1], "7 7 1");
+    }
+
+    #[test]
+    fn quaternions_and_orient() {
+        let out = output(
+            "vector4 q = quaternion(radians(90), {0, 1, 0});\n\
+             vector v = qrotate(q, {1, 0, 0});\n\
+             vector4 qi = qinvert(q); vector b = qrotate(qi, v);\n\
+             vector4 h = slerp({0, 0, 0, 1}, q, 0.5);\n\
+             vector e = quaterniontoeuler(eulertoquaternion({0.3, -0.7, 1.1}, XFORM_ZXY), XFORM_ZXY);\n\
+             vector d = qrotate(dihedral({1, 0, 0}, {0, 0, 1}), {1, 0, 0});\n\
+             matrix3 m = qconvert(q); vector mv = {1, 0, 0} * m;\n\
+             printf(\"%.3f %.3f | %.3f | %.4f | %.2f %.2f %.2f | %.3f | %.3f %.3f | %g\\n\", v.x, v.z, b.x, length(h), e.x, e.y, e.z, d.z, mv.x, mv.z, q.w > 0.7);",
+        );
+        assert_eq!(out, "0.000 -1.000 | 1.000 | 1.0000 | 0.30 -0.70 1.10 | 1.000 | -0.000 -1.000 | 1");
+        // p@orient and 3@ / 4@ attributes store 4, 9 and 16 floats.
+        let (mesh, report) = run(grid(), "p@orient = quaternion(radians(45), {0, 0, 1}); 3@rot = qconvert(@orient); 4@xform = maketransform({0, @ptnum, 0}, {0, 0, 0}, {1, 1, 1}); @P = @P * 4@xform;", 0.0, 2);
+        assert_eq!(report.error, None);
+        assert_eq!(mesh.point_attributes["orient"].len(), 9 * 4);
+        assert_eq!(mesh.point_attributes["rot"].len(), 9 * 9);
+        assert_eq!(mesh.point_attributes["xform"].len(), 9 * 16);
+        assert!((mesh.vertices[5].y - 5.0).abs() < 1e-5, "{:?}", mesh.vertices[5]);
+        // Reading orient back without a prefix knows it's a vector4.
+        let (mesh, report) = run(mesh, "@N = qrotate(@orient, {1, 0, 0});", 0.0, 2);
+        assert_eq!(report.error, None);
+        assert!((mesh.point_attributes["N"][1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-4);
+        assert!(error("matrix m[];").contains("arrays of matrix"));
+        assert!(error("matrix3 m = ident();\nm.x = 1;").contains("setcomp"));
+    }
+
+    #[test]
+    fn channels_strings_and_maths() {
+        let mut channels = Channels::new();
+        channels.insert("amp".into(), [2.5, 0.0, 0.0]);
+        channels.insert("count".into(), [3.2, 0.0, 0.0]);
+        channels.insert("dir".into(), [0.0, 1.0, 0.0]);
+        let (mesh, report) = run_masked(grid(), "@P += chv(\"dir\") * ch(\"amp\"); i@n = chi(\"count\"); f@missing = chf(\"nope\");", 0.0, 1.0, 2, None, Some(&channels));
+        assert_eq!(report.error, None);
+        assert_eq!(mesh.vertices[0].y, 2.5);
+        assert_eq!((mesh.point_attributes["n"][0], mesh.point_attributes["missing"][0]), (3.0, 0.0));
+        assert_eq!(channel_refs("ch(\"a\") + chi( \"b\" ) * chv(\"c\") + ch(\"a\")"), vec![("a".to_owned(), 'f'), ("b".to_owned(), 'i'), ("c".to_owned(), 'v')]);
+        assert_eq!(
+            output("printf(\"[%s] [%s] [%s] %d %d %s %s %d %s\\n\", strip(\"  hi  \"), lstrip(\"xxhix\", \"x\"), rstrip(\"hi\\n\"), match(\"pi*e\", \"piece\"), re_match(\"^[a-z]+[0-9]$\", \"box7\"), re_find(\"[0-9]+\", \"ab123cd\"), re_replace(\"(o+)\", \"[$1]\", \"foo boo\"), len(re_split(\",\\\\s*\", \"a, b,c\")), padzero(4, 42));"),
+            "[hi] [hix] [hi] 1 1 123 f[oo] b[oo] 3 0042"
+        );
+        assert_eq!(
+            output("printf(\"%g %g %g %g %g %g %d\\n\", spline(\"linear\", 0.25, 0, 10, 20), spline(\"constant\", 0.6, 1, 2, 3), spline(\"catrom\", 0.5, 0, 1, 2, 3), cbrt(27), invlerp(10, 20, 15), select(1, 4, 5), isnan(0));"),
+            "5 2 1.5 3 0.5 4 0"
+        );
+        let out = output("float a = wnoise({0.3, 0.4, 0.5}); float b = wnoise({7.3, 1.4, 2.5}); float c = anoise({1.2, 0.4, 3.0}); printf(\"%d %d %d\\n\", a >= 0 && a < 1.8, abs(a - b) > 0.0001, c >= 0 && c <= 1);");
+        assert_eq!(out, "1 1 1");
+        assert!(error("float x = spline(\"bezier\", 0.5, 1, 2);").contains("unknown basis"));
+        assert!(error("int x = re_match(\"(\", \"a\");").contains("regular expression"));
+    }
+
+    #[test]
+    fn primitive_and_vertex_queries() {
+        let out = output(
+            "vector m = primuv(0, \"P\", 0, {0.5, 0.5, 0});\n\
+             printf(\"%g %g %g | %d %d %d %d %d | %d %d | %g %.4f\\n\", m.x, m.y, m.z, primpoint(0, 0, 1), primvertexcount(0, 0), vertexpoint(0, 4), vertexprim(0, 4), primpoint(0, 99, 0), idtopoint(0, 5), findattribval(0, \"point\", \"P\", {1, 0, 1}), primintrinsic(0, \"measuredarea\", 0), primintrinsic(0, \"measuredperimeter\", 0));",
+        );
+        // Grid triangle 0 is points (0, 3, 1): halfway between 3 and 1.
+        assert_eq!(out, "-0.5 0 -0.5 | 3 3 3 1 -1 | 5 8 | 0.5 3.4142");
     }
 
     #[test]

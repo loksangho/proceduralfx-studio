@@ -21,6 +21,12 @@ env:
   # MoonRay's rats test-suite submodule stores images in Git LFS, and some of
   # those objects are missing upstream; nothing in the build needs them.
   GIT_LFS_SKIP_SMUDGE: '1'
+  # The runtime, SDK and SDK extensions in the manifest. flatpak-builder's cache
+  # keys every module on the SDK commit, so a Flathub SDK update would rebuild
+  # the whole stack (USD, MoonRay...): runs pin these to the commits the cache
+  # was built with, recorded in the cache itself.
+  SDK_REFS: org.gnome.Platform//49 org.gnome.Sdk//49 org.freedesktop.Sdk.Extension.rust-stable//25.08
+  SDK_PINS: .flatpak-builder/sdk-commits.txt
 
 permissions:
   contents: write
@@ -88,13 +94,34 @@ jobs:
             flatpak-${{ hashFiles('packaging/linux/**') }}-
             flatpak-
 
+      - name: Install the SDK the cache was built with
+        run: |
+          flatpak install --user -y --noninteractive flathub $SDK_REFS
+          if [ -f "$SDK_PINS" ]; then
+            while read -r ref commit; do
+              [ -n "$commit" ] || continue
+              flatpak update --user -y --noninteractive --commit="$commit" "$ref" \
+                || echo "::warning::Couldn't pin $ref to $commit; dependency modules may rebuild"
+            done < "$SDK_PINS"
+          else
+            echo "::warning::No recorded SDK commits in the cache; using the latest SDK"
+          fi
+          for ref in $SDK_REFS; do echo "$ref $(flatpak info --user --show-commit "$ref")"; done
+
       - name: Build
         timeout-minutes: 320
         run: |
-          flatpak-builder --user --install-deps-from=flathub --ccache --force-clean \
+          flatpak-builder --user --ccache --force-clean \
             --disable-rofiles-fuse --repo=repo build-dir "$MANIFEST"
           flatpak build-bundle repo "$BUNDLE" "$APP_ID" \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Record SDK commits
+        if: always()
+        run: |
+          mkdir -p .flatpak-builder
+          for ref in $SDK_REFS; do echo "$ref $(flatpak info --user --show-commit "$ref")"; done > "$SDK_PINS"
+          cat "$SDK_PINS"
 
       # Only main's cache can be restored by later runs, so tag runs don't save one
       # (it would only take space from main's in the 10 GB cache limit).
