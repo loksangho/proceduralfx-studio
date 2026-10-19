@@ -26,6 +26,7 @@ mod fileio;
 mod fracture;
 mod groom;
 mod groups;
+mod kinefx;
 mod muscle;
 mod paint;
 mod raster;
@@ -1677,14 +1678,23 @@ fn node_flip(
     max_dt: f32,
     substeps: usize,
     seed: usize,
+    // Domain box: centre xyz, size xyz. A zero size uses the emitter's bounds.
+    domain: [f32; 6],
     time: f32,
 ) -> Mesh {
     let max_particles = particle_count.clamp(1, 100_000);
     let resolution = grid_resolution.clamp(16, 128);
-    let Some((lo, hi)) = emitter.bounds() else {
+    let Some((seed_lo, seed_hi)) = emitter.bounds() else {
         return Mesh::default();
     };
-    let extent = hi.sub(lo);
+    let seed_extent = seed_hi.sub(seed_lo);
+    let boxed = domain[3] > 0.0 && domain[4] > 0.0 && domain[5] > 0.0;
+    let (lo, extent) = if boxed {
+        let size = Vec3::new(domain[3], domain[4], domain[5]);
+        (Vec3::new(domain[0], domain[1], domain[2]).sub(size.scale(0.5)), size)
+    } else {
+        (seed_lo, seed_extent)
+    };
     let max_extent = extent.x.max(extent.y).max(extent.z).max(0.1);
     let cell_size = max_extent / resolution as f32;
     let init = || {
@@ -1727,9 +1737,9 @@ fn node_flip(
         if !emitter.indices.is_empty() {
             for attempt in 0..32 {
                 let candidate = Vec3::new(
-                    lo.x + extent.x * a,
-                    lo.y + extent.y * b,
-                    lo.z + extent.z * c,
+                    seed_lo.x + seed_extent.x * a,
+                    seed_lo.y + seed_extent.y * b,
+                    seed_lo.z + seed_extent.z * c,
                 );
                 if point_inside(candidate) {
                     break;
@@ -1741,7 +1751,7 @@ fn node_flip(
             }
         }
         particles.push(FlipParticle {
-            position: Vec3::new(lo.x + extent.x * a, lo.y + extent.y * b, lo.z + extent.z * c),
+            position: Vec3::new(seed_lo.x + seed_extent.x * a, seed_lo.y + seed_extent.y * b, seed_lo.z + seed_extent.z * c),
             velocity: Vec3::zero(),
         });
     }
@@ -1904,6 +1914,23 @@ fn node_flip(
             if particle.position.y < lo.y {
                 particle.position.y = lo.y;
                 particle.velocity.y = particle.velocity.y.abs() * 0.15;
+            }
+            // A domain box is closed on every side.
+            if boxed {
+                let hi = lo.add(extent);
+                for (p, v, a, b) in [
+                    (&mut particle.position.x, &mut particle.velocity.x, lo.x, hi.x),
+                    (&mut particle.position.y, &mut particle.velocity.y, lo.y, hi.y),
+                    (&mut particle.position.z, &mut particle.velocity.z, lo.z, hi.z),
+                ] {
+                    if *p < a {
+                        *p = a;
+                        *v = v.abs() * 0.15;
+                    } else if *p > b {
+                        *p = b;
+                        *v = -v.abs() * 0.15;
+                    }
+                }
             }
             if !collider.indices.is_empty() {
                 // Collide with the actual swept mesh faces. Do not use the
@@ -3008,6 +3035,8 @@ enum NodeKind {
         max_dt: f32,
         substeps: usize,
         seed: usize,
+        // Domain box: centre xyz, size xyz (zero size: the emitter's bounds).
+        domain: [f32; 6],
     },
     // Spray, foam and bubbles from a FLIP fluid. Input 1: fluid particles (with v), input 2: optional collider.
     WhitewaterSolver(whitewater::WhitewaterSettings),
@@ -3081,6 +3110,16 @@ enum NodeKind {
     MuscleSolver(muscle::JiggleSettings),
     // Moves skin (input 1) with the muscles under it (input 2) relative to frame 0.
     MuscleSkin(muscle::SkinSettings),
+    // KineFX: skeletons as points with parent and transform (see kinefx.rs).
+    Skeleton(kinefx::SkeletonSettings),
+    RigPose(kinefx::RigPose),
+    TwoBoneIk(kinefx::IkSettings),
+    ProceduralMotion(kinefx::MotionSettings),
+    SkeletonBlend { weight: f32 },
+    // Input 1: mesh, input 2: skeleton in the capture (rest) pose.
+    JointCapture(kinefx::CaptureSettings),
+    // Input 1: captured mesh, input 2: rest skeleton, input 3: animated skeleton.
+    BoneDeform,
     // Heightfield terrain: a grid plus nodes that shape its heights.
     Terrain(terrain::TerrainSettings),
     TerrainNoise(terrain::NoiseSettings),
@@ -3234,6 +3273,11 @@ impl NodeKind {
                 (10, "activation"),
             ]),
             NodeKind::CrowdSolver(_) => named(&[(0, "speed"), (7, "goal.x"), (8, "goal.y"), (9, "goal.z"), (10, "goal_weight")]),
+            NodeKind::RigPose(_) => (0..kinefx::POSE_SLOTS)
+                .flat_map(|slot| ["rx", "ry", "rz", "tx", "ty", "tz"].iter().enumerate().map(move |(k, n)| (ChannelTarget::Param(slot * 6 + k), format!("joint{}.{n}", slot + 1))))
+                .collect(),
+            NodeKind::TwoBoneIk(_) => named(&[(0, "goal.x"), (1, "goal.y"), (2, "goal.z"), (3, "pole.x"), (4, "pole.y"), (5, "pole.z"), (7, "blend")]),
+            NodeKind::SkeletonBlend { .. } => named(&[(0, "weight")]),
             NodeKind::Wrangle { .. } | NodeKind::MoonRayRender { .. } | NodeKind::AttributeVop { .. } | NodeKind::Vop(_) => Vec::new(),
             other => (0..other.params().len()).map(|i| (ChannelTarget::Param(i), format!("parm{i}"))).collect(),
         }
@@ -3259,6 +3303,8 @@ impl NodeKind {
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
             NodeKind::ShaderNode(n) => n.texts.clone(),
+            NodeKind::RigPose(p) => p.joints.clone(),
+            NodeKind::TwoBoneIk(k) => vec![k.root.clone(), k.mid.clone(), k.tip.clone()],
             _ => Vec::new(),
         }
     }
@@ -3292,6 +3338,12 @@ impl NodeKind {
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
             NodeKind::ShaderNode(n) => n.texts.iter_mut().for_each(|t| next(t)),
+            NodeKind::RigPose(p) => p.joints.iter_mut().for_each(|t| next(t)),
+            NodeKind::TwoBoneIk(k) => {
+                next(&mut k.root);
+                next(&mut k.mid);
+                next(&mut k.tip);
+            }
             _ => {}
         }
     }
@@ -3473,6 +3525,7 @@ impl NodeKind {
                         max_dt: 0.02,
                         substeps: 2,
                         seed: 11,
+                        domain: [0.0; 6],
                     },
                     NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings::defaults()),
                     NodeKind::Pyro(sims::PyroSettings::default()),
@@ -3537,6 +3590,18 @@ impl NodeKind {
             (
                 "Crowds",
                 vec![NodeKind::CrowdSolver(crowd::CrowdSettings::defaults())],
+            ),
+            (
+                "KineFX",
+                vec![
+                    NodeKind::Skeleton(kinefx::SkeletonSettings::defaults()),
+                    NodeKind::RigPose(kinefx::RigPose::new()),
+                    NodeKind::TwoBoneIk(kinefx::IkSettings::defaults()),
+                    NodeKind::ProceduralMotion(kinefx::MotionSettings::defaults()),
+                    NodeKind::SkeletonBlend { weight: 0.5 },
+                    NodeKind::JointCapture(kinefx::CaptureSettings::defaults()),
+                    NodeKind::BoneDeform,
+                ],
             ),
             (
                 "Muscles",
@@ -3728,6 +3793,13 @@ impl NodeKind {
             NodeKind::Muscle(_) => "muscle",
             NodeKind::MuscleSolver(_) => "muscle_solver",
             NodeKind::MuscleSkin(_) => "muscle_skin",
+            NodeKind::Skeleton(_) => "skeleton",
+            NodeKind::RigPose(_) => "rig_pose",
+            NodeKind::TwoBoneIk(_) => "two_bone_ik",
+            NodeKind::ProceduralMotion(_) => "procedural_motion",
+            NodeKind::SkeletonBlend { .. } => "skeleton_blend",
+            NodeKind::JointCapture(_) => "joint_capture",
+            NodeKind::BoneDeform => "bone_deform",
             NodeKind::Terrain(_) => "terrain",
             NodeKind::TerrainNoise(_) => "terrain_noise",
             NodeKind::TerrainErode(_) => "terrain_erode",
@@ -3770,6 +3842,9 @@ impl NodeKind {
             NodeKind::Boolean(_) => 2,
             NodeKind::CrowdSolver(_) => 3,
             NodeKind::MuscleSkin(_) => 2,
+            NodeKind::Skeleton(_) => 0,
+            NodeKind::SkeletonBlend { .. } | NodeKind::JointCapture(_) => 2,
+            NodeKind::BoneDeform => 3,
             NodeKind::Particles { .. } => 2,
             NodeKind::Flip { .. } => 2,
             NodeKind::WhitewaterSolver(_) => 2,
@@ -3924,16 +3999,12 @@ impl NodeKind {
                 max_dt,
                 substeps,
                 seed,
-            } => vec![
-                *particle_count as f32,
-                *grid_resolution as f32,
-                *flip_ratio,
-                *viscosity,
-                *gravity,
-                *max_dt,
-                *substeps as f32,
-                *seed as f32,
-            ],
+                domain,
+            } => [
+                vec![*particle_count as f32, *grid_resolution as f32, *flip_ratio, *viscosity, *gravity, *max_dt, *substeps as f32, *seed as f32],
+                domain.to_vec(),
+            ]
+            .concat(),
             NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
                 vec![*radius, *join_distance, *resolution as f32, *smoothing as f32]
             }
@@ -4014,6 +4085,13 @@ impl NodeKind {
             NodeKind::Muscle(s) => s.to_params(),
             NodeKind::MuscleSolver(s) => vec![s.stiffness, s.damping, s.smoothing as f32, s.substeps as f32],
             NodeKind::MuscleSkin(s) => vec![s.falloff, s.influences as f32],
+            NodeKind::Skeleton(s) => vec![s.preset as f32, s.scale, s.joints as f32, s.length],
+            NodeKind::RigPose(p) => p.values.iter().flatten().copied().collect(),
+            NodeKind::TwoBoneIk(k) => [k.goal.to_vec(), k.pole.to_vec(), vec![k.use_pole as u8 as f32, k.blend, k.keep_tip as u8 as f32]].concat(),
+            NodeKind::ProceduralMotion(m) => vec![m.motion as f32, m.rate, m.amplitude, m.travel, m.lag, m.axis as f32],
+            NodeKind::SkeletonBlend { weight } => vec![*weight],
+            NodeKind::JointCapture(c) => vec![c.influences as f32, c.falloff, c.visualize as u8 as f32],
+            NodeKind::BoneDeform => vec![],
             NodeKind::Terrain(s) => vec![s.size[0], s.size[1], s.resolution as f32],
             NodeKind::TerrainNoise(s) => vec![
                 s.kind as f32,
@@ -4193,6 +4271,7 @@ impl NodeKind {
                 max_dt: g(5).clamp(0.001, 0.1),
                 substeps: u(6).clamp(1, 8),
                 seed: u(7),
+                domain: [g(8), g(9), g(10), g(11).max(0.0), g(12).max(0.0), g(13).max(0.0)],
             },
             "particle_surface" => NodeKind::ParticleSurface {
                 radius: g(0).max(0.001),
@@ -4326,6 +4405,39 @@ impl NodeKind {
                 splinter: g(9).max(1.0),
                 separate: g(10).max(0.0),
             }),
+            "skeleton" => NodeKind::Skeleton(kinefx::SkeletonSettings {
+                preset: u(0).min(kinefx::PRESETS.len() - 1),
+                scale: if p.len() > 1 { g(1).max(1e-3) } else { 1.0 },
+                joints: u(2).clamp(2, 200),
+                length: g(3).max(1e-3),
+            }),
+            "rig_pose" => NodeKind::RigPose(kinefx::RigPose {
+                joints: vec![String::new(); kinefx::POSE_SLOTS],
+                values: (0..kinefx::POSE_SLOTS).map(|s| std::array::from_fn(|k| g(s * 6 + k))).collect(),
+            }),
+            "two_bone_ik" => NodeKind::TwoBoneIk(kinefx::IkSettings {
+                goal: v3(0),
+                pole: v3(3),
+                use_pole: g(6) > 0.5,
+                blend: if p.len() > 7 { g(7).clamp(0.0, 1.0) } else { 1.0 },
+                keep_tip: g(8) > 0.5,
+                ..kinefx::IkSettings::defaults()
+            }),
+            "procedural_motion" => NodeKind::ProceduralMotion(kinefx::MotionSettings {
+                motion: u(0).min(kinefx::MOTIONS.len() - 1),
+                rate: g(1),
+                amplitude: g(2),
+                travel: g(3),
+                lag: g(4),
+                axis: u(5).min(2),
+            }),
+            "skeleton_blend" => NodeKind::SkeletonBlend { weight: g(0).clamp(0.0, 1.0) },
+            "joint_capture" => NodeKind::JointCapture(kinefx::CaptureSettings {
+                influences: u(0).clamp(1, kinefx::MAX_INFLUENCES),
+                falloff: g(1).max(0.1),
+                visualize: g(2) > 0.5,
+            }),
+            "bone_deform" => NodeKind::BoneDeform,
             "crowd_solver" => NodeKind::CrowdSolver(crowd::CrowdSettings::from_params(p)),
             "muscle" => NodeKind::Muscle(muscle::MuscleSettings::from_params(p)),
             "muscle_solver" => NodeKind::MuscleSolver(muscle::JiggleSettings {
@@ -5320,6 +5432,7 @@ impl Graph {
                 | NodeKind::WhitewaterSolver(_)
                 | NodeKind::CrowdSolver(_)
                 | NodeKind::MuscleSolver(_)
+                | NodeKind::ProceduralMotion(_)
                 | NodeKind::Cache { .. }
                 | NodeKind::Pyro(_)
                 | NodeKind::RbdSolver(_)
@@ -5550,6 +5663,7 @@ impl Graph {
                     max_dt,
                     substeps,
                     seed,
+                    domain,
                 } => node_flip(
                     self.sim_key(id),
                     input(0, cache),
@@ -5562,6 +5676,7 @@ impl Graph {
                     *max_dt,
                     *substeps,
                     *seed,
+                    *domain,
                     time,
                 ),
                 NodeKind::WhitewaterSolver(settings) => {
@@ -5741,6 +5856,13 @@ impl Graph {
                     }
                 }
                 NodeKind::Muscle(settings) => self.report(id, muscle::muscle(&input(0, cache), settings)),
+                NodeKind::Skeleton(settings) => kinefx::skeleton(settings),
+                NodeKind::RigPose(pose) => self.report(id, kinefx::rig_pose(&input(0, cache), pose)),
+                NodeKind::TwoBoneIk(settings) => self.report(id, kinefx::two_bone_ik(&input(0, cache), settings)),
+                NodeKind::ProceduralMotion(settings) => self.report(id, kinefx::motion(&input(0, cache), settings, time)),
+                NodeKind::SkeletonBlend { weight } => self.report(id, kinefx::blend(&input(0, cache), &input(1, cache), *weight)),
+                NodeKind::JointCapture(settings) => self.report(id, kinefx::capture(&input(0, cache), &input(1, cache), settings)),
+                NodeKind::BoneDeform => self.report(id, kinefx::bone_deform(&input(0, cache), &input(1, cache), &input(2, cache))),
                 NodeKind::MuscleSolver(settings) => {
                     let source = self.input_of(id, 0);
                     muscle::jiggle(self.sim_key(id), settings, time, |t| self.cook_fresh(source, t))
@@ -6228,6 +6350,29 @@ const SCENE_FILE: &str = "scene.pfs";
 const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
 // Returns the MoonRay class name and its RDLA definition for a MAT node's settings.
+// A joint picker: the input skeleton's joint names, or a typed name.
+fn joint_menu(ui: &mut egui::Ui, salt: impl std::hash::Hash, label: &str, joint: &mut String, names: &[String], optional: bool) -> bool {
+    let mut c = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let shown = if joint.trim().is_empty() { "(none)".to_owned() } else { joint.clone() };
+        egui::ComboBox::from_id_salt(salt).selected_text(shown).height(400.0).show_ui(ui, |ui| {
+            if optional && ui.selectable_label(joint.trim().is_empty(), "(none)").clicked() {
+                joint.clear();
+                c = true;
+            }
+            for name in names {
+                if ui.selectable_label(joint == name, name).clicked() {
+                    *joint = name.clone();
+                    c = true;
+                }
+            }
+        });
+        c |= ui.add(egui::TextEdit::singleline(joint).desired_width(90.0)).changed();
+    });
+    c
+}
+
 // One parameter of a shader table: a slider, colour swatch or checkbox.
 fn shader_param_ui(ui: &mut egui::Ui, param: &shading::Param, slot: &mut [f32]) -> bool {
     match param.kind {
@@ -6426,6 +6571,44 @@ enum GizmoHandle {
     Ring(usize),
     // Screen-plane move, or uniform scale.
     Center,
+    // A box gizmo's face on `axis`, + or - side: dragging resizes that side.
+    Face(usize, bool),
+}
+
+// What the gizmo looks like: move/rotate/scale handles, or a box to move and resize.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GizmoStyle {
+    Xform,
+    Box,
+}
+
+// The node the gizmo edits. `value` holds translate/rotate/scale (a box: centre in t,
+// size in s), in the coordinates of `space`: the enclosing object's transform for
+// SOP nodes, identity for objects.
+#[derive(Debug, Clone, Copy)]
+struct GizmoTarget {
+    node: NodeId,
+    value: ObjectXform,
+    space: ObjectXform,
+    style: GizmoStyle,
+}
+
+impl GizmoTarget {
+    fn point(&self, p: Vec3) -> Vec3 {
+        p.mul(Vec3::from_arr(self.space.s)).rotate_deg(self.space.r).add(Vec3::from_arr(self.space.t))
+    }
+
+    fn dir(&self, d: Vec3) -> Vec3 {
+        d.mul(Vec3::from_arr(self.space.s)).rotate_deg(self.space.r)
+    }
+
+    // A world-space offset in the target's own coordinates.
+    fn local_dir(&self, d: Vec3) -> Vec3 {
+        let r = self.space.r;
+        let u = d.rotate_deg([0.0, 0.0, -r[2]]).rotate_deg([0.0, -r[1], 0.0]).rotate_deg([-r[0], 0.0, 0.0]);
+        let s = self.space.s.map(|v| if v.abs() < 1e-6 { 1e-6 } else { v });
+        Vec3::new(u.x / s[0], u.y / s[1], u.z / s[2])
+    }
 }
 
 // One handle as drawn last frame, for hit testing and for turning mouse motion into edits.
@@ -6479,7 +6662,7 @@ struct GizmoDrag {
     part: GizmoPart,
     frame: GizmoFrame,
     start_pointer: egui::Pos2,
-    start: ObjectXform,
+    target: GizmoTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6793,6 +6976,8 @@ struct ProceduralFxStudioApp {
     // Handles drawn last frame, and the handle being dragged.
     gizmo_frame: Option<GizmoFrame>,
     gizmo_drag: Option<GizmoDrag>,
+    // A FLIP node's automatic domain (its emitter's bounds), keyed by the upstream hash.
+    gizmo_bounds: std::cell::RefCell<Option<(u64, Option<(Vec3, Vec3)>)>>,
     animate: bool,
     anim_speed: f32,
     time: f32,
@@ -7002,6 +7187,7 @@ impl Default for ProceduralFxStudioApp {
             gizmo_mode: GizmoMode::Translate,
             gizmo_frame: None,
             gizmo_drag: None,
+            gizmo_bounds: std::cell::RefCell::new(None),
             animate: true,
             anim_speed: 0.02,
             time: 0.0,
@@ -10626,6 +10812,14 @@ impl ProceduralFxStudioApp {
                 _ => None,
             })
             .collect();
+        // Joint names of the input skeleton, for KineFX nodes' joint menus.
+        let joint_names: Vec<String> = match self.graph.nodes.get(&id).map(|n| &n.kind) {
+            Some(NodeKind::RigPose(_) | NodeKind::TwoBoneIk(_)) => {
+                let input = self.graph.cook_fresh(self.graph.input_of(id, 0), self.time);
+                kinefx::Skeleton::from_mesh(&input).map(|s| s.names).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
         // Group names on the node's input, for the Group field's menu (filled in on request).
         let group_choices = self.group_choices.as_ref().filter(|(for_id, ..)| *for_id == id).map(|(_, p, q)| (p.clone(), q.clone()));
         let Some(node) = self.graph.nodes.get_mut(&id) else {
@@ -11185,6 +11379,7 @@ impl ProceduralFxStudioApp {
                 max_dt,
                 substeps,
                 seed,
+                domain,
             } => {
                 ui.label("3D CPU FLIP solver");
                 c |= ui.add(egui::Slider::new(particle_count, 1..=100_000).logarithmic(true).text("Particles")).changed();
@@ -11195,7 +11390,22 @@ impl ProceduralFxStudioApp {
                 c |= ui.add(egui::Slider::new(max_dt, 0.001..=0.1).logarithmic(true).text("Max timestep")).changed();
                 c |= ui.add(egui::Slider::new(substeps, 1..=8).text("Substeps")).changed();
                 c |= ui.add(egui::Slider::new(seed, 0..=9999).text("Seed")).changed();
-                ui.small("Input 1: emitter surface • Input 2: optional static collider.");
+                let mut auto = domain[3] <= 0.0;
+                if ui.checkbox(&mut auto, "Domain from the emitter's bounds").on_hover_text("Or drag the domain box's faces in the viewport").changed() {
+                    *domain = if auto { [0.0; 6] } else { [0.0, 1.5, 0.0, 4.0, 3.0, 4.0] };
+                    c = true;
+                }
+                if !auto {
+                    for (label, range) in [("Domain centre", 0..3), ("Domain size", 3..6)] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            for k in range {
+                                c |= ui.add(egui::DragValue::new(&mut domain[k]).speed(0.02).range(if k >= 3 { 0.01..=1000.0 } else { -1000.0..=1000.0 })).changed();
+                            }
+                        });
+                    }
+                }
+                ui.small("Input 1: emitter surface • Input 2: optional static collider. Select the node to drag its domain box in the viewport.");
             }
             NodeKind::WhitewaterSolver(w) => {
                 ui.small("Spray, foam and bubbles where the fluid input splashes. Input 1: FLIP fluid • Input 2: optional collider. Writes `type` and spray/foam/bubble groups; renders as small spheres.");
@@ -11746,6 +11956,90 @@ impl ProceduralFxStudioApp {
                 c |= ui.add(egui::Slider::new(&mut set.avoid_distance, 0.0..=10.0).text("Obstacle look-ahead")).changed();
                 c |= ui.add(egui::Slider::new(&mut set.agent_height, 0.1..=5.0).text("Agent height")).changed();
                 c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+            }
+            NodeKind::Skeleton(set) => {
+                ui.small("A KineFX skeleton: joints as points with `parent` and `transform`. Pose it with Rig Pose, Two Bone IK or Procedural Motion; skin a mesh with Joint Capture and Bone Deform.");
+                egui::ComboBox::from_label("Preset").selected_text(kinefx::PRESETS[set.preset.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in kinefx::PRESETS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.preset, value, *label).changed();
+                    }
+                });
+                c |= ui.add(egui::Slider::new(&mut set.scale, 0.01..=10.0).logarithmic(true).text("Scale")).changed();
+                if set.preset != 0 {
+                    c |= ui.add(egui::Slider::new(&mut set.joints, 2..=200).text("Joints")).changed();
+                    c |= ui.add(egui::Slider::new(&mut set.length, 0.01..=50.0).logarithmic(true).text("Length")).changed();
+                }
+            }
+            NodeKind::RigPose(pose) => {
+                ui.small("Rotates (degrees, in the joint's own axes) and moves joints; children follow. Every value can be keyframed.");
+                for slot in 0..kinefx::POSE_SLOTS {
+                    ui.separator();
+                    c |= joint_menu(ui, ("pose", id, slot), &format!("Joint {}", slot + 1), &mut pose.joints[slot], &joint_names, true);
+                    if pose.joints[slot].trim().is_empty() {
+                        continue;
+                    }
+                    let v = &mut pose.values[slot];
+                    for (label, range) in [("Rotate", 0..3), ("Translate", 3..6)] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            for k in range {
+                                c |= ui.add(egui::DragValue::new(&mut v[k]).speed(if k < 3 { 0.5 } else { 0.01 })).changed();
+                            }
+                        });
+                    }
+                }
+            }
+            NodeKind::TwoBoneIk(set) => {
+                ui.small("Bends a root → mid → tip chain (thigh, shin, foot) so the tip reaches the goal. Keyframe the goal to animate.");
+                c |= joint_menu(ui, ("ik", id, 0), "Root", &mut set.root, &joint_names, false);
+                c |= joint_menu(ui, ("ik", id, 1), "Mid", &mut set.mid, &joint_names, false);
+                c |= joint_menu(ui, ("ik", id, 2), "Tip", &mut set.tip, &joint_names, false);
+                for (label, value) in [("Goal", &mut set.goal), ("Pole", &mut set.pole)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        for k in 0..3 {
+                            c |= ui.add(egui::DragValue::new(&mut value[k]).speed(0.01)).changed();
+                        }
+                    });
+                }
+                c |= ui.checkbox(&mut set.use_pole, "Bend towards the pole").changed();
+                c |= ui.checkbox(&mut set.keep_tip, "Keep the tip's orientation").changed();
+                c |= ui.add(egui::Slider::new(&mut set.blend, 0.0..=1.0).text("Blend")).changed();
+            }
+            NodeKind::ProceduralMotion(set) => {
+                egui::ComboBox::from_label("Motion").selected_text(kinefx::MOTIONS[set.motion.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in kinefx::MOTIONS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.motion, value, *label).changed();
+                    }
+                });
+                c |= ui.add(egui::Slider::new(&mut set.rate, 0.0..=5.0).text("Cycles per second")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.amplitude, 0.0..=3.0).text("Amplitude")).changed();
+                match set.motion {
+                    0 => c |= ui.add(egui::Slider::new(&mut set.travel, 0.0..=5.0).text("Forward speed")).changed(),
+                    1 => {
+                        c |= ui.add(egui::Slider::new(&mut set.lag, 0.0..=3.0).text("Lag per joint")).changed();
+                        ui.horizontal(|ui| {
+                            ui.label("Bend about");
+                            for (value, label) in sops::AXES.iter().enumerate() {
+                                c |= ui.selectable_value(&mut set.axis, value, *label).changed();
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            NodeKind::SkeletonBlend { weight } => {
+                ui.small("Blends two poses of the same skeleton (input 1 at 0, input 2 at 1).");
+                c |= ui.add(egui::Slider::new(weight, 0.0..=1.0).text("Blend")).changed();
+            }
+            NodeKind::JointCapture(set) => {
+                ui.small("Input 1: mesh • Input 2: skeleton in its rest pose. Writes capture weights for Bone Deform.");
+                c |= ui.add(egui::Slider::new(&mut set.influences, 1..=kinefx::MAX_INFLUENCES).text("Joints per point")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.falloff, 0.5..=12.0).text("Falloff")).on_hover_text("Higher: sharper transitions between bones").changed();
+                c |= ui.checkbox(&mut set.visualize, "Colour by joint").changed();
+            }
+            NodeKind::BoneDeform => {
+                ui.small("Input 1: captured mesh (Joint Capture) • Input 2: rest skeleton • Input 3: animated skeleton.");
             }
             NodeKind::Muscle(set) => {
                 ui.small("A muscle from origin to insertion, or along a curve connected to input 1. Animate Activation to flex it.");
@@ -12732,9 +13026,9 @@ impl ProceduralFxStudioApp {
         // Gizmo handles are hit-tested against where they were drawn last frame.
         if response.drag_started_by(egui::PointerButton::Primary) && !box_select_modifier {
             if let (Some(frame), Some(pointer)) = (self.gizmo_frame.clone(), response.interact_pointer_pos()) {
-                if let (Some(part), Some((node, xform))) = (frame.hit(pointer).cloned(), self.gizmo_target()) {
-                    if node == frame.node {
-                        self.gizmo_drag = Some(GizmoDrag { part, frame, start_pointer: pointer, start: xform });
+                if let (Some(part), Some(target)) = (frame.hit(pointer).cloned(), self.gizmo_target()) {
+                    if target.node == frame.node {
+                        self.gizmo_drag = Some(GizmoDrag { part, frame, start_pointer: pointer, target });
                     }
                 }
             }
@@ -13628,7 +13922,7 @@ impl ProceduralFxStudioApp {
                 }
             }
         }
-        let has_unreferenced_points = referenced.iter().any(|&is_referenced| !is_referenced);
+        let has_unreferenced_points = !kinefx::Skeleton::is_skeleton(mesh) && referenced.iter().any(|&is_referenced| !is_referenced);
         if !curve_ranges.is_empty() {
             // Dense grooms are thinned for display; every curve still renders.
             const MAX_DRAWN_CURVES: usize = 8_000;
@@ -13639,6 +13933,21 @@ impl ProceduralFxStudioApp {
                 if line.len() >= 2 {
                     let colour = cd_color(range.start).unwrap_or(hair);
                     painter.add(egui::Shape::line(line, egui::Stroke::new(1.0, colour)));
+                }
+            }
+        }
+        // KineFX skeletons: a bone from each joint to its parent, and a dot per joint.
+        if kinefx::Skeleton::is_skeleton(mesh) {
+            let parent = &mesh.point_attributes["parent"];
+            let bone = egui::Color32::from_rgb(90, 220, 255);
+            for (j, p) in parent.iter().enumerate() {
+                if *p >= 0.0 {
+                    if let (Some(a), Some(b)) = (projected.get(j).copied().flatten(), projected.get(*p as usize).copied().flatten()) {
+                        painter.line_segment([a.0, b.0], egui::Stroke::new(2.5, bone));
+                    }
+                }
+                if let Some(a) = projected.get(j).copied().flatten() {
+                    painter.circle_filled(a.0, 3.5, egui::Color32::from_rgb(255, 230, 120));
                 }
             }
         }
@@ -13930,10 +14239,12 @@ impl ProceduralFxStudioApp {
             egui::FontId::monospace(12.0),
             egui::Color32::from_gray(210),
         );
-        // Transform gizmo for the selected object, drawn at its pivot with a constant screen size.
+        // The gizmo for the selected node, drawn at its pivot with a constant screen size:
+        // move/rotate/scale handles, or a domain box with a handle on each face.
         let mut gizmo_frame = None;
-        if let Some((node, xform)) = self.gizmo_target().filter(|_| self.show_gizmos) {
-            let pivot = Vec3::from_arr(xform.t);
+        if let Some(target) = self.gizmo_target().filter(|_| self.show_gizmos) {
+            let xform = target.value;
+            let pivot = target.point(Vec3::from_arr(xform.t));
             let cam_right = Vec3::new(cos_y, 0.0, -sin_y);
             let cam_up = Vec3::new(-sin_x * sin_y, cos_x, -sin_x * cos_y);
             let pivot_cam = to_cam(pivot);
@@ -13946,29 +14257,59 @@ impl ProceduralFxStudioApp {
                     let c = to_cam(p);
                     (c.z > near_plane).then(|| project_cam(c))
                 };
+                // Local point -> screen, and the local length that's `world` long along `dir`.
+                let local_screen = |p: Vec3| screen(target.point(p));
+                let local_len = |dir: Vec3, world: f32| world / target.dir(dir).length().max(1e-6);
+                let centre = Vec3::from_arr(xform.t);
                 let axes = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)];
                 let colours = [egui::Color32::from_rgb(235, 85, 85), egui::Color32::from_rgb(105, 215, 105), egui::Color32::from_rgb(95, 145, 245)];
                 let mut parts = Vec::new();
-                match self.gizmo_mode {
-                    GizmoMode::Translate | GizmoMode::Scale => {
+                match (target.style, self.gizmo_mode) {
+                    (GizmoStyle::Box, _) => {
+                        let half = Vec3::from_arr(xform.s).scale(0.5);
+                        // The box's edges.
+                        let corner = |k: usize| centre.add(Vec3::new(
+                            if k & 1 == 0 { -half.x } else { half.x },
+                            if k & 2 == 0 { -half.y } else { half.y },
+                            if k & 4 == 0 { -half.z } else { half.z },
+                        ));
+                        for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
+                            if let (Some(pa), Some(pb)) = (local_screen(corner(a)), local_screen(corner(b))) {
+                                painter.line_segment([pa, pb], egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255)));
+                            }
+                        }
                         for i in 0..3 {
-                            // Scale works along the object's own (rotated) axes.
-                            let axis = if self.gizmo_mode == GizmoMode::Scale { axes[i].rotate_deg(xform.r).normalize() } else { axes[i] };
-                            if let Some(tip) = screen(pivot.add(axis.scale(length))) {
-                                parts.push(GizmoPart { handle: GizmoHandle::Axis(i), points: vec![pivot_screen, tip], axis_screen: (tip - pivot_screen) / length, ring_sign: 1.0 });
+                            for plus in [true, false] {
+                                let sign = if plus { 1.0 } else { -1.0 };
+                                let face = centre.add(axes[i].scale(sign * [half.x, half.y, half.z][i]));
+                                let out = local_len(axes[i], length * 0.3);
+                                if let (Some(c), Some(tip)) = (local_screen(face), local_screen(face.add(axes[i].scale(sign * out)))) {
+                                    parts.push(GizmoPart { handle: GizmoHandle::Face(i, plus), points: vec![c], axis_screen: (tip - c) / out, ring_sign: 1.0 });
+                                }
                             }
                         }
                     }
-                    GizmoMode::Rotate => {
+                    (GizmoStyle::Xform, GizmoMode::Translate | GizmoMode::Scale) => {
+                        for i in 0..3 {
+                            // Scale works along the node's own (rotated) axes.
+                            let axis = if self.gizmo_mode == GizmoMode::Scale { axes[i].rotate_deg(xform.r).normalize() } else { axes[i] };
+                            let l = local_len(axis, length);
+                            if let Some(tip) = local_screen(centre.add(axis.scale(l))) {
+                                parts.push(GizmoPart { handle: GizmoHandle::Axis(i), points: vec![pivot_screen, tip], axis_screen: (tip - pivot_screen) / l, ring_sign: 1.0 });
+                            }
+                        }
+                    }
+                    (GizmoStyle::Xform, GizmoMode::Rotate) => {
                         for i in 0..3 {
                             let (u, v) = (axes[(i + 1) % 3], axes[(i + 2) % 3]);
+                            let (lu, lv) = (local_len(u, length), local_len(v, length));
                             let points: Vec<egui::Pos2> = (0..=48)
                                 .filter_map(|k| {
                                     let a = k as f32 / 48.0 * std::f32::consts::TAU;
-                                    screen(pivot.add(u.scale(a.cos() * length)).add(v.scale(a.sin() * length)))
+                                    local_screen(centre.add(u.scale(a.cos() * lu)).add(v.scale(a.sin() * lv)))
                                 })
                                 .collect();
-                            let (us, vs) = (screen(pivot.add(u.scale(length))), screen(pivot.add(v.scale(length))));
+                            let (us, vs) = (local_screen(centre.add(u.scale(lu))), local_screen(centre.add(v.scale(lv))));
                             if let (true, Some(us), Some(vs)) = (points.len() > 8, us, vs) {
                                 let (a, b) = (us - pivot_screen, vs - pivot_screen);
                                 let sign = if a.x * b.y - a.y * b.x >= 0.0 { 1.0 } else { -1.0 };
@@ -13977,23 +14318,29 @@ impl ProceduralFxStudioApp {
                         }
                     }
                 }
-                if self.gizmo_mode != GizmoMode::Rotate {
+                if target.style == GizmoStyle::Box || self.gizmo_mode != GizmoMode::Rotate {
                     parts.push(GizmoPart { handle: GizmoHandle::Center, points: vec![pivot_screen], axis_screen: egui::Vec2::ZERO, ring_sign: 1.0 });
                 }
-                let frame = GizmoFrame { node, pivot: pivot_screen, pixels_per_unit, cam_right, cam_up, handle_px, parts };
+                let frame = GizmoFrame { node: target.node, pivot: pivot_screen, pixels_per_unit, cam_right, cam_up, handle_px, parts };
                 let active = self.gizmo_drag.as_ref().map(|d| d.part.handle);
                 let hovered = response.hover_pos().and_then(|p| frame.hit(p)).map(|p| p.handle);
                 for part in &frame.parts {
                     let highlight = active == Some(part.handle) || (active.is_none() && hovered == Some(part.handle));
                     let colour = match part.handle {
                         _ if highlight => egui::Color32::from_rgb(255, 225, 70),
-                        GizmoHandle::Axis(i) | GizmoHandle::Ring(i) => colours[i],
+                        GizmoHandle::Axis(i) | GizmoHandle::Ring(i) | GizmoHandle::Face(i, _) => colours[i],
                         GizmoHandle::Center => egui::Color32::from_gray(235),
                     };
                     match (part.handle, part.points.as_slice()) {
                         (GizmoHandle::Center, [c]) => {
                             let rect = egui::Rect::from_center_size(*c, egui::vec2(11.0, 11.0));
                             painter.rect_stroke(rect, 2.0, egui::Stroke::new(2.0, colour), egui::StrokeKind::Middle);
+                        }
+                        (GizmoHandle::Face(..), [c]) => {
+                            // A dot with a stub pointing out of the face.
+                            let out = part.axis_screen.normalized() * 14.0;
+                            painter.line_segment([*c, *c + out], egui::Stroke::new(2.0, colour));
+                            painter.circle_filled(*c, if highlight { 6.5 } else { 5.0 }, colour);
                         }
                         (GizmoHandle::Axis(_), [a, b]) => {
                             painter.line_segment([*a, *b], egui::Stroke::new(if highlight { 3.5 } else { 2.5 }, colour));
@@ -14031,38 +14378,73 @@ impl ProceduralFxStudioApp {
         }
     }
 
-    // The selected object the gizmo edits, as a transform (lights and cameras have no scale).
-    fn gizmo_target(&self) -> Option<(NodeId, ObjectXform)> {
+    // What the gizmo edits for the selected node: an object's transform, a Transform
+    // SOP, or the domain box of a Pyro or FLIP solver.
+    fn gizmo_target(&self) -> Option<GizmoTarget> {
         if self.context != AppContext::Obj {
             return None;
         }
         let id = self.selected?;
         let node = self.graph.nodes.get(&id)?;
+        let identity = ObjectXform::default();
+        // SOPs live in their geometry object's space.
+        let space = self.graph.enclosing_geometry(id).map_or(identity, |object| self.graph.xform_at(object, self.time));
+        let target = |value: ObjectXform, space: ObjectXform, style: GizmoStyle| Some(GizmoTarget { node: id, value, space, style });
+        let boxed = |centre: Vec3, size: Vec3| ObjectXform { t: [centre.x, centre.y, centre.z], r: [0.0; 3], s: [size.x, size.y, size.z] };
         match &node.kind {
-            NodeKind::Geometry { .. } => Some((id, node.xform)),
+            NodeKind::Geometry { .. } => target(node.xform, identity, GizmoStyle::Xform),
             NodeKind::Light { position, rotation, .. } | NodeKind::Camera { position, rotation, .. } => {
-                Some((id, ObjectXform { t: *position, r: *rotation, s: [1.0; 3] }))
+                target(ObjectXform { t: *position, r: *rotation, s: [1.0; 3] }, identity, GizmoStyle::Xform)
+            }
+            NodeKind::Transform { t, r, s } => target(ObjectXform { t: *t, r: *r, s: *s }, space, GizmoStyle::Xform),
+            NodeKind::Pyro(p) => target(boxed(Vec3::from_arr(p.center), Vec3::from_arr(p.size)), space, GizmoStyle::Box),
+            NodeKind::Flip { domain, .. } if domain[3] > 0.0 => {
+                target(boxed(Vec3::new(domain[0], domain[1], domain[2]), Vec3::new(domain[3], domain[4], domain[5])), space, GizmoStyle::Box)
+            }
+            NodeKind::Flip { .. } => {
+                // Automatic domain: the emitter's bounds (cooked once per upstream change).
+                let key = self.graph.sim_key(id);
+                let cached = self.gizmo_bounds.borrow().filter(|(k, _)| *k == key).map(|(_, b)| b);
+                let bounds = cached.unwrap_or_else(|| {
+                    let b = self.graph.cook_fresh(self.graph.input_of(id, 0), 0.0).bounds();
+                    *self.gizmo_bounds.borrow_mut() = Some((key, b));
+                    b
+                });
+                let (lo, hi) = bounds?;
+                target(boxed(lo.add(hi).scale(0.5), hi.sub(lo)), space, GizmoStyle::Box)
             }
             _ => None,
         }
     }
 
-    // Turns the mouse motion since the drag started into a new transform for the target.
+    // Turns the mouse motion since the drag started into new values for the target.
     fn apply_gizmo_drag(&mut self, drag: &GizmoDrag, pointer: egui::Pos2) {
         let total = pointer - drag.start_pointer;
         let frame = &drag.frame;
-        let mut x = drag.start;
-        match (self.gizmo_mode, drag.part.handle) {
-            (GizmoMode::Translate, GizmoHandle::Axis(i)) => {
+        let target = &drag.target;
+        let start = target.value;
+        let mut x = start;
+        let screen_move = || {
+            let ppu = frame.pixels_per_unit;
+            target.local_dir(frame.cam_right.scale(total.x / ppu).sub(frame.cam_up.scale(total.y / ppu)))
+        };
+        match (target.style, self.gizmo_mode, drag.part.handle) {
+            (GizmoStyle::Box, _, GizmoHandle::Face(i, plus)) => {
+                let a = drag.part.axis_screen;
+                let grow = total.dot(a) / a.length_sq().max(1e-6);
+                let size = (start.s[i] + grow).max(0.01);
+                x.s[i] = size;
+                x.t[i] = start.t[i] + if plus { 0.5 } else { -0.5 } * (size - start.s[i]);
+            }
+            (GizmoStyle::Box, _, GizmoHandle::Center) | (GizmoStyle::Xform, GizmoMode::Translate, GizmoHandle::Center) => {
+                let d = screen_move();
+                x.t = [start.t[0] + d.x, start.t[1] + d.y, start.t[2] + d.z];
+            }
+            (GizmoStyle::Xform, GizmoMode::Translate, GizmoHandle::Axis(i)) => {
                 let a = drag.part.axis_screen;
                 x.t[i] += total.dot(a) / a.length_sq().max(1e-6);
             }
-            (GizmoMode::Translate, GizmoHandle::Center) => {
-                let ppu = frame.pixels_per_unit;
-                let delta = frame.cam_right.scale(total.x / ppu).sub(frame.cam_up.scale(total.y / ppu));
-                x.t = [x.t[0] + delta.x, x.t[1] + delta.y, x.t[2] + delta.z];
-            }
-            (GizmoMode::Rotate, GizmoHandle::Ring(i)) => {
+            (GizmoStyle::Xform, GizmoMode::Rotate, GizmoHandle::Ring(i)) => {
                 let angle = |p: egui::Pos2| (p.y - frame.pivot.y).atan2(p.x - frame.pivot.x);
                 let mut delta = angle(pointer) - angle(drag.start_pointer);
                 if delta > std::f32::consts::PI {
@@ -14072,13 +14454,13 @@ impl ProceduralFxStudioApp {
                 }
                 x.r[i] += delta.to_degrees() * drag.part.ring_sign;
             }
-            (GizmoMode::Scale, GizmoHandle::Axis(i)) => {
+            (GizmoStyle::Xform, GizmoMode::Scale, GizmoHandle::Axis(i)) => {
                 let dir = drag.part.axis_screen.normalized();
-                x.s[i] = (drag.start.s[i] * (1.0 + total.dot(dir) / frame.handle_px)).max(0.001);
+                x.s[i] = (start.s[i] * (1.0 + total.dot(dir) / frame.handle_px)).max(0.001);
             }
-            (GizmoMode::Scale, GizmoHandle::Center) => {
+            (GizmoStyle::Xform, GizmoMode::Scale, GizmoHandle::Center) => {
                 let factor = (1.0 + (total.x - total.y) / frame.handle_px).max(0.001);
-                x.s = drag.start.s.map(|s| (s * factor).max(0.001));
+                x.s = start.s.map(|s| (s * factor).max(0.001));
             }
             _ => return,
         }
@@ -14089,6 +14471,16 @@ impl ProceduralFxStudioApp {
                 *position = x.t;
                 *rotation = x.r;
             }
+            NodeKind::Transform { t, r, s } => {
+                *t = x.t;
+                *r = x.r;
+                *s = x.s;
+            }
+            NodeKind::Pyro(p) => {
+                p.center = x.t;
+                p.size = x.s;
+            }
+            NodeKind::Flip { domain, .. } => *domain = [x.t[0], x.t[1], x.t[2], x.s[0], x.s[1], x.s[2]],
             _ => return,
         }
         self.dirty = true;
@@ -14765,8 +15157,8 @@ mod tests {
             parts: Vec::new(),
         };
         let axis = GizmoPart { handle: GizmoHandle::Axis(0), points: vec![], axis_screen: egui::vec2(100.0, 0.0), ring_sign: 1.0 };
-        let (_, start) = app.gizmo_target().unwrap();
-        let drag = GizmoDrag { part: axis.clone(), frame: frame.clone(), start_pointer: egui::pos2(100.0, 100.0), start };
+        let target = app.gizmo_target().unwrap();
+        let drag = GizmoDrag { part: axis.clone(), frame: frame.clone(), start_pointer: egui::pos2(100.0, 100.0), target };
         app.gizmo_mode = GizmoMode::Translate;
         app.apply_gizmo_drag(&drag, egui::pos2(150.0, 130.0));
         assert!((app.graph.nodes[&geo].xform.t[0] - 0.5).abs() < 1e-5);
@@ -14774,7 +15166,7 @@ mod tests {
         app.apply_gizmo_drag(&drag, egui::pos2(185.0, 100.0));
         assert!((app.graph.nodes[&geo].xform.s[0] - 2.0).abs() < 1e-4);
         let ring = GizmoPart { handle: GizmoHandle::Ring(1), points: vec![], axis_screen: egui::Vec2::ZERO, ring_sign: 1.0 };
-        let drag = GizmoDrag { part: ring, frame, start_pointer: egui::pos2(200.0, 100.0), start };
+        let drag = GizmoDrag { part: ring, frame, start_pointer: egui::pos2(200.0, 100.0), target };
         app.gizmo_mode = GizmoMode::Rotate;
         app.apply_gizmo_drag(&drag, egui::pos2(100.0, 200.0));
         assert!((app.graph.nodes[&geo].xform.r[1] - 90.0).abs() < 1e-3);
@@ -14961,6 +15353,18 @@ mod scene_file_tests {
             NodeKind::Muscle(muscle::MuscleSettings { activation: 0.4, profile: 1, ..muscle::MuscleSettings::defaults() }),
             NodeKind::MuscleSolver(muscle::JiggleSettings { stiffness: 77.0, ..muscle::JiggleSettings::defaults() }),
             NodeKind::MuscleSkin(muscle::SkinSettings { falloff: 0.7, influences: 3 }),
+            NodeKind::Skeleton(kinefx::SkeletonSettings { preset: 2, scale: 2.0, joints: 9, length: 3.0 }),
+            NodeKind::RigPose({
+                let mut p = kinefx::RigPose::new();
+                p.joints[2] = "forearm_l".into();
+                p.values[2] = [10.0, 20.0, 30.0, 0.1, 0.2, 0.3];
+                p
+            }),
+            NodeKind::TwoBoneIk(kinefx::IkSettings { root: "upperarm_r".into(), goal: [1.0, 2.0, 3.0], keep_tip: false, ..kinefx::IkSettings::defaults() }),
+            NodeKind::ProceduralMotion(kinefx::MotionSettings { motion: 1, lag: 0.9, axis: 2, ..kinefx::MotionSettings::defaults() }),
+            NodeKind::SkeletonBlend { weight: 0.3 },
+            NodeKind::JointCapture(kinefx::CaptureSettings { influences: 2, falloff: 6.0, visualize: true }),
+            NodeKind::BoneDeform,
             NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings { lifespan: 3.5, ..whitewater::WhitewaterSettings::defaults() }),
             NodeKind::Shader(shading::Values::preset(shading::Table::Principled, 5)),
             NodeKind::Shader(shading::Values::preset(shading::Table::Pyro, 2)),
@@ -15828,7 +16232,7 @@ mod whitewater_node_tests {
     use super::*;
 
     fn flip() -> NodeKind {
-        NodeKind::Flip { particle_count: 3000, grid_resolution: 24, flip_ratio: 0.95, viscosity: 0.1, gravity: -9.8, max_dt: 0.02, substeps: 1, seed: 3 }
+        NodeKind::Flip { particle_count: 3000, grid_resolution: 24, flip_ratio: 0.95, viscosity: 0.1, gravity: -9.8, max_dt: 0.02, substeps: 1, seed: 3, domain: [0.0; 6] }
     }
 
     #[test]
@@ -15982,5 +16386,133 @@ mod material_builder_ui_tests {
         app.apply(Action::Enter(builder));
         app.context = AppContext::Obj;
         assert_eq!(app.view_parent(), None);
+    }
+}
+
+#[cfg(test)]
+mod kinefx_node_tests {
+    use super::*;
+
+    #[test]
+    fn a_walking_skeleton_deforms_a_captured_mesh() {
+        let mut g = Graph::default();
+        g.next_id += 9700;
+        let rest = g.add(NodeKind::Skeleton(kinefx::SkeletonSettings::defaults()), egui::pos2(0.0, 0.0));
+        let walk = g.add(NodeKind::ProceduralMotion(kinefx::MotionSettings { travel: 0.0, ..kinefx::MotionSettings::defaults() }), egui::pos2(0.0, 0.0));
+        let ik = g.add(NodeKind::TwoBoneIk(kinefx::IkSettings { blend: 0.0, ..kinefx::IkSettings::defaults() }), egui::pos2(0.0, 0.0));
+        g.connect(rest, walk, 0);
+        g.connect(walk, ik, 0);
+        assert!(g.time_dependent(ik));
+        // A "body": points down the left leg.
+        let body = g.add(NodeKind::Add { count: 20, spacing: 0.045, layout: 1 }, egui::pos2(0.0, 0.0));
+        let place = g.add(NodeKind::Transform { t: [0.13, 0.08, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        g.connect(body, place, 0);
+        let capture = g.add(NodeKind::JointCapture(kinefx::CaptureSettings::defaults()), egui::pos2(0.0, 0.0));
+        g.connect(place, capture, 0);
+        g.connect(rest, capture, 1);
+        let deform = g.add(NodeKind::BoneDeform, egui::pos2(0.0, 0.0));
+        g.connect(capture, deform, 0);
+        g.connect(rest, deform, 1);
+        g.connect(ik, deform, 2);
+        let a = g.cook(deform, 0.25, &mut HashMap::new());
+        let b = g.cook(deform, 0.75, &mut HashMap::new());
+        for id in [rest, walk, ik, capture, deform] {
+            assert!(node_errors(|e| e.get(&id).cloned()).is_none(), "{:?}: {:?}", g.nodes[&id].kind, node_errors(|e| e.get(&id).cloned()));
+        }
+        // The leg swings, so the skinned points move between the two times.
+        let moved = a.vertices.iter().zip(&b.vertices).map(|(p, q)| p.sub(*q).length()).fold(0.0f32, f32::max);
+        assert!(moved > 0.1, "skinned points moved {moved}");
+        assert!(kinefx::Skeleton::is_skeleton(&g.cook(ik, 0.25, &mut HashMap::new())));
+        // A posing node on something that isn't a skeleton says so.
+        let not = g.add(NodeKind::RigPose(kinefx::RigPose::new()), egui::pos2(0.0, 0.0));
+        g.connect(body, not, 0);
+        g.cook(not, 0.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&not).cloned()).unwrap().contains("skeleton"));
+    }
+}
+
+#[cfg(test)]
+mod gizmo_tests {
+    use super::*;
+
+    fn drag(app: &mut ProceduralFxStudioApp, handle: GizmoHandle, axis_screen: egui::Vec2, moved: egui::Vec2) {
+        let target = app.gizmo_target().expect("the selected node has a gizmo");
+        let part = GizmoPart { handle, points: vec![egui::pos2(100.0, 100.0)], axis_screen, ring_sign: 1.0 };
+        let frame = GizmoFrame {
+            node: target.node,
+            pivot: egui::pos2(100.0, 100.0),
+            pixels_per_unit: 10.0,
+            cam_right: Vec3::new(1.0, 0.0, 0.0),
+            cam_up: Vec3::new(0.0, 1.0, 0.0),
+            handle_px: 85.0,
+            parts: vec![part.clone()],
+        };
+        let start = egui::pos2(100.0, 100.0);
+        let d = GizmoDrag { part, frame, start_pointer: start, target };
+        app.apply_gizmo_drag(&d, start + moved);
+    }
+
+    #[test]
+    fn domain_boxes_resize_from_their_faces() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        app.context = AppContext::Obj;
+        let pyro = app.graph.add(NodeKind::Pyro(sims::PyroSettings::default()), egui::pos2(0.0, 0.0));
+        app.selected = Some(pyro);
+        let t = app.gizmo_target().unwrap();
+        assert_eq!(t.style, GizmoStyle::Box);
+        assert_eq!(t.value.s, [4.0, 5.0, 4.0]);
+        // Drag the top face up 20 px at 10 px per unit: 2 units taller, centre up 1.
+        drag(&mut app, GizmoHandle::Face(1, true), egui::vec2(0.0, -10.0), egui::vec2(0.0, -20.0));
+        let NodeKind::Pyro(p) = &app.graph.nodes[&pyro].kind else { panic!() };
+        assert!((p.size[1] - 7.0).abs() < 1e-4 && (p.center[1] - 3.0).abs() < 1e-4, "{:?} {:?}", p.size, p.center);
+        // The bottom face: dragging it down grows the box downwards.
+        drag(&mut app, GizmoHandle::Face(1, false), egui::vec2(0.0, 10.0), egui::vec2(0.0, 10.0));
+        let NodeKind::Pyro(p) = &app.graph.nodes[&pyro].kind else { panic!() };
+        assert!((p.size[1] - 8.0).abs() < 1e-4 && (p.center[1] - 2.5).abs() < 1e-4, "{:?} {:?}", p.size, p.center);
+
+        // FLIP's automatic domain shows the emitter's bounds; dragging makes it explicit.
+        let emitter = app.graph.add(NodeKind::Box { size: 2.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let flip = app.graph.add(
+            NodeKind::Flip { particle_count: 100, grid_resolution: 16, flip_ratio: 0.9, viscosity: 0.0, gravity: -9.8, max_dt: 0.02, substeps: 1, seed: 1, domain: [0.0; 6] },
+            egui::pos2(0.0, 0.0),
+        );
+        app.graph.connect(emitter, flip, 0);
+        app.selected = Some(flip);
+        let t = app.gizmo_target().unwrap();
+        assert!((t.value.s[0] - 2.0).abs() < 1e-4);
+        drag(&mut app, GizmoHandle::Face(0, true), egui::vec2(10.0, 0.0), egui::vec2(30.0, 0.0));
+        let NodeKind::Flip { domain, .. } = app.graph.nodes[&flip].kind else { panic!() };
+        assert!((domain[3] - 5.0).abs() < 1e-4 && (domain[0] - 1.5).abs() < 1e-4, "{domain:?}");
+    }
+
+    #[test]
+    fn transform_sops_get_a_gizmo_in_their_objects_space() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        app.context = AppContext::Obj;
+        let object = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&object).unwrap().xform = ObjectXform { t: [5.0, 0.0, 0.0], r: [0.0, 90.0, 0.0], s: [2.0, 2.0, 2.0] };
+        let xf = app.graph.add(NodeKind::Transform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&xf).unwrap().parent = Some(object);
+        app.selected = Some(xf);
+        let t = app.gizmo_target().unwrap();
+        assert_eq!(t.style, GizmoStyle::Xform);
+        // The handle sits where the object puts the SOP's translate: (1,0,0) * 2, turned 90° about y, + (5,0,0).
+        let pivot = t.point(Vec3::from_arr(t.value.t));
+        let expected = Vec3::new(1.0, 0.0, 0.0).scale(2.0).rotate_deg([0.0, 90.0, 0.0]).add(Vec3::new(5.0, 0.0, 0.0));
+        assert!(pivot.sub(expected).length() < 1e-4, "{pivot:?}");
+        // local_dir undoes dir.
+        let d = Vec3::new(0.3, -0.7, 1.1);
+        assert!(t.local_dir(t.dir(d)).sub(d).length() < 1e-4);
+        // A screen-plane drag of 20 px right (2 world units along x) moves the SOP by the local equivalent.
+        app.gizmo_mode = GizmoMode::Translate;
+        drag(&mut app, GizmoHandle::Center, egui::Vec2::ZERO, egui::vec2(20.0, 0.0));
+        let NodeKind::Transform { t: moved, .. } = app.graph.nodes[&xf].kind else { panic!() };
+        let world = t.point(Vec3::from_arr(moved)).sub(pivot);
+        assert!(world.sub(Vec3::new(2.0, 0.0, 0.0)).length() < 1e-3, "moved {world:?} in world");
+        // Nodes without a gizmo, and other contexts, have none.
+        app.selected = Some(app.graph.add(NodeKind::Merge, egui::pos2(0.0, 0.0)));
+        assert!(app.gizmo_target().is_none());
     }
 }
