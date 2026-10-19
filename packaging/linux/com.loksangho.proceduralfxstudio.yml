@@ -348,6 +348,19 @@ modules:
         sha256: e9d99a480d80e999667643747c76eb0138d36c418fc154fd71b4bd65be103d52
 
   # Core USD only (no Hydra/imaging); same commit as the macOS build.
+  # Ptex textures, for USD imaging and MoonRay's Hydra delegate.
+  - name: ptex
+    buildsystem: cmake-ninja
+    builddir: true
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DPTEX_BUILD_STATIC_LIBS=OFF
+      - -DPTEX_BUILD_DOCS=OFF
+    sources:
+      - type: archive
+        url: https://github.com/wdas/ptex/archive/refs/tags/v2.4.3.tar.gz
+        sha256: 435aa2ee1781ff24859bd282b7616bfaeb86ca10604b13d085ada8aa7602ad27
+
   - name: openusd
     buildsystem: cmake-ninja
     builddir: true
@@ -355,8 +368,13 @@ modules:
       - -DCMAKE_BUILD_TYPE=Release
       - -DPython3_EXECUTABLE=/usr/bin/python3
       - -DPXR_ENABLE_PYTHON_SUPPORT=ON
-      - -DPXR_BUILD_IMAGING=OFF
-      - -DPXR_BUILD_USD_IMAGING=OFF
+      # Hydra: USD's imaging libraries, for MoonRay's Hydra delegate (hdMoonray).
+      - -DPXR_BUILD_IMAGING=ON
+      - -DPXR_BUILD_USD_IMAGING=ON
+      - -DPXR_ENABLE_GL_SUPPORT=ON
+      - -DPXR_BUILD_OPENIMAGEIO_PLUGIN=OFF
+      - -DPXR_BUILD_OPENCOLORIO_PLUGIN=OFF
+      - -DPXR_BUILD_EMBREE_PLUGIN=OFF
       - -DPXR_BUILD_USDVIEW=OFF
       - -DPXR_BUILD_TESTS=OFF
       - -DPXR_BUILD_EXAMPLES=OFF
@@ -365,7 +383,7 @@ modules:
       - -DPXR_BUILD_DOCUMENTATION=OFF
       - -DPXR_ENABLE_MATERIALX_SUPPORT=OFF
       - -DPXR_ENABLE_OPENVDB_SUPPORT=OFF
-      - -DPXR_ENABLE_PTEX_SUPPORT=OFF
+      - -DPXR_ENABLE_PTEX_SUPPORT=ON
     sources:
       - type: git
         url: https://github.com/PixarAnimationStudios/OpenUSD.git
@@ -426,9 +444,6 @@ modules:
       # Boost >= 1.87 removed asio::io_service.
       - type: patch
         path: patches/arras4_core-boost-asio.patch
-      # hdMoonray needs USD imaging, Ptex and OpenGL; the app only uses the CLI.
-      - type: patch
-        path: patches/moonray-skip-hydra.patch
       # The bundled FindTBB only understands TBB 2020; use oneTBB's own config.
       - type: shell
         commands:
