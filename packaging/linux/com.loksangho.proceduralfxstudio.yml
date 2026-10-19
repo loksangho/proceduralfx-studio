@@ -347,7 +347,6 @@ modules:
         url: https://github.com/PixarAnimationStudios/OpenSubdiv/archive/refs/tags/v3_6_1.tar.gz
         sha256: e9d99a480d80e999667643747c76eb0138d36c418fc154fd71b4bd65be103d52
 
-  # Core USD only (no Hydra/imaging); same commit as the macOS build.
   # Ptex textures, for USD imaging and MoonRay's Hydra delegate.
   - name: ptex
     buildsystem: cmake-ninja
@@ -361,6 +360,7 @@ modules:
         url: https://github.com/wdas/ptex/archive/refs/tags/v2.4.3.tar.gz
         sha256: 435aa2ee1781ff24859bd282b7616bfaeb86ca10604b13d085ada8aa7602ad27
 
+  # Same commit as the macOS build.
   - name: openusd
     buildsystem: cmake-ninja
     builddir: true
@@ -421,6 +421,7 @@ modules:
           -DCMAKE_PREFIX_PATH=/app
           -Dpxr_DIR=/app
           -DPYTHON_EXECUTABLE=/usr/bin/python3
+          -DCMAKE_PROJECT_INCLUDE_BEFORE=$(pwd)/ptex_first.cmake
           -DBOOST_PYTHON_COMPONENT_NAME=python$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])')
           -DABI_VERSION=0
           -DBUILD_QT_APPS=OFF
@@ -456,6 +457,17 @@ modules:
           - sed -i 's/--output-target=elf64-x86-64/& --set-section-alignment .data=64/'
               moonray/moonray/lib/rendering/pbr/CMakeLists.txt
           - grep -q 'set-section-alignment' moonray/moonray/lib/rendering/pbr/CMakeLists.txt
+          # The Sdr shader-registry plugins use Ndr, which USD 0.26 removed;
+          # hdMoonray maps material ids to MoonRay shaders without them.
+          - sed -i 's/^add_subdirectory(moonray_sdr_plugins)/# &/' moonray/hydra/CMakeLists.txt
+          # USD's imaging targets link Ptex::Ptex_dynamic, which pxrConfig.cmake doesn't
+          # define: load Ptex's own config first, at the top level, so every directory sees it.
+          - printf 'if(NOT TARGET Ptex::Ptex_dynamic)\n  find_package(Ptex CONFIG QUIET)\nendif()\n' > ptex_first.cmake
+          # hdMoonray asks for Vulkan with USD 25.05+, but only USD built with Vulkan needs it (this one isn't).
+          - sed -i 's/    find_package(Vulkan REQUIRED)/    find_package(Vulkan)/' moonray/hydra/hdMoonray/CMakeLists.txt
+          # USD 0.27 passes the renderer's create arguments to HdRendererPlugin::IsSupported.
+          - sed -i 's/bool IsSupported(bool gpuEnabled = true) const override {/bool IsSupported(const pxr::HdRendererCreateArgsSchema \&, std::string * = nullptr) const override {/'
+              moonray/hydra/hdMoonray/plugin/hd_moonray/RendererPlugin.cc moonray/hydra/hdMoonray/plugin/hd_moonray_debug/RendererPlugin.cc
 
   # Some CMake projects install into /app/lib64; the runtime linker path and the
   # app's build script only use /app/lib, so fold lib64 into it.

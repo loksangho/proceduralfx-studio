@@ -247,7 +247,7 @@ do_oidn() {
 do_opensubdiv() {
   fetch opensubdiv https://github.com/PixarAnimationStudios/OpenSubdiv/archive/refs/tags/v3_6_1.tar.gz e9d99a480d80e999667643747c76eb0138d36c418fc154fd71b4bd65be103d52
   cmake_build opensubdiv "$SRC/opensubdiv" -DNO_PTEX=ON -DNO_OMP=ON -DNO_TBB=ON -DNO_CUDA=ON -DNO_OPENCL=ON -DNO_CLEW=ON -DNO_GLFW=ON \
-    -DNO_DOC=ON -DNO_EXAMPLES=ON -DNO_TUTORIALS=ON -DNO_REGRESSION=ON -DNO_TESTS=ON -DNO_GLTESTS=ON -DNO_METAL=ON
+    -DNO_DOC=ON -DNO_EXAMPLES=ON -DNO_TUTORIALS=ON -DNO_REGRESSION=ON -DNO_TESTS=ON -DNO_GLTESTS=ON
 }
 
 do_ptex() {
@@ -265,18 +265,49 @@ do_usd() {
     -DPXR_BUILD_OPENIMAGEIO_PLUGIN=OFF -DPXR_BUILD_OPENCOLORIO_PLUGIN=OFF -DPXR_BUILD_EMBREE_PLUGIN=OFF -DPXR_ENABLE_GL_SUPPORT=$imaging
 }
 
+# OpenSSL and FreeType are static, so they end up inside MoonRay's own libraries.
+do_openssl() {
+  fetch openssl https://github.com/openssl/openssl/releases/download/openssl-4.0.3/openssl-4.0.3.tar.gz 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
+  (cd "$SRC/openssl" && ./Configure darwin64-arm64-cc no-shared no-tests no-docs no-apps -fPIC --prefix="$PREFIX" --libdir=lib "-mmacosx-version-min=$TARGET" \
+    && make -j "$JOBS" && make install_sw)
+}
+
+do_freetype() {
+  fetch freetype https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz 36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f
+  cmake_build freetype "$SRC/freetype" -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DFT_DISABLE_ZLIB=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_PNG=ON -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON
+}
+
 do_moonray() {
   # Same source and options as the current build, against PREFIX. Makefiles, not Ninja (duplicate outputs).
   # Boost.Python is only needed with USD's Python bindings, which this USD doesn't have.
   for f in "$MOONRAY_SRC/moonray/moonshine_usd/CMakeLists.txt" "$MOONRAY_SRC/moonray/hydra/hdMoonray/CMakeLists.txt"; do
     sed -i '' 's/find_package(Boost REQUIRED COMPONENTS "${BOOST_PYTHON_COMPONENT_NAME}")/find_package(Boost REQUIRED)/' "$f"
   done
+  # Nor the Python module of scene_rdl2, or Boost.Python in the Hydra command line tools.
+  sed -i '' 's/^add_subdirectory(python)/# add_subdirectory(python)/' "$MOONRAY_SRC/moonray/scene_rdl2/mod/CMakeLists.txt"
+  for f in "$MOONRAY_SRC"/moonray/hydra/hdMoonray/cmd/hd_cmd/{hd_render,hd_usd2rdl}/CMakeLists.txt; do
+    sed -i '' '/Boost::\${BOOST_PYTHON_COMPONENT_NAME}/d' "$f"
+  done
+  # They start Python for USD's plugin loader, which only USD built with Python needs.
+  sed -i '' '/Py_Initialize();/d' "$MOONRAY_SRC"/moonray/hydra/hdMoonray/cmd/hd_cmd/{hd_render/hd_render.cc,hd_usd2rdl/hd_usd2rdl.cc}
+  # The Sdr shader-registry plugins (MoonRay shaders listed in other apps) use Ndr, which
+  # USD 0.26 removed; hdMoonray maps material ids to MoonRay shaders without them.
+  sed -i '' 's/^add_subdirectory(moonray_sdr_plugins)/# add_subdirectory(moonray_sdr_plugins)/' "$MOONRAY_SRC/moonray/hydra/CMakeLists.txt"
+  # USD 0.27 passes the renderer's create arguments to HdRendererPlugin::IsSupported.
+  sed -i '' 's/bool IsSupported(bool gpuEnabled = true) const override {/bool IsSupported(const pxr::HdRendererCreateArgsSchema \&, std::string * = nullptr) const override {/' \
+    "$MOONRAY_SRC"/moonray/hydra/hdMoonray/plugin/{hd_moonray,hd_moonray_debug}/RendererPlugin.cc
+  # hdMoonray asks for Vulkan with USD 25.05+, but only USD built with Vulkan needs it (this one isn't).
+  sed -i '' 's/    find_package(Vulkan REQUIRED)/    find_package(Vulkan)/' "$MOONRAY_SRC/moonray/hydra/hdMoonray/CMakeLists.txt"
   # The Hydra delegate builds only with WITH_HYDRA (it needs USD imaging).
   if [[ "$WITH_HYDRA" == 1 ]]; then
     sed -i '' 's/^# add_subdirectory(hydra)/add_subdirectory(hydra)/' "$MOONRAY_SRC/moonray/CMakeLists.txt"
   else
     sed -i '' 's/^add_subdirectory(hydra)/# add_subdirectory(hydra)/' "$MOONRAY_SRC/moonray/CMakeLists.txt"
   fi
+  # uuid is part of libSystem on macOS, and curl comes with the SDK.
+  local SDK
+  SDK=$(xcrun --show-sdk-path)
   cat > "$BUILD/moonray_usd_fix.cmake" <<EOF
 include_directories(SYSTEM "$PREFIX/include")
 EOF
@@ -284,7 +315,10 @@ EOF
   cmake -S "$MOONRAY_SRC" -B "$BUILD/moonray" -G "Unix Makefiles" "${CMAKE_COMMON[@]:2}" \
     -DCMAKE_PROJECT_INCLUDE_BEFORE="$BUILD/moonray_usd_fix.cmake" \
     -Dpxr_DIR="$PREFIX" -DPXR_USD_LOCATION="$PREFIX" -DPXR_INCLUDE_DIRS="$PREFIX/include" \
-    -DRandom123_INCLUDE_DIR="$RANDOM123_INCLUDE" -DCMAKE_ISPC_COMPILER="$(command -v ispc)" \
+    -DLibuuid_INCLUDE_DIRS="$SDK/usr/include" -DLibuuid_LIBRARY="$SDK/usr/lib/libSystem.tbd" \
+    -DLibcurl_INCLUDE_DIR="$SDK/usr/include/curl" -DLibcurl_LIBRARY="$SDK/usr/lib/libcurl.tbd" \
+    -DOPENSSL_ROOT_DIR="$PREFIX" -DOPENSSL_USE_STATIC_LIBS=ON \
+    -DRandom123_INCLUDE_DIR="$RANDOM123_INCLUDE/Random123" -DCMAKE_ISPC_COMPILER="$(command -v ispc)" \
     -DPython_EXECUTABLE=/usr/bin/python3 -DABI_VERSION=0 -DBUILD_QT_APPS=OFF -DMOONRAY_USE_OPTIX=OFF -DMOONRAY_USE_METAL=OFF \
     -DBUILD_TESTING=OFF -DARRASCORE_BUILD_TESTING=OFF -DMCRTCOMPUTATION_BUILD_TESTING=OFF -DMCRTDATAIO_BUILD_TESTING=OFF \
     -DMCRTDENOISE_BUILD_TESTING=OFF -DMCRTMESSAGES_BUILD_TESTING=OFF -DMOONRAY_BUILD_TESTING=OFF -DMOONSHINE_BUILD_TESTING=OFF \
@@ -316,6 +350,8 @@ step oidn do_oidn
 step opensubdiv do_opensubdiv
 [[ "$WITH_HYDRA" == 1 ]] && step ptex do_ptex
 step usd do_usd
+step openssl do_openssl
+step freetype do_freetype
 step moonray do_moonray
 
 # Everything in PREFIX should now need macOS 14 or older.

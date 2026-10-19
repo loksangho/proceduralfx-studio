@@ -8,8 +8,28 @@ set -euo pipefail
 #   ./proceduralfx_studio.sh preview-exr <file.exr> [out.png]
 #   ./proceduralfx_studio.sh render-moonray <scene.rdla> <out.exr> [width] [height]
 
-OPENVDB_ROOT="$(brew --prefix openvdb)"
-PKG_CONFIG_PATH="$(brew --prefix tbb)/lib/pkgconfig:${PKG_CONFIG_PATH-}"
+# Dependencies: the macOS 14 build from scripts/build_macos_deps.sh when it's there
+# (PFX_DEPS, PFX_BUILD), else Homebrew and the local USD and MoonRay builds.
+PFX_DEPS="${PFX_DEPS:-$HOME/pfx-deps/macos14.0}"
+PFX_BUILD="${PFX_BUILD:-$HOME/pfx-deps/build}"
+PFX_MOONRAY="$PFX_BUILD/moonray/moonray/moonray/cmd/raas_cmd/moonray/moonray"
+if [[ -f "$PFX_DEPS/include/pxr/pxr.h" && -x "$PFX_MOONRAY" ]]; then
+  OPENVDB_ROOT="$PFX_DEPS"
+  PKG_CONFIG_PATH="$PFX_DEPS/lib/pkgconfig:$PFX_DEPS/share/pkgconfig:${PKG_CONFIG_PATH-}"
+  export USD_ROOT="${USD_ROOT:-$PFX_DEPS}"
+  export RDL2_DSO_PATH="${RDL2_DSO_PATH:-$PFX_BUILD/moonray/rdl2dso}"
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+  MOONRAY_SRC_BIN="$PFX_MOONRAY"
+  # Hydra: hd_render and hdMoonray's USD plugins, when MoonRay was built with them (WITH_HYDRA=1).
+  PFX_HYDRA="$PFX_BUILD/moonray/moonray/hydra/hdMoonray"
+  if [[ -x "$PFX_HYDRA/cmd/hd_cmd/hd_render/hd_render" ]]; then
+    HD_RENDER_BIN="$PFX_HYDRA/cmd/hd_cmd/hd_render/hd_render"
+  fi
+else
+  OPENVDB_ROOT="$(brew --prefix openvdb)"
+  PKG_CONFIG_PATH="$(brew --prefix tbb)/lib/pkgconfig:${PKG_CONFIG_PATH-}"
+  MOONRAY_SRC_BIN="native/moonray/macos/moonray"
+fi
 
 preview_exr() {
   local input_exr="$1"
@@ -25,8 +45,8 @@ find_moonray() {
     echo "dist/ProceduralFxStudio.app/Contents/Resources/moonray"
     return 0
   fi
-  if [[ -x native/moonray/macos/moonray ]]; then
-    echo "native/moonray/macos/moonray"
+  if [[ -x "$MOONRAY_SRC_BIN" ]]; then
+    echo "$MOONRAY_SRC_BIN"
     return 0
   fi
   if command -v moonray >/dev/null 2>&1; then
@@ -75,8 +95,7 @@ if [[ ${1-} == "package-macos" ]]; then
   # is the highest of this and every bundled library; the bundler reports it.
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
   # Ensure build.rs can find OpenVDB and tbb when building release
-  OPENVDB_ROOT="$(brew --prefix openvdb)" \
-  PKG_CONFIG_PATH="$(brew --prefix tbb)/lib/pkgconfig:${PKG_CONFIG_PATH-}" \
+  OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" \
   cargo build --release --features "native-openvdb native-usd"
   APP_NAME="ProceduralFxStudio"
   APP_DIR="dist/${APP_NAME}.app"
@@ -90,14 +109,14 @@ if [[ ${1-} == "package-macos" ]]; then
   cp target/release/proceduralfx_studio "$BIN_DIR/${APP_NAME}"
   chmod +x "$BIN_DIR/${APP_NAME}"
 
-  # If a bundled moonray exists in native/moonray/macos, copy it into Resources
-  if [[ -x native/moonray/macos/moonray ]]; then
-    echo "Bundling MoonRay from native/moonray/macos/moonray into app Resources"
+  # Bundle the MoonRay command line renderer into Resources when there is one.
+  if [[ -x "$MOONRAY_SRC_BIN" ]]; then
+    echo "Bundling MoonRay from $MOONRAY_SRC_BIN into app Resources"
     mkdir -p "$RES_DIR"
-    cp native/moonray/macos/moonray "$RES_DIR/moonray"
+    cp "$MOONRAY_SRC_BIN" "$RES_DIR/moonray"
     chmod +x "$RES_DIR/moonray"
   else
-    echo "No native/moonray/macos/moonray found; skipping MoonRay bundle"
+    echo "No MoonRay binary at $MOONRAY_SRC_BIN; skipping MoonRay bundle"
   fi
 
   # Bundle RDL2 DSOs so constructors like RdlMeshGeometry are available at runtime.
@@ -136,6 +155,17 @@ if [[ ${1-} == "package-macos" ]]; then
     find "$APP_DIR/Contents/plugin/usd" -name plugInfo.json -exec sed -i '' 's|"LibraryPath": "\.\./\.\./|"LibraryPath": "../../../Frameworks/|' {} +
   else
     echo "No USD plugin registry found (set USD_ROOT); USD files will not open in the app"
+  fi
+
+  # Hydra (STAGE renders through hdMoonray): hd_render in Resources, and hdMoonray's
+  # plugins next to USD's, with their libraries in Frameworks.
+  if [[ -n "${HD_RENDER_BIN-}" && -d "$APP_DIR/Contents/plugin/usd" ]]; then
+    echo "Bundling hd_render and hdMoonray's USD plugins"
+    cp "$HD_RENDER_BIN" "$RES_DIR/hd_render"
+    chmod +x "$RES_DIR/hd_render"
+    python3 scripts/hydra_plugins.py "$PFX_HYDRA" "$APP_DIR/Contents/plugin/usd" --frameworks "$APP_DIR/Contents/Frameworks"
+  else
+    echo "No hd_render found; STAGE renders through Hydra won't be available in the app"
   fi
 
   # Also writes Info.plist and signs the bundle (SIGN_IDENTITY, default ad-hoc).
@@ -180,4 +210,8 @@ if [[ ${1-} == "package-macos" ]]; then
 fi
 
 echo "Running (debug) via cargo run..."
+if [[ -n "${HD_RENDER_BIN-}" ]]; then
+  python3 scripts/hydra_plugins.py "$PFX_HYDRA" "$PFX_BUILD/hydra-plugins" >/dev/null
+  export PFX_HD_RENDER="$HD_RENDER_BIN" PFX_HYDRA_PLUGIN_PATH="$PFX_BUILD/hydra-plugins"
+fi
 OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cargo run --features "native-openvdb native-usd"

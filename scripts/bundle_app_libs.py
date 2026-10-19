@@ -231,6 +231,16 @@ def main():
     if moonray.is_file():
         bundler.add_root(moonray, moonray, "@executable_path/../Frameworks", macos)
 
+    # hd_render, for STAGE renders through Hydra.
+    hd_render = resources / "hd_render"
+    if hd_render.is_file():
+        bundler.add_root(hd_render, hd_render, "@executable_path/../Frameworks", macos)
+
+    # Libraries already in Frameworks: plugins USD loads at run time (hdMoonray).
+    for lib in sorted(bundler.frameworks.glob("*.dylib")):
+        bundler.libs[lib.name] = lib
+        bundler.work.append((lib, lib, "@loader_path", macos, True))
+
     for exe in sorted(macos.iterdir()):
         if exe.is_file() and is_macho(exe):
             bundler.add_root(exe, exe, "@executable_path/../Frameworks", macos)
