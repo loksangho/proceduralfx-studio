@@ -29,13 +29,13 @@ pub struct Param {
     pub default: [f32; 3],
 }
 
-const fn f(key: &'static str, label: &'static str, group: &'static str, min: f32, max: f32, value: f32) -> Param {
+pub(crate) const fn f(key: &'static str, label: &'static str, group: &'static str, min: f32, max: f32, value: f32) -> Param {
     Param { key, label, group, kind: Kind::Float(min, max), default: [value, 0.0, 0.0] }
 }
-const fn c(key: &'static str, label: &'static str, group: &'static str, value: [f32; 3]) -> Param {
+pub(crate) const fn c(key: &'static str, label: &'static str, group: &'static str, value: [f32; 3]) -> Param {
     Param { key, label, group, kind: Kind::Color, default: value }
 }
-const fn t(key: &'static str, label: &'static str, group: &'static str, on: bool) -> Param {
+pub(crate) const fn t(key: &'static str, label: &'static str, group: &'static str, on: bool) -> Param {
     Param { key, label, group, kind: Kind::Toggle, default: [on as u8 as f32, 0.0, 0.0] }
 }
 

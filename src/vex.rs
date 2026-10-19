@@ -846,6 +846,8 @@ enum Expr {
     Builtin(&'static str, Vec<Expr>, Vec<Option<Place>>, bool),
     // User function index, arguments, argument places written back (VEX passes by reference).
     Call(usize, Vec<Expr>, Vec<Option<Place>>),
+    // A call to an overloaded function: the candidates, picked by argument types at run time.
+    CallOverload(Vec<usize>, Vec<Expr>, Vec<Option<Place>>),
 }
 
 #[derive(Clone, Debug)]
@@ -1163,7 +1165,8 @@ struct Parser {
     scopes: Vec<HashMap<String, usize>>,
     slot_types: Vec<Option<Ty>>,
     functions: Vec<Function>,
-    fn_index: HashMap<String, usize>,
+    // Every definition of each name (overloads differ in parameter types).
+    fn_index: HashMap<String, Vec<usize>>,
     attrs: Vec<AttrRef>,
     attr_index: HashMap<String, usize>,
     loop_depth: usize,
@@ -1533,9 +1536,6 @@ impl Parser {
     }
 
     fn function_def(&mut self, ret: Option<Ty>, name: String) -> PR<()> {
-        if self.fn_index.contains_key(&name) {
-            return self.error(format!("function '{name}' is already defined"));
-        }
         if builtin_info(&name).is_some() {
             return self.error(format!("'{name}' is a built-in function and cannot be redefined"));
         }
@@ -1569,9 +1569,13 @@ impl Parser {
                 }
             }
         }
+        // Overloads are allowed; the same parameter types twice are not.
+        if self.fn_index.get(&name).is_some_and(|defs| defs.iter().any(|&i| self.functions[i].param_types == param_types)) {
+            return self.error(format!("function '{name}' is already defined with these parameter types"));
+        }
         let index = self.functions.len();
         self.functions.push(Function { name: name.clone(), ret, param_types, slot_types: Vec::new(), body: Vec::new() });
-        self.fn_index.insert(name, index);
+        self.fn_index.entry(name).or_default().push(index);
         let saved_ret = self.fn_ret.replace(ret);
         self.expect("{", "to start the function body")?;
         let body = self.block_body();
@@ -1835,18 +1839,24 @@ impl Parser {
     }
 
     fn call(&mut self, name: String, mut args: Vec<Expr>, token: &Token) -> PR<Expr> {
-        if let Some(&index) = self.fn_index.get(&name) {
-            let params = self.functions[index].param_types.clone();
-            if args.len() != params.len() {
-                return Self::err_at(token, format!("'{name}' expects {} argument(s), got {}", params.len(), args.len()));
+        if let Some(defs) = self.fn_index.get(&name).cloned() {
+            let fitting: Vec<usize> = defs.iter().copied().filter(|&i| self.functions[i].param_types.len() == args.len()).collect();
+            if fitting.is_empty() {
+                let counts: Vec<String> = defs.iter().map(|&i| self.functions[i].param_types.len().to_string()).collect();
+                return Self::err_at(token, format!("'{name}' expects {} argument(s), got {}", counts.join(" or "), args.len()));
             }
-            for (arg, ty) in args.iter_mut().zip(&params) {
-                if *ty == Ty::Vector {
+            for (k, arg) in args.iter_mut().enumerate() {
+                // A {a, b, c} literal is a vector when any version takes one there.
+                if fitting.iter().any(|&i| self.functions[i].param_types[k] == Ty::Vector) {
                     hint_vector(arg);
                 }
             }
             let places = args.iter().map(to_place).collect();
-            return Ok(Expr::Call(index, args, places));
+            return Ok(match fitting.as_slice() {
+                [index] => Expr::Call(*index, args, places),
+                // Overloads: chosen when called, by the arguments' types.
+                _ => Expr::CallOverload(fitting, args, places),
+            });
         }
         let Some(&(static_name, min, max, ..)) = builtin_info(&name) else {
             return Self::err_at(token, format!("unknown function '{name}'"));
@@ -3019,6 +3029,14 @@ impl<'a> Runtime<'a> {
             }
             Expr::Builtin(name, args, places, want_vec) => self.call_builtin(*name, args, places, *want_vec, fr)?,
             Expr::Call(index, args, places) => self.call_user(*index, args, places, fr)?,
+            Expr::CallOverload(candidates, args, places) => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval(arg, fr)?);
+                }
+                let index = self.pick_overload(candidates, &values)?;
+                self.call_user_values(index, values, places, fr)?
+            }
         })
     }
 
@@ -3067,7 +3085,44 @@ impl<'a> Runtime<'a> {
         }
     }
 
+    // The overload whose parameter types fit the arguments best: exact types beat conversions.
+    fn pick_overload(&self, candidates: &[usize], values: &[Value]) -> R<usize> {
+        let prog: &'a Program = self.prog;
+        let score = |i: usize| -> Option<usize> {
+            let f = &prog.functions[i];
+            let mut total = 0;
+            for (v, ty) in values.iter().zip(&f.param_types) {
+                let exact = v.type_name() == ty.name() || (matches!(v, Value::Arr(_)) && ty.name().ends_with("[]"));
+                // {a, b, c} with three numbers reads as a vector first, as in VEX.
+                let triple = matches!(v, Value::Arr(items) if items.len() == 3 && items.iter().all(|i| matches!(i, Value::Int(_) | Value::Float(_))));
+                if triple && *ty == Ty::Vector {
+                    total += 3;
+                } else if exact {
+                    total += 2;
+                } else if v.clone().convert(*ty).is_ok() {
+                    total += 1;
+                } else {
+                    return None;
+                }
+            }
+            Some(total)
+        };
+        let best = candidates.iter().filter_map(|&i| score(i).map(|s| (s, i))).max_by_key(|(s, i)| (*s, std::cmp::Reverse(*i)));
+        best.map(|(_, i)| i).ok_or_else(|| {
+            let got: Vec<&str> = values.iter().map(Value::type_name).collect();
+            format!("no version of {}() takes ({})", prog.functions[candidates[0]].name, got.join(", "))
+        })
+    }
+
     fn call_user(&mut self, index: usize, args: &'a [Expr], places: &'a [Option<Place>], fr: &mut Frame<'a>) -> R<Value> {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg, fr)?);
+        }
+        self.call_user_values(index, values, places, fr)
+    }
+
+    fn call_user_values(&mut self, index: usize, args: Vec<Value>, places: &'a [Option<Place>], fr: &mut Frame<'a>) -> R<Value> {
         self.tick()?;
         if self.depth >= MAX_CALL_DEPTH {
             return Err(format!("too many nested function calls (more than {MAX_CALL_DEPTH}): runaway recursion?"));
@@ -3075,8 +3130,7 @@ impl<'a> Runtime<'a> {
         let prog: &'a Program = self.prog;
         let f = &prog.functions[index];
         let mut vals: Vec<Value> = f.slot_types.iter().map(|t| t.map_or(Value::Int(0), Ty::default_value)).collect();
-        for (i, arg) in args.iter().enumerate() {
-            let value = self.eval(arg, fr)?;
+        for (i, value) in args.into_iter().enumerate() {
             vals[i] = value.convert(f.param_types[i]).map_err(|e| format!("argument {} of {}(): {e}", i + 1, f.name))?;
         }
         let mut frame = Frame { vals, types: &f.slot_types };
@@ -4378,7 +4432,8 @@ Control    if (...) {...} else if (...) {...} else {...}
            foreach (vector p; pts) {...}   foreach (int i; vector p; pts) {...}
            break; continue; return;
 Functions  float twice(float x) { return x * 2; }   defined before use, at the top level;
-           parameters are separated by ';' or ',' and passed by reference
+           parameters are separated by ';' or ',' and passed by reference;
+           overloads (same name, other parameter types) and recursion work
 Comments   // line   /* block */
 Notes      int / int is integer division (1 / 2 == 0, write 1.0 / 2 for 0.5).
            rand() and noise() return a vector when assigned to a vector.
@@ -4831,4 +4886,37 @@ mod tests {
         assert!(error("@TimeInc = 1;").contains("read-only"));
     }
 
+}
+
+#[cfg(test)]
+mod function_tests {
+    use super::*;
+
+    fn out(code: &str) -> String {
+        let (_, report) = run(Mesh { vertices: vec![Vec3::new(0.0, 0.0, 0.0)], ..Mesh::default() }, code, 0.0, 0);
+        format!("{}{}", report.output.join(""), report.error.map(|e| format!("ERROR {e}")).unwrap_or_default()).trim().to_owned()
+    }
+
+    #[test]
+    fn user_functions_cover_vex_features() {
+        let cases = [
+            ("float sq(float x) { return x * x; } printf('%g', sq(3));", "9"),
+            ("void bump(float x) { x += 1; } float a = 1; bump(a); printf('%g', a);", "2"),
+            ("int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); } printf('%d', fact(5));", "120"),
+            ("function float twice(float x) { return 2 * x; } printf('%g', twice(4));", "8"),
+            ("float total(float a[]) { float s = 0; foreach (float v; a) s += v; return s; } float xs[] = {1,2,3}; printf('%g', total(xs));", "6"),
+            ("vector up(float s) { return set(0, s, 0); } printf('%g', up(2).y);", "2"),
+            // Overloads, chosen by argument types (exact types first, then int -> float).
+            ("float f(float x) { return 1; } float f(vector v) { return 2; } float f(string s) { return 3; } printf('%g %g %g', f(1.0), f({1,2,3}), f('a'));", "1 2 3"),
+            ("float g(int x) { return 10; } float g(float x) { return 20; } printf('%g %g', g(1), g(1.5));", "10 20"),
+            ("float h(float x) { return x; } float h(float x, float y) { return x + y; } printf('%g %g', h(2), h(2, 3));", "2 5"),
+            ("float k(vector v) { return v.x; } float k(float a[]) { return len(a); } printf('%g %g', k({4,0,0}), k(array(1.0, 2.0)));", "4 2"),
+            ("float m(float x) { return x; } float m(float y) { return y; }", "ERROR"),
+            ("float n(vector v) { return 1; } float n(vector4 q) { return 2; } printf('%g', n('text'));", "ERROR"),
+        ];
+        for (code, expected) in cases {
+            let got = out(code);
+            assert!(got == expected || (expected == "ERROR" && got.contains("ERROR")), "{code}\n  got: {got}");
+        }
+    }
 }

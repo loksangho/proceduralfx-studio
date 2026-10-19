@@ -20,13 +20,17 @@ use rfd::FileDialog;
 mod render_viewer;
 mod anim;
 mod boolean;
+mod cops;
 mod crowd;
+mod docs;
 mod envlight;
 mod fileio;
+mod flow;
 mod fracture;
 mod groom;
 mod groups;
 mod kinefx;
+mod measure;
 mod muscle;
 mod paint;
 mod raster;
@@ -35,6 +39,7 @@ mod shading;
 mod sops;
 mod terrain;
 mod textures;
+mod tops;
 mod updater;
 mod vellum;
 mod usd;
@@ -50,6 +55,10 @@ thread_local! {
     static SOLVER_PREV_FRAME: std::cell::RefCell<HashMap<NodeId, Mesh>> = std::cell::RefCell::new(HashMap::new());
     // @TimeInc for wrangles: one frame, or one step while a SOP Solver is stepping.
     static SOLVER_TIME_INC: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0 / sims::SIM_FPS) };
+    // The geometry each For-Each Begin puts out for the iteration being cooked on this thread.
+    static FOREACH_INPUT: std::cell::RefCell<HashMap<NodeId, Mesh>> = std::cell::RefCell::new(HashMap::new());
+    // Object Merge nesting, to stop merges that (indirectly) merge themselves.
+    static MERGE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FLIP_CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -2957,6 +2966,27 @@ struct RenderVolume {
     anisotropy: f32,
 }
 
+// A TOP network cook in progress: items still to run (last first), and the one running.
+struct TopRun {
+    queue: Vec<(NodeId, usize)>,
+    items: HashMap<NodeId, Vec<tops::WorkItem>>,
+    current: Option<TopJob>,
+    total: usize,
+    failed: usize,
+}
+
+struct TopJob {
+    node: NodeId,
+    index: usize,
+    output: String,
+    wait: TopWait,
+}
+
+enum TopWait {
+    Render,
+    Shell(Receiver<Result<String, String>>),
+}
+
 struct SequenceJob {
     executable: String,
     arguments: String,
@@ -2978,7 +3008,9 @@ const STAGE_NETWORK: NodeId = usize::MAX;
 
 #[derive(Clone, Debug)]
 enum NodeKind {
-    Add { count: usize, spacing: f32, layout: usize },
+    // Points: a pattern of `count` points (0: none) plus explicit positions, added to the
+    // optional input; `delete_geometry` drops the input's primitives but keeps its points.
+    Add { count: usize, spacing: f32, layout: usize, points: Vec<[f32; 3]>, delete_geometry: bool },
     Grid { size: f32, res: usize },
     Plane { size: f32, res: usize },
     Cone { radius: f32, height: f32, rows: usize, cols: usize, caps: bool },
@@ -3098,6 +3130,17 @@ enum NodeKind {
     Normal(sops::NormalSettings),
     // Points on (or inside) the input's surface.
     Scatter(sops::ScatterSettings),
+    // Area, perimeter, curvature, gradient, volume or curve length as attributes.
+    Measure(measure::MeasureSettings),
+    // Flow control (see flow.rs): For-Each and Compile blocks are Begin/End pairs.
+    ForEachBegin,
+    ForEachEnd(flow::ForEachSettings),
+    CompileBegin,
+    CompileEnd { begin: Option<NodeId> },
+    // Geometry of other objects (or nodes in other networks), optionally moved into this object's space.
+    ObjectMerge { sources: Vec<Option<NodeId>>, into_this: bool },
+    // Assigns MAT materials to primitive groups, overriding the object's material (see PRIM_MATERIAL).
+    MaterialAssign { slots: Vec<(String, Option<NodeId>)> },
     // Union / intersection / subtraction of two closed meshes.
     Boolean(boolean::BooleanSettings),
     // Breaks a closed mesh into concrete, glass or wood pieces (with `piece` for RBD).
@@ -3174,6 +3217,12 @@ enum NodeKind {
     MaterialBuilder,
     // One node inside a Material Builder.
     ShaderNode(shading::ShaderNode),
+    // IMG: a compositing network of COP nodes (see cops.rs).
+    CopNetwork,
+    Cop(cops::CopNode),
+    // TASKS: a task graph of TOP nodes (see tops.rs).
+    TopNetwork,
+    Top(tops::TopNode),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3298,11 +3347,16 @@ impl NodeKind {
                 vec![file.clone()]
             }
             NodeKind::AttributePaint { attribute, .. } => vec![attribute.clone()],
+            NodeKind::MaterialAssign { slots } => slots.iter().map(|(g, _)| g.clone()).collect(),
+            NodeKind::ForEachEnd(f) => vec![f.attribute.clone()],
+            NodeKind::Measure(m) => vec![m.name.clone(), m.source.clone()],
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
             NodeKind::ShaderNode(n) => n.texts.clone(),
+            NodeKind::Cop(n) => n.texts.clone(),
+            NodeKind::Top(n) => n.texts.clone(),
             NodeKind::RigPose(p) => p.joints.clone(),
             NodeKind::TwoBoneIk(k) => vec![k.root.clone(), k.mid.clone(), k.tip.clone()],
             _ => Vec::new(),
@@ -3330,6 +3384,12 @@ impl NodeKind {
                 next(file)
             }
             NodeKind::AttributePaint { attribute, .. } => next(attribute),
+            NodeKind::MaterialAssign { slots } => slots.iter_mut().for_each(|(g, _)| next(g)),
+            NodeKind::ForEachEnd(f) => next(&mut f.attribute),
+            NodeKind::Measure(m) => {
+                next(&mut m.name);
+                next(&mut m.source);
+            }
             NodeKind::EnvironmentLight { file, .. } => next(file),
             NodeKind::GroupCreate(g) => {
                 next(&mut g.name);
@@ -3338,6 +3398,8 @@ impl NodeKind {
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
             NodeKind::ShaderNode(n) => n.texts.iter_mut().for_each(|t| next(t)),
+            NodeKind::Cop(n) => n.texts.iter_mut().for_each(|t| next(t)),
+            NodeKind::Top(n) => n.texts.iter_mut().for_each(|t| next(t)),
             NodeKind::RigPose(p) => p.joints.iter_mut().for_each(|t| next(t)),
             NodeKind::TwoBoneIk(k) => {
                 next(&mut k.root);
@@ -3350,7 +3412,10 @@ impl NodeKind {
 
     // Nodes whose network lives in their children: Geometry objects and SOP Solvers.
     fn is_container(&self) -> bool {
-        matches!(self, NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder)
+        matches!(
+            self,
+            NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder | NodeKind::CopNetwork | NodeKind::TopNetwork
+        )
     }
 
     fn is_solver(&self) -> bool {
@@ -3374,7 +3439,11 @@ impl NodeKind {
             NodeKind::Vop(v) => v.def().label.to_owned(),
             NodeKind::Shader(v) => v.name().to_owned(),
             NodeKind::ShaderNode(n) => n.def().label.to_owned(),
+            NodeKind::Cop(n) => n.def().label.to_owned(),
+            NodeKind::Top(n) => n.def().label.to_owned(),
             NodeKind::MaterialFracture(f) => format!("material_fracture ({})", fracture::MATERIALS[f.material.min(2)]),
+            NodeKind::ForEachEnd(f) => f.menu_name(),
+            NodeKind::CompileEnd { .. } => "Compile Block".into(),
             other => other.name().to_owned(),
         }
     }
@@ -3383,6 +3452,8 @@ impl NodeKind {
         match self {
             NodeKind::Vop(v) => Some(v.def().help),
             NodeKind::ShaderNode(n) => Some(n.def().help),
+            NodeKind::Cop(n) => Some(n.def().help),
+            NodeKind::Top(n) => Some(n.def().help),
             _ => None,
         }
     }
@@ -3395,6 +3466,8 @@ impl NodeKind {
             NodeKind::Vop(v) => v.label(id),
             NodeKind::Shader(v) => format!("{}{id}", v.name().to_lowercase().replace(' ', "_")),
             NodeKind::ShaderNode(n) => n.label(id),
+            NodeKind::Cop(n) => n.label(id),
+            NodeKind::Top(n) => n.label(id),
             _ => format!("{}{id}", self.name()),
         }
     }
@@ -3455,7 +3528,7 @@ impl NodeKind {
             (
                 "Generators",
                 vec![
-                    NodeKind::Add { count: 1, spacing: 1.0, layout: 0 },
+                    NodeKind::Add { count: 0, spacing: 1.0, layout: 0, points: vec![[0.0; 3]], delete_geometry: false },
                     NodeKind::Grid { size: 4.0, res: 20 },
                     NodeKind::Plane { size: 4.0, res: 20 },
                     NodeKind::Cone { radius: 1.0, height: 2.0, rows: 1, cols: 32, caps: true },
@@ -3538,7 +3611,11 @@ impl NodeKind {
             ),
             (
                 "Import/Export",
-                vec![NodeKind::FileImport { file: String::new() }, NodeKind::FileExport { file: String::new() }],
+                vec![
+                    NodeKind::FileImport { file: String::new() },
+                    NodeKind::FileExport { file: String::new() },
+                    NodeKind::ObjectMerge { sources: vec![None], into_this: true },
+                ],
             ),
             (
                 "Volumes",
@@ -3582,6 +3659,17 @@ impl NodeKind {
                     NodeKind::Merge,
                     NodeKind::Null,
                 ],
+            ),
+            (
+                "Flow Control",
+                (0..flow::MODES.len())
+                    .map(|m| NodeKind::ForEachEnd(flow::ForEachSettings::new(m)))
+                    .chain(std::iter::once(NodeKind::CompileEnd { begin: None }))
+                    .collect(),
+            ),
+            (
+                "Shading",
+                vec![NodeKind::MaterialAssign { slots: vec![(String::new(), None)] }],
             ),
             (
                 "Destruction",
@@ -3640,6 +3728,7 @@ impl NodeKind {
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 0 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
+                    NodeKind::Measure(measure::MeasureSettings::new(0)),
                     NodeKind::AttributePaint { attribute: "mask".into(), values: Vec::new(), settings: paint::PaintSettings::default() },
                 ],
             ),
@@ -3707,6 +3796,13 @@ impl NodeKind {
         all.push(("Toon & Hair Presets", (1..shading::TOON_PRESETS.len()).map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Toon, i)))
             .chain((1..shading::HAIR_PRESETS.len()).map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Hair, i)))).collect()));
         all.push(("Volume Presets", (1..shading::PYRO_PRESETS.len()).map(|i| NodeKind::Shader(shading::Values::preset(shading::Table::Pyro, i))).collect()));
+        // IMG and TASKS: the network nodes, and what goes inside them.
+        all.push(("COP Network", vec![NodeKind::CopNetwork]));
+        for category in cops::CATEGORIES {
+            all.push((category, (0..cops::OPS.len()).filter(|&op| cops::OPS[op].category == category).map(|op| NodeKind::Cop(cops::CopNode::new(op))).collect()));
+        }
+        all.push(("TOP Network", vec![NodeKind::TopNetwork]));
+        all.push((tops::CATEGORY, (0..tops::OPS.len()).map(|op| NodeKind::Top(tops::TopNode::new(op))).collect()));
         // Material Builder nodes (only shown inside a Material Builder).
         all.push((shading::CATEGORY, (0..shading::SHADER_OPS.len()).map(|op| NodeKind::ShaderNode(shading::ShaderNode::new(op))).collect()));
         // VOP networks: one menu per category (only shown inside an Attribute VOP).
@@ -3788,6 +3884,13 @@ impl NodeKind {
             NodeKind::Normal(_) => "normal",
             NodeKind::Scatter(_) => "scatter",
             NodeKind::Boolean(_) => "boolean",
+            NodeKind::MaterialAssign { .. } => "material",
+            NodeKind::Measure(_) => "measure",
+            NodeKind::ForEachBegin => "foreach_begin",
+            NodeKind::ForEachEnd(_) => "foreach_end",
+            NodeKind::CompileBegin => "compile_begin",
+            NodeKind::CompileEnd { .. } => "compile_end",
+            NodeKind::ObjectMerge { .. } => "object_merge",
             NodeKind::MaterialFracture(_) => "material_fracture",
             NodeKind::CrowdSolver(_) => "crowd_solver",
             NodeKind::Muscle(_) => "muscle",
@@ -3824,12 +3927,16 @@ impl NodeKind {
             },
             NodeKind::MaterialBuilder => "material_builder",
             NodeKind::ShaderNode(_) => "shader_node",
+            NodeKind::CopNetwork => "cop_network",
+            NodeKind::Cop(_) => "cop",
+            NodeKind::TopNetwork => "top_network",
+            NodeKind::Top(_) => "top",
         }
     }
 
     fn num_inputs(&self) -> usize {
         match self {
-            NodeKind::Add { .. } => 0,
+            NodeKind::Add { .. } => 1,
             NodeKind::Grid { .. }
             | NodeKind::Plane { .. }
             | NodeKind::Cone { .. }
@@ -3840,6 +3947,7 @@ impl NodeKind {
             | NodeKind::Tube { .. } => 0,
             NodeKind::Terrain(_) => 0,
             NodeKind::Boolean(_) => 2,
+            NodeKind::ObjectMerge { .. } => 0,
             NodeKind::CrowdSolver(_) => 3,
             NodeKind::MuscleSkin(_) => 2,
             NodeKind::Skeleton(_) => 0,
@@ -3867,6 +3975,9 @@ impl NodeKind {
             NodeKind::EnvironmentLight { .. } => 0,
             NodeKind::Shader(_) | NodeKind::MaterialBuilder => 0,
             NodeKind::ShaderNode(n) => n.def().inputs.len(),
+            NodeKind::CopNetwork | NodeKind::TopNetwork => 0,
+            NodeKind::Cop(n) => n.def().inputs,
+            NodeKind::Top(n) => n.def().inputs,
             _ => 1,
         }
     }
@@ -3914,8 +4025,10 @@ impl NodeKind {
     // ---- serialization (flat list of numbers) ----
     fn params(&self) -> Vec<f32> {
         match self {
-            NodeKind::Add { count, spacing, layout } => {
-                vec![*count as f32, *spacing, *layout as f32]
+            NodeKind::Add { count, spacing, layout, points, delete_geometry } => {
+                let mut p = vec![*count as f32, *spacing, *layout as f32, *delete_geometry as u8 as f32];
+                p.extend(points.iter().flatten());
+                p
             }
             NodeKind::Grid { size, res } => vec![*size, *res as f32],
             NodeKind::Plane { size, res } => vec![*size, *res as f32],
@@ -4068,6 +4181,14 @@ impl NodeKind {
             }
             NodeKind::Scatter(s) => vec![s.count as f32, s.seed as f32, s.relax_iterations as f32, s.volume as u8 as f32],
             NodeKind::Boolean(s) => vec![s.operation as f32, s.mode as f32, s.resolution as f32],
+            // One value per slot: the material's node id + 1 (0: none).
+            NodeKind::MaterialAssign { slots } => slots.iter().map(|(_, m)| m.map_or(0.0, |m| m as f32 + 1.0)).collect(),
+            NodeKind::Measure(m) => vec![m.kind as f32, m.curvature as f32, m.summary as f32],
+            NodeKind::ForEachBegin | NodeKind::CompileBegin => vec![],
+            NodeKind::ForEachEnd(f) => f.to_params(),
+            NodeKind::CompileEnd { begin } => vec![begin.map_or(-1.0, |b| b as f32)],
+            // Into-this flag, then each source's node id + 1 (0: empty slot).
+            NodeKind::ObjectMerge { sources, into_this } => std::iter::once(*into_this as u8 as f32).chain(sources.iter().map(|s| s.map_or(0.0, |s| s as f32 + 1.0))).collect(),
             NodeKind::MaterialFracture(s) => vec![
                 s.material as f32,
                 s.pieces as f32,
@@ -4178,6 +4299,9 @@ impl NodeKind {
             NodeKind::Shader(v) => v.to_params(),
             NodeKind::MaterialBuilder => vec![],
             NodeKind::ShaderNode(n) => n.to_params(),
+            NodeKind::CopNetwork | NodeKind::TopNetwork => vec![],
+            NodeKind::Cop(n) => n.to_params(),
+            NodeKind::Top(n) => n.to_params(),
         }
     }
     fn from_params(name: &str, p: &[f32]) -> Option<NodeKind> {
@@ -4186,9 +4310,11 @@ impl NodeKind {
         let v3 = |i: usize| [g(i), g(i + 1), g(i + 2)];
         Some(match name {
             "add" => NodeKind::Add {
-                count: u(0).clamp(1, 100_000),
+                count: u(0).min(100_000),
                 spacing: g(1).max(0.001),
                 layout: u(2).min(2),
+                delete_geometry: g(3) > 0.5,
+                points: p.get(4..).unwrap_or(&[]).chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
             },
             "grid" => NodeKind::Grid { size: g(0), res: u(1) },
             "plane" => NodeKind::Plane { size: g(0), res: u(1) },
@@ -4394,6 +4520,23 @@ impl NodeKind {
                 mode: u(1).min(boolean::MODES.len() - 1),
                 resolution: u(2).clamp(16, 400),
             }),
+            "measure" => NodeKind::Measure(measure::MeasureSettings {
+                kind: u(0).min(measure::KINDS.len() - 1),
+                curvature: u(1).min(1),
+                summary: u(2).min(measure::SUMMARIES.len() - 1),
+                ..measure::MeasureSettings::new(u(0).min(measure::KINDS.len() - 1))
+            }),
+            "foreach_begin" => NodeKind::ForEachBegin,
+            "foreach_end" => NodeKind::ForEachEnd(flow::ForEachSettings::from_params(p)),
+            "compile_begin" => NodeKind::CompileBegin,
+            "compile_end" => NodeKind::CompileEnd { begin: p.first().filter(|v| **v >= 0.0).map(|v| *v as usize) },
+            "object_merge" => NodeKind::ObjectMerge {
+                into_this: p.first().is_none_or(|v| *v > 0.5),
+                sources: p.iter().skip(1).map(|v| (*v >= 0.5).then(|| (*v - 1.0).round() as usize)).collect(),
+            },
+            "material" => NodeKind::MaterialAssign {
+                slots: p.iter().map(|v| (String::new(), (*v >= 0.5).then(|| (*v - 1.0).round() as usize))).collect(),
+            },
             "material_fracture" => NodeKind::MaterialFracture(fracture::FractureSettings {
                 material: u(0).min(fracture::MATERIALS.len() - 1),
                 pieces: u(1).clamp(2, 500),
@@ -4563,6 +4706,10 @@ impl NodeKind {
             "pyro_shader" => NodeKind::Shader(shading::Values::from_params(shading::Table::Pyro, p)),
             "material_builder" => NodeKind::MaterialBuilder,
             "shader_node" => NodeKind::ShaderNode(shading::ShaderNode::from_params(p)),
+            "cop_network" => NodeKind::CopNetwork,
+            "cop" => NodeKind::Cop(cops::CopNode::from_params(p)),
+            "top_network" => NodeKind::TopNetwork,
+            "top" => NodeKind::Top(tops::TopNode::from_params(p)),
             _ => return None,
         })
     }
@@ -4586,6 +4733,15 @@ struct Node {
     group: groups::NodeGroup,
     // Values of the ch("...") parameters its code uses (wrangles, VOP networks).
     channels: vex::Channels,
+    // A name the user gave the node; empty shows the generated one (box3, noise7…).
+    name: String,
+}
+
+impl Node {
+    // What the node is called on screen: its given name, else the generated label.
+    fn title(&self, id: NodeId) -> String {
+        if self.name.trim().is_empty() { self.kind.label(id) } else { self.name.trim().to_owned() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4681,7 +4837,7 @@ impl Graph {
     fn add(&mut self, kind: NodeKind, pos: egui::Pos2) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.insert(id, Node { kind, pos, bypass: false, context: AppContext::Obj, parent: None, xform: ObjectXform::default(), group: groups::NodeGroup::default(), channels: vex::Channels::new() });
+        self.nodes.insert(id, Node { kind, pos, bypass: false, context: AppContext::Obj, parent: None, xform: ObjectXform::default(), group: groups::NodeGroup::default(), channels: vex::Channels::new(), name: String::new() });
         id
     }
 
@@ -4893,7 +5049,7 @@ impl Graph {
             let node = &self.nodes[id];
             id.hash(&mut hasher);
             // Animated parameters are compared at time 0, so playback itself is not an edit.
-            format!("{:?}{:?}{:?}", self.kind_at(*id, 0.0), node.parent, self.xform_at(*id, 0.0)).hash(&mut hasher);
+            format!("{:?}{:?}{:?}{}", self.kind_at(*id, 0.0), node.parent, self.xform_at(*id, 0.0), node.name).hash(&mut hasher);
             (node.bypass, node.context as u8).hash(&mut hasher);
         }
         for link in &self.links {
@@ -4939,16 +5095,48 @@ impl Graph {
                     mesh = self.xform_at(object, time).apply(mesh);
                 }
             }
-            let material = match self.nodes.get(id).map(|n| &n.kind) {
-                Some(NodeKind::Geometry { material: Some(m) }) => self.nodes.get(m).map(|n| &n.kind),
+            // The object's material (inside a geometry network: the enclosing object's).
+            let object = if matches!(self.nodes.get(id).map(|n| &n.kind), Some(NodeKind::Geometry { .. })) { Some(*id) } else { self.enclosing_geometry(*id) };
+            let object_material = match object.and_then(|o| self.nodes.get(&o)).map(|n| &n.kind) {
+                Some(NodeKind::Geometry { material }) => *material,
                 _ => None,
             };
-            let _ = material;
-            let material = match self.nodes.get(id).map(|n| &n.kind) {
-                Some(NodeKind::Geometry { material: Some(m) }) => self.material_preview(*m),
-                _ => None,
-            };
-            if let Some((color, texture, uses_cd)) = material {
+            // Material SOP assignments: each primitive shows its own material's colour.
+            if let Some(ids) = mesh.point_attributes.get(PRIM_MATERIAL).filter(|v| v.len() == mesh.indices.len() && v.iter().any(|m| *m >= 0.5)).cloned() {
+                let n = mesh.indices.len();
+                let point_cd = mesh.point_attributes.get("Cd").filter(|c| c.len() == mesh.vertices.len() * 3).cloned();
+                let mut colours = mesh.point_attributes.get("prim:Cd").filter(|c| c.len() == n * 3).cloned().unwrap_or_else(|| {
+                    (0..n).flat_map(|t| match &point_cd {
+                        Some(cd) => {
+                            let tri = mesh.indices[t];
+                            std::array::from_fn::<f32, 3, _>(|k| tri.iter().map(|v| cd[v * 3 + k]).sum::<f32>() / 3.0)
+                        }
+                        None => [0.8; 3],
+                    }).collect()
+                });
+                let mut textures: Vec<Option<String>> = Vec::new();
+                for (t, m) in ids.iter().enumerate() {
+                    let material = if *m >= 0.5 { Some((*m - 1.0).round() as usize) } else { object_material };
+                    let preview = material.and_then(|m| self.material_preview(m));
+                    if let Some((colour, texture, uses_cd)) = preview {
+                        if !(uses_cd && point_cd.is_some()) {
+                            colours[t * 3..t * 3 + 3].copy_from_slice(&colour);
+                        }
+                        textures.push(texture);
+                    } else {
+                        textures.push(None);
+                    }
+                }
+                mesh.point_attributes.remove("Cd");
+                mesh.point_attributes.insert("prim:Cd".into(), colours);
+                // One texture for the whole mesh shows (the viewport has one per object).
+                textures.dedup();
+                if let [Some(texture)] = textures.as_slice() {
+                    if let Ok(shaded) = sops::uv_quickshade(&mesh, texture) {
+                        mesh = shaded;
+                    }
+                }
+            } else if let Some((color, texture, uses_cd)) = object_material.and_then(|m| self.material_preview(m)) {
                 let coloured = mesh.point_attributes.keys().any(|k| k == "Cd" || k.ends_with(":Cd"));
                 if !(coloured && uses_cd) && !mesh.indices.is_empty() {
                     mesh.point_attributes.remove("Cd");
@@ -5144,13 +5332,28 @@ impl Graph {
                             continue;
                         }
                         let prim_path = if geometry.is_some() { path.clone() } else { format!("{path}/geometry{object}") };
-                        let material = match self.nodes.get(&object).map(|n| &n.kind) {
-                            Some(NodeKind::Geometry { material: Some(m) }) => self.material_prim(&mut stage, *m),
+                        let object_material = match self.nodes.get(&object).map(|n| &n.kind) {
+                            Some(NodeKind::Geometry { material }) => *material,
                             _ => None,
                         };
-                        let prim = stage.define(&prim_path, "Mesh");
-                        prim.mesh = Some(Arc::new(mesh));
-                        prim.binding = material;
+                        let parts = split_by_material(mesh, object_material, |m| self.nodes.get(&m).is_some_and(|n| n.kind.is_material()));
+                        if parts.len() == 1 {
+                            let (mesh, m) = parts.into_iter().next().unwrap();
+                            let material = m.and_then(|m| self.material_prim(&mut stage, m));
+                            let prim = stage.define(&prim_path, "Mesh");
+                            prim.mesh = Some(Arc::new(mesh));
+                            prim.binding = material;
+                        } else {
+                            // Several materials: one Mesh child per material under an Xform.
+                            stage.define(&prim_path, "Xform");
+                            for (mesh, m) in parts {
+                                let material = m.and_then(|m| self.material_prim(&mut stage, m));
+                                let child = format!("{prim_path}/{}", m.map_or("default".to_owned(), |m| format!("mat{m}")));
+                                let prim = stage.define(&child, "Mesh");
+                                prim.mesh = Some(Arc::new(mesh));
+                                prim.binding = material;
+                            }
+                        }
                     }
                 }
                 NodeKind::LopReference { file, path, sublayer } => match usd::load_file(file, time) {
@@ -5246,6 +5449,200 @@ impl Graph {
         });
         cache.insert(id, stage.clone());
         stage
+    }
+
+    // The For-Each End paired with a Begin.
+    fn foreach_end_of(&self, begin: NodeId) -> Option<NodeId> {
+        self.nodes.iter().find(|(_, n)| matches!(&n.kind, NodeKind::ForEachEnd(s) if s.begin == Some(begin))).map(|(id, _)| *id)
+    }
+
+    // A loop's body: nodes downstream of `begin` up to (not including) `end`, and `begin` itself.
+    fn loop_body(&self, begin: NodeId, end: NodeId) -> Vec<NodeId> {
+        let mut body = vec![begin];
+        let mut i = 0;
+        while i < body.len() {
+            let at = body[i];
+            for l in self.links.iter().filter(|l| l.from == at) {
+                if l.to != end && !body.contains(&l.to) {
+                    body.push(l.to);
+                }
+            }
+            i += 1;
+        }
+        body
+    }
+
+    // Whether `node` sits inside a Compile Block (a paired Compile Begin up its input chain).
+    fn in_compile_block(&self, node: NodeId) -> bool {
+        let mut at = Some(node);
+        for _ in 0..256 {
+            let Some(id) = at else { return false };
+            if matches!(self.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::CompileBegin))
+                && self.nodes.values().any(|n| matches!(n.kind, NodeKind::CompileEnd { begin: Some(b) } if b == id))
+            {
+                return true;
+            }
+            at = self.input_of(id, 0);
+        }
+        false
+    }
+
+    // Runs a For-Each loop: the body once per iteration, results merged (or fed back).
+    fn cook_foreach(&self, end: NodeId, set: &flow::ForEachSettings, time: f32, cache: &mut HashMap<NodeId, Mesh>) -> Result<Mesh, String> {
+        let begin = set
+            .begin
+            .filter(|b| matches!(self.nodes.get(b).map(|n| &n.kind), Some(NodeKind::ForEachBegin)))
+            .ok_or("this For-Each End has lost its For-Each Begin: add the loop again from the Flow Control menu")?;
+        let body_out = self.input_of(end, 0).ok_or("connect the loop's last node to the For-Each End")?;
+        let source = self.input_of(begin, 0).map(|s| self.cook(s, time, cache)).unwrap_or_default();
+        let body = self.loop_body(begin, end);
+        let run = |input: Mesh, cache: &mut HashMap<NodeId, Mesh>| -> Mesh {
+            FOREACH_INPUT.with(|m| m.borrow_mut().insert(begin, input));
+            for b in &body {
+                cache.remove(b);
+            }
+            let out = self.cook(body_out, time, cache);
+            FOREACH_INPUT.with(|m| m.borrow_mut().remove(&begin));
+            out
+        };
+        let result = if set.mode == flow::FEEDBACK {
+            let count = set.iterations.min(100_000);
+            let mut current = source;
+            for i in 0..count {
+                if set.single_pass >= 0 && i as i32 > set.single_pass {
+                    break;
+                }
+                current = run(flow::stamp(current, i, count, set.start + i as f32 * set.increment), cache);
+            }
+            current
+        } else {
+            let inputs: Vec<Mesh> = if set.mode == flow::NUMBER {
+                let count = set.iterations.min(100_000);
+                (0..count).map(|i| flow::stamp(source.clone(), i, count, set.start + i as f32 * set.increment)).collect()
+            } else {
+                let pieces = flow::pieces(&source, set)?;
+                let n = pieces.len();
+                pieces.into_iter().enumerate().map(|(i, p)| flow::stamp(p, i, n, i as f32)).collect()
+            };
+            let inputs: Vec<Mesh> = match usize::try_from(set.single_pass) {
+                Ok(only) => inputs.into_iter().skip(only).take(1).collect(),
+                Err(_) => inputs,
+            };
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(inputs.len().max(1));
+            let outputs: Vec<Mesh> = if set.multithread && threads > 1 && self.in_compile_block(begin) {
+                // Compiled: iterations run on several threads, each with its own cook cache.
+                let mut slots: Vec<Option<Mesh>> = vec![None; inputs.len()];
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let (inputs, run) = (&inputs, &run);
+                            scope.spawn(move || {
+                                let mut local = HashMap::new();
+                                (t..inputs.len()).step_by(threads).map(|i| (i, run(inputs[i].clone(), &mut local))).collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        for (i, mesh) in h.join().unwrap_or_default() {
+                            slots[i] = Some(mesh);
+                        }
+                    }
+                });
+                slots.into_iter().map(Option::unwrap_or_default).collect()
+            } else {
+                inputs.into_iter().map(|input| run(input, cache)).collect()
+            };
+            outputs.into_iter().fold(Mesh::default(), node_merge)
+        };
+        // Body results of the last iteration mustn't be mistaken for the loop's outside.
+        for b in &body {
+            cache.remove(b);
+        }
+        Ok(result)
+    }
+
+    // Object Merge: other objects' (or nodes') geometry, in this object's space when asked.
+    fn object_merge(&self, id: NodeId, sources: &[Option<NodeId>], into_this: bool, time: f32) -> Result<Mesh, String> {
+        let own = self.enclosing_geometry(id);
+        if MERGE_DEPTH.with(|d| d.get()) > 16 {
+            return Err("these Object Merges merge each other in a loop".into());
+        }
+        MERGE_DEPTH.with(|d| d.set(d.get() + 1));
+        let mut merged = Mesh::default();
+        let mut problem = None;
+        for src in sources.iter().flatten() {
+            let Some(node) = self.nodes.get(src) else {
+                problem = Some(format!("node {src} no longer exists"));
+                continue;
+            };
+            if Some(*src) == own {
+                problem = Some("an Object Merge can't merge its own object".into());
+                continue;
+            }
+            // An object's display output in its own space, with its transform; or a SOP node and its object's.
+            let (mesh, xform) = match node.kind {
+                NodeKind::Geometry { .. } => (self.display_of(*src).map(|d| self.cook(d, time, &mut HashMap::new())).unwrap_or_default(), self.xform_at(*src, time)),
+                _ => (self.cook(*src, time, &mut HashMap::new()), self.enclosing_geometry(*src).map_or(ObjectXform::default(), |o| self.xform_at(o, time))),
+            };
+            let mesh = if into_this {
+                let world = xform.apply(mesh);
+                match own {
+                    Some(o) => inverse_xform(&self.xform_at(o, time), world),
+                    None => world,
+                }
+            } else {
+                mesh
+            };
+            merged = node_merge(merged, mesh);
+        }
+        MERGE_DEPTH.with(|d| d.set(d.get() - 1));
+        match problem {
+            Some(p) if merged.vertices.is_empty() => Err(p),
+            _ => Ok(merged),
+        }
+    }
+
+    // A TOP node's work items, generated from its input's.
+    fn top_items(&self, id: NodeId) -> Result<Vec<tops::WorkItem>, String> {
+        self.top_items_depth(id, 0)
+    }
+
+    fn top_items_depth(&self, id: NodeId, depth: usize) -> Result<Vec<tops::WorkItem>, String> {
+        let Some(NodeKind::Top(node)) = self.nodes.get(&id).map(|n| &n.kind) else {
+            return Err("not a TOP node".into());
+        };
+        if depth > 64 {
+            return Err("the TOP network has a loop".into());
+        }
+        let upstream = match self.input_of(id, 0) {
+            Some(src) => Some(self.top_items_depth(src, depth + 1).map_err(|e| format!("{}: {e}", self.nodes[&src].title(src)))?),
+            None => None,
+        };
+        tops::generate(node, upstream.as_deref(), |target| match self.nodes.get(&target).map(|n| &n.kind) {
+            Some(NodeKind::MoonRayRender { output, opts, .. }) => Some(tops::FetchTarget {
+                render: true,
+                output: output.clone(),
+                frames: if opts.sequence {
+                    frame_times(opts.range_start, opts.range_end, opts.range_step).iter().map(|t| t * sims::SIM_FPS + 1.0).collect()
+                } else {
+                    vec![1.0]
+                },
+            }),
+            Some(NodeKind::FileExport { file }) => Some(tops::FetchTarget { render: false, output: file.clone(), frames: vec![1.0] }),
+            _ => None,
+        })
+    }
+
+    // Sets parameter `index` of `node`; returns the old value (for wedges, put back afterwards).
+    fn set_param(&mut self, node: NodeId, index: usize, value: f32) -> Option<f32> {
+        let n = self.nodes.get_mut(&node)?;
+        let mut params = n.kind.params();
+        let old = *params.get(index)?;
+        params[index] = value;
+        let mut kind = NodeKind::from_params(n.kind.name(), &params)?;
+        kind.set_texts(&n.kind.texts());
+        n.kind = kind;
+        Some(old)
     }
 
     // The Surface Output a Material Builder renders: its display node, else its first one.
@@ -5443,6 +5840,7 @@ impl Graph {
             || matches!(&n.kind, NodeKind::Wrangle { code, .. } if code.contains("@Time") || code.contains("@Frame") || code.contains("@SimTime") || code.contains("@SimFrame"))
             || (matches!(n.kind, NodeKind::AttributeVop { .. })
                 && self.vop_code(id).is_ok_and(|code| ["@Time", "@Frame", "@SimTime", "@SimFrame"].iter().any(|t| code.contains(t))))
+            || matches!(&n.kind, NodeKind::Cop(c) if c.time_dependent())
             || self.is_animated(id)
             || match &n.kind {
                 NodeKind::LopSopImport { geometry: Some(g), .. } => self.time_dependent(*g),
@@ -5454,7 +5852,7 @@ impl Graph {
                 _ => false,
             }
             || (!n.bypass
-                && matches!(n.kind, NodeKind::Geometry { .. })
+                && matches!(n.kind, NodeKind::Geometry { .. } | NodeKind::CopNetwork)
                 && self.display_of(id).is_some_and(|d| self.time_dependent(d)))
             || self
                 .links
@@ -5524,7 +5922,22 @@ impl Graph {
         } else {
             let animated = self.kind_at(id, time);
             match animated.as_ref() {
-                NodeKind::Add { count, spacing, layout } => node_add(*count, *spacing, *layout),
+                NodeKind::Add { count, spacing, layout, points, delete_geometry } => {
+                    let mut base = input(0, cache);
+                    if *delete_geometry {
+                        base.indices.clear();
+                        base.point_attributes.retain(|k, _| !k.starts_with("prim:") && !k.starts_with("vertex:"));
+                    }
+                    let mut added = if *count > 0 { node_add(*count, *spacing, *layout) } else { Mesh::default() };
+                    added.vertices.extend(points.iter().map(|p| Vec3::from_arr(*p)));
+                    if base.vertices.is_empty() {
+                        added
+                    } else if added.vertices.is_empty() {
+                        base
+                    } else {
+                        node_merge(base, added)
+                    }
+                }
                 NodeKind::Grid { size, res } => node_grid(*size, *size, *res, *res),
                 NodeKind::Plane { size, res } => node_grid(*size, *size, *res, *res),
                 NodeKind::Cone { radius, height, rows, cols, caps } => {
@@ -5774,7 +6187,24 @@ impl Graph {
                 | NodeKind::Material { .. }
                 | NodeKind::Shader(_)
                 | NodeKind::MaterialBuilder
-                | NodeKind::ShaderNode(_) => Mesh::default(),
+                | NodeKind::ShaderNode(_)
+                | NodeKind::TopNetwork
+                | NodeKind::Top(_) => Mesh::default(),
+                NodeKind::CopNetwork => match self.display_of(id) {
+                    Some(display) => self.cook(display, time, cache),
+                    None => Mesh::default(),
+                },
+                NodeKind::Cop(cop) => {
+                    let images: Vec<Option<cops::Image>> = (0..cop.def().inputs)
+                        .map(|slot| self.input_of(id, slot).and_then(|_| cops::Image::from_mesh(&input(slot, cache))))
+                        .collect();
+                    let file = match cop.op {
+                        cops::FILE => cop.texts.first().map(|f| fileio::expand_frame(f.trim(), time, sims::SIM_FPS)),
+                        cops::RENDER => cops::last_render(),
+                        _ => None,
+                    };
+                    self.report(id, cops::cook(cop, &images, file.as_deref(), time).map(|img| img.to_mesh()))
+                }
                 NodeKind::Geometry { .. } => match self.display_of(id) {
                     Some(display) => self.xform_at(id, time).apply(self.cook(display, time, cache)),
                     None => Mesh::default(),
@@ -5840,6 +6270,55 @@ impl Graph {
                     self.report(id, result)
                 }
                 NodeKind::MaterialFracture(settings) => self.report(id, fracture::fracture(&input(0, cache), settings)),
+                NodeKind::MaterialAssign { slots } => self.report(id, material_assign(&input(0, cache), slots)),
+                NodeKind::Measure(settings) => self.report(id, measure::measure(&input(0, cache), settings)),
+                NodeKind::ForEachBegin => match FOREACH_INPUT.with(|m| m.borrow().get(&id).cloned()) {
+                    Some(iteration) => iteration,
+                    // Viewed on its own: the first iteration.
+                    None => {
+                        let source = input(0, cache);
+                        match self.foreach_end_of(id).and_then(|e| match &self.nodes.get(&e)?.kind {
+                            NodeKind::ForEachEnd(set) => Some(set.clone()),
+                            _ => None,
+                        }) {
+                            Some(set) if matches!(set.mode, flow::NUMBER | flow::FEEDBACK) => flow::stamp(source, 0, set.iterations, set.start),
+                            Some(set) => match flow::pieces(&source, &set) {
+                                Ok(pieces) => {
+                                    let n = pieces.len();
+                                    pieces.into_iter().next().map_or_else(Mesh::default, |p| flow::stamp(p, 0, n, 0.0))
+                                }
+                                Err(e) => self.report(id, Err(e)),
+                            },
+                            None => source,
+                        }
+                    }
+                },
+                NodeKind::ForEachEnd(settings) => {
+                    let result = self.cook_foreach(id, settings, time, cache);
+                    self.report(id, result)
+                }
+                NodeKind::CompileBegin => input(0, cache),
+                NodeKind::CompileEnd { .. } => {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    self.sim_key(id).hash(&mut hasher);
+                    if self.time_dependent(id) {
+                        time.to_bits().hash(&mut hasher);
+                    }
+                    let key = hasher.finish();
+                    match flow::compiled(key) {
+                        Some(mesh) => mesh,
+                        None => {
+                            let mesh = input(0, cache);
+                            flow::store_compiled(key, &mesh);
+                            mesh
+                        }
+                    }
+                }
+                NodeKind::ObjectMerge { sources, into_this } => {
+                    let result = self.object_merge(id, sources, *into_this, time);
+                    self.report(id, result)
+                }
                 NodeKind::CrowdSolver(settings) => {
                     let (start, ground, obstacles) = (self.input_of(id, 0), self.input_of(id, 1), self.input_of(id, 2));
                     if start.is_none() {
@@ -6031,6 +6510,8 @@ impl Graph {
                     AppContext::Mat => "mat",
                     AppContext::Out => "out",
                     AppContext::Stage => "stage",
+                    AppContext::Img => "img",
+                    AppContext::Tasks => "tasks",
                 },
                 n.kind.name(),
                 serialized_params
@@ -6054,6 +6535,12 @@ impl Graph {
         for id in self.nodes.keys().copied().collect::<std::collections::BTreeSet<_>>() {
             for (name, v) in &self.nodes[&id].channels {
                 s += &format!("chan {id} {} {} {} {}\n", encode_text(name), v[0], v[1], v[2]);
+            }
+        }
+        for id in self.nodes.keys().copied().collect::<std::collections::BTreeSet<_>>() {
+            let name = self.nodes[&id].name.trim();
+            if !name.is_empty() {
+                s += &format!("name {id} {}\n", encode_text(name));
             }
         }
         for id in self.nodes.keys().copied().collect::<std::collections::BTreeSet<_>>() {
@@ -6102,6 +6589,8 @@ impl Graph {
                             "mat" => { ctx = AppContext::Mat; cursor += 1; }
                             "out" => { ctx = AppContext::Out; cursor += 1; }
                             "stage" => { ctx = AppContext::Stage; cursor += 1; }
+                            "img" => { ctx = AppContext::Img; cursor += 1; }
+                            "tasks" => { ctx = AppContext::Tasks; cursor += 1; }
                             _ => {}
                         }
                     }
@@ -6126,6 +6615,7 @@ impl Graph {
                                     xform: ObjectXform::default(),
                                     group: groups::NodeGroup::default(),
                                     channels: vex::Channels::new(),
+                                    name: String::new(),
                                 },
                             );
                             g.next_id = g.next_id.max(id + 1);
@@ -6190,6 +6680,7 @@ impl Graph {
                                     xform: ObjectXform::default(),
                                     group: groups::NodeGroup::default(),
                                     channels: vex::Channels::new(),
+                                    name: String::new(),
                                 },
                             );
                             g.next_id = g.next_id.max(id + 1);
@@ -6217,7 +6708,7 @@ impl Graph {
                     ) {
                         g.nodes.insert(
                             id,
-                            Node { kind, pos: egui::pos2(x, y), bypass: *bp == "1", context: ctx, parent: None, xform: ObjectXform::default(), group: groups::NodeGroup::default(), channels: vex::Channels::new() },
+                            Node { kind, pos: egui::pos2(x, y), bypass: *bp == "1", context: ctx, parent: None, xform: ObjectXform::default(), group: groups::NodeGroup::default(), channels: vex::Channels::new(), name: String::new() },
                         );
                         g.next_id = g.next_id.max(id + 1);
                     }
@@ -6232,6 +6723,13 @@ impl Graph {
                         if let Some(node) = g.nodes.get_mut(&id) {
                             let v = [x, y, z].map(|c| c.parse::<f32>().unwrap_or(0.0));
                             node.channels.insert(name, v);
+                        }
+                    }
+                }
+                ["name", id, name] => {
+                    if let (Ok(id), Some(name)) = (id.parse::<usize>(), decode_text(name)) {
+                        if let Some(node) = g.nodes.get_mut(&id) {
+                            node.name = name;
                         }
                     }
                 }
@@ -6350,6 +6848,15 @@ const SCENE_FILE: &str = "scene.pfs";
 const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
 // Returns the MoonRay class name and its RDLA definition for a MAT node's settings.
+fn top_state_colour(state: tops::State) -> egui::Color32 {
+    match state {
+        tops::State::Waiting => egui::Color32::from_gray(150),
+        tops::State::Running => egui::Color32::from_rgb(250, 200, 60),
+        tops::State::Done => egui::Color32::from_rgb(90, 210, 110),
+        tops::State::Failed => egui::Color32::from_rgb(235, 80, 70),
+    }
+}
+
 // A joint picker: the input skeleton's joint names, or a typed name.
 fn joint_menu(ui: &mut egui::Ui, salt: impl std::hash::Hash, label: &str, joint: &mut String, names: &[String], optional: bool) -> bool {
     let mut c = false;
@@ -6440,6 +6947,99 @@ fn shader_values_ui(ui: &mut egui::Ui, values: &mut shading::Values) -> bool {
         at += width;
     }
     c
+}
+
+// Add-menu search: every word typed must appear in the node's name, menu name or category.
+fn node_matches(kind: &NodeKind, category: &str, query: &str) -> bool {
+    let haystack = format!("{} {} {}", kind.name(), kind.menu_name(), category).to_lowercase().replace('_', " ");
+    query.to_lowercase().split_whitespace().all(|word| haystack.contains(word) || haystack.replace(' ', "").contains(word))
+}
+
+// Undoes an object transform (scale, then rotate, then translate) on a mesh's points.
+fn inverse_xform(x: &ObjectXform, mut mesh: Mesh) -> Mesh {
+    if x.is_identity() {
+        return mesh;
+    }
+    let s = x.s.map(|v| if v.abs() < 1e-6 { 1e-6 } else { v });
+    for v in mesh.vertices.iter_mut() {
+        let p = v.sub(Vec3::from_arr(x.t));
+        let p = p.rotate_deg([0.0, 0.0, -x.r[2]]).rotate_deg([0.0, -x.r[1], 0.0]).rotate_deg([-x.r[0], 0.0, 0.0]);
+        *v = Vec3::new(p.x / s[0], p.y / s[1], p.z / s[2]);
+    }
+    if s[0] * s[1] * s[2] < 0.0 {
+        mesh.indices.iter_mut().for_each(|t| t.swap(1, 2));
+    }
+    mesh.point_attributes.remove("N");
+    mesh
+}
+
+// Writes the documentation page next to the app's settings and opens it in the browser.
+fn open_documentation() -> Result<String, String> {
+    let dir = app_config_dir().ok_or("no home folder")?.join("docs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("index.html");
+    std::fs::write(&path, docs::html(env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    Command::new(opener).arg(&path).spawn().map_err(|e| format!("{opener}: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+// Primitive attribute with each primitive's MAT material: node id + 1, or 0 for the object's
+// own material (so primitives merged in without one keep it).
+const PRIM_MATERIAL: &str = "prim:material";
+
+// The Material SOP: later slots (and later Material nodes) override earlier ones.
+fn material_assign(input: &Mesh, slots: &[(String, Option<NodeId>)]) -> Result<Mesh, String> {
+    let n = input.indices.len();
+    let mut ids = input.point_attributes.get(PRIM_MATERIAL).filter(|v| v.len() == n).cloned().unwrap_or_else(|| vec![0.0; n]);
+    for (group, material) in slots {
+        let value = material.map_or(0.0, |m| m as f32 + 1.0);
+        // Primitives, like Houdini's Material SOP (numbers are primitive numbers); a point
+        // group name still works, covering the primitives made of its points.
+        let mask = groups::prim_mask(input, &groups::NodeGroup { pattern: group.clone(), kind: 2 })
+            .or_else(|_| groups::prim_mask(input, &groups::NodeGroup { pattern: group.clone(), kind: 0 }))?;
+        for (t, id) in ids.iter_mut().enumerate() {
+            if mask.as_ref().is_none_or(|m| m[t]) {
+                *id = value;
+            }
+        }
+    }
+    let mut out = input.clone();
+    out.point_attributes.insert(PRIM_MATERIAL.into(), ids);
+    Ok(out)
+}
+
+// Splits `mesh` into one part per material: primitives the Material SOP assigned, and the
+// rest with `object` (the Geometry's material). Curves and points stay with the object's.
+fn split_by_material(mesh: Mesh, object: Option<NodeId>, is_material: impl Fn(NodeId) -> bool) -> Vec<(Mesh, Option<NodeId>)> {
+    let Some(ids) = mesh.point_attributes.get(PRIM_MATERIAL).filter(|v| v.len() == mesh.indices.len() && !v.is_empty()).cloned() else {
+        return vec![(mesh, object)];
+    };
+    let effective: Vec<Option<NodeId>> = ids.iter().map(|v| if *v >= 0.5 { Some((*v - 1.0).round() as usize).filter(|m| is_material(*m)) } else { None }.or(object)).collect();
+    let mut materials: Vec<Option<NodeId>> = effective.clone();
+    // Curves (hair) and render points travel with the object's material, even when every
+    // primitive has another one.
+    if groom::has_curves(&mesh) || mesh.point_attributes.contains_key(whitewater::RENDER_POINTS) {
+        materials.push(object);
+    }
+    materials.sort_unstable();
+    materials.dedup();
+    if materials.len() == 1 {
+        return vec![(mesh, materials[0])];
+    }
+    materials
+        .into_iter()
+        .map(|m| {
+            let mask: Vec<bool> = effective.iter().map(|e| *e == m).collect();
+            let mut part = groups::only_prims(&mesh, &mask);
+            // Curves and loose points go with the object's own material only.
+            if m != object {
+                part.point_attributes.remove(groom::CURVEU);
+                part.point_attributes.remove(whitewater::RENDER_POINTS);
+            }
+            (part, m)
+        })
+        .collect()
 }
 
 // Points the renderer draws as spheres (Whitewater output), not left out like other point clouds.
@@ -6549,6 +7149,10 @@ enum AppContext {
     Out,
     // USD stage (LOP) network.
     Stage,
+    // Compositing: COP networks.
+    Img,
+    // Task graphs: TOP networks.
+    Tasks,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -6978,6 +7582,20 @@ struct ProceduralFxStudioApp {
     gizmo_drag: Option<GizmoDrag>,
     // A FLIP node's automatic domain (its emitter's bounds), keyed by the upstream hash.
     gizmo_bounds: std::cell::RefCell<Option<(u64, Option<(Vec3, Vec3)>)>>,
+    // Puts the cursor in the selected node's Name field (F2 / Rename).
+    focus_rename: bool,
+    // TOP networks: each node's work item states from the last cook, and the running cook.
+    top_results: tops::Results,
+    top_run: Option<TopRun>,
+    top_cook_request: Option<NodeId>,
+    top_cancel_request: bool,
+    // The last finished MoonRay render: whether it worked, and the file being written.
+    render_ok: Option<bool>,
+    pending_render_output: Option<String>,
+    // File Output COP: (node, whole timeline range) to write.
+    cop_write_request: Option<(NodeId, bool)>,
+    // The IMG viewer's texture, keyed by the image buffer it was made from.
+    cop_texture: Option<((usize, usize, usize, usize), egui::TextureHandle)>,
     animate: bool,
     anim_speed: f32,
     time: f32,
@@ -7116,6 +7734,8 @@ struct ProceduralFxStudioApp {
     cook_generation: u64,
     tab_open: bool,
     tab_query: String,
+    // The right-click add menu's search text.
+    menu_query: String,
     tab_pos: egui::Pos2,
     context: AppContext,
     selected_vertices: Vec<usize>,
@@ -7188,6 +7808,15 @@ impl Default for ProceduralFxStudioApp {
             gizmo_frame: None,
             gizmo_drag: None,
             gizmo_bounds: std::cell::RefCell::new(None),
+            focus_rename: false,
+            top_results: HashMap::new(),
+            top_run: None,
+            top_cook_request: None,
+            top_cancel_request: false,
+            render_ok: None,
+            pending_render_output: None,
+            cop_write_request: None,
+            cop_texture: None,
             animate: true,
             anim_speed: 0.02,
             time: 0.0,
@@ -7295,6 +7924,7 @@ impl Default for ProceduralFxStudioApp {
             cook_generation: 0,
             tab_open: false,
             tab_query: String::new(),
+            menu_query: String::new(),
             tab_pos: egui::Pos2::ZERO,
             context: AppContext::Obj,
             selected_vertices: Vec::new(),
@@ -7730,7 +8360,7 @@ impl ProceduralFxStudioApp {
                 .graph
                 .nodes
                 .get(&id)
-                .map(|node| node.kind.label(id))
+                .map(|node| node.title(id))
                 .unwrap_or_else(|| format!("node {id}")),
             None if self.sheet_from_selected => "no node selected".into(),
             None => "final geometry in the viewport".into(),
@@ -8022,10 +8652,10 @@ impl ProceduralFxStudioApp {
             targets.truncate(6);
         }
         if targets.is_empty() {
-            self.status = format!("{} has no parameters that can be animated", node.kind.label(id));
+            self.status = format!("{} has no parameters that can be animated", node.title(id));
             return;
         }
-        let label = node.kind.label(id);
+        let label = node.title(id);
         for (target, _) in &targets {
             self.graph.set_key(ChannelId { node: id, target: *target }, self.time);
         }
@@ -8042,7 +8672,7 @@ impl ProceduralFxStudioApp {
             if focus.is_some_and(|f| f != channel_id.node) {
                 continue;
             }
-            let group = node.kind.label(channel_id.node);
+            let group = node.title(channel_id.node);
             let name = node
                 .kind
                 .animatable()
@@ -8400,7 +9030,17 @@ impl ProceduralFxStudioApp {
                     ui.close();
                 }
             });
-            ui.menu_button("Help", |ui| self.updater.menu(ui));
+            ui.menu_button("Help", |ui| {
+                if ui.button("📖 Documentation").on_hover_text("All nodes and VEX, as a web page in your browser").clicked() {
+                    self.status = match open_documentation() {
+                        Ok(path) => format!("Opened the documentation ({path})"),
+                        Err(e) => format!("Couldn't open the documentation: {e}"),
+                    };
+                    ui.close_menu();
+                }
+                ui.separator();
+                self.updater.menu(ui);
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.updater.indicator(ui));
         });
 
@@ -8410,6 +9050,8 @@ impl ProceduralFxStudioApp {
                 (AppContext::Mat, "MAT", "Materials"),
                 (AppContext::Out, "OUT", "Render nodes"),
                 (AppContext::Stage, "STAGE", "USD stage (LOP) network"),
+                (AppContext::Img, "IMG", "Compositing (COP networks)"),
+                (AppContext::Tasks, "TASKS", "Task graphs: renders, wedges and batch jobs (TOP networks)"),
             ] {
                 if ui.selectable_label(self.context == context, egui::RichText::new(label).strong()).on_hover_text(hover).clicked()
                     && self.context != context
@@ -8997,6 +9639,7 @@ impl ProceduralFxStudioApp {
         // Now perform argument replacement with the (possibly) adjusted output path
         let arguments = replace(&arguments).replace("{output}", &used_output_pb.to_string_lossy());
         let output_path = used_output_pb.to_string_lossy().into_owned();
+        self.pending_render_output = Some(copy_back_target.to_string_lossy().into_owned());
         let (tx, rx) = mpsc::channel();
         self.moonray_rx = Some(rx);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -9207,6 +9850,14 @@ impl ProceduralFxStudioApp {
         self.render_cancel = None;
         let seconds = self.render_started.take().map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
         self.last_render_log = outcome.log;
+        self.render_ok = Some(outcome.result.is_ok());
+        if outcome.result.is_ok() {
+            if let Some(path) = self.pending_render_output.take() {
+                cops::set_last_render(&path);
+                // Render COPs read it again.
+                self.dirty = true;
+            }
+        }
         let outcome = outcome.result.map(|(message, image)| {
             self.viewer.add(image, self.open_viewer_after_render);
             format!("{message} in {seconds:.1}s")
@@ -9225,6 +9876,254 @@ impl ProceduralFxStudioApp {
             self.render_at = None;
             self.status = format!("Sequence stopped: {error}");
         }
+    }
+
+    // Starts cooking a TOP node: its input chain's work items first, then its own.
+    fn start_top_cook(&mut self, id: NodeId) {
+        if self.top_run.is_some() {
+            self.status = "A TOP network is already cooking".into();
+            return;
+        }
+        // The chain from the first node down to `id`.
+        let mut chain = vec![id];
+        while let Some(src) = self.graph.input_of(*chain.last().unwrap(), 0) {
+            if chain.contains(&src) || chain.len() > 64 {
+                break;
+            }
+            chain.push(src);
+        }
+        chain.reverse();
+        let mut items = HashMap::new();
+        let mut queue = Vec::new();
+        for node in &chain {
+            match self.graph.top_items(*node) {
+                Ok(list) => {
+                    queue.extend((0..list.len()).map(|i| (*node, i)));
+                    self.top_results.insert(*node, vec![(tops::State::Waiting, String::new()); list.len()]);
+                    items.insert(*node, list);
+                }
+                Err(e) => {
+                    self.status = format!("{}: {e}", self.graph.nodes.get(node).map_or(String::new(), |n| n.title(*node)));
+                    return;
+                }
+            }
+        }
+        queue.reverse();
+        let total = queue.len();
+        self.top_run = Some(TopRun { queue, items, current: None, total, failed: 0 });
+        self.status = format!("Cooking {total} work items…");
+        self.advance_top_run();
+    }
+
+    fn set_item_state(&mut self, node: NodeId, index: usize, state: tops::State, log: String) {
+        if let Some(slot) = self.top_results.get_mut(&node).and_then(|v| v.get_mut(index)) {
+            *slot = (state, log);
+        }
+    }
+
+    // Runs the TOP cook: finishes the running item when it's done, then starts the next.
+    fn advance_top_run(&mut self) {
+        if std::mem::take(&mut self.top_cancel_request) {
+            if let Some(run) = self.top_run.take() {
+                if let Some(cancel) = &self.render_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                for (node, index) in run.queue {
+                    self.set_item_state(node, index, tops::State::Failed, "cancelled".into());
+                }
+                if let Some(TopJob { node, index, .. }) = run.current {
+                    self.set_item_state(node, index, tops::State::Failed, "cancelled".into());
+                }
+                self.status = "TOP cook cancelled".into();
+            }
+            return;
+        }
+        loop {
+            let Some(run) = self.top_run.as_mut() else { return };
+            // The running item.
+            if let Some(job) = run.current.as_ref() {
+                let finished = match &job.wait {
+                    TopWait::Render => {
+                        if self.moonray_rx.is_some() {
+                            return;
+                        }
+                        let ok = self.render_ok.unwrap_or(false);
+                        Some((ok, if ok { job.output.clone() } else { self.last_render_summary.clone() }))
+                    }
+                    TopWait::Shell(rx) => match rx.try_recv() {
+                        Ok(result) => Some(match result {
+                            Ok(log) => (true, log),
+                            Err(log) => (false, log),
+                        }),
+                        Err(mpsc::TryRecvError::Empty) => return,
+                        Err(mpsc::TryRecvError::Disconnected) => Some((false, "the command stopped unexpectedly".into())),
+                    },
+                };
+                let (node, index) = (job.node, job.index);
+                let run = self.top_run.as_mut().unwrap();
+                run.current = None;
+                if let Some((ok, log)) = finished {
+                    if !ok {
+                        run.failed += 1;
+                    }
+                    self.set_item_state(node, index, if ok { tops::State::Done } else { tops::State::Failed }, log);
+                }
+                continue;
+            }
+            let Some((node, index)) = run.queue.pop() else {
+                let (total, failed) = (run.total, run.failed);
+                self.top_run = None;
+                self.render_at = None;
+                self.status = if failed == 0 { format!("TOP cook finished: {total} work items") } else { format!("TOP cook finished: {failed} of {total} work items failed") };
+                return;
+            };
+            let item = run.items[&node][index].clone();
+            self.set_item_state(node, index, tops::State::Running, String::new());
+            match item.job.clone() {
+                tops::Job::Nothing => self.set_item_state(node, index, tops::State::Done, item.output.clone()),
+                tops::Job::Export(target) => {
+                    let result = self.with_wedges(&item, |app| {
+                        let source = app.graph.input_of(target, 0).ok_or("the File Export node has no input")?;
+                        let mesh = app.graph.cook_fresh(Some(source), item.time(sims::SIM_FPS));
+                        write_geometry_file(&mesh, &item.output).map(|_| item.output.clone())
+                    });
+                    let run = self.top_run.as_mut().unwrap();
+                    if result.is_err() {
+                        run.failed += 1;
+                    }
+                    let (state, log) = match result {
+                        Ok(out) => (tops::State::Done, out),
+                        Err(e) => (tops::State::Failed, e),
+                    };
+                    self.set_item_state(node, index, state, log);
+                }
+                tops::Job::Render(target) => {
+                    let Some(NodeKind::MoonRayRender { executable, arguments, width, height, samples, opts, .. }) = self.graph.nodes.get(&target).map(|n| n.kind.clone()) else {
+                        self.set_item_state(node, index, tops::State::Failed, "the render node is gone".into());
+                        continue;
+                    };
+                    if self.moonray_rx.is_some() {
+                        // Another render is running: try again next frame.
+                        let run = self.top_run.as_mut().unwrap();
+                        run.queue.push((node, index));
+                        return;
+                    }
+                    self.render_ok = None;
+                    let output = item.output.clone();
+                    self.with_wedges(&item, |app| {
+                        app.render_opts = opts.clone();
+                        app.render_at = Some(item.time(sims::SIM_FPS));
+                        // Wedged parameters must not come from the cache of unchanging nodes.
+                        let cache = std::mem::take(&mut app.static_cache);
+                        app.spawn_moonray_render(executable.clone(), arguments.clone(), output.clone(), width, height, samples);
+                        app.static_cache = cache;
+                        Ok::<(), String>(())
+                    })
+                    .ok();
+                    if self.moonray_rx.is_none() {
+                        let reason = self.status.clone();
+                        self.top_run.as_mut().unwrap().failed += 1;
+                        self.set_item_state(node, index, tops::State::Failed, reason);
+                        continue;
+                    }
+                    self.status = format!("TOP: rendering {output}");
+                    self.top_run.as_mut().unwrap().current = Some(TopJob { node, index, output, wait: TopWait::Render });
+                    return;
+                }
+                tops::Job::Shell(command) => {
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = Command::new("/bin/sh").arg("-c").arg(&command).output();
+                        let _ = tx.send(match result {
+                            Ok(out) => {
+                                let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).trim().to_owned();
+                                if out.status.success() { Ok(log) } else { Err(if log.is_empty() { format!("exit status {}", out.status) } else { log }) }
+                            }
+                            Err(e) => Err(e.to_string()),
+                        });
+                    });
+                    self.top_run.as_mut().unwrap().current = Some(TopJob { node, index, output: item.output.clone(), wait: TopWait::Shell(rx) });
+                    return;
+                }
+            }
+        }
+    }
+
+    // Runs `f` with the item's wedged parameters set, putting them back afterwards.
+    fn with_wedges<T>(&mut self, item: &tops::WorkItem, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        let mut restore = Vec::new();
+        for (node, param, value) in &item.wedges {
+            if let Some(old) = self.graph.set_param(*node, *param, *value) {
+                restore.push((*node, *param, old));
+            }
+        }
+        let result = f(self);
+        for (node, param, old) in restore.into_iter().rev() {
+            self.graph.set_param(node, param, old);
+        }
+        result
+    }
+
+    // File Output COP: writes the cooked image (one file per frame over the timeline when asked).
+    fn write_cop_output(&mut self, id: NodeId, range: bool) -> Result<String, String> {
+        let Some(NodeKind::Cop(cop)) = self.graph.nodes.get(&id).map(|n| n.kind.clone()) else {
+            return Err("not a File Output node".into());
+        };
+        let file = cop.texts.first().map(|f| f.trim().to_owned()).filter(|f| !f.is_empty()).ok_or("choose a file to write")?;
+        let times = if range { frame_times(self.playback_start.max(0.0), self.playback_end, 1.0 / sims::SIM_FPS) } else { vec![self.time] };
+        let mut written = Vec::new();
+        for time in times {
+            let mesh = self.graph.cook_fresh(Some(id), time);
+            let img = cops::Image::from_mesh(&mesh).ok_or_else(|| node_errors(|e| e.get(&id).cloned()).unwrap_or_else(|| "no image to write".into()))?;
+            let path = fileio::expand_frame(&file, time, sims::SIM_FPS);
+            cops::write_image(&img, &path)?;
+            written.push(path);
+        }
+        Ok(match written.as_slice() {
+            [one] => format!("Wrote {one}"),
+            many => format!("Wrote {} images ({} … {})", many.len(), many[0], many[many.len() - 1]),
+        })
+    }
+
+    // The IMG viewer: the COP network's output, fitted to the pane, over a checkerboard.
+    fn image_view(&mut self, ui: &egui::Ui, response: &egui::Response, painter: &egui::Painter) {
+        let rect = response.rect;
+        let Some(img) = cops::Image::from_mesh(&self.current_mesh) else {
+            let message = if self.view_displays().is_empty() { "Add a COP Network, open it and build a composite" } else { "Nothing to show: check the display node's errors" };
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, message, egui::FontId::proportional(15.0), egui::Color32::from_gray(170));
+            return;
+        };
+        let raw = &self.current_mesh.point_attributes[cops::RGBA];
+        let key = (img.w, img.h, raw.as_ptr() as usize, raw.len());
+        if self.cop_texture.as_ref().is_none_or(|(k, _)| *k != key) {
+            let pixels: Vec<egui::Color32> = img
+                .px
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let (x, y) = (i % img.w, i / img.w);
+                    let check = if (x / 8 + y / 8) % 2 == 0 { 0.22 } else { 0.32 };
+                    let a = p[3].clamp(0.0, 1.0);
+                    let c = |k: usize| ((cops::linear_to_srgb(p[k]) * a + check * (1.0 - a)).clamp(0.0, 1.0) * 255.0) as u8;
+                    egui::Color32::from_rgb(c(0), c(1), c(2))
+                })
+                .collect();
+            let image = egui::ColorImage { size: [img.w, img.h], pixels, source_size: egui::vec2(img.w as f32, img.h as f32) };
+            let texture = ui.ctx().load_texture("cop_view", image, egui::TextureOptions::LINEAR);
+            self.cop_texture = Some((key, texture));
+        }
+        let Some((_, texture)) = &self.cop_texture else { return };
+        let scale = ((rect.width() - 24.0) / img.w as f32).min((rect.height() - 48.0) / img.h as f32).max(0.01);
+        let shown = egui::Rect::from_center_size(rect.center(), egui::vec2(img.w as f32, img.h as f32) * scale);
+        painter.image(texture.id(), shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        painter.rect_stroke(shown, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
+        let mut info = format!("{} × {}", img.w, img.h);
+        if let Some(p) = response.hover_pos().filter(|p| shown.contains(*p)) {
+            let (x, y) = (((p.x - shown.min.x) / scale) as usize, ((p.y - shown.min.y) / scale) as usize);
+            let v = img.px[y.min(img.h - 1) * img.w + x.min(img.w - 1)];
+            info += &format!("   ({x}, {y})  R {:.3}  G {:.3}  B {:.3}  A {:.3}", v[0], v[1], v[2], v[3]);
+        }
+        painter.text(rect.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, info, egui::FontId::monospace(12.0), egui::Color32::from_gray(210));
     }
 
     fn begin_sequence(&mut self, job: SequenceJob) {
@@ -9545,7 +10444,7 @@ impl ProceduralFxStudioApp {
                     let output = self.graph.builder_output(id).ok_or("Material Builder: add a Surface Output node inside it")?;
                     let nodes = self.graph.builder_nodes(id);
                     let (class, text) = shading::compile_builder(&name, &nodes, |to, slot| self.graph.input_of(to, slot), output)
-                        .map_err(|e| format!("Material Builder {}: {e}", self.graph.nodes[&id].kind.label(id)))?;
+                        .map_err(|e| format!("Material Builder {}: {e}", self.graph.nodes[&id].title(id)))?;
                     if !written.contains(&id) {
                         written.push(id);
                         write!(f, "{text}\n") .map_err(|e| e.to_string())?;
@@ -9706,6 +10605,18 @@ impl ProceduralFxStudioApp {
         if self.context == AppContext::Stage {
             return self.graph.display_of(STAGE_NETWORK).into_iter().collect();
         }
+        if self.context == AppContext::Img {
+            // The open COP network's output, else the first COP network's.
+            let net = self.network().or_else(|| {
+                let mut nets: Vec<NodeId> = self.graph.nodes.iter().filter(|(_, n)| matches!(n.kind, NodeKind::CopNetwork)).map(|(id, _)| *id).collect();
+                nets.sort_unstable();
+                nets.first().copied()
+            });
+            return net.and_then(|n| self.graph.display_of(n)).into_iter().collect();
+        }
+        if self.context == AppContext::Tasks {
+            return self.graph.geometry_ids();
+        }
         match self.network() {
             Some(geo) => self.graph.display_of(geo).into_iter().collect(),
             None => self.graph.geometry_ids(),
@@ -9741,6 +10652,12 @@ impl ProceduralFxStudioApp {
         let in_builder = self
             .network()
             .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::MaterialBuilder)));
+        let in_cop = self
+            .network()
+            .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::CopNetwork)));
+        let in_top = self
+            .network()
+            .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::TopNetwork)));
         let context = self.context;
         NodeKind::templates()
             .into_iter()
@@ -9753,13 +10670,23 @@ impl ProceduralFxStudioApp {
                         AppContext::Mat => k.is_material(),
                         AppContext::Out => k.is_render(),
                         AppContext::Stage => k.is_lop(),
+                        // IMG and TASKS: only their network node at the top, and its nodes inside.
+                        AppContext::Img if in_cop => matches!(k, NodeKind::Cop(_)),
+                        AppContext::Img => matches!(k, NodeKind::CopNetwork),
+                        AppContext::Tasks if in_top => matches!(k, NodeKind::Top(_)),
+                        AppContext::Tasks => matches!(k, NodeKind::TopNetwork),
                         AppContext::Obj if k.is_lop() => false,
                         // Inside an Attribute VOP only VOPs; VOPs nowhere else.
                         AppContext::Obj if in_vop => matches!(k, NodeKind::Vop(_)),
                         AppContext::Obj if matches!(k, NodeKind::Vop(_)) => false,
                         AppContext::Obj if top_obj => k.is_object(),
                         AppContext::Obj if matches!(k, NodeKind::SolverInput { .. }) => in_solver,
-                        AppContext::Obj => !k.is_object() && !k.is_material() && !k.is_render(),
+                        AppContext::Obj => {
+                            !k.is_object()
+                                && !k.is_material()
+                                && !k.is_render()
+                                && !matches!(k, NodeKind::ShaderNode(_) | NodeKind::CopNetwork | NodeKind::Cop(_) | NodeKind::TopNetwork | NodeKind::Top(_))
+                        }
                     })
                     .collect();
                 (!kinds.is_empty()).then_some((category, kinds))
@@ -9858,11 +10785,15 @@ impl ProceduralFxStudioApp {
             let mut parts = Vec::new();
             let mut volumes = Vec::new();
             for (index, (mesh, material)) in self.render_scene_parts().into_iter().enumerate() {
-                let material = material.map_or(PartMaterial::Default, PartMaterial::Node);
                 if !volume::is_volume(&mesh) {
-                    parts.push((mesh, material));
+                    // Material SOP assignments split the object into one part per material.
+                    let is_material = |m: NodeId| self.graph.nodes.get(&m).is_some_and(|n| n.kind.is_material());
+                    for (part, m) in split_by_material(mesh, material, is_material) {
+                        parts.push((part, m.map_or(PartMaterial::Default, PartMaterial::Node)));
+                    }
                     continue;
                 }
+                let material = material.map_or(PartMaterial::Default, PartMaterial::Node);
                 let grid = volume::from_mesh(&mesh)?;
                 if grid.class == volume::Class::LevelSet {
                     // Level sets render as their surface.
@@ -10153,6 +11084,33 @@ impl ProceduralFxStudioApp {
 
     // A new SOP Solver starts like Houdini's: Prev_Frame and Input_1 nodes, displaying Prev_Frame.
     fn populate_new_node(&mut self, id: NodeId) {
+        // Loops and compile blocks are Begin/End pairs: the Begin goes above the End, wired to it.
+        let pair = match self.graph.nodes.get(&id).map(|n| &n.kind) {
+            Some(NodeKind::ForEachEnd(s)) if s.begin.is_none() => Some(NodeKind::ForEachBegin),
+            Some(NodeKind::CompileEnd { begin: None }) => Some(NodeKind::CompileBegin),
+            _ => None,
+        };
+        if let Some(begin_kind) = pair {
+            let (pos, context, parent) = {
+                let n = &self.graph.nodes[&id];
+                (n.pos, n.context, n.parent)
+            };
+            let begin = self.graph.add(begin_kind, pos);
+            if let Some(n) = self.graph.nodes.get_mut(&begin) {
+                n.context = context;
+                n.parent = parent;
+            }
+            if let Some(n) = self.graph.nodes.get_mut(&id) {
+                n.pos = pos + egui::vec2(0.0, 160.0);
+                match &mut n.kind {
+                    NodeKind::ForEachEnd(s) => s.begin = Some(begin),
+                    NodeKind::CompileEnd { begin: b } => *b = Some(begin),
+                    _ => {}
+                }
+            }
+            self.graph.connect(begin, id, 0);
+            self.status = "Loop created: put the nodes to repeat between the Begin and the End".into();
+        }
         if self.graph.nodes.get(&id).is_some_and(|n| n.kind.is_lop()) && self.graph.display_of(STAGE_NETWORK).is_none() {
             self.graph.set_display(id);
         }
@@ -10242,9 +11200,14 @@ impl ProceduralFxStudioApp {
                     n.parent = parent;
                 }
                 self.populate_new_node(id);
+                // A loop or compile block takes its input at its Begin.
+                let target = match self.graph.nodes.get(&id).map(|n| &n.kind) {
+                    Some(NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(b), .. })) | Some(NodeKind::CompileEnd { begin: Some(b) }) => *b,
+                    _ => id,
+                };
                 if takes_input {
                     if self.graph.nodes.get(&from).map_or(false, |n| n.context == self.context && n.parent == parent) {
-                        self.graph.connect(from, id, 0);
+                        self.graph.connect(from, target, 0);
                         if self.graph.is_display(from) {
                             self.graph.set_display(id);
                         }
@@ -10798,7 +11761,7 @@ impl ProceduralFxStudioApp {
             .iter()
             .filter(|(_, n)| n.kind.is_material())
             .filter(|(_, n)| n.parent.is_none())
-            .map(|(mid, n)| (*mid, n.kind.label(*mid)))
+            .map(|(mid, n)| (*mid, n.title(*mid)))
             .collect();
         material_ids.sort_unstable();
         // An Attribute VOP's generated code and its Parameter VOPs' defaults.
@@ -10822,16 +11785,91 @@ impl ProceduralFxStudioApp {
         };
         // Group names on the node's input, for the Group field's menu (filled in on request).
         let group_choices = self.group_choices.as_ref().filter(|(for_id, ..)| *for_id == id).map(|(_, p, q)| (p.clone(), q.clone()));
+        let focus_rename = std::mem::take(&mut self.focus_rename);
+        // TOP nodes: what they can fetch or wedge, their items and the last cook's results.
+        let (fetch_targets, wedge_targets, top_preview) = match self.graph.nodes.get(&id).map(|n| &n.kind) {
+            Some(NodeKind::Top(_)) => {
+                let mut fetch: Vec<(NodeId, String)> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|(_, n)| matches!(n.kind, NodeKind::MoonRayRender { .. } | NodeKind::FileExport { .. }))
+                    .map(|(nid, n)| (*nid, n.title(*nid)))
+                    .collect();
+                fetch.sort_unstable();
+                let mut wedge: Vec<(NodeId, String, Vec<(usize, String)>)> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|(_, n)| !matches!(n.kind, NodeKind::Top(_) | NodeKind::TopNetwork))
+                    .filter_map(|(nid, n)| {
+                        let params: Vec<(usize, String)> = n.kind.animatable().into_iter().filter_map(|(t, name)| match t {
+                            ChannelTarget::Param(i) => Some((i, name)),
+                            _ => None,
+                        }).collect();
+                        (!params.is_empty()).then(|| (*nid, n.title(*nid), params))
+                    })
+                    .collect();
+                wedge.sort_by_key(|w| w.0);
+                (fetch, wedge, Some(self.graph.top_items(id)))
+            }
+            _ => (Vec::new(), Vec::new(), None),
+        };
+        let top_states = self.top_results.get(&id).cloned().unwrap_or_default();
+        // Object Merge: what it can merge (objects, and nodes inside other networks).
+        let merge_sources: Vec<(NodeId, String)> = if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::ObjectMerge { .. })) {
+            let own = self.graph.enclosing_geometry(id);
+            let mut list: Vec<(NodeId, String)> = self
+                .graph
+                .nodes
+                .iter()
+                .filter(|(nid, n)| n.context == AppContext::Obj && Some(**nid) != own && **nid != id)
+                .filter(|(_, n)| matches!(n.kind, NodeKind::Geometry { .. }) || (n.parent.is_some() && n.parent != own))
+                .map(|(nid, n)| {
+                    let label = match n.parent.and_then(|p| self.graph.nodes.get(&p).map(|o| o.title(p))) {
+                        Some(object) => format!("{object} / {}", n.title(*nid)),
+                        None => n.title(*nid),
+                    };
+                    (*nid, label)
+                })
+                .collect();
+            list.sort_by(|a, b| a.1.cmp(&b.1));
+            list
+        } else {
+            Vec::new()
+        };
+        let loop_begin_name = match self.graph.nodes.get(&id).map(|n| &n.kind) {
+            Some(NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(b), .. }) | NodeKind::CompileEnd { begin: Some(b) }) => self.graph.nodes.get(b).map(|n| n.title(*b)),
+            Some(NodeKind::ForEachBegin) | Some(NodeKind::CompileBegin) => self
+                .graph
+                .nodes
+                .iter()
+                .find(|(_, n)| matches!(n.kind, NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(b), .. }) | NodeKind::CompileEnd { begin: Some(b) } if b == id))
+                .map(|(e, n)| n.title(*e)),
+            _ => None,
+        };
+        let compiled_loop = matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(b), .. })) if self.graph.in_compile_block(*b));
+        let top_busy = self.top_run.is_some();
         let Some(node) = self.graph.nodes.get_mut(&id) else {
             return false;
         };
         let is_object = node.kind.is_object();
+        let title = node.title(id);
         ui.heading(match &node.kind {
-            NodeKind::Vop(v) => format!("{} · {}", v.def().label, v.label(id)),
-            NodeKind::ShaderNode(n) => format!("{} · {}", n.def().label, n.label(id)),
-            kind => kind.label(id),
+            NodeKind::Vop(v) => format!("{} · {title}", v.def().label),
+            NodeKind::ShaderNode(n) => format!("{} · {title}", n.def().label),
+            _ => title,
         });
         let mut c = false;
+        // Renaming: empty goes back to the generated name.
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            let field = ui.add(egui::TextEdit::singleline(&mut node.name).hint_text(node.kind.label(id)).desired_width(160.0));
+            if focus_rename {
+                field.request_focus();
+            }
+            c |= field.changed();
+        });
         ui.horizontal(|ui| {
             if is_object {
                 let mut active = !node.bypass;
@@ -10946,6 +11984,178 @@ impl ProceduralFxStudioApp {
                 }
                 ui.small("Double-click the node to enter; press U in the network to go back up.");
             }
+            NodeKind::CopNetwork => {
+                ui.small("A compositing network: double-click to build it from COP nodes. The viewport shows the display node's image while you're in IMG.");
+            }
+            NodeKind::TopNetwork => {
+                ui.small("A task graph: double-click to build it from TOP nodes, then cook the last node to run its work items.");
+            }
+            NodeKind::Cop(cop) => {
+                ui.small(cop.def().help);
+                let labels = cop.def().texts;
+                for (label, text) in labels.iter().zip(cop.texts.iter_mut()) {
+                    ui.horizontal(|ui| {
+                        ui.label(*label);
+                        c |= ui.add(egui::TextEdit::singleline(text).desired_width(200.0)).changed();
+                        if ui.button("…").clicked() {
+                            let dialog = FileDialog::new().add_filter("Images", &["exr", "hdr", "png", "jpg", "jpeg", "tif", "tiff", "tga", "bmp"]);
+                            let chosen = if cop.op == cops::OUTPUT { dialog.set_file_name("comp.$F4.exr").save_file() } else { dialog.pick_file() };
+                            if let Some(path) = chosen {
+                                *text = path.to_string_lossy().into_owned();
+                                c = true;
+                            }
+                        }
+                    });
+                }
+                let op = cop.op;
+                for (param, slot) in cop.param_mut() {
+                    match param.key {
+                        "mode" => {
+                            let mut mode = slot[0].round() as usize;
+                            egui::ComboBox::from_label("Mode").selected_text(cops::BLEND_MODES[mode.min(9)]).show_ui(ui, |ui| {
+                                for (value, label) in cops::BLEND_MODES.iter().enumerate() {
+                                    c |= ui.selectable_value(&mut mode, value, *label).changed();
+                                }
+                            });
+                            slot[0] = mode as f32;
+                        }
+                        "type" if op == 3 => {
+                            let mut kind = slot[0].round() as usize;
+                            ui.horizontal(|ui| {
+                                for (value, label) in cops::RAMP_TYPES.iter().enumerate() {
+                                    c |= ui.selectable_value(&mut kind, value, *label).changed();
+                                }
+                            });
+                            slot[0] = kind as f32;
+                        }
+                        _ => c |= shader_param_ui(ui, param, slot),
+                    }
+                }
+                if op == cops::OUTPUT {
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Write current frame").clicked() {
+                            self.cop_write_request = Some((id, false));
+                        }
+                        if ui.button("Write timeline range").on_hover_text("Put $F or $F4 in the file name for one file per frame").clicked() {
+                            self.cop_write_request = Some((id, true));
+                        }
+                    });
+                }
+            }
+            NodeKind::Top(top) => {
+                ui.small(top.def().help);
+                let op = top.op;
+                // Node pickers: what to fetch, or which node's parameter to wedge.
+                if op == tops::FETCH {
+                    let current = top.node();
+                    let shown = current.and_then(|n| fetch_targets.iter().find(|(t, _)| *t == n)).map_or("(choose)".to_owned(), |(_, name)| name.clone());
+                    egui::ComboBox::from_label("Fetch").selected_text(shown).show_ui(ui, |ui| {
+                        for (target, name) in &fetch_targets {
+                            if ui.selectable_label(current == Some(*target), name).clicked() {
+                                top.set("node", *target as f32);
+                                c = true;
+                            }
+                        }
+                    });
+                    if fetch_targets.is_empty() {
+                        ui.small("Add a MoonRay render node (OUT) or a File Export node (in a geometry network) to fetch.");
+                    }
+                }
+                if op == tops::WEDGE {
+                    let current = top.node();
+                    let shown = current.and_then(|n| wedge_targets.iter().find(|(t, ..)| *t == n)).map_or("(none: attribute only)".to_owned(), |(_, name, _)| name.clone());
+                    egui::ComboBox::from_label("Node").selected_text(shown).height(400.0).show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), "(none: attribute only)").clicked() {
+                            top.set("node", -1.0);
+                            c = true;
+                        }
+                        for (target, name, _) in &wedge_targets {
+                            if ui.selectable_label(current == Some(*target), name).clicked() {
+                                top.set("node", *target as f32);
+                                c = true;
+                            }
+                        }
+                    });
+                    if let Some((_, _, params)) = current.and_then(|n| wedge_targets.iter().find(|(t, ..)| *t == n)) {
+                        let mut param = top.v("param") as usize;
+                        let shown = params.iter().find(|(i, _)| *i == param).map_or("(choose)".to_owned(), |(_, n)| n.clone());
+                        egui::ComboBox::from_label("Parameter").selected_text(shown).height(400.0).show_ui(ui, |ui| {
+                            for (i, name) in params {
+                                c |= ui.selectable_value(&mut param, *i, name).changed();
+                            }
+                        });
+                        top.set("param", param as f32);
+                    }
+                }
+                let labels = top.def().texts;
+                for (label, text) in labels.iter().zip(top.texts.iter_mut()) {
+                    ui.label(*label);
+                    c |= ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY)).changed();
+                }
+                if matches!(op, tops::FETCH | tops::COMMAND) {
+                    ui.small("Tokens: $F / $F4 frame, @index, @wedgeindex, @<wedge attribute>, {input} (the item's input files).");
+                }
+                let def = top.def();
+                for (i, param) in def.params.iter().enumerate() {
+                    if param.key == "node" || param.key == "param" {
+                        continue;
+                    }
+                    let mut v = top.values[i];
+                    if let shading::Kind::Float(min, max) = param.kind {
+                        if matches!(param.key, "count" | "start" | "end" | "step") && op != tops::WEDGE || param.key == "count" || param.key == "step" {
+                            let mut whole = v.round() as i64;
+                            c |= ui.add(egui::DragValue::new(&mut whole).range(min as i64..=max as i64).prefix(format!("{}: ", param.label))).changed();
+                            v = whole as f32;
+                        } else {
+                            c |= ui.add(egui::DragValue::new(&mut v).speed(0.01).range(min..=max).prefix(format!("{}: ", param.label))).changed();
+                        }
+                    }
+                    top.values[i] = v;
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!top_busy, egui::Button::new("▶ Cook")).on_hover_text("Runs this node's work items (and its inputs' first)").clicked() {
+                        self.top_cook_request = Some(id);
+                    }
+                    if ui.add_enabled(top_busy, egui::Button::new("■ Cancel")).clicked() {
+                        self.top_cancel_request = true;
+                    }
+                });
+                match &top_preview {
+                    Some(Err(e)) => {
+                        ui.colored_label(egui::Color32::from_rgb(240, 120, 100), e);
+                    }
+                    Some(Ok(items)) => {
+                        let done = top_states.iter().filter(|s| s.0 == tops::State::Done).count();
+                        let failed = top_states.iter().filter(|s| s.0 == tops::State::Failed).count();
+                        ui.label(format!("{} work items{}", items.len(), if top_states.is_empty() { String::new() } else { format!(" · {done} done · {failed} failed") }));
+                        egui::ScrollArea::vertical().max_height(260.0).id_salt(("top_items", id)).show(ui, |ui| {
+                            for (i, item) in items.iter().take(500).enumerate() {
+                                let (state, log) = top_states.get(i).cloned().unwrap_or((tops::State::Waiting, String::new()));
+                                let colour = top_state_colour(state);
+                                let mut line = format!("#{} · frame {}", item.index, item.frame);
+                                for (name, value) in &item.attrs {
+                                    line += &format!(" · {name} {value}");
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(colour, "●");
+                                    ui.label(line);
+                                })
+                                .response
+                                .on_hover_text(match &item.job {
+                                    tops::Job::Shell(cmd) => format!("{cmd}\n{log}"),
+                                    _ if !log.is_empty() => log.clone(),
+                                    _ => item.output.clone(),
+                                });
+                                if !item.output.is_empty() {
+                                    ui.small(&item.output);
+                                }
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            }
             NodeKind::Shader(values) => {
                 ui.small(match values.table {
                     shading::Table::Principled => "Physically based surface (MoonRay DwaBaseMaterial). Assign it from a Geometry node.",
@@ -11010,16 +12220,44 @@ impl ProceduralFxStudioApp {
                     }
                 }
             }
-            NodeKind::Add { count, spacing, layout } => {
-                ui.label("Create points for attribute workflows and Copy to Points.");
-                c |= ui.add(egui::Slider::new(count, 1..=100_000).logarithmic(true).text("Point count")).changed();
-                c |= ui.add(egui::Slider::new(spacing, 0.01..=10.0).logarithmic(true).text("Spacing")).changed();
-                ui.horizontal(|ui| {
-                    ui.label("Layout");
-                    c |= ui.selectable_value(layout, 0, "Line").changed();
-                    c |= ui.selectable_value(layout, 1, "Vertical").changed();
-                    c |= ui.selectable_value(layout, 2, "Grid").changed();
-                });
+            NodeKind::Add { count, spacing, layout, points, delete_geometry } => {
+                ui.small("Adds points (to the input, if one is connected): at the positions below, and/or a line or grid of them.");
+                c |= ui.checkbox(delete_geometry, "Delete geometry but keep the points").on_hover_text("Removes the input's polygons, leaving its points").changed();
+                ui.separator();
+                ui.strong("Points");
+                let mut remove = None;
+                for (i, p) in points.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{i}"));
+                        for k in 0..3 {
+                            c |= ui.add(egui::DragValue::new(&mut p[k]).speed(0.01)).changed();
+                        }
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    points.remove(i);
+                    c = true;
+                }
+                if ui.button("➕ Add point").clicked() {
+                    let next = points.last().map_or([0.0; 3], |p| [p[0] + 1.0, p[1], p[2]]);
+                    points.push(next);
+                    c = true;
+                }
+                ui.separator();
+                ui.strong("Pattern");
+                c |= ui.add(egui::Slider::new(count, 0..=100_000).logarithmic(true).text("Point count")).on_hover_text("0: no pattern").changed();
+                if *count > 0 {
+                    c |= ui.add(egui::Slider::new(spacing, 0.01..=10.0).logarithmic(true).text("Spacing")).changed();
+                    ui.horizontal(|ui| {
+                        ui.label("Layout");
+                        c |= ui.selectable_value(layout, 0, "Line").changed();
+                        c |= ui.selectable_value(layout, 1, "Vertical").changed();
+                        c |= ui.selectable_value(layout, 2, "Grid").changed();
+                    });
+                }
             }
             NodeKind::Grid { size, res } => {
                 c |= ui.add(egui::Slider::new(size, 0.5..=20.0).text("Size")).changed();
@@ -11896,6 +13134,167 @@ impl ProceduralFxStudioApp {
                     ui.small("Exact keeps sharp edges. Use Volume for very dense or leaky meshes.");
                 }
             }
+            NodeKind::Measure(set) => {
+                egui::ComboBox::from_label("Measure").selected_text(measure::KINDS[set.kind.min(6)]).show_ui(ui, |ui| {
+                    for (value, label) in measure::KINDS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.kind, value, *label).changed();
+                    }
+                });
+                ui.small(match set.kind {
+                    0 => "Each primitive's area (prim attribute).",
+                    1 => "Each primitive's perimeter; the Sum summary is the mesh's open boundary length.",
+                    2 => "Each point's share of the surface area.",
+                    3 => "Per point: mean curvature (1/radius on a sphere, + convex) or Gaussian (1/radius², 0 on flat or cylinders).",
+                    4 => "Per point: the gradient (direction and rate of fastest increase) of a float attribute, as a vector.",
+                    5 => "The volume of the closed mesh (detail attribute).",
+                    _ => "Per point: the length of the curve it's on.",
+                });
+                if set.kind == 3 {
+                    ui.horizontal(|ui| {
+                        for (value, label) in measure::CURVATURES.iter().enumerate() {
+                            c |= ui.selectable_value(&mut set.curvature, value, *label).changed();
+                        }
+                    });
+                }
+                if set.kind == 4 {
+                    ui.horizontal(|ui| {
+                        ui.label("Of attribute");
+                        c |= ui.add(egui::TextEdit::singleline(&mut set.source).desired_width(120.0)).changed();
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Output name");
+                    let hint = set.output_name();
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.name).hint_text(hint).desired_width(120.0)).changed();
+                });
+                if set.kind != 5 {
+                    egui::ComboBox::from_label("Detail summary").selected_text(measure::SUMMARIES[set.summary.min(4)]).show_ui(ui, |ui| {
+                        for (value, label) in measure::SUMMARIES.iter().enumerate() {
+                            c |= ui.selectable_value(&mut set.summary, value, *label).changed();
+                        }
+                    });
+                }
+            }
+            NodeKind::ForEachBegin | NodeKind::CompileBegin => {
+                ui.small(if matches!(node.kind, NodeKind::ForEachBegin) {
+                    "Puts out each iteration's geometry (detail attributes iteration, numiterations and value). Set the loop up on its For-Each End."
+                } else {
+                    "Start of a Compile Block: For-Each loops inside it run on several threads, and the block's result is cached."
+                });
+                if let Some(end) = &loop_begin_name {
+                    ui.label(format!("Ends at {end}"));
+                }
+            }
+            NodeKind::ForEachEnd(set) => {
+                ui.small("Runs the nodes between its For-Each Begin and here once per iteration, merging the results (or feeding each result to the next, for feedback).");
+                egui::ComboBox::from_label("Loop over").selected_text(flow::MODES[set.mode.min(5)]).show_ui(ui, |ui| {
+                    for (value, label) in flow::MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.mode, value, *label).changed();
+                    }
+                });
+                match set.mode {
+                    flow::NAMED => {
+                        ui.horizontal(|ui| {
+                            ui.label("Piece attribute");
+                            c |= ui.add(egui::TextEdit::singleline(&mut set.attribute).hint_text("name").desired_width(120.0)).changed();
+                        });
+                        ui.small("A primitive or point attribute, e.g. piece (Material Fracture) or name.");
+                    }
+                    flow::NUMBER | flow::FEEDBACK => {
+                        c |= ui.add(egui::DragValue::new(&mut set.iterations).range(0..=100_000).prefix("Iterations: ")).changed();
+                        c |= ui.add(egui::DragValue::new(&mut set.start).speed(0.1).prefix("Start value: ")).changed();
+                        c |= ui.add(egui::DragValue::new(&mut set.increment).speed(0.1).prefix("Increment: ")).changed();
+                    }
+                    _ => {}
+                }
+                let mut single = set.single_pass >= 0;
+                ui.horizontal(|ui| {
+                    c |= ui.checkbox(&mut single, "Single pass").on_hover_text("Run only one iteration, to check it").changed();
+                    if single {
+                        let mut pass = set.single_pass.max(0);
+                        c |= ui.add(egui::DragValue::new(&mut pass).range(0..=1_000_000)).changed();
+                        set.single_pass = pass;
+                    } else {
+                        set.single_pass = -1;
+                    }
+                });
+                if set.mode != flow::FEEDBACK {
+                    c |= ui.checkbox(&mut set.multithread, "Multithread when compiled").changed();
+                    ui.small(if compiled_loop { "This loop is inside a Compile Block: iterations run in parallel." } else { "Put the loop inside a Compile Block to run its iterations in parallel." });
+                }
+                match &loop_begin_name {
+                    Some(begin) => ui.label(format!("Begins at {begin}")),
+                    None => ui.colored_label(egui::Color32::from_rgb(240, 120, 100), "No For-Each Begin: add the loop again from Flow Control."),
+                };
+            }
+            NodeKind::CompileEnd { .. } => {
+                ui.small("End of a Compile Block: the block cooks as a unit, its result is cached, and For-Each loops inside it run on several threads.");
+                if let Some(begin) = &loop_begin_name {
+                    ui.label(format!("Begins at {begin}"));
+                }
+            }
+            NodeKind::ObjectMerge { sources, into_this } => {
+                ui.small("Brings in other objects' geometry (their display node), or any node in another network.");
+                let mut remove = None;
+                for (i, source) in sources.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let shown = source.and_then(|s| merge_sources.iter().find(|(n, _)| *n == s)).map_or("(choose)".to_owned(), |(_, l)| l.clone());
+                        egui::ComboBox::from_id_salt(("object_merge", id, i)).selected_text(shown).height(400.0).width(220.0).show_ui(ui, |ui| {
+                            for (n, label) in &merge_sources {
+                                if ui.selectable_label(*source == Some(*n), label).clicked() {
+                                    *source = Some(*n);
+                                    c = true;
+                                }
+                            }
+                        });
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    sources.remove(i);
+                    c = true;
+                }
+                if ui.button("➕ Add object").clicked() {
+                    sources.push(None);
+                    c = true;
+                }
+                c |= ui.checkbox(into_this, "Into this object").on_hover_text("Keep each object's position in the scene (off: its geometry as built, without its transform)").changed();
+            }
+            NodeKind::MaterialAssign { slots } => {
+                ui.small("Assigns MAT materials to parts of the geometry: each slot's group (empty: everything) gets its material, overriding the object's. Later slots win.");
+                let mut remove = None;
+                for (i, (group, material)) in slots.iter_mut().enumerate() {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Group {}", i + 1));
+                        c |= ui.add(egui::TextEdit::singleline(group).hint_text("all").desired_width(120.0)).changed();
+                        if ui.small_button("✕").on_hover_text("Remove this slot").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    let shown = material.and_then(|m| material_ids.iter().find(|(mid, _)| *mid == m)).map_or("(object's material)".to_owned(), |(_, name)| name.clone());
+                    ui.horizontal(|ui| {
+                        ui.label("Material");
+                        egui::ComboBox::from_id_salt(("material_slot", id, i)).selected_text(shown).show_ui(ui, |ui| {
+                            c |= ui.selectable_value(material, None, "(object's material)").changed();
+                            for (mid, name) in &material_ids {
+                                c |= ui.selectable_value(material, Some(*mid), name).changed();
+                            }
+                        });
+                    });
+                }
+                if let Some(i) = remove {
+                    slots.remove(i);
+                    c = true;
+                }
+                if ui.button("➕ Add slot").clicked() {
+                    slots.push((String::new(), None));
+                    c = true;
+                }
+                ui.small("Groups: names (from Group Create or Boolean's a_faces/b_faces), ranges like 0-99, or @Cd.r>0.5. Make materials in the MAT context.");
+            }
             NodeKind::MaterialFracture(set) => {
                 ui.small("Breaks a closed mesh into pieces for the RBD Solver. Pieces get `piece`; cut faces are in the `inside` group, the original surface in `outside`.");
                 egui::ComboBox::from_label("Material").selected_text(fracture::MATERIALS[set.material.min(2)]).show_ui(ui, |ui| {
@@ -12636,13 +14035,13 @@ impl ProceduralFxStudioApp {
                 if let Some(open) = self.network() {
                     if let Some(outer) = self.parent_network() {
                         ui.label("›");
-                        let outer_label = self.graph.nodes.get(&outer).map_or_else(String::new, |n| n.kind.label(outer));
+                        let outer_label = self.graph.nodes.get(&outer).map_or_else(String::new, |n| n.title(outer));
                         if ui.selectable_label(false, outer_label).clicked() {
                             self.enter_network(Some(outer));
                         }
                     }
                     ui.label("›");
-                    ui.strong(self.graph.nodes.get(&open).map_or_else(String::new, |n| n.kind.label(open)));
+                    ui.strong(self.graph.nodes.get(&open).map_or_else(String::new, |n| n.title(open)));
                     if ui.small_button("⬆ Up").on_hover_text("Back to the containing network (U)").clicked() {
                         let outer = self.parent_network();
                         self.enter_network(outer);
@@ -12693,12 +14092,45 @@ impl ProceduralFxStudioApp {
             if let Some(p) = canvas.interact_pointer_pos() {
                 self.menu_pos = p;
             }
+            self.menu_query.clear();
         }
         let menu_pos = self.menu_pos;
         let templates = self.templates_for_view();
+        let zoom = self.graph_zoom;
+        let mut query = std::mem::take(&mut self.menu_query);
         canvas.clone().context_menu(|ui| {
-            for (cat, kinds) in templates {
-                ui.menu_button(cat, |ui| {
+            let at = egui::pos2((menu_pos.x - origin.x) / zoom, (menu_pos.y - origin.y) / zoom);
+            // Type straight away to search every category.
+            let field = ui.add(egui::TextEdit::singleline(&mut query).hint_text("Search nodes…").desired_width(180.0));
+            field.request_focus();
+            if !query.trim().is_empty() {
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let found: Vec<(&str, &NodeKind)> = templates
+                    .iter()
+                    .flat_map(|(cat, kinds)| kinds.iter().map(move |k| (*cat, k)))
+                    .filter(|(cat, k)| node_matches(k, cat, &query))
+                    .collect();
+                if found.is_empty() {
+                    ui.weak("No matching nodes");
+                }
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (i, (cat, kind)) in found.iter().enumerate() {
+                        let button = ui.button(format!("{}   ({cat})", kind.menu_name()));
+                        let button = match kind.menu_help() {
+                            Some(help) => button.on_hover_text(help),
+                            None => button,
+                        };
+                        if button.clicked() || (enter && i == 0) {
+                            actions.push(Action::Add((*kind).clone(), at));
+                            ui.close_menu();
+                        }
+                    }
+                });
+                return;
+            }
+            ui.separator();
+            for (cat, kinds) in &templates {
+                ui.menu_button(*cat, |ui| {
                     for kind in kinds {
                         let button = ui.button(kind.menu_name());
                         let button = match kind.menu_help() {
@@ -12706,19 +14138,14 @@ impl ProceduralFxStudioApp {
                             None => button,
                         };
                         if button.clicked() {
-                            actions.push(Action::Add(
-                                kind,
-                                egui::pos2(
-                                    (menu_pos.x - origin.x) / self.graph_zoom,
-                                    (menu_pos.y - origin.y) / self.graph_zoom,
-                                ),
-                            ));
+                            actions.push(Action::Add(kind.clone(), at));
                             ui.close_menu();
                         }
                     }
                 });
             }
         });
+        self.menu_query = query;
 
         // Wires (only within current context)
         for l in &self.graph.links {
@@ -12776,6 +14203,11 @@ impl ProceduralFxStudioApp {
             resp.clone().context_menu(|ui| {
                 if is_geometry && ui.button("Enter (double-click)").clicked() {
                     actions.push(Action::Enter(id));
+                    ui.close_menu();
+                }
+                if ui.button("Rename (F2)").clicked() {
+                    self.selected = Some(id);
+                    self.focus_rename = true;
                     ui.close_menu();
                 }
                 let display_label = if is_object { "Toggle Active / Activate Camera" } else { "Set Display Flag" };
@@ -12899,7 +14331,7 @@ impl ProceduralFxStudioApp {
                 );
                 painter.circle_filled(rect.right_center() - egui::vec2(14.0 * self.graph_zoom, 0.0), 6.0 * self.graph_zoom, swatch);
             }
-            let label = format!("{}{}", node.kind.label(id), if node.bypass { " (byp)" } else { "" });
+            let label = format!("{}{}", node.title(id), if node.bypass { " (byp)" } else { "" });
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -12907,6 +14339,19 @@ impl ProceduralFxStudioApp {
                 egui::FontId::proportional(14.0),
                 egui::Color32::WHITE,
             );
+            // TOP nodes: a dot per work item from the last cook, like Houdini's.
+            if let Some(states) = self.top_results.get(&id).filter(|_| matches!(node.kind, NodeKind::Top(_))) {
+                let r = 3.0 * self.graph_zoom;
+                let per_row = ((rect.width() / (r * 2.6)).floor() as usize).max(1);
+                for (i, (state, _)) in states.iter().take(per_row * 2).enumerate() {
+                    let (col, row) = (i % per_row, i / per_row);
+                    let p = egui::pos2(rect.left() + r * 1.6 + col as f32 * r * 2.6, rect.bottom() + r * 2.0 + row as f32 * r * 2.6);
+                    painter.circle_filled(p, r, top_state_colour(*state));
+                }
+                if states.len() > per_row * 2 {
+                    painter.text(egui::pos2(rect.right(), rect.bottom() + r * 4.6), egui::Align2::RIGHT_CENTER, format!("+{}", states.len() - per_row * 2), egui::FontId::proportional(10.0 * self.graph_zoom), egui::Color32::from_gray(190));
+                }
+            }
             for slot in 0..n_in {
                 let ip = in_port(rect, slot, n_in);
                 let hot = self.dragging_link.is_some() && pointer.map_or(false, |p| p.distance(ip) < 16.0);
@@ -12962,6 +14407,10 @@ impl ProceduralFxStudioApp {
             }
         }
 
+        // F2: rename the selected node (in the parameters pane).
+        if pointer_in && !typing && self.selected.is_some() && ui.input(|i| i.key_pressed(egui::Key::F2)) {
+            self.focus_rename = true;
+        }
         // TAB: searchable add-node menu (auto-wires below the selected node)
         if pointer_in && !typing && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
             self.tab_open = true;
@@ -12969,12 +14418,12 @@ impl ProceduralFxStudioApp {
             self.tab_pos = pointer.unwrap_or(canvas.rect.center());
         }
         if self.tab_open {
-            let q = self.tab_query.to_lowercase();
+            let q = self.tab_query.clone();
+            let q = q.as_str();
             let matches: Vec<NodeKind> = self
                 .templates_for_view()
                 .into_iter()
-                .flat_map(|(_, k)| k)
-                .filter(|k| k.name().contains(&q) || k.menu_name().to_lowercase().contains(&q))
+                .flat_map(|(cat, kinds)| kinds.into_iter().filter(move |k| node_matches(k, cat, q)))
                 .collect();
             let selected = self.selected.filter(|id| self.graph.nodes.contains_key(id));
             let tab_pos = self.tab_pos;
@@ -13018,6 +14467,12 @@ impl ProceduralFxStudioApp {
         let (response, painter) =
             ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(self.viewport_bg));
+        // IMG: the viewport shows the composite.
+        if self.context == AppContext::Img {
+            let _ = ctx;
+            self.image_view(ui, &response, &painter.with_clip_rect(response.rect));
+            return;
+        }
 
         // Restrict painter rendering strictly to the viewport rectangle
         let painter = painter.with_clip_rect(response.rect);
@@ -13397,7 +14852,7 @@ impl ProceduralFxStudioApp {
                 groups::GroupDomain::Points => (self.selected_vertices.len(), "points"),
                 groups::GroupDomain::Prims => (self.selected_triangles.len(), "primitives"),
             };
-            let name = self.graph.nodes.get(&pick.node).map_or(String::new(), |n| n.kind.label(pick.node));
+            let name = self.graph.nodes.get(&pick.node).map_or(String::new(), |n| n.title(pick.node));
             painter.text(
                 response.rect.center_top() + egui::vec2(0.0, 14.0),
                 egui::Align2::CENTER_TOP,
@@ -14217,7 +15672,7 @@ impl ProceduralFxStudioApp {
             None => "No display node — enter a geometry node and double-click a node".to_string(),
             Some(id) => format!(
                 "{}  |  {} pts  {} tris  |  cook {:.1} ms  |  t = {:.2}  |  cache {}/{} \n{}{}",
-                self.graph.nodes.get(&id).map_or_else(|| format!("?{id}"), |n| n.kind.label(id)),
+                self.graph.nodes.get(&id).map_or_else(|| format!("?{id}"), |n| n.title(id)),
                 mesh.vertices.len(),
                 mesh.indices.len(),
                 self.cook_ms,
@@ -14548,6 +16003,16 @@ impl eframe::App for ProceduralFxStudioApp {
 
         self.poll_moonray_render();
         self.advance_sequence();
+        if let Some(id) = self.top_cook_request.take() {
+            self.start_top_cook(id);
+        }
+        if self.top_run.is_some() || self.top_cancel_request {
+            self.advance_top_run();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some((id, range)) = self.cop_write_request.take() {
+            self.status = self.write_cop_output(id, range).unwrap_or_else(|e| format!("File Output failed: {e}"));
+        }
 
         if self.dirty || self.simulation_rx.is_some() {
             self.rebuild_graph();
@@ -14629,7 +16094,7 @@ impl eframe::App for ProceduralFxStudioApp {
                 .graph
                 .nodes
                 .get(&node_id)
-                .map(|node| node.kind.label(node_id))
+                .map(|node| node.title(node_id))
                 .unwrap_or_else(|| format!("Node {node_id}"));
             let mut cache = HashMap::new();
             let mesh = self.graph.cook(node_id, self.time, &mut cache);
@@ -16213,7 +17678,7 @@ mod shader_render_tests {
                 .args(["-in", rdla.to_str().unwrap(), "-out", exr.to_str().unwrap()])
                 .output()
                 .unwrap();
-            let label = app.graph.nodes[&material].kind.label(material);
+            let label = app.graph.nodes[&material].title(material);
             let log = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
             assert!(run.status.success(), "{label}: {log}");
             for bad in ["Error", "ERROR", "does not exist", "no attribute", "Unknown"] {
@@ -16315,7 +17780,7 @@ mod fx_node_tests {
         assert!(count >= 4, "{count} pieces");
 
         // Crowd: agents from a few points, walking.
-        let starts = g.add(NodeKind::Add { count: 6, spacing: 1.0, layout: 2 }, egui::pos2(0.0, 0.0));
+        let starts = g.add(NodeKind::Add { count: 6, spacing: 1.0, layout: 2, points: Vec::new(), delete_geometry: false }, egui::pos2(0.0, 0.0));
         let crowd_node = g.add(NodeKind::CrowdSolver(crowd::CrowdSettings::defaults()), egui::pos2(0.0, 0.0));
         g.connect(starts, crowd_node, 0);
         assert!(g.time_dependent(crowd_node));
@@ -16404,7 +17869,7 @@ mod kinefx_node_tests {
         g.connect(walk, ik, 0);
         assert!(g.time_dependent(ik));
         // A "body": points down the left leg.
-        let body = g.add(NodeKind::Add { count: 20, spacing: 0.045, layout: 1 }, egui::pos2(0.0, 0.0));
+        let body = g.add(NodeKind::Add { count: 20, spacing: 0.045, layout: 1, points: Vec::new(), delete_geometry: false }, egui::pos2(0.0, 0.0));
         let place = g.add(NodeKind::Transform { t: [0.13, 0.08, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
         g.connect(body, place, 0);
         let capture = g.add(NodeKind::JointCapture(kinefx::CaptureSettings::defaults()), egui::pos2(0.0, 0.0));
@@ -16514,5 +17979,445 @@ mod gizmo_tests {
         // Nodes without a gizmo, and other contexts, have none.
         app.selected = Some(app.graph.add(NodeKind::Merge, egui::pos2(0.0, 0.0)));
         assert!(app.gizmo_target().is_none());
+    }
+}
+
+#[cfg(test)]
+mod material_sop_tests {
+    use super::*;
+
+    #[test]
+    fn material_nodes_assign_materials_to_groups() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let red = app.graph.add(NodeKind::Material { kind: 0, color: [1.0, 0.0, 0.0], roughness: 0.5, value: 0.5 }, egui::pos2(0.0, 0.0));
+        let gold = app.graph.add(NodeKind::Shader(shading::Values::preset(shading::Table::Principled, 8)), egui::pos2(0.0, 0.0));
+        for m in [red, gold] {
+            app.graph.nodes.get_mut(&m).unwrap().context = AppContext::Mat;
+        }
+        let geo = app.graph.add(NodeKind::Geometry { material: Some(red) }, egui::pos2(0.0, 0.0));
+        let child = |app: &mut ProceduralFxStudioApp, kind: NodeKind| {
+            let id = app.graph.add(kind, egui::pos2(0.0, 0.0));
+            app.graph.nodes.get_mut(&id).unwrap().parent = Some(geo);
+            id
+        };
+        let grid = child(&mut app, NodeKind::Grid { size: 2.0, res: 4 });
+        let assign = child(&mut app, NodeKind::MaterialAssign { slots: vec![("0-5".into(), Some(gold))] });
+        app.graph.connect(grid, assign, 0);
+        app.graph.set_display(assign);
+        let cooked = app.graph.cook(assign, 0.0, &mut HashMap::new());
+        let ids = &cooked.point_attributes[PRIM_MATERIAL];
+        assert_eq!(ids.len(), 18);
+        assert!(ids[..6].iter().all(|v| *v == gold as f32 + 1.0) && ids[6..].iter().all(|v| *v == 0.0));
+        // Render: two parts, gold on the group and the object's red on the rest.
+        app.render_at = Some(0.0);
+        let scene = app.render_scene().unwrap();
+        let mut parts: Vec<(usize, Option<NodeId>)> = scene.parts.iter().map(|(m, pm)| (m.indices.len(), match pm { PartMaterial::Node(n) => Some(*n), _ => None })).collect();
+        parts.sort();
+        assert_eq!(parts, vec![(6, Some(gold)), (12, Some(red))]);
+        // Viewport: each primitive shows its own material's colour.
+        let shown = app.graph.cook_display(&[geo], 0.0, &mut HashMap::new());
+        let cd = &shown.point_attributes["prim:Cd"];
+        assert!(cd[0] > 0.9 && cd[1] > 0.6, "gold first: {:?}", &cd[..3]);
+        assert_eq!(&cd[17 * 3..], &[1.0, 0.0, 0.0], "the rest is the object's red");
+        // USD: one Mesh child per material.
+        let import = app.graph.add(NodeKind::LopSopImport { geometry: Some(geo), path: "/geo".into() }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&import).unwrap().context = AppContext::Stage;
+        let stage = app.graph.cook_stage(import, 0.0, &mut HashMap::new());
+        let meshes: Vec<String> = stage.flatten().into_iter().map(|(path, ..)| path).collect();
+        assert_eq!(meshes.len(), 2, "{meshes:?}");
+        assert!(meshes.iter().any(|p| p == &format!("/geo/mat{gold}")));
+        // Saved and loaded with its groups, materials and node names.
+        app.graph.nodes.get_mut(&assign).unwrap().name = "shirt_materials".into();
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        assert!(matches!(&loaded.nodes[&assign].kind, NodeKind::MaterialAssign { slots } if slots == &vec![("0-5".to_owned(), Some(gold))]));
+        assert_eq!(loaded.nodes[&assign].title(assign), "shirt_materials");
+        assert_eq!(loaded.nodes[&grid].title(grid), format!("grid{grid}"));
+        // A later Material node with an empty group overrides everything.
+        let all = child(&mut app, NodeKind::MaterialAssign { slots: vec![(String::new(), Some(red))] });
+        app.graph.connect(assign, all, 0);
+        let every = app.graph.cook(all, 0.0, &mut HashMap::new());
+        assert!(every.point_attributes[PRIM_MATERIAL].iter().all(|v| *v == red as f32 + 1.0));
+    }
+
+    #[test]
+    fn geometry_menus_have_no_shading_networks_and_search_matches_words() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        app.apply(Action::Enter(geo));
+        let menus = app.templates_for_view();
+        let kinds: Vec<&NodeKind> = menus.iter().flat_map(|(_, k)| k).collect();
+        assert!(kinds.iter().all(|k| !matches!(k, NodeKind::ShaderNode(_) | NodeKind::Shader(_) | NodeKind::MaterialBuilder | NodeKind::Material { .. })));
+        assert!(kinds.iter().any(|k| matches!(k, NodeKind::MaterialAssign { .. })));
+        assert!(!menus.iter().any(|(c, _)| *c == shading::CATEGORY));
+        let find = |q: &str| menus.iter().flat_map(|(c, ks)| ks.iter().map(move |k| (*c, k))).filter(|(c, k)| node_matches(k, c, q)).map(|(_, k)| k.menu_name()).collect::<Vec<_>>();
+        assert!(find("noise").iter().any(|n| n == "noise"));
+        assert!(find("terrain erode").iter().any(|n| n == "terrain_erode"));
+        assert!(find("terrainerode").iter().any(|n| n == "terrain_erode"));
+        assert!(find("kinefx ik").iter().any(|n| n == "two_bone_ik"), "category words match too");
+        assert!(find("zzzz").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod material_sop_point_group_tests {
+    use super::*;
+
+    #[test]
+    fn point_group_names_select_their_primitives() {
+        let mut grid = node_grid(2.0, 2.0, 3, 3);
+        // Points of the first row of quads.
+        grid.point_attributes.insert("group:bottom".into(), (0..9).map(|i| (i < 6) as u8 as f32).collect());
+        let out = material_assign(&grid, &[("bottom".into(), Some(4))]).unwrap();
+        let ids = &out.point_attributes[PRIM_MATERIAL];
+        // The first row of quads: four triangles.
+        assert_eq!(ids, &vec![5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0]);
+        // Primitive groups by name work directly.
+        let mut tagged = grid.clone();
+        tagged.point_attributes.insert("prim:group:roof".into(), vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+        let out = material_assign(&tagged, &[("roof".into(), Some(1))]).unwrap();
+        assert_eq!(out.point_attributes[PRIM_MATERIAL], vec![0.0, 0.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod img_tasks_tests {
+    use super::*;
+
+    fn inside(app: &mut ProceduralFxStudioApp, net: NodeId, context: AppContext, kind: NodeKind) -> NodeId {
+        let id = app.graph.add(kind, egui::pos2(0.0, 0.0));
+        let n = app.graph.nodes.get_mut(&id).unwrap();
+        n.context = context;
+        n.parent = Some(net);
+        id
+    }
+
+    fn cop(label: &str) -> NodeKind {
+        NodeKind::Cop(cops::CopNode::new(cops::OPS.iter().position(|o| o.label == label).unwrap()))
+    }
+
+    fn top(op: usize) -> tops::TopNode {
+        tops::TopNode::new(op)
+    }
+
+    #[test]
+    fn cop_networks_composite_and_show_in_img() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        app.context = AppContext::Img;
+        // Only the COP Network at the top of IMG.
+        let top_menu: Vec<NodeKind> = app.templates_for_view().into_iter().flat_map(|(_, k)| k).collect();
+        assert!(matches!(top_menu.as_slice(), [NodeKind::CopNetwork]));
+        app.apply(Action::Add(NodeKind::CopNetwork, egui::pos2(0.0, 0.0)));
+        let net = app.selected.unwrap();
+        assert_eq!(app.graph.nodes[&net].context, AppContext::Img);
+        app.apply(Action::Enter(net));
+        assert_eq!(app.context, AppContext::Img);
+        let menu: Vec<NodeKind> = app.templates_for_view().into_iter().flat_map(|(_, k)| k).collect();
+        assert_eq!(menu.len(), cops::OPS.len());
+        assert!(menu.iter().all(|k| matches!(k, NodeKind::Cop(_))));
+        // Constant + Ramp, composited and blurred.
+        let mut fg = cops::CopNode::new(2);
+        fg.values = vec![1.0, 0.0, 0.0, 0.5, 64.0, 32.0];
+        let a = inside(&mut app, net, AppContext::Img, NodeKind::Cop(fg));
+        let b = inside(&mut app, net, AppContext::Img, cop("Ramp"));
+        let comp = inside(&mut app, net, AppContext::Img, cop("Composite"));
+        let blur = inside(&mut app, net, AppContext::Img, cop("Blur"));
+        app.graph.connect(a, comp, 0);
+        app.graph.connect(b, comp, 1);
+        app.graph.connect(comp, blur, 0);
+        app.graph.set_display(blur);
+        let out = cops::Image::from_mesh(&app.graph.cook(net, 0.0, &mut HashMap::new())).expect("an image");
+        assert_eq!((out.w, out.h), (64, 32));
+        assert!(node_errors(|e| e.get(&blur).cloned()).is_none());
+        assert_eq!(app.view_displays(), vec![blur]);
+        // Missing input is an error; OBJ menus have no COPs or TOPs.
+        let lonely = inside(&mut app, net, AppContext::Img, cop("Invert"));
+        app.graph.cook(lonely, 0.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&lonely).cloned()).unwrap().contains("input 1"));
+        app.enter_network(None);
+        app.context = AppContext::Obj;
+        let obj: Vec<NodeKind> = app.templates_for_view().into_iter().flat_map(|(_, k)| k).collect();
+        assert!(obj.iter().all(|k| !matches!(k, NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::CopNetwork | NodeKind::TopNetwork)));
+        // Saved with contexts.
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        assert_eq!(loaded.nodes[&blur].context, AppContext::Img);
+        assert_eq!(format!("{:?}", loaded.nodes[&a].kind), format!("{:?}", app.graph.nodes[&a].kind));
+    }
+
+    #[test]
+    fn top_networks_wedge_and_fetch_exports() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        // Geometry: a box whose size is wedged, exported per work item.
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let cube = inside(&mut app, geo, AppContext::Obj, NodeKind::Box { size: 1.0, div: 1 });
+        let export = inside(&mut app, geo, AppContext::Obj, NodeKind::FileExport { file: String::new() });
+        app.graph.connect(cube, export, 0);
+        app.context = AppContext::Tasks;
+        let menu: Vec<NodeKind> = app.templates_for_view().into_iter().flat_map(|(_, k)| k).collect();
+        assert!(matches!(menu.as_slice(), [NodeKind::TopNetwork]));
+        let net = app.graph.add(NodeKind::TopNetwork, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&net).unwrap().context = AppContext::Tasks;
+        let mut range = top(tops::FRAME_RANGE);
+        range.set("start", 1.0);
+        range.set("end", 2.0);
+        let range = inside(&mut app, net, AppContext::Tasks, NodeKind::Top(range));
+        let mut wedge = top(tops::WEDGE);
+        wedge.set("count", 2.0);
+        wedge.set("start", 1.0);
+        wedge.set("end", 3.0);
+        wedge.set("node", cube as f32);
+        wedge.set("param", 0.0);
+        let wedge = inside(&mut app, net, AppContext::Tasks, NodeKind::Top(wedge));
+        let dir = std::env::temp_dir().join(format!("pfx_tops_run_{}", std::process::id()));
+        let mut fetch = top(tops::FETCH);
+        fetch.set("node", export as f32);
+        fetch.texts[0] = dir.join("box_w@wedgeindex.$F4.obj").to_string_lossy().into_owned();
+        let fetch = inside(&mut app, net, AppContext::Tasks, NodeKind::Top(fetch));
+        app.graph.connect(range, wedge, 0);
+        app.graph.connect(wedge, fetch, 0);
+        let mut cmd = top(tops::COMMAND);
+        cmd.texts[0] = "test -f {input}".into();
+        let cmd = inside(&mut app, net, AppContext::Tasks, NodeKind::Top(cmd));
+        app.graph.connect(fetch, cmd, 0);
+        assert_eq!(app.graph.top_items(cmd).unwrap().len(), 4);
+        app.start_top_cook(cmd);
+        for _ in 0..500 {
+            if app.top_run.is_none() {
+                break;
+            }
+            app.advance_top_run();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.top_run.is_none(), "the cook finished");
+        for node in [range, wedge, fetch, cmd] {
+            let states = &app.top_results[&node];
+            assert!(states.iter().all(|s| s.0 == tops::State::Done), "{:?}: {states:?}", app.graph.nodes[&node].kind);
+        }
+        // The wedge changed the box: wedge 1 (size 3) is three times as wide as wedge 0 (size 1).
+        let width = |name: &str| {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            let xs: Vec<f32> = text.lines().filter_map(|l| l.strip_prefix("v ")).map(|l| l.split_whitespace().next().unwrap().parse().unwrap()).collect();
+            xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert!((width("box_w0.0001.obj") - 1.0).abs() < 1e-3 && (width("box_w1.0002.obj") - 3.0).abs() < 1e-3);
+        // The box is back to its own size afterwards.
+        assert!(matches!(app.graph.nodes[&cube].kind, NodeKind::Box { size, .. } if size == 1.0));
+        // A failing command fails its item; cancelling stops the rest.
+        if let Some(NodeKind::Top(c)) = app.graph.nodes.get_mut(&cmd).map(|n| &mut n.kind) {
+            c.texts[0] = "exit 3".into();
+        }
+        app.start_top_cook(cmd);
+        for _ in 0..500 {
+            if app.top_run.is_none() {
+                break;
+            }
+            app.advance_top_run();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.top_results[&cmd].iter().all(|s| s.0 == tops::State::Failed));
+        app.start_top_cook(cmd);
+        app.top_cancel_request = true;
+        app.advance_top_run();
+        assert!(app.top_run.is_none());
+    }
+}
+
+#[cfg(test)]
+mod top_render_tests {
+    use super::*;
+
+    // `cargo test --release -- --ignored fetch_renders_frames_with_moonray`
+    #[test]
+    #[ignore]
+    fn fetch_renders_frames_with_moonray() {
+        // The packaged app finds MoonRay's shader DSOs itself; a test run needs telling.
+        unsafe { std::env::set_var("RDL2_DSO_PATH", "/Users/loksangho/moonray/build/rdl2dso") };
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        app.render_camera = RenderCamera::Viewport;
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let sphere = app.graph.add(NodeKind::Sphere { radius: 1.0, rows: 12, cols: 16 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&sphere).unwrap().parent = Some(geo);
+        app.graph.set_display(sphere);
+        let dir = std::env::temp_dir().join(format!("pfx_fetch_{}", std::process::id()));
+        let render = app.graph.add(
+            NodeKind::MoonRayRender {
+                executable: "native/moonray/macos/moonray".into(),
+                arguments: "--scene {scene} --output {output}".into(),
+                output: dir.join("frame.exr").to_string_lossy().into_owned(),
+                width: 64,
+                height: 48,
+                samples: 4,
+                opts: RenderOpts::default(),
+            },
+            egui::pos2(0.0, 0.0),
+        );
+        app.graph.nodes.get_mut(&render).unwrap().context = AppContext::Out;
+        let mut range = tops::TopNode::new(tops::FRAME_RANGE);
+        range.set("end", 2.0);
+        let range = app.graph.add(NodeKind::Top(range), egui::pos2(0.0, 0.0));
+        let mut fetch = tops::TopNode::new(tops::FETCH);
+        fetch.set("node", render as f32);
+        fetch.texts[0] = dir.join("beauty.$F4.exr").to_string_lossy().into_owned();
+        let fetch = app.graph.add(NodeKind::Top(fetch), egui::pos2(0.0, 0.0));
+        app.graph.connect(range, fetch, 0);
+        app.start_top_cook(fetch);
+        for _ in 0..6000 {
+            if app.top_run.is_none() {
+                break;
+            }
+            app.poll_moonray_render();
+            app.advance_top_run();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.top_results[&fetch].iter().all(|s| s.0 == tops::State::Done), "{:?} / {}", app.top_results[&fetch], app.status);
+        for f in ["beauty.0001.exr", "beauty.0002.exr"] {
+            assert!(dir.join(f).exists(), "{f} missing");
+        }
+        // A Render COP reads the latest one.
+        assert!(cops::last_render().is_some_and(|p| p.ends_with("beauty.0002.exr")));
+    }
+}
+
+#[cfg(test)]
+mod flow_node_tests {
+    use super::*;
+
+    fn add_in(app: &mut ProceduralFxStudioApp, geo: NodeId, kind: NodeKind) -> NodeId {
+        app.current_network = Some(geo);
+        app.context = AppContext::Obj;
+        app.apply(Action::Add(kind, egui::pos2(0.0, 0.0)));
+        app.selected.unwrap()
+    }
+
+    #[test]
+    fn foreach_loops_run_their_body_per_piece() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        // Two boxes, merged: two connected pieces.
+        let a = add_in(&mut app, geo, NodeKind::Box { size: 1.0, div: 1 });
+        let b = add_in(&mut app, geo, NodeKind::Box { size: 1.0, div: 1 });
+        let shift = add_in(&mut app, geo, NodeKind::Transform { t: [5.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] });
+        app.graph.connect(b, shift, 0);
+        let merge = add_in(&mut app, geo, NodeKind::Merge);
+        app.graph.connect(a, merge, 0);
+        app.graph.connect(shift, merge, 1);
+        // TAB-add a For-Each Connected Piece below the merge: merge -> Begin -> End.
+        app.current_network = Some(geo);
+        app.apply(Action::AddBelow(NodeKind::ForEachEnd(flow::ForEachSettings::new(flow::CONNECTED)), merge));
+        let end = app.selected.unwrap();
+        let NodeKind::ForEachEnd(set) = app.graph.nodes[&end].kind.clone() else { panic!() };
+        let begin = set.begin.unwrap();
+        assert_eq!(app.graph.input_of(begin, 0), Some(merge));
+        assert_eq!(app.graph.input_of(end, 0), Some(begin));
+        // Body: lift each piece by its iteration number (detail iteration).
+        let lift = app.graph.add(NodeKind::Wrangle { code: "@P.y += detail(0, \"iteration\") * 10;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&lift).unwrap().parent = Some(geo);
+        app.graph.connect(begin, lift, 0);
+        app.graph.connect(lift, end, 0);
+        let out = app.graph.cook(end, 0.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&end).cloned()).is_none(), "{:?}", node_errors(|e| e.get(&end).cloned()));
+        assert_eq!(out.vertices.len(), 16);
+        let high = out.vertices.iter().filter(|v| v.y > 5.0).count();
+        assert_eq!(high, 8, "the second piece is lifted by 10");
+        // Single pass: only the second piece.
+        if let NodeKind::ForEachEnd(s) = &mut app.graph.nodes.get_mut(&end).unwrap().kind {
+            s.single_pass = 1;
+        }
+        let one = app.graph.cook(end, 0.0, &mut HashMap::new());
+        assert_eq!(one.vertices.len(), 8);
+        assert!(one.vertices.iter().all(|v| v.y > 5.0));
+        // The same loop inside a Compile Block, multithreaded, gives the same result.
+        if let NodeKind::ForEachEnd(s) = &mut app.graph.nodes.get_mut(&end).unwrap().kind {
+            s.single_pass = -1;
+        }
+        let compile_end = add_in(&mut app, geo, NodeKind::CompileEnd { begin: None });
+        let NodeKind::CompileEnd { begin: Some(compile_begin) } = app.graph.nodes[&compile_end].kind else { panic!() };
+        app.graph.disconnect(begin, 0);
+        app.graph.connect(merge, compile_begin, 0);
+        app.graph.connect(compile_begin, begin, 0);
+        app.graph.disconnect(compile_end, 0);
+        app.graph.connect(end, compile_end, 0);
+        assert!(app.graph.in_compile_block(begin));
+        let compiled = app.graph.cook(compile_end, 0.0, &mut HashMap::new());
+        let mut sorted = |m: &Mesh| { let mut v: Vec<(i32, i32, i32)> = m.vertices.iter().map(|p| ((p.x * 100.0) as i32, (p.y * 100.0) as i32, (p.z * 100.0) as i32)).collect(); v.sort(); v };
+        assert_eq!(sorted(&compiled), sorted(&out));
+        // Feedback: each pass adds 1.
+        let fb = add_in(&mut app, geo, NodeKind::ForEachEnd(flow::ForEachSettings { iterations: 5, ..flow::ForEachSettings::new(flow::FEEDBACK) }));
+        let NodeKind::ForEachEnd(fset) = app.graph.nodes[&fb].kind.clone() else { panic!() };
+        let fbegin = fset.begin.unwrap();
+        app.graph.connect(a, fbegin, 0);
+        let step = app.graph.add(NodeKind::Wrangle { code: "@P.y += 1;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&step).unwrap().parent = Some(geo);
+        app.graph.connect(fbegin, step, 0);
+        app.graph.connect(step, fb, 0);
+        let fed = app.graph.cook(fb, 0.0, &mut HashMap::new());
+        let low = fed.vertices.iter().map(|v| v.y).fold(f32::MAX, f32::min);
+        assert!((low - 4.5).abs() < 1e-4, "five passes of +1 from -0.5: {low}");
+        // Saved and loaded with the pairing intact.
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        assert!(matches!(&loaded.nodes[&end].kind, NodeKind::ForEachEnd(s) if s.begin == Some(begin)));
+    }
+
+    #[test]
+    fn object_merge_brings_other_objects_in() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let source = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&source).unwrap().xform.t = [10.0, 0.0, 0.0];
+        let cube = add_in(&mut app, source, NodeKind::Box { size: 1.0, div: 1 });
+        app.graph.set_display(cube);
+        let target = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&target).unwrap().xform.t = [2.0, 0.0, 0.0];
+        let merge = add_in(&mut app, target, NodeKind::ObjectMerge { sources: vec![Some(source)], into_this: true });
+        let into = app.graph.cook(merge, 0.0, &mut HashMap::new());
+        let cx = |m: &Mesh| m.vertices.iter().map(|v| v.x).sum::<f32>() / m.vertices.len() as f32;
+        assert!((cx(&into) - 8.0).abs() < 1e-4, "at x=10 in the world, x=8 inside an object at x=2: {}", cx(&into));
+        if let NodeKind::ObjectMerge { into_this, .. } = &mut app.graph.nodes.get_mut(&merge).unwrap().kind {
+            *into_this = false;
+        }
+        assert!(cx(&app.graph.cook(merge, 0.0, &mut HashMap::new())).abs() < 1e-4);
+        // Merging its own object is refused.
+        let own = add_in(&mut app, target, NodeKind::ObjectMerge { sources: vec![Some(target)], into_this: true });
+        app.graph.cook(own, 0.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&own).cloned()).is_some());
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        assert!(matches!(&loaded.nodes[&merge].kind, NodeKind::ObjectMerge { sources, into_this: false } if sources == &vec![Some(source)]));
+    }
+}
+
+#[cfg(test)]
+mod add_measure_tests {
+    use super::*;
+
+    #[test]
+    fn add_places_points_and_can_strip_geometry() {
+        let mut g = Graph::default();
+        g.next_id += 9900;
+        let add = g.add(NodeKind::Add { count: 0, spacing: 1.0, layout: 0, points: vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], delete_geometry: false }, egui::pos2(0.0, 0.0));
+        let out = g.cook(add, 0.0, &mut HashMap::new());
+        assert_eq!(out.vertices, vec![Vec3::new(1.0, 2.0, 3.0), Vec3::new(4.0, 5.0, 6.0)]);
+        // Onto a box, keeping only its points.
+        let cube = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let strip = g.add(NodeKind::Add { count: 0, spacing: 1.0, layout: 0, points: vec![[9.0, 9.0, 9.0]], delete_geometry: true }, egui::pos2(0.0, 0.0));
+        g.connect(cube, strip, 0);
+        let out = g.cook(strip, 0.0, &mut HashMap::new());
+        assert!(out.indices.is_empty());
+        assert_eq!(out.vertices.len(), 9);
+        assert_eq!(*out.vertices.last().unwrap(), Vec3::new(9.0, 9.0, 9.0));
+        // A pattern still works, and old saves (count, spacing, layout) load as before.
+        let old = NodeKind::from_params("add", &[5.0, 0.5, 0.0]).unwrap();
+        assert!(matches!(&old, NodeKind::Add { count: 5, points, delete_geometry: false, .. } if points.is_empty()));
+        let loaded = Graph::deserialize(&g.serialize());
+        assert_eq!(format!("{:?}", loaded.nodes[&strip].kind), format!("{:?}", g.nodes[&strip].kind));
+        // Measure in a network: a box's area.
+        let measure = g.add(NodeKind::Measure(measure::MeasureSettings::new(0)), egui::pos2(0.0, 0.0));
+        g.connect(cube, measure, 0);
+        let m = g.cook(measure, 0.0, &mut HashMap::new());
+        assert!((m.point_attributes["detail:area"][0] - 6.0).abs() < 1e-4);
     }
 }
