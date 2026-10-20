@@ -20,6 +20,11 @@ if [[ -f "$PFX_DEPS/include/pxr/pxr.h" && -x "$PFX_MOONRAY" ]]; then
   export RDL2_DSO_PATH="${RDL2_DSO_PATH:-$PFX_BUILD/moonray/rdl2dso}"
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
   MOONRAY_SRC_BIN="$PFX_MOONRAY"
+  # Alembic (.abc import and export), when the prefix has it (scripts/build_macos_deps.sh).
+  if [[ -f "$PFX_DEPS/include/Alembic/AbcGeom/All.h" ]]; then
+    export ALEMBIC_ROOT="$PFX_DEPS"
+    APP_FEATURES="native-openvdb native-usd native-alembic"
+  fi
   # Hydra: hd_render and hdMoonray's USD plugins, when MoonRay was built with them (WITH_HYDRA=1).
   PFX_HYDRA="$PFX_BUILD/moonray/moonray/hydra/hdMoonray"
   if [[ -x "$PFX_HYDRA/cmd/hd_cmd/hd_render/hd_render" ]]; then
@@ -96,7 +101,7 @@ if [[ ${1-} == "package-macos" ]]; then
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
   # Ensure build.rs can find OpenVDB and tbb when building release
   OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" \
-  cargo build --release --features "native-openvdb native-usd"
+  cargo build --release --features "${APP_FEATURES:-native-openvdb native-usd}"
   APP_NAME="ProceduralFxStudio"
   APP_DIR="dist/${APP_NAME}.app"
   BIN_DIR="${APP_DIR}/Contents/MacOS"
@@ -214,4 +219,4 @@ if [[ -n "${HD_RENDER_BIN-}" ]]; then
   python3 scripts/hydra_plugins.py "$PFX_HYDRA" "$PFX_BUILD/hydra-plugins" >/dev/null
   export PFX_HD_RENDER="$HD_RENDER_BIN" PFX_HYDRA_PLUGIN_PATH="$PFX_BUILD/hydra-plugins"
 fi
-OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cargo run --features "native-openvdb native-usd"
+OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" cargo run --features "${APP_FEATURES:-native-openvdb native-usd}"

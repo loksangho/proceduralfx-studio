@@ -6,6 +6,11 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_NATIVE_USD").is_some() {
         build_usd_bridge();
     }
+    println!("cargo:rerun-if-changed=native/abc_bridge.cpp");
+    println!("cargo:rerun-if-env-changed=ALEMBIC_ROOT");
+    if std::env::var_os("CARGO_FEATURE_NATIVE_ALEMBIC").is_some() {
+        build_alembic_bridge();
+    }
     if std::env::var_os("CARGO_FEATURE_NATIVE_OPENVDB").is_none() {
         return;
     }
@@ -128,5 +133,27 @@ fn build_usd_bridge() {
         }
     }
     // USD libraries use @rpath install names.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+}
+
+// Alembic for .abc import and export. ALEMBIC_ROOT is an install (include/Alembic,
+// lib/libAlembic) that also has Imath, e.g. the macOS 14 prefix or the Flatpak's /app.
+fn build_alembic_bridge() {
+    let root = std::path::PathBuf::from(std::env::var_os("ALEMBIC_ROOT").or_else(|| std::env::var_os("USD_ROOT")).unwrap_or_else(|| "/usr/local".into()));
+    let (include, lib) = (root.join("include"), root.join("lib"));
+    if !include.join("Alembic/AbcGeom/All.h").exists() {
+        panic!("native-alembic needs an Alembic install: set ALEMBIC_ROOT to a directory with include/Alembic and lib/; got {}", root.display());
+    }
+    cc::Build::new()
+        .cpp(true)
+        .file("native/abc_bridge.cpp")
+        .include(&include)
+        .include(include.join("Imath"))
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-Wno-deprecated-declarations")
+        .compile("proceduralfx_studio_abc");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-lib=static=Alembic");
+    println!("cargo:rustc-link-lib=dylib=Imath");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
 }

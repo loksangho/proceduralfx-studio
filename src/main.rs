@@ -18,6 +18,7 @@ use std::time::Instant;
 use rfd::FileDialog;
 
 mod render_viewer;
+mod abc;
 mod anim;
 mod boolean;
 mod bullet;
@@ -28,6 +29,7 @@ mod docs;
 mod envlight;
 mod extrude;
 mod fileio;
+mod flipbook;
 mod flow;
 mod fracture;
 mod groom;
@@ -37,9 +39,12 @@ mod measure;
 mod muscle;
 mod packed;
 mod paint;
+mod poly;
+mod randomize;
 mod raster;
 mod sims;
 mod shading;
+mod sopkit;
 mod sops;
 mod terrain;
 mod textures;
@@ -400,14 +405,17 @@ fn node_grid(width: f32, depth: f32, res_x: usize, res_z: usize) -> Mesh {
             mesh.indices.push([i1, i2, i3]);
         }
     }
+    poly::tag_quads(&mut mesh, 0, (res_x - 1) * (res_z - 1));
     mesh
 }
 
+// A closed cone: rings of quads narrowing to one apex point (the top row is
+// triangles), and a polygon base when `caps` is on.
 fn node_cone(radius: f32, height: f32, rows: usize, cols: usize, caps: bool) -> Mesh {
     let rows = rows.max(1);
     let cols = cols.max(3);
     let mut mesh = Mesh::default();
-    for r in 0..=rows {
+    for r in 0..rows {
         let t = r as f32 / rows as f32;
         let y = -height * 0.5 + height * t;
         let ring_radius = radius * (1.0 - t);
@@ -416,7 +424,9 @@ fn node_cone(radius: f32, height: f32, rows: usize, cols: usize, caps: bool) -> 
             mesh.vertices.push(Vec3::new(ring_radius * a.cos(), y, ring_radius * a.sin()));
         }
     }
-    for r in 0..rows {
+    let apex = mesh.vertices.len();
+    mesh.vertices.push(Vec3::new(0.0, height * 0.5, 0.0));
+    for r in 0..rows - 1 {
         for c in 0..cols {
             let a = r * cols + c;
             let b = r * cols + (c + 1) % cols;
@@ -426,18 +436,20 @@ fn node_cone(radius: f32, height: f32, rows: usize, cols: usize, caps: bool) -> 
             mesh.indices.push([b, d, e]);
         }
     }
+    poly::tag_quads(&mut mesh, 0, (rows - 1) * cols);
+    let top = (rows - 1) * cols;
+    for c in 0..cols {
+        mesh.indices.push([top + c, apex, top + (c + 1) % cols]);
+    }
     if caps {
+        // The base is one polygon (a fan around its centre point), facing down.
         let bottom = mesh.vertices.len();
         mesh.vertices.push(Vec3::new(0.0, -height * 0.5, 0.0));
-        let top = mesh.vertices.len();
-        mesh.vertices.push(Vec3::new(0.0, height * 0.5, 0.0));
+        let first = mesh.indices.len();
         for c in 0..cols {
-            let next = (c + 1) % cols;
-            mesh.indices.push([bottom, next, c]);
-            let a = rows * cols + c;
-            let b = rows * cols + next;
-            mesh.indices.push([top, a, b]);
+            mesh.indices.push([bottom, c, (c + 1) % cols]);
         }
+        poly::tag(&mut mesh, first, [cols]);
     }
     mesh
 }
@@ -469,6 +481,8 @@ fn add_patch(m: &mut Mesh, o: Vec3, u: Vec3, v: Vec3, d: usize) {
             m.indices.push([b, c + 1, c]);
         }
     }
+    let first = m.indices.len() - 2 * d * d;
+    poly::tag_quads(m, first, d * d);
 }
 
 fn node_box(size: f32, div: usize) -> Mesh {
@@ -508,6 +522,8 @@ fn node_sphere(radius: f32, rows: usize, cols: usize) -> Mesh {
             m.indices.push([b, cc + 1, cc]);
         }
     }
+    // Quads, except at the poles, where fusing leaves one triangle of each.
+    poly::tag_quads(&mut m, 0, rows * cols);
     node_fuse(m, 1e-4)
 }
 
@@ -531,6 +547,7 @@ fn node_torus(major: f32, minor: f32, rows: usize, cols: usize) -> Mesh {
             m.indices.push([b, cc, d]);
         }
     }
+    poly::tag_quads(&mut m, 0, rows * cols);
     m
 }
 
@@ -554,11 +571,18 @@ fn node_fuse(mesh: Mesh, tol: f32) -> Mesh {
             })
         })
         .collect();
-    for t in &mesh.indices {
+    let ids = mesh.point_attributes.get(poly::KEY).filter(|ids| ids.len() == mesh.indices.len());
+    let mut kept_ids = Vec::new();
+    for (i, t) in mesh.indices.iter().enumerate() {
         let n = [remap[t[0]], remap[t[1]], remap[t[2]]];
         if n[0] != n[1] && n[1] != n[2] && n[0] != n[2] {
             out.indices.push(n);
+            kept_ids.extend(ids.map(|ids| ids[i]));
         }
+    }
+    // Polygons stay polygons (the generators fuse their seams).
+    if ids.is_some() {
+        out.point_attributes.insert(poly::KEY.into(), kept_ids);
     }
     out
 }
@@ -597,35 +621,6 @@ fn node_attribute_create(mut mesh: Mesh, attribute: usize, value: f32) -> Mesh {
         );
     } else {
         mesh.point_attributes.insert(name.into(), vec![value; mesh.vertices.len()]);
-    }
-    mesh
-}
-
-fn node_attribute_randomize(mut mesh: Mesh, attribute: usize, amount: f32, seed: usize) -> Mesh {
-    let name = match attribute.min(3) {
-        1 => "pscale",
-        2 => "Cd",
-        3 => "orient",
-        _ => "id",
-    };
-    if name == "Cd" {
-        let values = mesh.point_attributes.entry(name.into()).or_insert_with(|| {
-            vec![0.0; mesh.vertices.len() * 3]
-        });
-        values.resize(mesh.vertices.len() * 3, 0.0);
-        let point_count = mesh.vertices.len();
-        for index in 0..point_count {
-            let value = (hash01(index as u32, seed as u32) + amount * 0.5).fract();
-            let color = attribute_color(value);
-            values[index * 3..index * 3 + 3].copy_from_slice(&color);
-        }
-        return mesh;
-    }
-    let component_count = 1;
-    let values = mesh.point_attributes.entry(name.into()).or_insert_with(|| vec![0.0; mesh.vertices.len() * component_count]);
-    values.resize(mesh.vertices.len() * component_count, 0.0);
-    for (index, value) in values.iter_mut().enumerate() {
-        *value += (hash01(index as u32, seed as u32) - 0.5) * 2.0 * amount;
     }
     mesh
 }
@@ -675,6 +670,7 @@ fn read_geometry_file(path: &str, time: f32) -> Result<Mesh, String> {
     }
     match fileio::extension(path).as_str() {
         "usd" | "usda" | "usdc" | "usdz" => usd::load_file(path, time).map(|stage| stage.to_mesh()),
+        "abc" => abc::read(path, time),
         "vdb" => read_vdb_file(path),
         _ => fileio::read_geometry(path),
     }
@@ -1059,9 +1055,12 @@ fn node_subdivide(input: Mesh, levels: usize) -> Mesh {
     input
 }
 
+// Linear subdivision: triangles split into four; polygons into one quad per
+// corner around a new centre point (as Houdini does), so quads stay quads.
 fn node_subdivide_once(input: Mesh) -> Mesh {
     // Shared edge midpoints so the result stays watertight
     let mut m = Mesh { vertices: input.vertices.clone(), indices: Vec::new(), point_attributes: input.point_attributes.clone() };
+    m.point_attributes.remove(poly::KEY);
     let mut edge_mid: HashMap<(usize, usize), usize> = HashMap::new();
     let mut mid = |a: usize, b: usize, m: &mut Mesh| -> usize {
         let key = (a.min(b), a.max(b));
@@ -1070,14 +1069,51 @@ fn node_subdivide_once(input: Mesh) -> Mesh {
             m.vertices.len() - 1
         })
     };
-    for t in &input.indices {
-        let a = mid(t[0], t[1], &mut m);
-        let b = mid(t[1], t[2], &mut m);
-        let c = mid(t[2], t[0], &mut m);
-        m.indices.push([t[0], a, c]);
-        m.indices.push([t[1], b, a]);
-        m.indices.push([t[2], c, b]);
-        m.indices.push([a, b, c]);
+    let mut sizes = Vec::new();
+    // The input triangle each new triangle comes from, for primitive attributes.
+    let mut source = Vec::new();
+    for run in poly::runs(&input) {
+        let outline = (run.len() > 1).then(|| poly::boundary(&input, &run)).flatten();
+        match outline {
+            Some(loop_points) => {
+                let centre = m.vertices.len();
+                m.vertices.push(poly::centroid(&input, &run));
+                let n = loop_points.len();
+                for i in 0..n {
+                    let (prev, here, next) = (loop_points[(i + n - 1) % n], loop_points[i], loop_points[(i + 1) % n]);
+                    let (a, b) = (mid(here, next, &mut m), mid(prev, here, &mut m));
+                    m.indices.push([here, a, centre]);
+                    m.indices.push([here, centre, b]);
+                    sizes.push(2);
+                    source.extend([run.start; 2]);
+                }
+            }
+            None => {
+                for (ti, t) in input.indices[run.clone()].iter().enumerate() {
+                    source.extend([run.start + ti; 4]);
+                    let a = mid(t[0], t[1], &mut m);
+                    let b = mid(t[1], t[2], &mut m);
+                    let c = mid(t[2], t[0], &mut m);
+                    m.indices.push([t[0], a, c]);
+                    m.indices.push([t[1], b, a]);
+                    m.indices.push([t[2], c, b]);
+                    m.indices.push([a, b, c]);
+                    sizes.extend([1; 4]);
+                }
+            }
+        }
+    }
+    let tris = input.indices.len();
+    for (_, values) in m.point_attributes.iter_mut().filter(|(k, _)| k.starts_with("prim:")) {
+        if tris > 0 && values.len() % tris == 0 {
+            let w = values.len() / tris;
+            *values = source.iter().flat_map(|&t| values[t * w..t * w + w].to_vec()).collect();
+        }
+    }
+    // Corner attributes would need interpolating; they're dropped rather than left misaligned.
+    m.point_attributes.retain(|k, _| !k.starts_with("vertex:"));
+    if sizes.iter().any(|n| *n > 1) {
+        poly::tag(&mut m, 0, sizes);
     }
     m
 }
@@ -1093,22 +1129,33 @@ fn node_remesh(input: Mesh, target_triangles: usize) -> Mesh {
     mesh
 }
 
+// The input plus its mirror image (merged, so attributes and polygons come along).
 fn node_mirror(mesh: Mesh, axis: usize) -> Mesh {
-    let mut out = mesh.clone();
-    let off = out.vertices.len();
-    for v in &mesh.vertices {
-        let mut p = *v;
+    let mut copy = mesh.clone();
+    for p in &mut copy.vertices {
         match axis {
             0 => p.x = -p.x,
             1 => p.y = -p.y,
             _ => p.z = -p.z,
         }
-        out.vertices.push(p);
     }
-    for t in &mesh.indices {
-        out.indices.push([t[0] + off, t[2] + off, t[1] + off]);
+    for t in &mut copy.indices {
+        t.swap(1, 2);
     }
-    out
+    // Corner attributes follow the swapped corners.
+    let tris = copy.indices.len();
+    for (_, values) in copy.point_attributes.iter_mut().filter(|(k, _)| k.starts_with("vertex:")) {
+        if tris == 0 || values.len() % (tris * 3) != 0 {
+            continue;
+        }
+        let w = values.len() / (tris * 3);
+        for t in 0..tris {
+            for c in 0..w {
+                values.swap((t * 3 + 1) * w + c, (t * 3 + 2) * w + c);
+            }
+        }
+    }
+    node_merge(mesh, copy)
 }
 
 fn node_copy(mesh: Mesh, count: usize, t: [f32; 3], r: [f32; 3], s: f32) -> Mesh {
@@ -1217,17 +1264,23 @@ fn node_tube(r_bot: f32, r_top: f32, height: f32, rows: usize, cols: usize, caps
             m.indices.push([b, cc, d]);
         }
     }
+    poly::tag_quads(&mut m, 0, rows * cols);
     if caps {
+        // Each cap is one polygon (a fan around its centre point).
         let bot = m.vertices.len();
         m.vertices.push(Vec3::new(0.0, -height / 2.0, 0.0));
         let top = m.vertices.len();
         m.vertices.push(Vec3::new(0.0, height / 2.0, 0.0));
         let tr = rows * cols;
+        let first = m.indices.len();
+        for c in 0..cols {
+            m.indices.push([bot, c, (c + 1) % cols]);
+        }
         for c in 0..cols {
             let n = (c + 1) % cols;
-            m.indices.push([bot, c, n]);
             m.indices.push([top, tr + n, tr + c]);
         }
+        poly::tag(&mut m, first, [cols, cols]);
     }
     m
 }
@@ -1249,6 +1302,14 @@ fn node_reverse(mut mesh: Mesh) -> Mesh {
 }
 
 /// Remove points no triangle uses.
+// The triangles `keep` accepts, with their primitive and vertex attributes, and
+// only the points they use.
+fn keep_triangles(mesh: Mesh, keep: impl Fn(usize, &[usize; 3]) -> bool) -> Mesh {
+    let mask: Vec<bool> = mesh.indices.iter().enumerate().map(|(i, t)| keep(i, t)).collect();
+    compact(groups::only_prims(&mesh, &mask))
+}
+
+// Drops unused points (renumbering point attributes); triangles keep their order.
 fn compact(mesh: Mesh) -> Mesh {
     let mut remap = vec![usize::MAX; mesh.vertices.len()];
     let mut out = Mesh::default();
@@ -1265,6 +1326,11 @@ fn compact(mesh: Mesh) -> Mesh {
         out.indices.push(nt);
     }
     for (name, values) in mesh.point_attributes {
+        // Primitive, vertex and detail attributes follow the triangles, which stay as they are.
+        if name.starts_with("prim:") || name.starts_with("vertex:") || name.starts_with("detail:") {
+            out.point_attributes.insert(name, values);
+            continue;
+        }
         let components = if mesh.vertices.is_empty() {
             1
         } else {
@@ -1308,7 +1374,8 @@ fn attribute_element_count(key: &str, points: usize, prims: usize) -> usize {
     }
 }
 
-fn node_merge(mut a: Mesh, b: Mesh) -> Mesh {
+fn node_merge(mut a: Mesh, mut b: Mesh) -> Mesh {
+    poly::offset_for_merge(&a, &mut b);
     let (a_points, a_prims) = (a.vertices.len(), a.indices.len());
     let (b_points, b_prims) = (b.vertices.len(), b.indices.len());
     a.vertices.extend(b.vertices);
@@ -1538,11 +1605,11 @@ fn node_ripple(mut mesh: Mesh, freq: f32, amp: f32, speed: f32, time: f32) -> Me
     mesh
 }
 
-fn node_jitter(mut mesh: Mesh, amp: f32, seed: u32) -> Mesh {
+fn node_jitter(mut mesh: Mesh, amp: f32, seed: u32, scale: [f32; 3]) -> Mesh {
     for (i, v) in mesh.vertices.iter_mut().enumerate() {
-        let dx = (hash01(i as u32 * 3, seed) - 0.5) * 2.0 * amp;
-        let dy = (hash01(i as u32 * 3 + 1, seed) - 0.5) * 2.0 * amp;
-        let dz = (hash01(i as u32 * 3 + 2, seed) - 0.5) * 2.0 * amp;
+        let dx = (hash01(i as u32 * 3, seed) - 0.5) * 2.0 * amp * scale[0];
+        let dy = (hash01(i as u32 * 3 + 1, seed) - 0.5) * 2.0 * amp * scale[1];
+        let dz = (hash01(i as u32 * 3 + 2, seed) - 0.5) * 2.0 * amp * scale[2];
         *v = v.add(Vec3::new(dx, dy, dz));
     }
     mesh
@@ -2023,26 +2090,12 @@ fn node_flip(
 }
 
 fn node_clip(mesh: Mesh, axis: usize, offset: f32, invert: bool) -> Mesh {
-    let mut out = Mesh {
-        vertices: mesh.vertices.clone(),
-        indices: Vec::new(),
-        point_attributes: mesh.point_attributes.clone(),
+    let keep = |v: Vec3| {
+        let val = axis_of(v, axis);
+        if invert { val <= offset } else { val >= offset }
     };
-    for tri in &mesh.indices {
-        let v0 = mesh.vertices[tri[0]];
-        let v1 = mesh.vertices[tri[1]];
-        let v2 = mesh.vertices[tri[2]];
-
-        let keep = |v: Vec3| {
-            let val = axis_of(v, axis);
-            if invert { val <= offset } else { val >= offset }
-        };
-
-        if keep(v0) && keep(v1) && keep(v2) {
-            out.indices.push(*tri);
-        }
-    }
-    compact(out)
+    let vertices = mesh.vertices.clone();
+    keep_triangles(mesh, |_, tri| tri.iter().all(|&v| keep(vertices[v])))
 }
 
 fn node_blast(mesh: Mesh, component: usize, indices: &[usize], invert: bool) -> Mesh {
@@ -2060,25 +2113,9 @@ fn node_blast(mesh: Mesh, component: usize, indices: &[usize], invert: bool) -> 
             let remove_vertex: HashSet<usize> = (0..mesh.vertices.len())
                 .filter(|&index| selected(index))
                 .collect();
-            let mut out = Mesh {
-                vertices: mesh.vertices,
-                indices: mesh.indices
-                    .into_iter()
-                    .filter(|tri| !tri.iter().any(|index| remove_vertex.contains(index)))
-                    .collect(),
-                point_attributes: mesh.point_attributes,
-            };
-            compact(out)
+            keep_triangles(mesh, |_, tri| !tri.iter().any(|index| remove_vertex.contains(index)))
         }
-        1 => compact(Mesh {
-            vertices: mesh.vertices,
-            indices: mesh.indices
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, tri)| (!selected(index)).then_some(tri))
-                .collect(),
-            point_attributes: mesh.point_attributes,
-        }),
+        1 => keep_triangles(mesh, |index, _| !selected(index)),
         _ => {
             let mut edges = Vec::<(usize, usize)>::new();
             let mut edge_ids = HashMap::<(usize, usize), usize>::new();
@@ -2097,18 +2134,11 @@ fn node_blast(mesh: Mesh, component: usize, indices: &[usize], invert: bool) -> 
                 .enumerate()
                 .filter_map(|(index, edge)| selected(index).then_some(edge))
                 .collect();
-            compact(Mesh {
-                vertices: mesh.vertices,
-                indices: mesh.indices
+            keep_triangles(mesh, |_, tri| {
+                ![(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
                     .into_iter()
-                    .filter(|tri| {
-                        ![(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
-                            .into_iter()
-                            .map(|(a, b)| if a < b { (a, b) } else { (b, a) })
-                            .any(|edge| remove_edges.contains(&edge))
-                    })
-                    .collect(),
-                point_attributes: mesh.point_attributes,
+                    .map(|(a, b)| if a < b { (a, b) } else { (b, a) })
+                    .any(|edge| remove_edges.contains(&edge))
             })
         }
     }
@@ -2570,18 +2600,18 @@ fn channel_params_ui(ui: &mut egui::Ui, code: &str, channels: &mut vex::Channels
             match kind {
                 'i' => {
                     let mut v = value[0].round() as i32;
-                    if ui.add(egui::DragValue::new(&mut v).speed(0.1)).changed() {
+                    if pfield(ui, pdrag(&mut v).speed(0.1)).changed() {
                         value[0] = v as f32;
                         changed = true;
                     }
                 }
                 'v' => {
                     for c in value.iter_mut() {
-                        changed |= ui.add(egui::DragValue::new(c).speed(0.01)).changed();
+                        changed |= pfield(ui, pdrag(c).speed(0.01)).changed();
                     }
                 }
                 _ => {
-                    changed |= ui.add(egui::Slider::new(&mut value[0], 0.0..=1.0).clamping(egui::SliderClamping::Never)).changed();
+                    changed |= pfield(ui, pslider(&mut value[0], 0.0..=1.0).clamping(egui::SliderClamping::Never)).changed();
                 }
             }
         });
@@ -2690,6 +2720,7 @@ fn write_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Res
 
 const SHORTCUT_OPEN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
 const SHORTCUT_SAVE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+const SHORTCUT_QUIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
 const SHORTCUT_SAVE_AS: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::S);
 
@@ -2722,6 +2753,73 @@ fn hydra_plugin_path(hd_render: &std::path::Path) -> Option<String> {
     }
     let dirs: Vec<PathBuf> = hd_render.ancestors().skip(1).take(8).flat_map(|dir| [dir.join("plugin/pxr"), dir.join("plugin/usd")]).collect();
     dirs.into_iter().find(|dir| dir.join("hd_moonray_debug/plugInfo.json").is_file()).map(|dir| dir.to_string_lossy().into_owned())
+}
+
+// What was last typed into a parameter field (see pdrag and parameters_pane).
+enum Typed {
+    Number,
+    Expression(String),
+    Error(String),
+    // Delete Channel, from the menu of a field showing this value.
+    Delete(f32),
+}
+
+thread_local! {
+    static TYPED: std::cell::RefCell<Option<Typed>> = const { std::cell::RefCell::new(None) };
+    static EXPRESSION_TIME: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    // The value of the field pdrag/pslider made last, for pfield's menu.
+    static FIELD_VALUE: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+// Reads typed text: a number, or an expression ($F, $FF, $T, VEX) evaluated at the
+// current time. An expression whose value equals the field's still changes the
+// field (by a step), so parameters_pane can tell which parameter it was typed into.
+fn typed_parser(current: f64, integral: bool) -> impl Fn(&str) -> Option<f64> {
+    move |text: &str| {
+        let text = text.trim();
+        if let Ok(v) = text.parse::<f64>() {
+            TYPED.with(|t| *t.borrow_mut() = Some(Typed::Number));
+            return Some(v);
+        }
+        match vex::eval_expression(text, EXPRESSION_TIME.with(|t| t.get())) {
+            Ok(v) => {
+                TYPED.with(|t| *t.borrow_mut() = Some(Typed::Expression(text.to_owned())));
+                let v = v as f64;
+                let step = if integral { 1.0 } else { (current.abs() * 1e-4).max(1e-4) };
+                Some(if v == current { v + step } else { v })
+            }
+            Err(error) => {
+                TYPED.with(|t| *t.borrow_mut() = Some(Typed::Error(error)));
+                None
+            }
+        }
+    }
+}
+
+// Number fields that also take expressions.
+fn pdrag<'a, N: egui::emath::Numeric>(value: &'a mut N) -> egui::DragValue<'a> {
+    let current = value.to_f64();
+    FIELD_VALUE.with(|v| v.set(current));
+    egui::DragValue::new(value).custom_parser(typed_parser(current, N::INTEGRAL))
+}
+
+fn pslider<'a, N: egui::emath::Numeric>(value: &'a mut N, range: std::ops::RangeInclusive<N>) -> egui::Slider<'a> {
+    let current = value.to_f64();
+    FIELD_VALUE.with(|v| v.set(current));
+    egui::Slider::new(value, range).custom_parser(typed_parser(current, N::INTEGRAL))
+}
+
+// A parameter field (pdrag/pslider) with its right-click menu.
+fn pfield(ui: &mut egui::Ui, field: impl egui::Widget) -> egui::Response {
+    let value = FIELD_VALUE.with(|v| v.get()) as f32;
+    let response = ui.add(field);
+    response.context_menu(|ui| {
+        if ui.button("Delete Channel").on_hover_text("Remove the parameter's expression and keyframes; it keeps its current value").clicked() {
+            TYPED.with(|t| *t.borrow_mut() = Some(Typed::Delete(value)));
+            ui.close();
+        }
+    });
+    response
 }
 
 fn run_logged(cmd: &mut Command, log_path: &std::path::Path, cancel: &AtomicBool) -> Result<std::process::ExitStatus, String> {
@@ -2998,7 +3096,7 @@ enum NodeKind {
     Copy { count: usize, t: [f32; 3], r: [f32; 3], s: f32 },
     CopyToPoints { scale: f32, rotation: [f32; 3] },
     AttributeCreate { attribute: usize, value: f32 },
-    AttributeRandomize { attribute: usize, amount: f32, seed: usize },
+    AttributeRandomize(randomize::RandomizeSettings),
     AttributeDelete { attribute: usize },
     Wrangle { code: String, domain: usize },
     Merge,
@@ -3006,7 +3104,8 @@ enum NodeKind {
     Tube { r_bot: f32, r_top: f32, height: f32, rows: usize, cols: usize, caps: bool },
     Peak { dist: f32 },
     Ripple { freq: f32, amp: f32, speed: f32 },
-    Jitter { amp: f32, seed: usize },
+    // Point Jitter: random offsets, scaled per axis.
+    Jitter { amp: f32, seed: usize, scale: [f32; 3] },
     // Point particles. Input 1: optional source geometry (emits from its
     // surface or points; the origin when unconnected), input 2: optional static collider.
     Particles {
@@ -3102,6 +3201,13 @@ enum NodeKind {
     TransformPieces,
     // Area, perimeter, curvature, gradient, volume or curve length as attributes.
     Measure(measure::MeasureSettings),
+    ExtractCentroid(sopkit::CentroidSettings),
+    // Input 2 (optional): the reference whose bounds are the target.
+    MatchSize(sopkit::MatchSizeSettings),
+    ConvertLine,
+    Metaball(sopkit::MetaballSettings),
+    Connectivity(sopkit::ConnectivitySettings),
+    Resample(sopkit::ResampleSettings),
     // Flow control (see flow.rs): For-Each and Compile blocks are Begin/End pairs.
     ForEachBegin,
     ForEachEnd(flow::ForEachSettings),
@@ -3226,7 +3332,7 @@ impl NodeKind {
             | NodeKind::Ripple { .. }
             | NodeKind::Jitter { .. }
             | NodeKind::AttributeCreate { .. }
-            | NodeKind::AttributeRandomize { .. }
+            | NodeKind::AttributeRandomize(_)
             | NodeKind::Normal(_)
             | NodeKind::UvTexture(_)
             | NodeKind::UvTransform(_)
@@ -3300,13 +3406,13 @@ impl NodeKind {
             NodeKind::Copy { .. } => names(&["copies", "t.x", "t.y", "t.z", "r.x", "r.y", "r.z", "uniform_scale"]),
             NodeKind::CopyToPoints { .. } => names(&["scale", "r.x", "r.y", "r.z"]),
             NodeKind::AttributeCreate { .. } => names(&["attribute", "value"]),
-            NodeKind::AttributeRandomize { .. } => names(&["attribute", "amount", "seed"]),
+            NodeKind::AttributeRandomize(_) => names(&["attribute", "amount", "seed", "class", "size", "min", "max", "mode"]),
             NodeKind::AttributeDelete { .. } => names(&["attribute"]),
             NodeKind::AttributeVop { .. } => names(&["run_over"]),
             NodeKind::Tube { .. } => names(&["bottom_radius", "top_radius", "height", "rows", "columns", "caps"]),
             NodeKind::Peak { .. } => names(&["distance"]),
             NodeKind::Ripple { .. } => names(&["frequency", "amplitude", "speed"]),
-            NodeKind::Jitter { .. } => names(&["amount", "seed"]),
+            NodeKind::Jitter { .. } => names(&["amount", "seed", "scale.x", "scale.y", "scale.z"]),
             NodeKind::Particles { .. } => names(&["max_particles", "birth_rate", "lifetime", "speed", "spread", "gravity", "seed", "drag", "bounce", "friction", "radius", "substeps", "along_normals"]),
             NodeKind::Flip { .. } => names(&["particles", "grid_resolution", "flip_blend", "viscosity", "gravity", "max_timestep", "substeps", "seed", "domain_center.x", "domain_center.y", "domain_center.z", "domain_size.x", "domain_size.y", "domain_size.z"]),
             NodeKind::ParticleSurface { .. } => names(&["particle_radius", "join_distance", "resolution", "smoothing"]),
@@ -3329,6 +3435,11 @@ impl NodeKind {
             NodeKind::Scatter(_) => names(&["count", "seed", "relax_iterations", "fill_volume"]),
             NodeKind::Boolean(_) => names(&["operation", "method", "voxel_resolution"]),
             NodeKind::Measure(_) => names(&["measure", "curvature", "summary"]),
+            NodeKind::ExtractCentroid(_) => names(&["partition", "method"]),
+            NodeKind::MatchSize(_) => names(&["justify.x", "justify.y", "justify.z", "scale_to_fit", "uniform", "center.x", "center.y", "center.z", "size.x", "size.y", "size.z"]),
+            NodeKind::Metaball(_) => names(&["radius", "threshold", "resolution"]),
+            NodeKind::Connectivity(_) => names(&["class"]),
+            NodeKind::Resample(_) => names(&["by_length", "length", "segments"]),
             NodeKind::PointDeform(_) => names(&["influences", "fit_neighbours", "follow_rotation"]),
             NodeKind::ForEachEnd(_) => names(&["loop_over", "iterations", "start_value", "increment", "single_pass", "multithread"]),
             NodeKind::ObjectMerge { .. } => names(&["into_this_object"]),
@@ -3433,6 +3544,8 @@ impl NodeKind {
             NodeKind::MaterialAssign { slots } => slots.iter().map(|(g, _)| g.clone()).collect(),
             NodeKind::ForEachEnd(f) => vec![f.attribute.clone()],
             NodeKind::Measure(m) => vec![m.name.clone(), m.source.clone()],
+            NodeKind::Connectivity(c) => vec![c.attribute.clone()],
+            NodeKind::AttributeRandomize(r) => vec![r.name.clone()],
             NodeKind::Extrude(e) => vec![e.front_group.clone(), e.side_group.clone(), e.back_group.clone()],
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
@@ -3474,6 +3587,8 @@ impl NodeKind {
                 next(&mut m.name);
                 next(&mut m.source);
             }
+            NodeKind::AttributeRandomize(r) => next(&mut r.name),
+            NodeKind::Connectivity(c) => next(&mut c.attribute),
             NodeKind::Extrude(e) => {
                 next(&mut e.front_group);
                 next(&mut e.side_group);
@@ -3534,6 +3649,7 @@ impl NodeKind {
             NodeKind::MaterialFracture(f) => format!("material_fracture ({})", fracture::MATERIALS[f.material.min(2)]),
             NodeKind::ForEachEnd(f) => f.menu_name(),
             NodeKind::CompileEnd { .. } => "Compile Block".into(),
+            NodeKind::Jitter { .. } => "point_jitter".into(),
             other => other.name().to_owned(),
         }
     }
@@ -3728,7 +3844,8 @@ impl NodeKind {
                     NodeKind::Bevel { amount: 0.25, segments: 2 },
                     NodeKind::Peak { dist: 0.1 },
                     NodeKind::Ripple { freq: 6.0, amp: 0.3, speed: 4.0 },
-                    NodeKind::Jitter { amp: 0.05, seed: 1 },
+                    NodeKind::Jitter { amp: 0.05, seed: 1, scale: [1.0; 3] },
+                    NodeKind::MatchSize(sopkit::MatchSizeSettings::defaults()),
                 ],
             ),
             (
@@ -3749,6 +3866,10 @@ impl NodeKind {
                     NodeKind::Unpack { transfer: true },
                     NodeKind::Cache { cache_id: 1, mode: 1 },
                     NodeKind::Reverse,
+                    NodeKind::ExtractCentroid(sopkit::CentroidSettings::defaults()),
+                    NodeKind::ConvertLine,
+                    NodeKind::Resample(sopkit::ResampleSettings::defaults()),
+                    NodeKind::Metaball(sopkit::MetaballSettings::defaults()),
                     NodeKind::Switch { index: 0 },
                     NodeKind::Merge,
                     NodeKind::Null,
@@ -3820,12 +3941,13 @@ impl NodeKind {
                 "Attributes",
                 vec![
                     NodeKind::AttributeCreate { attribute: 1, value: 1.0 },
-                    NodeKind::AttributeRandomize { attribute: 1, amount: 0.25, seed: 1 },
+                    NodeKind::AttributeRandomize(randomize::RandomizeSettings::defaults()),
                     NodeKind::AttributeDelete { attribute: 1 },
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 0 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
                     NodeKind::Measure(measure::MeasureSettings::new(0)),
+                    NodeKind::Connectivity(sopkit::ConnectivitySettings::defaults()),
                     NodeKind::AttributePaint { attribute: "mask".into(), values: Vec::new(), settings: paint::PaintSettings::default() },
                 ],
             ),
@@ -3933,7 +4055,7 @@ impl NodeKind {
             NodeKind::Copy { .. } => "copy",
             NodeKind::CopyToPoints { .. } => "copy_to_points",
             NodeKind::AttributeCreate { .. } => "attribute_create",
-            NodeKind::AttributeRandomize { .. } => "attribute_randomize",
+            NodeKind::AttributeRandomize(_) => "attribute_randomize",
             NodeKind::AttributeDelete { .. } => "attribute_delete",
             NodeKind::Wrangle { .. } => "wrangle",
             NodeKind::AttributeVop { .. } => "attribute_vop",
@@ -3983,6 +4105,12 @@ impl NodeKind {
             NodeKind::Boolean(_) => "boolean",
             NodeKind::MaterialAssign { .. } => "material",
             NodeKind::Measure(_) => "measure",
+            NodeKind::ExtractCentroid(_) => "extract_centroid",
+            NodeKind::MatchSize(_) => "match_size",
+            NodeKind::ConvertLine => "convert_line",
+            NodeKind::Metaball(_) => "metaball",
+            NodeKind::Connectivity(_) => "connectivity",
+            NodeKind::Resample(_) => "resample",
             NodeKind::PointDeform(_) => "point_deform",
             NodeKind::TransformPieces => "transform_pieces",
             NodeKind::ForEachBegin => "foreach_begin",
@@ -4067,6 +4195,7 @@ impl NodeKind {
             | NodeKind::Tube { .. } => 0,
             NodeKind::Terrain(_) => 0,
             NodeKind::Boolean(_) => 2,
+            NodeKind::MatchSize(_) => 2,
             NodeKind::ObjectMerge { .. } => 0,
             NodeKind::MaterialFracture(_) => 3,
             NodeKind::RbdBullet(_) => 4,
@@ -4089,7 +4218,7 @@ impl NodeKind {
             NodeKind::ParticleSurface { .. } => 1,
             NodeKind::Merge | NodeKind::Switch { .. } | NodeKind::CopyToPoints { .. } => 2,
             NodeKind::AttributeCreate { .. }
-            | NodeKind::AttributeRandomize { .. }
+            | NodeKind::AttributeRandomize(_)
             | NodeKind::AttributeDelete { .. } => 1,
             NodeKind::Wrangle { .. } => 1,
             NodeKind::AttributeVop { .. } => 1,
@@ -4133,7 +4262,7 @@ impl NodeKind {
                 | NodeKind::Copy { .. }
                 |                 NodeKind::CopyToPoints { .. }
                     | NodeKind::AttributeCreate { .. }
-                    | NodeKind::AttributeRandomize { .. }
+                    | NodeKind::AttributeRandomize(_)
                     | NodeKind::AttributeDelete { .. }
                     | NodeKind::Wrangle { .. } => egui::Color32::from_rgb(200, 140, 60),
                 NodeKind::Null => egui::Color32::from_gray(150),
@@ -4182,9 +4311,7 @@ impl NodeKind {
                 vec![*scale, rotation[0], rotation[1], rotation[2]]
             }
             NodeKind::AttributeCreate { attribute, value } => vec![*attribute as f32, *value],
-            NodeKind::AttributeRandomize { attribute, amount, seed } => {
-                vec![*attribute as f32, *amount, *seed as f32]
-            }
+            NodeKind::AttributeRandomize(r) => r.to_params(),
             NodeKind::AttributeDelete { attribute } => vec![*attribute as f32],
             NodeKind::Wrangle { .. } => vec![],
             NodeKind::AttributeVop { domain } => vec![*domain as f32],
@@ -4194,7 +4321,7 @@ impl NodeKind {
             }
             NodeKind::Peak { dist } => vec![*dist],
             NodeKind::Ripple { freq, amp, speed } => vec![*freq, *amp, *speed],
-            NodeKind::Jitter { amp, seed } => vec![*amp, *seed as f32],
+            NodeKind::Jitter { amp, seed, scale } => vec![*amp, *seed as f32, scale[0], scale[1], scale[2]],
             NodeKind::Particles {
                 count,
                 emission_rate,
@@ -4308,6 +4435,18 @@ impl NodeKind {
             // One value per slot: the material's node id + 1 (0: none).
             NodeKind::MaterialAssign { slots } => slots.iter().map(|(_, m)| m.map_or(0.0, |m| m as f32 + 1.0)).collect(),
             NodeKind::Measure(m) => vec![m.kind as f32, m.curvature as f32, m.summary as f32],
+            NodeKind::ExtractCentroid(c) => vec![c.partition as f32, c.method as f32],
+            NodeKind::MatchSize(m) => {
+                let mut v: Vec<f32> = m.justify.iter().map(|j| *j as f32).collect();
+                v.extend([m.scale_to_fit as u8 as f32, m.uniform as u8 as f32]);
+                v.extend(m.target_center);
+                v.extend(m.target_size);
+                v
+            }
+            NodeKind::ConvertLine => Vec::new(),
+            NodeKind::Metaball(m) => vec![m.radius, m.threshold, m.resolution as f32],
+            NodeKind::Connectivity(c) => vec![c.class as f32],
+            NodeKind::Resample(r) => vec![r.by_length as u8 as f32, r.length, r.segments as f32],
             NodeKind::PointDeform(s) => vec![s.influences as f32, s.fit_neighbours as f32, s.rotate as u8 as f32],
             NodeKind::TransformPieces => vec![],
             NodeKind::ForEachBegin | NodeKind::CompileBegin => vec![],
@@ -4475,9 +4614,7 @@ impl NodeKind {
                 rotation: v3(1),
             },
             "attribute_create" => NodeKind::AttributeCreate { attribute: u(0).min(3), value: g(1) },
-            "attribute_randomize" => NodeKind::AttributeRandomize {
-                attribute: u(0).min(3), amount: g(1).max(0.0), seed: u(2),
-            },
+            "attribute_randomize" => NodeKind::AttributeRandomize(randomize::RandomizeSettings::from_params(p)),
             "attribute_delete" => NodeKind::AttributeDelete { attribute: u(0).min(3) },
             "wrangle" => NodeKind::Wrangle { code: String::new(), domain: u(0).min(3) },
             "attribute_vop" => NodeKind::AttributeVop { domain: u(0).min(3) },
@@ -4499,7 +4636,8 @@ impl NodeKind {
             },
             "peak" => NodeKind::Peak { dist: g(0) },
             "ripple" => NodeKind::Ripple { freq: g(0), amp: g(1), speed: g(2) },
-            "jitter" => NodeKind::Jitter { amp: g(0), seed: u(1) },
+            // Old saves have no scale: 1 on every axis.
+            "jitter" => NodeKind::Jitter { amp: g(0), seed: u(1), scale: [2, 3, 4].map(|i| p.get(i).copied().unwrap_or(1.0)) },
             "particles" => {
                 let or = |i: usize, default: f32| p.get(i).copied().unwrap_or(default);
                 NodeKind::Particles {
@@ -4657,6 +4795,36 @@ impl NodeKind {
                 rotate: p.get(2).is_none_or(|v| *v > 0.5),
             }),
             "transform_pieces" => NodeKind::TransformPieces,
+            "extract_centroid" => NodeKind::ExtractCentroid(sopkit::CentroidSettings { partition: u(0).min(2), method: u(1).min(1) }),
+            "match_size" => {
+                let d = sopkit::MatchSizeSettings::defaults();
+                let f = |i: usize, default: f32| p.get(i).copied().unwrap_or(default);
+                NodeKind::MatchSize(sopkit::MatchSizeSettings {
+                    justify: std::array::from_fn(|a| (f(a, d.justify[a] as f32).max(0.0) as usize).min(3)),
+                    scale_to_fit: f(3, 0.0) != 0.0,
+                    uniform: f(4, 1.0) != 0.0,
+                    target_center: std::array::from_fn(|a| f(5 + a, 0.0)),
+                    target_size: std::array::from_fn(|a| f(8 + a, 1.0)),
+                })
+            }
+            "convert_line" => NodeKind::ConvertLine,
+            "metaball" => {
+                let d = sopkit::MetaballSettings::defaults();
+                NodeKind::Metaball(sopkit::MetaballSettings {
+                    radius: p.first().copied().unwrap_or(d.radius).max(1e-3),
+                    threshold: p.get(1).copied().unwrap_or(d.threshold).clamp(0.01, 0.99),
+                    resolution: (p.get(2).copied().unwrap_or(d.resolution as f32) as usize).clamp(8, 256),
+                })
+            }
+            "connectivity" => NodeKind::Connectivity(sopkit::ConnectivitySettings { class: u(0).min(1), ..sopkit::ConnectivitySettings::defaults() }),
+            "resample" => {
+                let d = sopkit::ResampleSettings::defaults();
+                NodeKind::Resample(sopkit::ResampleSettings {
+                    by_length: p.first().copied().unwrap_or(1.0) != 0.0,
+                    length: p.get(1).copied().unwrap_or(d.length).max(1e-4),
+                    segments: (p.get(2).copied().unwrap_or(d.segments as f32) as usize).max(1),
+                })
+            }
             "measure" => NodeKind::Measure(measure::MeasureSettings {
                 kind: u(0).min(measure::KINDS.len() - 1),
                 curvature: u(1).min(1),
@@ -5109,8 +5277,8 @@ impl Graph {
         let mut any = false;
         for (channel_id, channel) in self.node_channels(id) {
             if let ChannelTarget::Param(i) = channel_id.target {
-                if i < params.len() && !channel.keys.is_empty() {
-                    params[i] = channel.eval(time);
+                if let Some(v) = channel.value(time).filter(|_| i < params.len()) {
+                    params[i] = v;
                     any = true;
                 }
             }
@@ -5131,9 +5299,11 @@ impl Graph {
         let Some(node) = self.nodes.get(&id) else { return ObjectXform::default() };
         let mut x = node.xform;
         for (channel_id, channel) in self.node_channels(id) {
-            if let (ChannelTarget::Xform(i), false) = (channel_id.target, channel.keys.is_empty()) {
+            if let (ChannelTarget::Xform(i), false) = (channel_id.target, channel.is_empty()) {
                 if i < 9 {
-                    set_xform_component(&mut x, i, channel.eval(time));
+                    if let Some(v) = channel.value(time) {
+                        set_xform_component(&mut x, i, v);
+                    }
                 }
             }
         }
@@ -5177,6 +5347,10 @@ impl Graph {
         let mut changed = false;
         let applied: Vec<(ChannelId, f32)> = self.applied.iter().map(|(c, v)| (*c, *v)).collect();
         for (channel_id, before) in applied {
+            // Expressions drive their parameter: edits don't key over them.
+            if self.channels.get(&channel_id).is_some_and(|c| c.expression.is_some()) {
+                continue;
+            }
             let Some(now) = self.channel_value(channel_id) else { continue };
             if (now - before).abs() > 1e-4 * before.abs().max(1.0) {
                 if let Some(channel) = self.channels.get_mut(&channel_id) {
@@ -5224,6 +5398,35 @@ impl Graph {
     }
 
     // The Geometry object whose network (possibly through SOP Solvers) contains `id`.
+    // Every node fed (through links) by `id`, and `id` itself.
+    fn downstream(&self, id: NodeId) -> HashSet<NodeId> {
+        let mut seen = HashSet::from([id]);
+        let mut stack = vec![id];
+        while let Some(at) = stack.pop() {
+            for link in self.links.iter().filter(|l| l.from == at) {
+                if seen.insert(link.to) {
+                    stack.push(link.to);
+                }
+            }
+        }
+        seen
+    }
+
+    // A node's path inside its object, e.g. "foreach_end1 / box2".
+    fn path_in_object(&self, id: NodeId) -> String {
+        let mut parts = Vec::new();
+        let mut at = Some(id);
+        while let Some(n) = at.and_then(|a| self.nodes.get(&a).map(|node| (a, node))) {
+            if matches!(n.1.kind, NodeKind::Geometry { .. }) {
+                break;
+            }
+            parts.push(n.1.title(n.0));
+            at = n.1.parent;
+        }
+        parts.reverse();
+        parts.join(" / ")
+    }
+
     fn enclosing_geometry(&self, id: NodeId) -> Option<NodeId> {
         let mut current = self.nodes.get(&id)?.parent;
         while let Some(parent) = current {
@@ -6046,7 +6249,9 @@ impl Graph {
                 NodeKind::LopSopImport { geometry: None, .. } => self.geometry_ids().into_iter().any(|g| self.time_dependent(g)),
                 NodeKind::LopReference { file, .. } => usd::is_animated(file),
                 NodeKind::FileImport { file } => {
-                    fileio::has_frame_token(file) || (matches!(fileio::extension(file).as_str(), "usd" | "usda" | "usdc" | "usdz") && usd::is_animated(file))
+                    fileio::has_frame_token(file)
+                        || (matches!(fileio::extension(file).as_str(), "usd" | "usda" | "usdc" | "usdz") && usd::is_animated(file))
+                        || (fileio::extension(file) == "abc" && abc::is_animated(file.trim()))
                 }
                 _ => false,
             }
@@ -6189,8 +6394,9 @@ impl Graph {
                 NodeKind::AttributeCreate { attribute, value } => {
                     node_attribute_create(input(0, cache), *attribute, *value)
                 }
-                NodeKind::AttributeRandomize { attribute, amount, seed } => {
-                    node_attribute_randomize(input(0, cache), *attribute, *amount, *seed)
+                NodeKind::AttributeRandomize(settings) => {
+                    let result = randomize::randomize(input(0, cache), settings);
+                    self.report(id, result)
                 }
                 NodeKind::AttributeDelete { attribute } => {
                     node_attribute_delete(input(0, cache), *attribute)
@@ -6245,7 +6451,7 @@ impl Graph {
                 NodeKind::Ripple { freq, amp, speed } => {
                     node_ripple(input(0, cache), *freq, *amp, *speed, time)
                 }
-                NodeKind::Jitter { amp, seed } => node_jitter(input(0, cache), *amp, *seed as u32),
+                NodeKind::Jitter { amp, seed, scale } => node_jitter(input(0, cache), *amp, *seed as u32, *scale),
                 NodeKind::Particles {
                     count,
                     emission_rate,
@@ -6526,6 +6732,15 @@ impl Graph {
                 }
                 NodeKind::MaterialAssign { slots } => self.report(id, material_assign(&input(0, cache), slots)),
                 NodeKind::Measure(settings) => self.report(id, measure::measure(&input(0, cache), settings)),
+                NodeKind::ExtractCentroid(settings) => self.report(id, sopkit::extract_centroid(&input(0, cache), settings)),
+                NodeKind::MatchSize(settings) => {
+                    let reference = self.input_of(id, 1).is_some().then(|| input(1, cache));
+                    self.report(id, sopkit::match_size(&input(0, cache), reference.as_ref(), settings))
+                }
+                NodeKind::ConvertLine => self.report(id, sopkit::convert_line(&input(0, cache))),
+                NodeKind::Metaball(settings) => self.report(id, sopkit::metaball(&input(0, cache), settings)),
+                NodeKind::Connectivity(settings) => self.report(id, sopkit::connectivity(&input(0, cache), settings)),
+                NodeKind::Resample(settings) => self.report(id, sopkit::resample(&input(0, cache), settings)),
                 NodeKind::PointDeform(settings) => self.report(id, deform::point_deform(&input(0, cache), &input(1, cache), &input(2, cache), settings)),
                 NodeKind::TransformPieces => {
                     let rest = self.input_of(id, 2).map(|_| input(2, cache));
@@ -6819,7 +7034,7 @@ impl Graph {
             s += &format!("display {container} {display}\n");
         }
         for (channel_id, channel) in &self.channels {
-            if channel.keys.is_empty() || !self.nodes.contains_key(&channel_id.node) {
+            if channel.is_empty() || !self.nodes.contains_key(&channel_id.node) {
                 continue;
             }
             let (kind, index) = match channel_id.target {
@@ -7025,7 +7240,7 @@ impl Graph {
                     if let (Ok(node), Ok(index)) = (node.parse::<usize>(), index.parse::<usize>()) {
                         let target = if *kind == "x" { ChannelTarget::Xform(index) } else { ChannelTarget::Param(index) };
                         let channel = anim::Channel::from_text(keys);
-                        if !channel.keys.is_empty() {
+                        if !channel.is_empty() {
                             g.channels.insert(ChannelId { node, target }, channel);
                         }
                     }
@@ -7115,6 +7330,16 @@ const NODE_H: f32 = 40.0;
 // Scene files are .pfs (ProceduralFX Studio); .mhip is the old name, still opened.
 const SCENE_EXTENSION: &str = "pfs";
 const SCENE_FILE: &str = "scene.pfs";
+
+// A scene's content regardless of line order (some parts are written from hash maps).
+fn scene_fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut hasher);
+    hasher.finish()
+}
 const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
 // Returns the MoonRay class name and its RDLA definition for a MAT node's settings.
@@ -7155,7 +7380,7 @@ fn shader_param_ui(ui: &mut egui::Ui, param: &shading::Param, slot: &mut [f32]) 
     match param.kind {
         shading::Kind::Float(min, max) => {
             let log = min >= 0.0 && max / min.max(0.01) >= 1000.0;
-            ui.add(egui::Slider::new(&mut slot[0], min..=max).logarithmic(log).text(param.label)).changed()
+            pfield(ui, pslider(&mut slot[0], min..=max).logarithmic(log).text(param.label)).changed()
         }
         shading::Kind::Color => {
             ui.horizontal(|ui| {
@@ -7391,7 +7616,7 @@ fn vec3_ui(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f64) -> bool
     ui.horizontal(|ui| {
         ui.label(label);
         for x in v.iter_mut() {
-            changed |= ui.add(egui::DragValue::new(x).speed(speed)).changed();
+            changed |= pfield(ui, pdrag(x).speed(speed)).changed();
         }
     });
     changed
@@ -7568,8 +7793,16 @@ impl SheetDomain {
         match self {
             SheetDomain::Points => mesh.vertices.len(),
             SheetDomain::Vertices => mesh.indices.len() * 3,
-            SheetDomain::Primitives => mesh.indices.len(),
+            SheetDomain::Primitives => poly::count(mesh),
             SheetDomain::Detail => 1,
+        }
+    }
+
+    // How many values per component the attribute stores: primitive attributes are per triangle.
+    fn stored(self, mesh: &Mesh) -> usize {
+        match self {
+            SheetDomain::Primitives => mesh.indices.len(),
+            other => other.count(mesh),
         }
     }
 
@@ -7593,11 +7826,11 @@ struct SheetAttribute {
 }
 
 fn sheet_attributes(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetAttribute> {
-    let count = domain.count(mesh);
+    let count = domain.stored(mesh);
     let mut attributes: Vec<SheetAttribute> = mesh
         .point_attributes
         .iter()
-        .filter(|(key, _)| domain.owns(key))
+        .filter(|(key, _)| domain.owns(key) && !poly::is_internal(key))
         .map(|(key, values)| {
             let components = if count > 0 { (values.len() / count).max(1) } else { 1 };
             SheetAttribute {
@@ -7663,7 +7896,7 @@ fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn> {
             columns.push(column("Point".into(), "Point the vertex refers to", SheetSource::VertexPoint));
         }
         SheetDomain::Primitives => {
-            columns.push(column("Points".into(), "Point numbers of the triangle", SheetSource::PrimPoints));
+            columns.push(column("Points".into(), "Point numbers of the polygon, in order", SheetSource::PrimPoints));
         }
         SheetDomain::Detail => {}
     }
@@ -7689,17 +7922,31 @@ fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn> {
     columns
 }
 
-fn sheet_cell(mesh: &Mesh, normals: &[Vec3], source: &SheetSource, row: usize) -> String {
+// Primitive rows are polygons: `polys` are their triangles, `poly_of` each triangle's polygon.
+struct SheetPolys {
+    runs: Vec<std::ops::Range<usize>>,
+    of: Vec<usize>,
+}
+
+impl SheetPolys {
+    fn new(mesh: &Mesh) -> Self {
+        SheetPolys { runs: poly::runs(mesh), of: poly::of_triangles(mesh) }
+    }
+}
+
+fn sheet_cell(mesh: &Mesh, normals: &[Vec3], polys: &SheetPolys, source: &SheetSource, row: usize) -> String {
     let float = |v: f32| format!("{v:.3}");
     match source {
         SheetSource::Index => row.to_string(),
         SheetSource::Position(c) => mesh.vertices.get(row).map_or_else(String::new, |p| float([p.x, p.y, p.z][*c])),
         SheetSource::ComputedNormal(c) => normals.get(row).map_or_else(String::new, |n| float([n.x, n.y, n.z][*c])),
-        SheetSource::PrimPoints => mesh.indices.get(row).map_or_else(String::new, |t| format!("{} {} {}", t[0], t[1], t[2])),
-        SheetSource::VertexPrim => format!("{}:{}", row / 3, row % 3),
+        SheetSource::PrimPoints => polys.runs.get(row).map_or_else(String::new, |run| poly::points(mesh, run).iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")),
+        SheetSource::VertexPrim => format!("{}:{}", polys.of.get(row / 3).copied().unwrap_or(row / 3), row % 3),
         SheetSource::VertexPoint => mesh.indices.get(row / 3).map_or_else(String::new, |t| t[row % 3].to_string()),
         SheetSource::Attribute { key, components, component, integral } => {
-            match mesh.point_attributes.get(key).and_then(|values| values.get(row * components + component)) {
+            // A polygon's primitive attributes are its (first) triangle's.
+            let element = if key.starts_with("prim:") { polys.runs.get(row).map_or(row, |run| run.start) } else { row };
+            match mesh.point_attributes.get(key).and_then(|values| values.get(element * components + component)) {
                 Some(v) if *integral => format!("{}", *v as i64),
                 Some(v) => float(*v),
                 None => String::new(),
@@ -7898,6 +8145,10 @@ struct ProceduralFxStudioApp {
     camera_near: f32,
     orthographic: bool,
     viewport_bg: u8,
+    // Flipbook: the capture in progress, the viewer, and where the viewport is in the main window.
+    flipbook_recording: Option<flipbook::Recording>,
+    flipbook_viewer: Option<flipbook::Viewer>,
+    viewport_rect: Option<egui::Rect>,
     grid_spacing: f32,
     grid_extent: f32,
     ambient_light: f32,
@@ -7944,6 +8195,15 @@ struct ProceduralFxStudioApp {
     scene_path: Option<PathBuf>,
     recent_scenes: Vec<PathBuf>,
     window_title: String,
+    // Fingerprint of the scene as last opened or saved, for "unsaved changes".
+    saved_fingerprint: u64,
+    // Unsaved changes, rechecked every half second (for the title and quitting).
+    unsaved: bool,
+    unsaved_checked: Option<Instant>,
+    // Quitting with unsaved changes: the Save / Don't Save / Cancel question is up.
+    quit_prompt: bool,
+    // The user chose to quit; the next close request goes through.
+    quitting: bool,
     // Viewport drags paint the selected Attribute Paint node instead of orbiting.
     paint_active: bool,
     paint_fill: Option<NodeId>,
@@ -8061,6 +8321,7 @@ impl Default for ProceduralFxStudioApp {
             .unwrap_or(g);
         let selected = g.geometry_ids().first().copied();
         let last_state = g.serialize();
+        let saved_fingerprint = scene_fingerprint(&last_state);
 
         let detected_moonray = detect_moonray_executable();
         let default_mr_args = String::from("{scene} {output} {width} {height} {samples}");
@@ -8115,6 +8376,9 @@ impl Default for ProceduralFxStudioApp {
             camera_near: 0.5,
             orthographic: false,
             viewport_bg: 45,
+            flipbook_recording: None,
+            flipbook_viewer: None,
+            viewport_rect: None,
             grid_spacing: 0.5,
             grid_extent: 5.0,
             ambient_light: 0.25,
@@ -8154,6 +8418,11 @@ impl Default for ProceduralFxStudioApp {
             scene_path: None,
             recent_scenes: load_recent_scenes(),
             window_title: String::new(),
+            saved_fingerprint,
+            unsaved: false,
+            unsaved_checked: None,
+            quit_prompt: false,
+            quitting: false,
             paint_active: false,
             paint_fill: None,
             group_choices: None,
@@ -8520,7 +8789,14 @@ impl ProceduralFxStudioApp {
     }
 
     fn parameters_pane(&mut self, ui: &mut egui::Ui) {
-        if self.params_ui(ui) {
+        let before = self.selected.and_then(|id| self.graph.nodes.get(&id).map(|n| (id, n.kind.params(), n.xform)));
+        TYPED.with(|t| *t.borrow_mut() = None);
+        EXPRESSION_TIME.with(|t| t.set(self.time));
+        let edited = self.params_ui(ui);
+        if let (Some(typed), Some(before)) = (TYPED.with(|t| t.borrow_mut().take()), before) {
+            self.apply_typed(before, typed);
+        }
+        if edited {
             if self.pause_on_edit {
                 self.animate = false;
             }
@@ -8560,8 +8836,14 @@ impl ProceduralFxStudioApp {
                     self.time = self.playback_end;
                     self.dirty = true;
                 }
+                let flipbook = ui
+                    .add_enabled(self.flipbook_recording.is_none(), egui::Button::new("🎞 Flipbook"))
+                    .on_hover_text("Plays the playback range in the viewport, captures every frame, and plays them back (save as PNG frames or a movie)");
+                if flipbook.clicked() {
+                    self.start_flipbook();
+                }
                 ui.label(format!("Time: {:.2}", self.time));
-                ui.add(egui::Slider::new(&mut self.anim_speed, 0.001..=0.1).text("Speed")).on_hover_text("Playback step per update");
+                pfield(ui, pslider(&mut self.anim_speed, 0.001..=0.1).text("Speed")).on_hover_text("Playback step per update");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.status.is_empty() {
                         ui.label(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_GREEN));
@@ -8575,7 +8857,7 @@ impl ProceduralFxStudioApp {
                 ui.monospace(format!("Frame {frame:>4}"));
                 ui.spacing_mut().slider_width = (ui.available_width() - 90.0).max(120.0);
                 let scrub = ui
-                    .add(egui::Slider::new(&mut self.time, self.playback_start..=self.playback_end).suffix(" s").show_value(true))
+                    .add(pslider(&mut self.time, self.playback_start..=self.playback_end).suffix(" s").show_value(true))
                     .on_hover_text("Drag to scrub the timeline (← / → step one frame)");
                 if scrub.drag_started() {
                     self.animate = false;
@@ -8609,8 +8891,8 @@ impl ProceduralFxStudioApp {
             }
 
             ui.horizontal(|ui| {
-                let range_changed = ui.add(egui::DragValue::new(&mut self.playback_start).speed(0.1).prefix("Start ")).changed()
-                    | ui.add(egui::DragValue::new(&mut self.playback_end).speed(0.1).prefix("End   ")).changed();
+                let range_changed = pfield(ui, pdrag(&mut self.playback_start).speed(0.1).prefix("Start ")).changed()
+                    | pfield(ui, pdrag(&mut self.playback_end).speed(0.1).prefix("End   ")).changed();
                 if self.playback_end < self.playback_start {
                     self.playback_end = self.playback_start;
                 }
@@ -8686,12 +8968,16 @@ impl ProceduralFxStudioApp {
             Vec::new()
         };
         let count = domain.count(mesh);
+        let polys = SheetPolys::new(mesh);
         let selection: Option<&Vec<usize>> = match domain {
             SheetDomain::Points if selectable => Some(&self.selected_vertices),
             SheetDomain::Primitives if selectable => Some(&self.selected_triangles),
             _ => None,
         };
-        let selected: HashSet<usize> = selection.map(|s| s.iter().copied().collect()).unwrap_or_default();
+        // Selected primitives are triangles; their rows are polygons.
+        let selected: HashSet<usize> = selection
+            .map(|s| s.iter().map(|&i| if domain == SheetDomain::Primitives { polys.of.get(i).copied().unwrap_or(i) } else { i }).collect())
+            .unwrap_or_default();
         let filter = self.sheet_selected_only && selection.is_some();
         let rows: Vec<usize> = if domain == SheetDomain::Detail {
             if columns.is_empty() { Vec::new() } else { vec![0] }
@@ -8713,7 +8999,7 @@ impl ProceduralFxStudioApp {
                 let mut csv = columns.iter().map(|c| quote(&c.header)).collect::<Vec<_>>().join(",");
                 for &row in &rows {
                     csv.push('\n');
-                    csv.push_str(&columns.iter().map(|c| quote(&sheet_cell(mesh, &normals, &c.source, row))).collect::<Vec<_>>().join(","));
+                    csv.push_str(&columns.iter().map(|c| quote(&sheet_cell(mesh, &normals, &polys, &c.source, row))).collect::<Vec<_>>().join(","));
                 }
                 ui.ctx().copy_text(csv);
                 self.status = format!("Copied {} rows", rows.len());
@@ -8801,7 +9087,7 @@ impl ProceduralFxStudioApp {
                         row.set_selected(selected.contains(&element));
                         for column in &columns {
                             row.col(|ui| {
-                                ui.label(egui::RichText::new(sheet_cell(mesh, &normals, &column.source, element)).monospace());
+                                ui.label(egui::RichText::new(sheet_cell(mesh, &normals, &polys, &column.source, element)).monospace());
                             });
                         }
                         if row.response().clicked() {
@@ -8816,15 +9102,19 @@ impl ProceduralFxStudioApp {
                 SheetDomain::Points => (&mut self.selected_vertices, SelectionMode::Vertex),
                 _ => (&mut self.selected_triangles, SelectionMode::Triangle),
             };
+            // A polygon row selects all its triangles.
+            let members: Vec<usize> = match domain {
+                SheetDomain::Primitives => polys.runs.get(element).map_or_else(Vec::new, |run| run.clone().collect()),
+                _ => vec![element],
+            };
             if shift {
-                match list.iter().position(|i| *i == element) {
-                    Some(at) => {
-                        list.remove(at);
-                    }
-                    None => list.push(element),
+                if selected.contains(&element) {
+                    list.retain(|i| !members.contains(i));
+                } else {
+                    list.extend(members);
                 }
             } else {
-                *list = vec![element];
+                *list = members;
             }
             if self.selection_mode != mode {
                 self.selection_mode = mode;
@@ -8848,6 +9138,16 @@ impl ProceduralFxStudioApp {
         } else {
             vec![self.time]
         };
+        // Alembic keeps every frame in one file.
+        if fileio::extension(file.trim()) == "abc" && !fileio::has_frame_token(file.trim()) {
+            let frames: Vec<(f32, Mesh)> = times.iter().map(|t| (*t, self.graph.cook_fresh(Some(source), *t))).collect();
+            let path = file.trim();
+            if let Some(parent) = std::path::Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            abc::write(path, &frames, sims::SIM_FPS).map_err(|e| format!("{path}: {e}"))?;
+            return Ok(format!("Wrote {path} ({} frame{})", frames.len(), if frames.len() == 1 { "" } else { "s" }));
+        }
         let mut written = Vec::new();
         for time in &times {
             let mesh = self.graph.cook_fresh(Some(source), *time);
@@ -8968,7 +9268,7 @@ impl ProceduralFxStudioApp {
         let result = self.graph_editor.ui_inside(ui, &mut rows, self.time, (self.playback_start, self.playback_end), sims::SIM_FPS);
         drop(rows);
         if result.changed {
-            self.graph.channels.retain(|_, channel| !channel.keys.is_empty());
+            self.graph.channels.retain(|_, channel| !channel.is_empty());
             self.dirty = true;
         }
         if let Some(t) = result.scrub {
@@ -9042,9 +9342,9 @@ impl ProceduralFxStudioApp {
             if let Some(mesh) = &prim.mesh {
                 if prim.type_name == "Mesh" {
                     ui.weak("Geometry");
-                    ui.label(format!("{} points, {} triangles", mesh.vertices.len(), mesh.indices.len()));
+                    ui.label(format!("{} points, {} primitives", mesh.vertices.len(), poly::count(mesh)));
                     ui.end_row();
-                    let mut names: Vec<&String> = mesh.point_attributes.keys().collect();
+                    let mut names: Vec<&String> = mesh.point_attributes.keys().filter(|k| !poly::is_internal(k)).collect();
                     names.sort();
                     ui.weak("Primvars");
                     ui.label(names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "));
@@ -9227,19 +9527,19 @@ impl ProceduralFxStudioApp {
                     ui.close();
                 }
                 ui.separator();
-                ui.add(egui::Slider::new(&mut self.viewport_bg, 15..=80).text("Background"));
-                ui.add(egui::Slider::new(&mut self.grid_spacing, 0.1..=2.0).text("Grid spacing"));
-                ui.add(egui::Slider::new(&mut self.grid_extent, 1.0..=20.0).text("Grid extent"));
+                pfield(ui, pslider(&mut self.viewport_bg, 15..=80).text("Background"));
+                pfield(ui, pslider(&mut self.grid_spacing, 0.1..=2.0).text("Grid spacing"));
+                pfield(ui, pslider(&mut self.grid_extent, 1.0..=20.0).text("Grid extent"));
                 ui.menu_button("Camera & lights", |ui| {
-                    ui.add(egui::Slider::new(&mut self.camera_focal, 0.5..=2.5).text("Focal scale"));
-                    ui.add(egui::Slider::new(&mut self.camera_near, 0.05..=2.0).text("Near clip"));
+                    pfield(ui, pslider(&mut self.camera_focal, 0.5..=2.5).text("Focal scale"));
+                    pfield(ui, pslider(&mut self.camera_near, 0.05..=2.0).text("Near clip"));
                     ui.separator();
                     ui.label("Viewport lighting (used when the scene has no lights)");
-                    ui.add(egui::Slider::new(&mut self.ambient_light, 0.0..=1.0).text("Ambient"));
+                    pfield(ui, pslider(&mut self.ambient_light, 0.0..=1.0).text("Ambient"));
                     vec3_ui(ui, "Key direction", &mut self.key_light_dir, 0.05);
-                    ui.add(egui::Slider::new(&mut self.key_light_intensity, 0.0..=2.0).text("Key intensity"));
+                    pfield(ui, pslider(&mut self.key_light_intensity, 0.0..=2.0).text("Key intensity"));
                     vec3_ui(ui, "Fill direction", &mut self.fill_light_dir, 0.05);
-                    ui.add(egui::Slider::new(&mut self.fill_light_intensity, 0.0..=2.0).text("Fill intensity"));
+                    pfield(ui, pslider(&mut self.fill_light_intensity, 0.0..=2.0).text("Fill intensity"));
                 });
             });
             ui.menu_button("Render", |ui| {
@@ -9418,6 +9718,7 @@ impl ProceduralFxStudioApp {
             Ok(s) => {
                 self.undo.push(self.last_state.clone());
                 self.load_state(s);
+                self.mark_saved();
                 self.status = format!("Loaded {}", path.display());
                 push_recent_scene(&mut self.recent_scenes, path.clone());
                 save_recent_scenes(&self.recent_scenes);
@@ -9463,6 +9764,7 @@ impl ProceduralFxStudioApp {
     fn write_scene(&mut self, path: PathBuf) {
         match write_file_atomically(&path, &self.graph.serialize()) {
             Ok(()) => {
+                self.mark_saved();
                 self.status = format!("Saved {}", path.display());
                 push_recent_scene(&mut self.recent_scenes, path.clone());
                 save_recent_scenes(&self.recent_scenes);
@@ -9472,10 +9774,135 @@ impl ProceduralFxStudioApp {
         }
     }
 
+    // Flipbook: renders the playback range in the viewport, frame by frame.
+    fn start_flipbook(&mut self) {
+        if self.viewport_rect.is_none() {
+            self.status = "Flipbook: show the Viewport in the main window first".into();
+            return;
+        }
+        let times = frame_times(self.playback_start, self.playback_end, 1.0 / sims::SIM_FPS);
+        if times.len() > 1000 {
+            self.status = format!("Flipbook: {} frames is too many; shorten the playback range to at most 1000", times.len());
+            return;
+        }
+        self.animate = false;
+        self.flipbook_viewer = None;
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time));
+    }
+
+    // Takes each frame's screenshot as it arrives and moves on; Escape cancels.
+    fn flipbook_step(&mut self, ctx: &egui::Context) {
+        let Some(recording) = self.flipbook_recording.as_mut() else { return };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.time = recording.resume_time;
+            self.flipbook_recording = None;
+            self.dirty = true;
+            self.status = "Flipbook cancelled".into();
+            return;
+        }
+        if recording.waiting {
+            let shot = ctx.input(|i| i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            }));
+            let Some(shot) = shot else { return };
+            if let Some(frame) = self.viewport_rect.and_then(|rect| flipbook::crop(&shot, rect, ctx.pixels_per_point())) {
+                recording.frames.push(frame);
+            }
+            recording.next += 1;
+            recording.waiting = false;
+        }
+        if recording.next >= recording.times.len() {
+            let Some(done) = self.flipbook_recording.take() else { return };
+            self.time = done.resume_time;
+            self.dirty = true;
+            if done.frames.is_empty() {
+                self.status = "Flipbook: nothing was captured".into();
+            } else {
+                self.status = format!("Flipbook: {} frames", done.frames.len());
+                self.flipbook_viewer = Some(flipbook::Viewer::new(done.frames, done.times, sims::SIM_FPS));
+            }
+            return;
+        }
+        let t = recording.times[recording.next];
+        if self.time != t {
+            self.time = t;
+            self.dirty = true;
+        }
+        self.status = format!("Flipbook: frame {} of {} (Esc cancels)", recording.next + 1, recording.times.len());
+    }
+
+    // The scene now matches what's on disk.
+    fn mark_saved(&mut self) {
+        self.saved_fingerprint = scene_fingerprint(&self.graph.serialize());
+        self.unsaved = false;
+        self.unsaved_checked = Some(Instant::now());
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        scene_fingerprint(&self.graph.serialize()) != self.saved_fingerprint
+    }
+
+    // Quitting with unsaved changes asks first: Save, Don't Save or Cancel.
+    fn confirm_quit(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            if self.has_unsaved_changes() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.quit_prompt = true;
+            }
+        }
+        if !self.quit_prompt {
+            return;
+        }
+        let name = self.scene_path.as_ref().and_then(|p| p.file_name()).map_or_else(|| "this scene".to_owned(), |n| format!("\"{}\"", n.to_string_lossy()));
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("quit_prompt")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Save changes before quitting?");
+            ui.label(format!("Your changes to {name} will be lost if you don't save them."));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(false);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Save").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        choice = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.quit_prompt = false;
+                    }
+                });
+            });
+        });
+        match choice {
+            Some(true) => {
+                self.save_scene();
+                // Quit only once it's saved (the Save dialog can be cancelled).
+                if !self.has_unsaved_changes() {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                self.quit_prompt = false;
+            }
+            Some(false) => {
+                self.quitting = true;
+                self.quit_prompt = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
+        if self.unsaved_checked.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(500)) {
+            self.unsaved = self.has_unsaved_changes();
+            self.unsaved_checked = Some(Instant::now());
+        }
+        let edited = if self.unsaved { " •" } else { "" };
         let title = match self.scene_path.as_ref().and_then(|p| p.file_name()) {
-            Some(name) => format!("{} — ProceduralFX Studio", name.to_string_lossy()),
-            None => "ProceduralFX Studio".to_owned(),
+            Some(name) => format!("{}{edited} — ProceduralFX Studio", name.to_string_lossy()),
+            None => format!("Untitled{edited} — ProceduralFX Studio"),
         };
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -9553,11 +9980,11 @@ impl ProceduralFxStudioApp {
                                 });
                         });
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(w).range(1..=16384).prefix("W "));
+                            pfield(ui, pdrag(w).range(1..=16384).prefix("W "));
                             if ui.button("⇄").on_hover_text("Swap width and height").clicked() {
                                 std::mem::swap(w, h);
                             }
-                            ui.add(egui::DragValue::new(h).range(1..=16384).prefix("H "));
+                            pfield(ui, pdrag(h).range(1..=16384).prefix("H "));
                             ui.weak(format!("aspect {:.3}", *w as f32 / (*h).max(1) as f32));
                         });
                         ui.horizontal(|ui| {
@@ -9601,11 +10028,11 @@ impl ProceduralFxStudioApp {
                                 }
                             }
                         });
-                        ui.add(egui::DragValue::new(samples).range(1..=4096).prefix("Samples per pixel "));
-                        ui.add(egui::Slider::new(&mut opts.max_depth, 1..=32).text("Max ray depth"));
-                        ui.add(egui::Slider::new(&mut opts.light_samples, 1..=16).text("Light samples"));
-                        ui.add(egui::Slider::new(&mut opts.bsdf_samples, 1..=16).text("BSDF samples"));
-                        ui.add(egui::Slider::new(&mut opts.volume_samples, 1..=8).text("Volume lighting samples"))
+                        pfield(ui, pdrag(samples).range(1..=4096).prefix("Samples per pixel "));
+                        pfield(ui, pslider(&mut opts.max_depth, 1..=32).text("Max ray depth"));
+                        pfield(ui, pslider(&mut opts.light_samples, 1..=16).text("Light samples"));
+                        pfield(ui, pslider(&mut opts.bsdf_samples, 1..=16).text("BSDF samples"));
+                        pfield(ui, pslider(&mut opts.volume_samples, 1..=8).text("Volume lighting samples"))
                             .on_hover_text("Light samples per step inside smoke and fire. Render time grows roughly in proportion: 1 for previews, 4+ for clean finals.");
                         ui.horizontal(|ui| {
                             ui.label("Environment light");
@@ -9658,9 +10085,9 @@ impl ProceduralFxStudioApp {
                         ui.checkbox(&mut opts.sequence, "Render frame range");
                         if opts.sequence {
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut opts.range_start).speed(0.05).range(0.0..=100_000.0).prefix("Start "));
-                                ui.add(egui::DragValue::new(&mut opts.range_end).speed(0.05).range(0.0..=100_000.0).prefix("End "));
-                                ui.add(egui::DragValue::new(&mut opts.range_step).speed(0.01).range(0.0001..=1000.0).prefix("Step "));
+                                pfield(ui, pdrag(&mut opts.range_start).speed(0.05).range(0.0..=100_000.0).prefix("Start "));
+                                pfield(ui, pdrag(&mut opts.range_end).speed(0.05).range(0.0..=100_000.0).prefix("End "));
+                                pfield(ui, pdrag(&mut opts.range_step).speed(0.01).range(0.0001..=1000.0).prefix("Step "));
                             });
                             if ui.button("Use timeline range").clicked() {
                                 opts.range_start = self.playback_start.max(0.0);
@@ -11621,6 +12048,10 @@ impl ProceduralFxStudioApp {
             let save_as = i.consume_shortcut(&SHORTCUT_SAVE_AS);
             (i.consume_shortcut(&SHORTCUT_OPEN), i.consume_shortcut(&SHORTCUT_SAVE), save_as)
         });
+        // Quitting closes the window, which asks about unsaved changes first.
+        if ctx.input_mut(|i| i.consume_shortcut(&SHORTCUT_QUIT)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if save_as {
             self.save_scene_dialog();
         } else if save {
@@ -11893,8 +12324,8 @@ impl ProceduralFxStudioApp {
                         grown.insert(index);
                     }
                 }
-                self.selected_triangles = grown.into_iter().collect();
-                self.selected_triangles.sort_unstable();
+                let grown: Vec<usize> = grown.into_iter().collect();
+                self.selected_triangles = poly::whole_polygons(&self.current_mesh, &grown);
             }
             SelectionMode::Edge => {
                 let selected: HashSet<_> = self.selected_edges.iter().copied().collect();
@@ -11955,8 +12386,9 @@ impl ProceduralFxStudioApp {
                         retained.insert(triangle_index);
                     }
                 }
-                self.selected_triangles = retained.into_iter().collect();
-                self.selected_triangles.sort_unstable();
+                // Only polygons that keep all their triangles stay selected.
+                let runs = poly::runs(&self.current_mesh);
+                self.selected_triangles = runs.into_iter().filter(|run| run.clone().all(|t| retained.contains(&t))).flatten().collect();
             }
             SelectionMode::Edge => {
                 let selected: HashSet<_> = self.selected_edges.iter().copied().collect();
@@ -12092,6 +12524,60 @@ impl ProceduralFxStudioApp {
     }
 
     // ---------------- Parameter panel ----------------
+    // Text typed into a parameter field: an expression makes the parameter follow it
+    // (an expression channel), a plain number replaces an expression. The parameter
+    // is the one whose value the typing changed.
+    fn apply_typed(&mut self, (id, params, xform): (NodeId, Vec<f32>, ObjectXform), typed: Typed) {
+        // Delete Channel: the node's animated parameters showing the field's value.
+        if let Typed::Delete(value) = typed {
+            let matching: Vec<ChannelId> = self
+                .graph
+                .node_channels(id)
+                .map(|(c, _)| *c)
+                .filter(|c| self.graph.channel_value(*c).is_some_and(|v| (v - value).abs() <= 1e-4 * value.abs().max(1.0)))
+                .collect();
+            if matching.is_empty() {
+                self.status = "That parameter has no channel (expression or keys) to delete".into();
+            } else {
+                for channel in &matching {
+                    self.graph.channels.remove(channel);
+                }
+                self.status = format!("Deleted {} channel{}", matching.len(), if matching.len() == 1 { "" } else { "s" });
+                self.dirty = true;
+            }
+            return;
+        }
+        let Some(node) = self.graph.nodes.get(&id) else { return };
+        let now = node.kind.params();
+        let mut targets: Vec<ChannelTarget> = (0..params.len().min(now.len())).filter(|&i| params[i] != now[i]).map(ChannelTarget::Param).collect();
+        targets.extend((0..9).filter(|&i| xform_component(&xform, i) != xform_component(&node.xform, i)).map(ChannelTarget::Xform));
+        if targets.is_empty() {
+            if let Typed::Error(error) = typed {
+                self.status = format!("Expression error: {error}");
+            }
+            return;
+        }
+        for target in targets {
+            let channel_id = ChannelId { node: id, target };
+            match &typed {
+                Typed::Expression(text) => {
+                    self.graph.channels.entry(channel_id).or_default().expression = Some(text.clone());
+                    self.status = format!("The parameter follows {text}");
+                }
+                Typed::Number => {
+                    if let Some(channel) = self.graph.channels.get_mut(&channel_id) {
+                        channel.expression = None;
+                        if channel.is_empty() {
+                            self.graph.channels.remove(&channel_id);
+                        }
+                    }
+                }
+                Typed::Error(_) | Typed::Delete(_) => {}
+            }
+        }
+        self.dirty = true;
+    }
+
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(id) = self.selected else {
             ui.label("Select a node to edit its parameters.");
@@ -12168,28 +12654,37 @@ impl ProceduralFxStudioApp {
             _ => (Vec::new(), Vec::new(), None),
         };
         let top_states = self.top_results.get(&id).cloned().unwrap_or_default();
-        // Object Merge: what it can merge (objects, and nodes inside other networks).
-        let merge_sources: Vec<(NodeId, String)> = if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::ObjectMerge { .. })) {
-            let own = self.graph.enclosing_geometry(id);
-            let mut list: Vec<(NodeId, String)> = self
+        // Object Merge: what it can merge, by object: each object's display output and
+        // the nodes inside it (its own network too, except what's downstream of the merge).
+        let merge_sources: Vec<(NodeId, String, Vec<(NodeId, String)>)> = if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::ObjectMerge { .. })) {
+            let downstream = self.graph.downstream(id);
+            let mut objects: Vec<(NodeId, String, Vec<(NodeId, String)>)> = self
                 .graph
                 .nodes
                 .iter()
-                .filter(|(nid, n)| n.context == AppContext::Obj && Some(**nid) != own && **nid != id)
-                .filter(|(_, n)| matches!(n.kind, NodeKind::Geometry { .. }) || (n.parent.is_some() && n.parent != own))
-                .map(|(nid, n)| {
-                    let label = match n.parent.and_then(|p| self.graph.nodes.get(&p).map(|o| o.title(p))) {
-                        Some(object) => format!("{object} / {}", n.title(*nid)),
-                        None => n.title(*nid),
-                    };
-                    (*nid, label)
-                })
+                .filter(|(_, n)| n.context == AppContext::Obj && matches!(n.kind, NodeKind::Geometry { .. }))
+                .map(|(oid, n)| (*oid, n.title(*oid), Vec::new()))
                 .collect();
-            list.sort_by(|a, b| a.1.cmp(&b.1));
-            list
+            for (nid, n) in &self.graph.nodes {
+                if n.context != AppContext::Obj || matches!(n.kind, NodeKind::Geometry { .. }) || downstream.contains(nid) {
+                    continue;
+                }
+                let Some(object) = self.graph.enclosing_geometry(*nid) else { continue };
+                if let Some(entry) = objects.iter_mut().find(|(o, ..)| *o == object) {
+                    entry.2.push((*nid, self.graph.path_in_object(*nid)));
+                }
+            }
+            objects.sort_by(|a, b| a.1.cmp(&b.1));
+            for (.., nodes) in &mut objects {
+                nodes.sort_by(|a, b| a.1.cmp(&b.1));
+            }
+            objects
         } else {
             Vec::new()
         };
+        let merge_own_object = self.graph.enclosing_geometry(id);
+        // Match Size: whether input 2 gives the target box.
+        let has_reference = self.graph.input_of(id, 1).is_some();
         let loop_begin_name = match self.graph.nodes.get(&id).map(|n| &n.kind) {
             Some(NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(b), .. }) | NodeKind::CompileEnd { begin: Some(b) }) => self.graph.nodes.get(b).map(|n| n.title(*b)),
             Some(NodeKind::ForEachBegin) | Some(NodeKind::CompileBegin) => self
@@ -12457,10 +12952,10 @@ impl ProceduralFxStudioApp {
                     if let shading::Kind::Float(min, max) = param.kind {
                         if matches!(param.key, "count" | "start" | "end" | "step") && op != tops::WEDGE || param.key == "count" || param.key == "step" {
                             let mut whole = v.round() as i64;
-                            c |= ui.add(egui::DragValue::new(&mut whole).range(min as i64..=max as i64).prefix(format!("{}: ", param.label))).changed();
+                            c |= pfield(ui, pdrag(&mut whole).range(min as i64..=max as i64).prefix(format!("{}: ", param.label))).changed();
                             v = whole as f32;
                         } else {
-                            c |= ui.add(egui::DragValue::new(&mut v).speed(0.01).range(min..=max).prefix(format!("{}: ", param.label))).changed();
+                            c |= pfield(ui, pdrag(&mut v).speed(0.01).range(min..=max).prefix(format!("{}: ", param.label))).changed();
                         }
                     }
                     top.values[i] = v;
@@ -12558,18 +13053,18 @@ impl ProceduralFxStudioApp {
                 });
                 match *kind {
                     0 => {
-                        c |= ui.add(egui::Slider::new(roughness, 0.0..=1.0).text("Roughness")).changed();
-                        c |= ui.add(egui::Slider::new(value, 0.0..=1.0).text("Specular")).changed();
+                        c |= pfield(ui, pslider(roughness, 0.0..=1.0).text("Roughness")).changed();
+                        c |= pfield(ui, pslider(value, 0.0..=1.0).text("Specular")).changed();
                     }
                     1 => {
-                        c |= ui.add(egui::Slider::new(roughness, 0.0..=1.0).text("Roughness")).changed();
+                        c |= pfield(ui, pslider(roughness, 0.0..=1.0).text("Roughness")).changed();
                     }
                     2 => {
-                        c |= ui.add(egui::Slider::new(roughness, 0.0..=1.0).text("Roughness")).changed();
-                        c |= ui.add(egui::Slider::new(value, 1.0..=3.0).text("IOR")).changed();
+                        c |= pfield(ui, pslider(roughness, 0.0..=1.0).text("Roughness")).changed();
+                        c |= pfield(ui, pslider(value, 1.0..=3.0).text("IOR")).changed();
                     }
                     _ => {
-                        c |= ui.add(egui::Slider::new(value, 0.0..=50.0).logarithmic(true).text("Intensity")).changed();
+                        c |= pfield(ui, pslider(value, 0.0..=50.0).logarithmic(true).text("Intensity")).changed();
                     }
                 }
             }
@@ -12583,7 +13078,7 @@ impl ProceduralFxStudioApp {
                     ui.horizontal(|ui| {
                         ui.label(format!("{i}"));
                         for k in 0..3 {
-                            c |= ui.add(egui::DragValue::new(&mut p[k]).speed(0.01)).changed();
+                            c |= pfield(ui, pdrag(&mut p[k]).speed(0.01)).changed();
                         }
                         if ui.small_button("✕").clicked() {
                             remove = Some(i);
@@ -12601,9 +13096,9 @@ impl ProceduralFxStudioApp {
                 }
                 ui.separator();
                 ui.strong("Pattern");
-                c |= ui.add(egui::Slider::new(count, 0..=100_000).logarithmic(true).text("Point count")).on_hover_text("0: no pattern").changed();
+                c |= pfield(ui, pslider(count, 0..=100_000).logarithmic(true).text("Point count")).on_hover_text("0: no pattern").changed();
                 if *count > 0 {
-                    c |= ui.add(egui::Slider::new(spacing, 0.01..=10.0).logarithmic(true).text("Spacing")).changed();
+                    c |= pfield(ui, pslider(spacing, 0.01..=10.0).logarithmic(true).text("Spacing")).changed();
                     ui.horizontal(|ui| {
                         ui.label("Layout");
                         c |= ui.selectable_value(layout, 0, "Line").changed();
@@ -12613,40 +13108,40 @@ impl ProceduralFxStudioApp {
                 }
             }
             NodeKind::Grid { size, res } => {
-                c |= ui.add(egui::Slider::new(size, 0.5..=20.0).text("Size")).changed();
-                c |= ui.add(egui::Slider::new(res, 2..=120).text("Resolution")).changed();
+                c |= pfield(ui, pslider(size, 0.5..=20.0).text("Size")).changed();
+                c |= pfield(ui, pslider(res, 2..=120).text("Resolution")).changed();
             }
             NodeKind::Plane { size, res } => {
-                c |= ui.add(egui::Slider::new(size, 0.5..=20.0).text("Size")).changed();
-                c |= ui.add(egui::Slider::new(res, 2..=120).text("Resolution")).changed();
+                c |= pfield(ui, pslider(size, 0.5..=20.0).text("Size")).changed();
+                c |= pfield(ui, pslider(res, 2..=120).text("Resolution")).changed();
             }
             NodeKind::Cone { radius, height, rows, cols, caps } => {
-                c |= ui.add(egui::Slider::new(radius, 0.1..=10.0).text("Radius")).changed();
-                c |= ui.add(egui::Slider::new(height, 0.1..=20.0).text("Height")).changed();
-                c |= ui.add(egui::Slider::new(rows, 1..=32).text("Rows")).changed();
-                c |= ui.add(egui::Slider::new(cols, 3..=128).text("Columns")).changed();
+                c |= pfield(ui, pslider(radius, 0.1..=10.0).text("Radius")).changed();
+                c |= pfield(ui, pslider(height, 0.1..=20.0).text("Height")).changed();
+                c |= pfield(ui, pslider(rows, 1..=32).text("Rows")).changed();
+                c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
                 c |= ui.checkbox(caps, "End Caps").changed();
             }
             NodeKind::Capsule { radius, length, rows, cols } => {
-                c |= ui.add(egui::Slider::new(radius, 0.1..=10.0).text("Radius")).changed();
-                c |= ui.add(egui::Slider::new(length, 0.0..=20.0).text("Length")).changed();
-                c |= ui.add(egui::Slider::new(rows, 4..=96).text("Rows")).changed();
-                c |= ui.add(egui::Slider::new(cols, 8..=128).text("Columns")).changed();
+                c |= pfield(ui, pslider(radius, 0.1..=10.0).text("Radius")).changed();
+                c |= pfield(ui, pslider(length, 0.0..=20.0).text("Length")).changed();
+                c |= pfield(ui, pslider(rows, 4..=96).text("Rows")).changed();
+                c |= pfield(ui, pslider(cols, 8..=128).text("Columns")).changed();
             }
             NodeKind::Box { size, div } => {
-                c |= ui.add(egui::Slider::new(size, 0.1..=10.0).text("Size")).changed();
-                c |= ui.add(egui::Slider::new(div, 1..=30).text("Divisions")).changed();
+                c |= pfield(ui, pslider(size, 0.1..=10.0).text("Size")).changed();
+                c |= pfield(ui, pslider(div, 1..=30).text("Divisions")).changed();
             }
             NodeKind::Sphere { radius, rows, cols } => {
-                c |= ui.add(egui::Slider::new(radius, 0.1..=10.0).text("Radius")).changed();
-                c |= ui.add(egui::Slider::new(rows, 2..=96).text("Rows")).changed();
-                c |= ui.add(egui::Slider::new(cols, 3..=128).text("Columns")).changed();
+                c |= pfield(ui, pslider(radius, 0.1..=10.0).text("Radius")).changed();
+                c |= pfield(ui, pslider(rows, 2..=96).text("Rows")).changed();
+                c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
             }
             NodeKind::Torus { major, minor, rows, cols } => {
-                c |= ui.add(egui::Slider::new(major, 0.1..=10.0).text("Major Radius")).changed();
-                c |= ui.add(egui::Slider::new(minor, 0.01..=5.0).text("Minor Radius")).changed();
-                c |= ui.add(egui::Slider::new(rows, 3..=96).text("Rows")).changed();
-                c |= ui.add(egui::Slider::new(cols, 3..=128).text("Columns")).changed();
+                c |= pfield(ui, pslider(major, 0.1..=10.0).text("Major Radius")).changed();
+                c |= pfield(ui, pslider(minor, 0.01..=5.0).text("Minor Radius")).changed();
+                c |= pfield(ui, pslider(rows, 3..=96).text("Rows")).changed();
+                c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
             }
             NodeKind::Transform { t, r, s } => {
                 c |= vec3_ui(ui, "Translate", t, 0.02);
@@ -12654,29 +13149,28 @@ impl ProceduralFxStudioApp {
                 c |= vec3_ui(ui, "Scale    ", s, 0.01);
             }
             NodeKind::Noise { freq, amp } => {
-                c |= ui.add(egui::Slider::new(freq, 0.0..=10.0).text("Frequency")).changed();
-                c |= ui.add(egui::Slider::new(amp, 0.0..=2.0).text("Amplitude")).changed();
+                c |= pfield(ui, pslider(freq, 0.0..=10.0).text("Frequency")).changed();
+                c |= pfield(ui, pslider(amp, 0.0..=2.0).text("Amplitude")).changed();
             }
             NodeKind::Taper { factor } => {
-                c |= ui.add(egui::Slider::new(factor, -2.0..=2.0).text("Taper")).changed();
+                c |= pfield(ui, pslider(factor, -2.0..=2.0).text("Taper")).changed();
             }
             NodeKind::Twist { angle } => {
-                c |= ui.add(egui::Slider::new(angle, -5.0..=5.0).text("Twist / unit")).changed();
+                c |= pfield(ui, pslider(angle, -5.0..=5.0).text("Twist / unit")).changed();
             }
             NodeKind::Bend { angle } => {
-                c |= ui.add(egui::Slider::new(angle, -3.0..=3.0).text("Bend / unit")).changed();
+                c |= pfield(ui, pslider(angle, -3.0..=3.0).text("Bend / unit")).changed();
             }
             NodeKind::Smooth { iterations, strength } => {
-                c |= ui.add(egui::Slider::new(iterations, 0..=50).text("Iterations")).changed();
-                c |= ui.add(egui::Slider::new(strength, 0.0..=1.0).text("Strength")).changed();
+                c |= pfield(ui, pslider(iterations, 0..=50).text("Iterations")).changed();
+                c |= pfield(ui, pslider(strength, 0.0..=1.0).text("Strength")).changed();
             }
             NodeKind::Bevel { amount, segments } => {
-                c |= ui.add(egui::Slider::new(amount, 0.0..=1.0).text("Amount")).changed();
-                c |= ui.add(egui::Slider::new(segments, 1..=8).text("Segments")).changed();
+                c |= pfield(ui, pslider(amount, 0.0..=1.0).text("Amount")).changed();
+                c |= pfield(ui, pslider(segments, 1..=8).text("Segments")).changed();
             }
             NodeKind::Fuse { tol } => {
-                c |= ui
-                    .add(egui::Slider::new(tol, 0.0001..=0.5).logarithmic(true).text("Distance"))
+                c |= pfield(ui, pslider(tol, 0.0001..=0.5).logarithmic(true).text("Distance"))
                     .changed();
             }
             NodeKind::Mirror { axis } => {
@@ -12688,31 +13182,67 @@ impl ProceduralFxStudioApp {
                 });
             }
             NodeKind::Copy { count, t, r, s } => {
-                c |= ui.add(egui::Slider::new(count, 1..=100).text("Copies")).changed();
+                c |= pfield(ui, pslider(count, 1..=100).text("Copies")).changed();
                 c |= vec3_ui(ui, "Translate", t, 0.02);
                 c |= vec3_ui(ui, "Rotate°  ", r, 0.5);
-                c |= ui.add(egui::Slider::new(s, 0.5..=1.5).text("Uniform Scale")).changed();
+                c |= pfield(ui, pslider(s, 0.5..=1.5).text("Uniform Scale")).changed();
             }
             NodeKind::CopyToPoints { scale, rotation } => {
                 ui.label("Copy the first input onto every point from the second input.");
-                c |= ui.add(egui::Slider::new(scale, 0.01..=10.0).logarithmic(true).text("Copy scale")).changed();
+                c |= pfield(ui, pslider(scale, 0.01..=10.0).logarithmic(true).text("Copy scale")).changed();
                 c |= vec3_ui(ui, "Rotation°", rotation, 0.5);
                 ui.small("Use Add or a particle output as the point input.");
             }
             NodeKind::AttributeCreate { attribute, value } => {
                 ui.label("Create or replace a point attribute.");
-                c |= ui.add(egui::Slider::new(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
-                c |= ui.add(egui::DragValue::new(value).speed(0.05).prefix("Value ")).changed();
+                c |= pfield(ui, pslider(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
+                c |= pfield(ui, pdrag(value).speed(0.05).prefix("Value ")).changed();
             }
-            NodeKind::AttributeRandomize { attribute, amount, seed } => {
-                ui.label("Add deterministic random variation to a point attribute.");
-                c |= ui.add(egui::Slider::new(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
-                c |= ui.add(egui::Slider::new(amount, 0.0..=10.0).text("Amount")).changed();
-                c |= ui.add(egui::DragValue::new(seed).prefix("Seed ")).changed();
+            NodeKind::AttributeRandomize(r) => {
+                ui.label("Deterministic random values for an attribute.");
+                ui.horizontal(|ui| {
+                    ui.label("Attribute");
+                    egui::ComboBox::from_id_salt(("randomize_preset", id)).selected_text(randomize::PRESETS[r.preset]).show_ui(ui, |ui| {
+                        for (i, name) in randomize::PRESETS.iter().enumerate() {
+                            c |= ui.selectable_value(&mut r.preset, i, *name).changed();
+                        }
+                    });
+                    if r.preset == randomize::CUSTOM {
+                        c |= ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(110.0).hint_text("name")).changed();
+                    }
+                });
+                if r.preset == randomize::CUSTOM {
+                    ui.horizontal(|ui| {
+                        ui.label("Class");
+                        for (i, name) in randomize::CLASSES.iter().enumerate() {
+                            c |= ui.selectable_value(&mut r.class, i, *name).changed();
+                        }
+                    });
+                    c |= pfield(ui, pslider(&mut r.size, 1..=4).text("Size (components)")).changed();
+                    ui.horizontal(|ui| {
+                        c |= pfield(ui, pdrag(&mut r.min).speed(0.01).prefix("Min ")).changed();
+                        c |= pfield(ui, pdrag(&mut r.max).speed(0.01).prefix("Max ")).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Values");
+                        for (i, name) in randomize::MODES.iter().enumerate() {
+                            c |= ui.selectable_value(&mut r.mode, i, *name).changed();
+                        }
+                    });
+                    ui.small("Each point, polygon (or the detail) gets values between Min and Max. Size 3 makes a vector, e.g. a random velocity v.");
+                } else {
+                    c |= pfield(ui, pslider(&mut r.amount, 0.0..=10.0).text("Amount")).changed();
+                    ui.small(match r.preset {
+                        2 => "A random colour per point; Amount shifts the hues.",
+                        3 => "A random rotation per point (a quaternion), blended in from none by Amount (0 to 1).",
+                        _ => "Adds a random value between -Amount and +Amount to each point.",
+                    });
+                }
+                c |= pfield(ui, pdrag(&mut r.seed).prefix("Seed ")).changed();
             }
             NodeKind::AttributeDelete { attribute } => {
                 ui.label("Remove a point attribute.");
-                c |= ui.add(egui::Slider::new(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
+                c |= pfield(ui, pslider(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
             }
             NodeKind::AttributeVop { domain } => {
                 ui.heading("Attribute VOP");
@@ -12802,7 +13332,7 @@ impl ProceduralFxStudioApp {
                     if v.ty == 1 || v.ty == 3 {
                         c |= vec3_ui(ui, label, &mut v.value, 0.01);
                     } else {
-                        c |= ui.add(egui::DragValue::new(&mut v.value[0]).speed(0.01).prefix(format!("{label} "))).changed();
+                        c |= pfield(ui, pdrag(&mut v.value[0]).speed(0.01).prefix(format!("{label} "))).changed();
                     }
                 }
                 if !def.inputs.is_empty() {
@@ -12904,24 +13434,31 @@ impl ProceduralFxStudioApp {
                 });
             }
             NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
-                c |= ui.add(egui::Slider::new(r_bot, 0.0..=5.0).text("Bottom Radius")).changed();
-                c |= ui.add(egui::Slider::new(r_top, 0.0..=5.0).text("Top Radius")).changed();
-                c |= ui.add(egui::Slider::new(height, 0.1..=10.0).text("Height")).changed();
-                c |= ui.add(egui::Slider::new(rows, 1..=64).text("Rows")).changed();
-                c |= ui.add(egui::Slider::new(cols, 3..=128).text("Columns")).changed();
+                c |= pfield(ui, pslider(r_bot, 0.0..=5.0).text("Bottom Radius")).changed();
+                c |= pfield(ui, pslider(r_top, 0.0..=5.0).text("Top Radius")).changed();
+                c |= pfield(ui, pslider(height, 0.1..=10.0).text("Height")).changed();
+                c |= pfield(ui, pslider(rows, 1..=64).text("Rows")).changed();
+                c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
                 c |= ui.checkbox(caps, "End Caps").changed();
             }
             NodeKind::Peak { dist } => {
-                c |= ui.add(egui::Slider::new(dist, -2.0..=2.0).text("Distance")).changed();
+                c |= pfield(ui, pslider(dist, -2.0..=2.0).text("Distance")).changed();
             }
             NodeKind::Ripple { freq, amp, speed } => {
-                c |= ui.add(egui::Slider::new(freq, 0.0..=20.0).text("Frequency")).changed();
-                c |= ui.add(egui::Slider::new(amp, 0.0..=2.0).text("Amplitude")).changed();
-                c |= ui.add(egui::Slider::new(speed, 0.0..=20.0).text("Speed")).changed();
+                c |= pfield(ui, pslider(freq, 0.0..=20.0).text("Frequency")).changed();
+                c |= pfield(ui, pslider(amp, 0.0..=2.0).text("Amplitude")).changed();
+                c |= pfield(ui, pslider(speed, 0.0..=20.0).text("Speed")).changed();
             }
-            NodeKind::Jitter { amp, seed } => {
-                c |= ui.add(egui::Slider::new(amp, 0.0..=1.0).text("Amount")).changed();
-                c |= ui.add(egui::Slider::new(seed, 0..=999).text("Seed")).changed();
+            NodeKind::Jitter { amp, seed, scale } => {
+                ui.small("Moves each point by a random offset of up to Amount, scaled per axis (0 keeps that axis still).");
+                c |= pfield(ui, pslider(amp, 0.0..=1.0).text("Amount")).changed();
+                ui.horizontal(|ui| {
+                    ui.label("Axis scale");
+                    for (axis, value) in ["x", "y", "z"].iter().zip(scale.iter_mut()) {
+                        c |= pfield(ui, pdrag(value).speed(0.01).range(0.0..=10.0).prefix(format!("{axis} "))).changed();
+                    }
+                });
+                c |= pfield(ui, pslider(seed, 0..=999).text("Seed")).changed();
             }
             NodeKind::Particles {
                 count,
@@ -12940,25 +13477,25 @@ impl ProceduralFxStudioApp {
             } => {
                 ui.small("Input 1: optional source (emits from its surface, or its points; the origin when unconnected) • Input 2: optional static collider.");
                 ui.strong("Emission");
-                c |= ui.add(egui::Slider::new(count, 1..=50_000).logarithmic(true).text("Max particles")).changed();
-                c |= ui.add(egui::Slider::new(emission_rate, 1.0..=10_000.0).logarithmic(true).text("Birth rate (per second)")).changed();
-                c |= ui.add(egui::Slider::new(lifetime, 0.1..=20.0).text("Lifetime")).changed();
-                c |= ui.add(egui::Slider::new(speed, 0.0..=20.0).text("Speed")).changed();
-                c |= ui.add(egui::Slider::new(spread, 0.0..=2.0).text("Spread")).changed();
+                c |= pfield(ui, pslider(count, 1..=50_000).logarithmic(true).text("Max particles")).changed();
+                c |= pfield(ui, pslider(emission_rate, 1.0..=10_000.0).logarithmic(true).text("Birth rate (per second)")).changed();
+                c |= pfield(ui, pslider(lifetime, 0.1..=20.0).text("Lifetime")).changed();
+                c |= pfield(ui, pslider(speed, 0.0..=20.0).text("Speed")).changed();
+                c |= pfield(ui, pslider(spread, 0.0..=2.0).text("Spread")).changed();
                 c |= ui
                     .checkbox(along_normals, "Emit along source normals")
                     .on_hover_text("Off: particles head up (+Y). Points inherit their v attribute either way.")
                     .changed();
                 ui.strong("Forces");
-                c |= ui.add(egui::Slider::new(gravity, -20.0..=10.0).text("Gravity")).changed();
-                c |= ui.add(egui::Slider::new(drag, 0.0..=5.0).text("Drag")).changed();
+                c |= pfield(ui, pslider(gravity, -20.0..=10.0).text("Gravity")).changed();
+                c |= pfield(ui, pslider(drag, 0.0..=5.0).text("Drag")).changed();
                 ui.strong("Collisions");
-                c |= ui.add(egui::Slider::new(bounce, 0.0..=1.0).text("Bounce")).changed();
-                c |= ui.add(egui::Slider::new(friction, 0.0..=1.0).text("Friction")).changed();
-                c |= ui.add(egui::Slider::new(radius, 0.0..=0.5).text("Particle radius")).changed();
+                c |= pfield(ui, pslider(bounce, 0.0..=1.0).text("Bounce")).changed();
+                c |= pfield(ui, pslider(friction, 0.0..=1.0).text("Friction")).changed();
+                c |= pfield(ui, pslider(radius, 0.0..=0.5).text("Particle radius")).changed();
                 ui.strong("Solver");
-                c |= ui.add(egui::Slider::new(substeps, 1..=8).text("Substeps")).changed();
-                c |= ui.add(egui::Slider::new(seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(substeps, 1..=8).text("Substeps")).changed();
+                c |= pfield(ui, pslider(seed, 0..=9999).text("Seed")).changed();
                 ui.small("Outputs points with v, age, life and id attributes.");
             }
             NodeKind::Flip {
@@ -12973,14 +13510,14 @@ impl ProceduralFxStudioApp {
                 domain,
             } => {
                 ui.label("3D CPU FLIP solver");
-                c |= ui.add(egui::Slider::new(particle_count, 1..=100_000).logarithmic(true).text("Particles")).changed();
-                c |= ui.add(egui::Slider::new(grid_resolution, 16..=128).text("Grid resolution")).changed();
-                c |= ui.add(egui::Slider::new(flip_ratio, 0.0..=1.0).text("FLIP blend")).changed();
-                c |= ui.add(egui::Slider::new(viscosity, 0.0..=4.0).text("Viscosity")).changed();
-                c |= ui.add(egui::Slider::new(gravity, -30.0..=10.0).text("Gravity")).changed();
-                c |= ui.add(egui::Slider::new(max_dt, 0.001..=0.1).logarithmic(true).text("Max timestep")).changed();
-                c |= ui.add(egui::Slider::new(substeps, 1..=8).text("Substeps")).changed();
-                c |= ui.add(egui::Slider::new(seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(particle_count, 1..=100_000).logarithmic(true).text("Particles")).changed();
+                c |= pfield(ui, pslider(grid_resolution, 16..=128).text("Grid resolution")).changed();
+                c |= pfield(ui, pslider(flip_ratio, 0.0..=1.0).text("FLIP blend")).changed();
+                c |= pfield(ui, pslider(viscosity, 0.0..=4.0).text("Viscosity")).changed();
+                c |= pfield(ui, pslider(gravity, -30.0..=10.0).text("Gravity")).changed();
+                c |= pfield(ui, pslider(max_dt, 0.001..=0.1).logarithmic(true).text("Max timestep")).changed();
+                c |= pfield(ui, pslider(substeps, 1..=8).text("Substeps")).changed();
+                c |= pfield(ui, pslider(seed, 0..=9999).text("Seed")).changed();
                 let mut auto = domain[3] <= 0.0;
                 if ui.checkbox(&mut auto, "Domain from the emitter's bounds").on_hover_text("Or drag the domain box's faces in the viewport").changed() {
                     *domain = if auto { [0.0; 6] } else { [0.0, 1.5, 0.0, 4.0, 3.0, 4.0] };
@@ -12991,7 +13528,7 @@ impl ProceduralFxStudioApp {
                         ui.horizontal(|ui| {
                             ui.label(label);
                             for k in range {
-                                c |= ui.add(egui::DragValue::new(&mut domain[k]).speed(0.02).range(if k >= 3 { 0.01..=1000.0 } else { -1000.0..=1000.0 })).changed();
+                                c |= pfield(ui, pdrag(&mut domain[k]).speed(0.02).range(if k >= 3 { 0.01..=1000.0 } else { -1000.0..=1000.0 })).changed();
                             }
                         });
                     }
@@ -13000,37 +13537,37 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::WhitewaterSolver(w) => {
                 ui.small("Spray, foam and bubbles where the fluid input splashes. Input 1: FLIP fluid • Input 2: optional collider. Writes `type` and spray/foam/bubble groups; renders as small spheres.");
-                c |= ui.add(egui::Slider::new(&mut w.max_particles, 0..=2_000_000).logarithmic(true).text("Max particles")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.emission_rate, 0.0..=10_000.0).logarithmic(true).text("Emission rate")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.trapped_air, 0.0..=4.0).text("Trapped air")).on_hover_text("Emission where fluid collides or tears apart").changed();
-                c |= ui.add(egui::Slider::new(&mut w.wave_crest, 0.0..=4.0).text("Wave crests")).on_hover_text("Emission from breaking crests").changed();
-                c |= ui.add(egui::Slider::new(&mut w.min_speed, 0.0..=10.0).text("Min speed")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.max_speed, 0.1..=30.0).text("Full emission speed")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.lifespan, 0.05..=10.0).text("Foam lifespan (s)")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.spray_drag, 0.0..=5.0).text("Spray drag")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.bubble_buoyancy, 0.0..=10.0).text("Bubble buoyancy")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.bubble_drag, 0.0..=1.0).text("Bubble drag")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.spray_neighbours, 0..=50).text("Spray below (neighbours)")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.bubble_neighbours, 1..=100).text("Bubbles above (neighbours)")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.gravity, -30.0..=10.0).text("Gravity")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.particle_size, 0.0005..=0.2).logarithmic(true).text("Particle size")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.substeps, 1..=8).text("Substeps")).changed();
-                c |= ui.add(egui::Slider::new(&mut w.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut w.max_particles, 0..=2_000_000).logarithmic(true).text("Max particles")).changed();
+                c |= pfield(ui, pslider(&mut w.emission_rate, 0.0..=10_000.0).logarithmic(true).text("Emission rate")).changed();
+                c |= pfield(ui, pslider(&mut w.trapped_air, 0.0..=4.0).text("Trapped air")).on_hover_text("Emission where fluid collides or tears apart").changed();
+                c |= pfield(ui, pslider(&mut w.wave_crest, 0.0..=4.0).text("Wave crests")).on_hover_text("Emission from breaking crests").changed();
+                c |= pfield(ui, pslider(&mut w.min_speed, 0.0..=10.0).text("Min speed")).changed();
+                c |= pfield(ui, pslider(&mut w.max_speed, 0.1..=30.0).text("Full emission speed")).changed();
+                c |= pfield(ui, pslider(&mut w.lifespan, 0.05..=10.0).text("Foam lifespan (s)")).changed();
+                c |= pfield(ui, pslider(&mut w.spray_drag, 0.0..=5.0).text("Spray drag")).changed();
+                c |= pfield(ui, pslider(&mut w.bubble_buoyancy, 0.0..=10.0).text("Bubble buoyancy")).changed();
+                c |= pfield(ui, pslider(&mut w.bubble_drag, 0.0..=1.0).text("Bubble drag")).changed();
+                c |= pfield(ui, pslider(&mut w.spray_neighbours, 0..=50).text("Spray below (neighbours)")).changed();
+                c |= pfield(ui, pslider(&mut w.bubble_neighbours, 1..=100).text("Bubbles above (neighbours)")).changed();
+                c |= pfield(ui, pslider(&mut w.gravity, -30.0..=10.0).text("Gravity")).changed();
+                c |= pfield(ui, pslider(&mut w.particle_size, 0.0005..=0.2).logarithmic(true).text("Particle size")).changed();
+                c |= pfield(ui, pslider(&mut w.substeps, 1..=8).text("Substeps")).changed();
+                c |= pfield(ui, pslider(&mut w.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
                 ui.label("Voxel particle-fluid surface");
-                c |= ui.add(egui::Slider::new(radius, 0.01..=1.0).logarithmic(true).text("Particle radius")).changed();
-                c |= ui.add(egui::Slider::new(join_distance, 0.0..=1.0).text("Join distance")).changed();
-                c |= ui.add(egui::Slider::new(resolution, 8..=96).text("Resolution")).changed();
-                c |= ui.add(egui::Slider::new(smoothing, 0..=3).text("Smoothing")).changed();
+                c |= pfield(ui, pslider(radius, 0.01..=1.0).logarithmic(true).text("Particle radius")).changed();
+                c |= pfield(ui, pslider(join_distance, 0.0..=1.0).text("Join distance")).changed();
+                c |= pfield(ui, pslider(resolution, 8..=96).text("Resolution")).changed();
+                c |= pfield(ui, pslider(smoothing, 0..=3).text("Smoothing")).changed();
                 ui.small("Nearby particles are unioned into one fluid-like surface before polygon extraction.");
             }
             NodeKind::Extrude(set) => {
                 ui.small("Extrudes the node's group (or everything) along the normals. Faces outside the group stay as they are.");
                 c |= ui.checkbox(&mut set.connected, "Keep shared points together").on_hover_text("On: connected faces extrude as one, with walls only around the outside. Off: every face on its own").changed();
-                c |= ui.add(egui::Slider::new(&mut set.distance, -10.0..=10.0).text("Distance")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.inset, 0.0..=1.0).text("Inset")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.divisions, 1..=50).text("Divisions")).changed();
+                c |= pfield(ui, pslider(&mut set.distance, -10.0..=10.0).text("Distance")).changed();
+                c |= pfield(ui, pslider(&mut set.inset, 0.0..=1.0).text("Inset")).changed();
+                c |= pfield(ui, pslider(&mut set.divisions, 1..=50).text("Divisions")).changed();
                 ui.separator();
                 ui.strong("Output");
                 c |= ui.checkbox(&mut set.output_front, "Output front").changed();
@@ -13053,7 +13590,7 @@ impl ProceduralFxStudioApp {
                     c |= ui.selectable_value(axis, 1, "Y").changed();
                     c |= ui.selectable_value(axis, 2, "Z").changed();
                 });
-                c |= ui.add(egui::Slider::new(offset, -5.0..=5.0).text("Offset")).changed();
+                c |= pfield(ui, pslider(offset, -5.0..=5.0).text("Offset")).changed();
                 c |= ui.checkbox(invert, "Keep Below").changed();
             }
             NodeKind::Blast { component, indices, invert } => {
@@ -13073,7 +13610,7 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::Cache { cache_id, mode } => {
                 ui.label("Persistent frame cache: cache/cache_ID_frame.mcache");
-                c |= ui.add(egui::Slider::new(cache_id, 0..=9999).text("Cache ID")).changed();
+                c |= pfield(ui, pslider(cache_id, 0..=9999).text("Cache ID")).changed();
                 ui.horizontal(|ui| {
                     ui.label("Mode:");
                     c |= ui.selectable_value(mode, 0, "Read").changed();
@@ -13093,11 +13630,10 @@ impl ProceduralFxStudioApp {
                 } else {
                     "Converts the mesh to a signed-distance volume and outputs its surface directly."
                 });
-                c |= ui
-                    .add(egui::Slider::new(voxel_size, 0.03..=1.0).logarithmic(true).text("Voxel size"))
+                c |= pfield(ui, pslider(voxel_size, 0.03..=1.0).logarithmic(true).text("Voxel size"))
                     .changed();
                 ui.small("Smaller voxels = more detail and slower cooking.");
-                c |= ui.add(egui::Slider::new(padding, 0..=4).text("Volume padding")).changed();
+                c |= pfield(ui, pslider(padding, 0..=4).text("Volume padding")).changed();
                 ui.horizontal(|ui| {
                     ui.label("Surface operation");
                     egui::ComboBox::from_id_salt("vdb-operation")
@@ -13115,14 +13651,14 @@ impl ProceduralFxStudioApp {
                         });
                 });
                 if *operation == 1 || *operation == 2 {
-                    c |= ui.add(egui::Slider::new(iterations, 1..=4).text("Surface offset (voxels)")).changed();
+                    c |= pfield(ui, pslider(iterations, 1..=4).text("Surface offset (voxels)")).changed();
                     ui.small(if *operation == 1 {
                         "Moves the surface outward by the selected number of voxels."
                     } else {
                         "Moves the surface inward by the selected number of voxels."
                     });
                 } else if *operation == 3 {
-                    c |= ui.add(egui::Slider::new(iterations, 1..=4).text("Smoothing passes")).changed();
+                    c |= pfield(ui, pslider(iterations, 1..=4).text("Smoothing passes")).changed();
                     ui.small("Removes small voxel-scale bumps.");
                 } else {
                     ui.small("Creates the base VDB surface without changing its shape.");
@@ -13150,14 +13686,13 @@ impl ProceduralFxStudioApp {
                 });
                 c |= ui.checkbox(&mut opts.stage, "Render the STAGE (USD) instead of the OBJ objects").changed();
                 c |= hydra_checkbox(ui, opts);
-                c |= ui.add(egui::DragValue::new(width).range(1..=16384).prefix("Width ")).changed();
-                c |= ui.add(egui::DragValue::new(height).range(1..=16384).prefix("Height ")).changed();
-                c |= ui.add(egui::DragValue::new(samples).range(1..=4096).prefix("Samples per pixel ")).changed();
-                c |= ui.add(egui::Slider::new(&mut opts.max_depth, 1..=32).text("Max ray depth")).changed();
-                c |= ui.add(egui::Slider::new(&mut opts.light_samples, 1..=16).text("Light samples")).changed();
-                c |= ui.add(egui::Slider::new(&mut opts.bsdf_samples, 1..=16).text("BSDF samples")).changed();
-                c |= ui
-                    .add(egui::Slider::new(&mut opts.volume_samples, 1..=8).text("Volume lighting samples"))
+                c |= pfield(ui, pdrag(width).range(1..=16384).prefix("Width ")).changed();
+                c |= pfield(ui, pdrag(height).range(1..=16384).prefix("Height ")).changed();
+                c |= pfield(ui, pdrag(samples).range(1..=4096).prefix("Samples per pixel ")).changed();
+                c |= pfield(ui, pslider(&mut opts.max_depth, 1..=32).text("Max ray depth")).changed();
+                c |= pfield(ui, pslider(&mut opts.light_samples, 1..=16).text("Light samples")).changed();
+                c |= pfield(ui, pslider(&mut opts.bsdf_samples, 1..=16).text("BSDF samples")).changed();
+                c |= pfield(ui, pslider(&mut opts.volume_samples, 1..=8).text("Volume lighting samples"))
                     .on_hover_text("Light samples per step inside smoke and fire; render time grows roughly in proportion")
                     .changed();
                 ui.horizontal(|ui| {
@@ -13169,9 +13704,9 @@ impl ProceduralFxStudioApp {
                 c |= ui.checkbox(&mut opts.sequence, "Render frame range").changed();
                 if opts.sequence {
                     ui.horizontal(|ui| {
-                        c |= ui.add(egui::DragValue::new(&mut opts.range_start).speed(0.05).range(0.0..=100_000.0).prefix("Start ")).changed();
-                        c |= ui.add(egui::DragValue::new(&mut opts.range_end).speed(0.05).range(0.0..=100_000.0).prefix("End ")).changed();
-                        c |= ui.add(egui::DragValue::new(&mut opts.range_step).speed(0.01).range(0.0001..=1000.0).prefix("Step ")).changed();
+                        c |= pfield(ui, pdrag(&mut opts.range_start).speed(0.05).range(0.0..=100_000.0).prefix("Start ")).changed();
+                        c |= pfield(ui, pdrag(&mut opts.range_end).speed(0.05).range(0.0..=100_000.0).prefix("End ")).changed();
+                        c |= pfield(ui, pdrag(&mut opts.range_step).speed(0.01).range(0.0001..=1000.0).prefix("Step ")).changed();
                     });
                     if ui.button("Use timeline range").clicked() {
                         opts.range_start = self.playback_start.max(0.0);
@@ -13206,12 +13741,12 @@ impl ProceduralFxStudioApp {
                 ui.label("Viewport camera rig");
                 c |= vec3_ui(ui, "Target", position, 0.05);
                 c |= vec3_ui(ui, "Rotation°", rotation, 0.5);
-                c |= ui.add(egui::Slider::new(focal, 0.5..=2.5).text("Focal scale")).changed();
-                c |= ui.add(egui::Slider::new(near, 0.05..=10.0).text("Near clip")).changed();
+                c |= pfield(ui, pslider(focal, 0.5..=2.5).text("Focal scale")).changed();
+                c |= pfield(ui, pslider(near, 0.05..=10.0).text("Near clip")).changed();
                 c |= ui.checkbox(orthographic, "Orthographic").changed();
-                c |= ui.add(egui::DragValue::new(&mut pan[0]).speed(1.0).prefix("Pan X ")).changed();
-                c |= ui.add(egui::DragValue::new(&mut pan[1]).speed(1.0).prefix("Pan Y ")).changed();
-                c |= ui.add(egui::Slider::new(zoom, 0.5..=200.0).logarithmic(true).text("Zoom")).changed();
+                c |= pfield(ui, pdrag(&mut pan[0]).speed(1.0).prefix("Pan X ")).changed();
+                c |= pfield(ui, pdrag(&mut pan[1]).speed(1.0).prefix("Pan Y ")).changed();
+                c |= pfield(ui, pslider(zoom, 0.5..=200.0).logarithmic(true).text("Zoom")).changed();
                 if self.active_camera == Some(id) {
                     ui.label("Active viewport camera");
                 } else if ui.button("Use as viewport camera").clicked() {
@@ -13224,7 +13759,7 @@ impl ProceduralFxStudioApp {
                 c |= vec3_ui(ui, "Position", position, 0.05);
                 c |= vec3_ui(ui, "Rotation°", rotation, 0.5);
                 c |= vec3_ui(ui, "Color", color, 0.02);
-                c |= ui.add(egui::Slider::new(intensity, 0.0..=4.0).text("Intensity")).changed();
+                c |= pfield(ui, pslider(intensity, 0.0..=4.0).text("Intensity")).changed();
                 ui.horizontal(|ui| {
                     ui.label("Type");
                     c |= ui.selectable_value(kind, 0, "Directional").changed();
@@ -13243,22 +13778,21 @@ impl ProceduralFxStudioApp {
                 ui.label("Flips triangle winding (normals).");
             }
             NodeKind::Subdivide { levels } => {
-                c |= ui.add(egui::Slider::new(levels, 1..=4).text("Levels")).changed();
+                c |= pfield(ui, pslider(levels, 1..=4).text("Levels")).changed();
             }
             NodeKind::Remesh { target } => {
-                c |= ui
-                    .add(egui::Slider::new(target, 4..=50_000).logarithmic(true).text("Target triangles"))
+                c |= pfield(ui, pslider(target, 4..=50_000).logarithmic(true).text("Target triangles"))
                     .changed();
                 ui.label("Adds shared-edge subdivisions until the target is reached.");
             }
             NodeKind::HairGuides(set) => {
                 ui.small("Input 1: skin mesh. Grows guide curves from its surface along the normals.");
-                c |= ui.add(egui::Slider::new(&mut set.count, 1..=20_000).logarithmic(true).text("Guides")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.length, 0.0..=5.0).text("Length")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.length_variance, 0.0..=1.0).text("Length variance")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.segments, 1..=64).text("Segments")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.droop, 0.0..=3.0).text("Droop")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.count, 1..=20_000).logarithmic(true).text("Guides")).changed();
+                c |= pfield(ui, pslider(&mut set.length, 0.0..=5.0).text("Length")).changed();
+                c |= pfield(ui, pslider(&mut set.length_variance, 0.0..=1.0).text("Length variance")).changed();
+                c |= pfield(ui, pslider(&mut set.segments, 1..=64).text("Segments")).changed();
+                c |= pfield(ui, pslider(&mut set.droop, 0.0..=3.0).text("Droop")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::GuideProcess(set) => {
                 ui.small("Shapes the guide curves from input 1. Chain several to combine operations.");
@@ -13274,30 +13808,29 @@ impl ProceduralFxStudioApp {
                     3 => ("Curl radius", 0.0..=2.0),
                     _ => ("Smoothing", 0.0..=2.0),
                 };
-                c |= ui.add(egui::Slider::new(&mut set.amount, range).text(amount_label)).changed();
+                c |= pfield(ui, pslider(&mut set.amount, range).text(amount_label)).changed();
                 if matches!(set.op, 2 | 3) {
                     let label = if set.op == 2 { "Frequency" } else { "Turns per unit length" };
-                    c |= ui.add(egui::Slider::new(&mut set.frequency, 0.0..=20.0).text(label)).changed();
-                    c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                    c |= pfield(ui, pslider(&mut set.frequency, 0.0..=20.0).text(label)).changed();
+                    c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
                 }
             }
             NodeKind::HairDeform(set) => {
                 ui.small("Input 1: hair or guides • Input 2: animated skin. Each strand moves with the skin under its root.");
-                c |= ui
-                    .add(egui::DragValue::new(&mut set.rest_frame).speed(1.0).range(-10_000.0..=100_000.0).prefix("Rest frame "))
+                c |= pfield(ui, pdrag(&mut set.rest_frame).speed(1.0).range(-10_000.0..=100_000.0).prefix("Rest frame "))
                     .on_hover_text("The frame the hair was groomed on. The skin must keep the same topology at every frame.")
                     .changed();
             }
             NodeKind::HairGenerate(set) => {
                 ui.small("Input 1: skin • Input 2: guides. Interpolates dense hair from the three nearest guides.");
-                c |= ui.add(egui::Slider::new(&mut set.count, 1..=200_000).logarithmic(true).text("Hairs")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.segments, 1..=64).text("Segments")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.clump, 0.0..=1.0).text("Clumping")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.length_variance, 0.0..=1.0).text("Length variance")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.frizz, 0.0..=2.0).text("Frizz")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.width_root, 0.0..=0.05).text("Root width")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.width_tip, 0.0..=0.05).text("Tip width")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.count, 1..=200_000).logarithmic(true).text("Hairs")).changed();
+                c |= pfield(ui, pslider(&mut set.segments, 1..=64).text("Segments")).changed();
+                c |= pfield(ui, pslider(&mut set.clump, 0.0..=1.0).text("Clumping")).changed();
+                c |= pfield(ui, pslider(&mut set.length_variance, 0.0..=1.0).text("Length variance")).changed();
+                c |= pfield(ui, pslider(&mut set.frizz, 0.0..=2.0).text("Frizz")).changed();
+                c |= pfield(ui, pslider(&mut set.width_root, 0.0..=0.05).text("Root width")).changed();
+                c |= pfield(ui, pslider(&mut set.width_tip, 0.0..=0.05).text("Tip width")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
                 ui.small("Merge the result with the skin to render both.");
             }
             NodeKind::Pyro(set) => {
@@ -13319,27 +13852,27 @@ impl ProceduralFxStudioApp {
                 if ui.button("Fit around source").on_hover_text("Centre the box on the source and leave room for the smoke to rise").clicked() {
                     self.pyro_fit_request = Some(id);
                 }
-                c |= ui.add(egui::Slider::new(&mut set.resolution, 8..=160).text("Resolution (voxels on longest side)")).changed();
+                c |= pfield(ui, pslider(&mut set.resolution, 8..=160).text("Resolution (voxels on longest side)")).changed();
                 let voxels = {
                     let h = set.size.iter().cloned().fold(0.0, f32::max) / set.resolution.max(4) as f32;
                     set.size.iter().map(|s| ((s / h).ceil() as usize).max(4)).product::<usize>()
                 };
                 ui.weak(format!("{voxels} voxels"));
-                c |= ui.add(egui::Slider::new(&mut set.substeps, 1..=8).text("Substeps")).changed();
+                c |= pfield(ui, pslider(&mut set.substeps, 1..=8).text("Substeps")).changed();
                 ui.separator();
                 ui.strong("Source");
-                c |= ui.add(egui::Slider::new(&mut set.density, 0.0..=4.0).text("Density")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.temperature, 0.0..=4.0).text("Temperature")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.fuel, 0.0..=4.0).text("Fuel (fire)")).changed();
+                c |= pfield(ui, pslider(&mut set.density, 0.0..=4.0).text("Density")).changed();
+                c |= pfield(ui, pslider(&mut set.temperature, 0.0..=4.0).text("Temperature")).changed();
+                c |= pfield(ui, pslider(&mut set.fuel, 0.0..=4.0).text("Fuel (fire)")).changed();
                 ui.strong("Shape");
-                c |= ui.add(egui::Slider::new(&mut set.buoyancy, -2.0..=5.0).text("Buoyancy")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.dissipation, 0.0..=3.0).text("Dissipation")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.cooling, 0.0..=5.0).text("Cooling")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.burn_rate, 0.0..=5.0).text("Burn rate")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.vorticity, 0.0..=3.0).text("Vorticity")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.turbulence, 0.0..=3.0).text("Turbulence")).changed();
+                c |= pfield(ui, pslider(&mut set.buoyancy, -2.0..=5.0).text("Buoyancy")).changed();
+                c |= pfield(ui, pslider(&mut set.dissipation, 0.0..=3.0).text("Dissipation")).changed();
+                c |= pfield(ui, pslider(&mut set.cooling, 0.0..=5.0).text("Cooling")).changed();
+                c |= pfield(ui, pslider(&mut set.burn_rate, 0.0..=5.0).text("Burn rate")).changed();
+                c |= pfield(ui, pslider(&mut set.vorticity, 0.0..=3.0).text("Vorticity")).changed();
+                c |= pfield(ui, pslider(&mut set.turbulence, 0.0..=3.0).text("Turbulence")).changed();
                 c |= vec3_ui(ui, "Wind", &mut set.wind, 0.05);
-                c |= ui.add(egui::Slider::new(&mut set.opacity, 0.0..=4.0).text("Display opacity")).changed();
+                c |= pfield(ui, pslider(&mut set.opacity, 0.0..=4.0).text("Display opacity")).changed();
                 ui.small("Output: points with density, temperature, flame, Cd, Alpha and pscale, drawn as soft volume splats. Edits restart the simulation.");
             }
             NodeKind::GroupCreate(set) => {
@@ -13363,12 +13896,12 @@ impl ProceduralFxStudioApp {
                         c |= vec3_ui(ui, "Max", &mut set.bbox_max, 0.05);
                     }
                     1 => {
-                        c |= ui.add(egui::Slider::new(&mut set.percent, 0.0..=100.0).text("Percent")).changed();
-                        c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                        c |= pfield(ui, pslider(&mut set.percent, 0.0..=100.0).text("Percent")).changed();
+                        c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
                     }
                     2 => {
                         c |= vec3_ui(ui, "Direction", &mut set.direction, 0.05);
-                        c |= ui.add(egui::Slider::new(&mut set.spread, 0.0..=180.0).text("Spread angle")).changed();
+                        c |= pfield(ui, pslider(&mut set.spread, 0.0..=180.0).text("Spread angle")).changed();
                     }
                     _ => {
                         c |= ui.add(egui::TextEdit::singleline(&mut set.expression).hint_text("@P.y>0  0-10  other ^skip").desired_width(220.0)).changed();
@@ -13403,8 +13936,8 @@ impl ProceduralFxStudioApp {
                     ui.label("Color");
                     c |= ui.color_edit_button_rgb(color).changed();
                 });
-                c |= ui.add(egui::Slider::new(intensity, 0.0..=10.0).text("Intensity")).changed();
-                c |= ui.add(egui::Slider::new(rotation, -180.0..=180.0).text("Rotate (Y°)")).changed();
+                c |= pfield(ui, pslider(intensity, 0.0..=10.0).text("Intensity")).changed();
+                c |= pfield(ui, pslider(rotation, -180.0..=180.0).text("Rotate (Y°)")).changed();
                 c |= ui.checkbox(visible, "Visible in camera (background)").changed();
             }
             NodeKind::AttributePaint { attribute, values, settings: set } => {
@@ -13433,10 +13966,10 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.mode, value, *label).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.value, -2.0..=4.0).text("Paint value")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.default, -2.0..=4.0).text("Default (unpainted)")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.radius, 2.0..=400.0).logarithmic(true).text("Brush radius (px)")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.strength, 0.01..=1.0).text("Strength")).changed();
+                c |= pfield(ui, pslider(&mut set.value, -2.0..=4.0).text("Paint value")).changed();
+                c |= pfield(ui, pslider(&mut set.default, -2.0..=4.0).text("Default (unpainted)")).changed();
+                c |= pfield(ui, pslider(&mut set.radius, 2.0..=400.0).logarithmic(true).text("Brush radius (px)")).changed();
+                c |= pfield(ui, pslider(&mut set.strength, 0.01..=1.0).text("Strength")).changed();
                 c |= ui.checkbox(&mut set.visualize, "Show as colour (Cd)").changed();
                 ui.horizontal(|ui| {
                     if ui.button("Fill with paint value").clicked() {
@@ -13461,8 +13994,7 @@ impl ProceduralFxStudioApp {
                     }
                 });
                 if set.domain == 1 {
-                    c |= ui
-                        .add(egui::Slider::new(&mut set.cusp_angle, 0.0..=180.0).text("Cusp angle"))
+                    c |= pfield(ui, pslider(&mut set.cusp_angle, 0.0..=180.0).text("Cusp angle"))
                         .on_hover_text("Faces meeting at a sharper angle than this keep a hard edge")
                         .changed();
                 }
@@ -13476,10 +14008,10 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::Scatter(set) => {
                 ui.small("Scatters points on the input's surface, or inside it when it's a closed mesh. Points get N, pscale and sourceprim.");
-                c |= ui.add(egui::Slider::new(&mut set.count, 1..=1_000_000).logarithmic(true).text("Points")).changed();
+                c |= pfield(ui, pslider(&mut set.count, 1..=1_000_000).logarithmic(true).text("Points")).changed();
                 c |= ui.checkbox(&mut set.volume, "Fill the inside (closed meshes)").changed();
-                c |= ui.add(egui::Slider::new(&mut set.relax_iterations, 0..=50).text("Relax iterations")).on_hover_text("Spreads the points out evenly").changed();
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.relax_iterations, 0..=50).text("Relax iterations")).on_hover_text("Spreads the points out evenly").changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::Boolean(set) => {
                 ui.small("Combines input A (left) with input B (right). Both should be closed meshes. Result faces are in the a_faces and b_faces primitive groups.");
@@ -13494,19 +14026,91 @@ impl ProceduralFxStudioApp {
                     }
                 });
                 if set.mode == 1 {
-                    c |= ui.add(egui::Slider::new(&mut set.resolution, 16..=400).text("Voxel resolution")).on_hover_text("Voxels along the longest side").changed();
+                    c |= pfield(ui, pslider(&mut set.resolution, 16..=400).text("Voxel resolution")).on_hover_text("Voxels along the longest side").changed();
                 } else {
                     ui.small("Exact keeps sharp edges. Use Volume for very dense or leaky meshes.");
                 }
             }
             NodeKind::PointDeform(set) => {
                 ui.small("Input 1: geometry • Input 2: rest points • Input 3: the same points, moved (a simulation, a lattice, an animated cloud). The geometry follows them, bending and turning.");
-                c |= ui.add(egui::Slider::new(&mut set.influences, 1..=32).text("Points followed")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.fit_neighbours, 3..=64).text("Rotation from neighbours")).changed();
+                c |= pfield(ui, pslider(&mut set.influences, 1..=32).text("Points followed")).changed();
+                c |= pfield(ui, pslider(&mut set.fit_neighbours, 3..=64).text("Rotation from neighbours")).changed();
                 c |= ui.checkbox(&mut set.rotate, "Follow rotation").changed();
             }
             NodeKind::TransformPieces => {
                 ui.small("Input 1: geometry with `piece` (or `name`) • Input 2: one point per piece with P, orient or transform, pscale • Input 3 (optional): the template points at rest. Each piece moves rigidly with its point.");
+            }
+            NodeKind::ExtractCentroid(set) => {
+                ui.small("One point per piece, at its centre (with a piece attribute): feed it to Copy to Points or Transform Pieces.");
+                egui::ComboBox::from_label("Pieces").selected_text(sopkit::PARTITIONS[set.partition.min(2)]).show_ui(ui, |ui| {
+                    for (i, name) in sopkit::PARTITIONS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.partition, i, *name).changed();
+                    }
+                });
+                egui::ComboBox::from_label("Centre").selected_text(sopkit::CENTRES[set.method.min(1)]).show_ui(ui, |ui| {
+                    for (i, name) in sopkit::CENTRES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.method, i, *name).changed();
+                    }
+                });
+            }
+            NodeKind::MatchSize(set) => {
+                ui.small(if has_reference { "Lines the input up with input 2's bounding box." } else { "Lines the input up with the target box below (or connect a reference to input 2)." });
+                for (a, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Justify {axis}"));
+                        for (j, name) in sopkit::JUSTIFY.iter().enumerate() {
+                            c |= ui.selectable_value(&mut set.justify[a], j, *name).changed();
+                        }
+                    });
+                }
+                c |= ui.checkbox(&mut set.scale_to_fit, "Scale to fit").changed();
+                if set.scale_to_fit {
+                    c |= ui.checkbox(&mut set.uniform, "Uniform scale (keep proportions)").changed();
+                }
+                if !has_reference {
+                    ui.horizontal(|ui| {
+                        ui.label("Target centre");
+                        for v in set.target_center.iter_mut() {
+                            c |= pfield(ui, pdrag(v).speed(0.01)).changed();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Target size");
+                        for v in set.target_size.iter_mut() {
+                            c |= pfield(ui, pdrag(v).speed(0.01).range(0.0..=1e6)).changed();
+                        }
+                    });
+                }
+            }
+            NodeKind::ConvertLine => {
+                ui.small("Every polygon edge (not the diagonals inside quads) as a two-point line, with a restlength attribute. Lines are curves: Resample, Copy to Points and grooming work on them.");
+            }
+            NodeKind::Metaball(set) => {
+                ui.small("Soft blobs around the input's points (pscale scales each), joined where they meet; with no input, one ball at the origin.");
+                c |= pfield(ui, pslider(&mut set.radius, 0.01..=10.0).logarithmic(true).text("Radius")).changed();
+                c |= pfield(ui, pslider(&mut set.threshold, 0.01..=0.99).text("Threshold")).on_hover_text("Lower is fatter: blobs reach out and blend sooner").changed();
+                c |= pfield(ui, pslider(&mut set.resolution, 8..=256).text("Resolution")).changed();
+            }
+            NodeKind::Connectivity(set) => {
+                ui.small("Numbers the connected pieces 0, 1, 2… in an attribute.");
+                ui.horizontal(|ui| {
+                    ui.label("Class");
+                    c |= ui.selectable_value(&mut set.class, 0, "Points").changed();
+                    c |= ui.selectable_value(&mut set.class, 1, "Primitives").changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Attribute");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.attribute).desired_width(120.0)).changed();
+                });
+            }
+            NodeKind::Resample(set) => {
+                ui.small("Evenly spaced points along curves (Convert Line, grooms…); attributes are interpolated.");
+                c |= ui.checkbox(&mut set.by_length, "Maximum segment length").changed();
+                if set.by_length {
+                    c |= pfield(ui, pslider(&mut set.length, 0.001..=10.0).logarithmic(true).text("Length")).changed();
+                } else {
+                    c |= pfield(ui, pslider(&mut set.segments, 1..=500).text("Segments")).changed();
+                }
             }
             NodeKind::Measure(set) => {
                 egui::ComboBox::from_label("Measure").selected_text(measure::KINDS[set.kind.min(6)]).show_ui(ui, |ui| {
@@ -13575,9 +14179,9 @@ impl ProceduralFxStudioApp {
                         ui.small("A primitive or point attribute, e.g. piece (Material Fracture) or name.");
                     }
                     flow::NUMBER | flow::FEEDBACK => {
-                        c |= ui.add(egui::DragValue::new(&mut set.iterations).range(0..=100_000).prefix("Iterations: ")).changed();
-                        c |= ui.add(egui::DragValue::new(&mut set.start).speed(0.1).prefix("Start value: ")).changed();
-                        c |= ui.add(egui::DragValue::new(&mut set.increment).speed(0.1).prefix("Increment: ")).changed();
+                        c |= pfield(ui, pdrag(&mut set.iterations).range(0..=100_000).prefix("Iterations: ")).changed();
+                        c |= pfield(ui, pdrag(&mut set.start).speed(0.1).prefix("Start value: ")).changed();
+                        c |= pfield(ui, pdrag(&mut set.increment).speed(0.1).prefix("Increment: ")).changed();
                     }
                     _ => {}
                 }
@@ -13586,7 +14190,7 @@ impl ProceduralFxStudioApp {
                     c |= ui.checkbox(&mut single, "Single pass").on_hover_text("Run only one iteration, to check it").changed();
                     if single {
                         let mut pass = set.single_pass.max(0);
-                        c |= ui.add(egui::DragValue::new(&mut pass).range(0..=1_000_000)).changed();
+                        c |= pfield(ui, pdrag(&mut pass).range(0..=1_000_000)).changed();
                         set.single_pass = pass;
                     } else {
                         set.single_pass = -1;
@@ -13608,18 +14212,54 @@ impl ProceduralFxStudioApp {
                 }
             }
             NodeKind::ObjectMerge { sources, into_this } => {
-                ui.small("Brings in other objects' geometry (their display node), or any node in another network.");
+                ui.small("Brings in an object's geometry (its display output), or any node's, in another object or this one.");
                 let mut remove = None;
                 for (i, source) in sources.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        let shown = source.and_then(|s| merge_sources.iter().find(|(n, _)| *n == s)).map_or("(choose)".to_owned(), |(_, l)| l.clone());
-                        egui::ComboBox::from_id_salt(("object_merge", id, i)).selected_text(shown).height(400.0).width(220.0).show_ui(ui, |ui| {
-                            for (n, label) in &merge_sources {
-                                if ui.selectable_label(*source == Some(*n), label).clicked() {
-                                    *source = Some(*n);
-                                    c = true;
+                        // "object" for an object's display output, "object / node" for a node inside it.
+                        let shown = source
+                            .and_then(|s| {
+                                merge_sources.iter().find_map(|(object, name, nodes)| {
+                                    if *object == s {
+                                        Some(name.clone())
+                                    } else {
+                                        nodes.iter().find(|(n, _)| *n == s).map(|(_, path)| format!("{name} / {path}"))
+                                    }
+                                })
+                            })
+                            .unwrap_or_else(|| "(choose)".to_owned());
+                        ui.push_id(("object_merge", id, i), |ui| {
+                            ui.menu_button(format!("{shown} ⏷"), |ui| {
+                                if merge_sources.is_empty() {
+                                    ui.weak("No geometry objects");
                                 }
-                            }
+                                for (object, name, nodes) in &merge_sources {
+                                    ui.menu_button(name, |ui| {
+                                        let own = Some(*object) == merge_own_object;
+                                        let display = ui
+                                            .add_enabled(!own, egui::Button::selectable(*source == Some(*object), "Display output"))
+                                            .on_hover_text("The object's display node, with its transform")
+                                            .on_disabled_hover_text("An Object Merge can't merge its own object; pick a node in it instead");
+                                        if display.clicked() {
+                                            *source = Some(*object);
+                                            c = true;
+                                            ui.close();
+                                        }
+                                        if !nodes.is_empty() {
+                                            ui.separator();
+                                        }
+                                        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                                            for (n, path) in nodes {
+                                                if ui.add(egui::Button::selectable(*source == Some(*n), path)).clicked() {
+                                                    *source = Some(*n);
+                                                    c = true;
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    });
+                                }
+                            });
                         });
                         if ui.small_button("✕").clicked() {
                             remove = Some(i);
@@ -13681,14 +14321,14 @@ impl ProceduralFxStudioApp {
                         ui.horizontal(|ui| {
                             ui.label("Impact point");
                             for k in 0..3 {
-                                c |= ui.add(egui::DragValue::new(&mut set.impact[k]).speed(0.01)).changed();
+                                c |= pfield(ui, pdrag(&mut set.impact[k]).speed(0.01)).changed();
                             }
                         });
-                        c |= ui.add(egui::Slider::new(&mut set.rings, 1..=20).text("Crack rings")).changed();
-                        c |= ui.add(egui::Slider::new(&mut set.spokes, 3..=64).text("Radial cracks")).changed();
+                        c |= pfield(ui, pslider(&mut set.rings, 1..=20).text("Crack rings")).changed();
+                        c |= pfield(ui, pslider(&mut set.spokes, 3..=64).text("Radial cracks")).changed();
                     }
                     m => {
-                        c |= ui.add(egui::Slider::new(&mut set.pieces, 2..=500).logarithmic(true).text("Pieces")).changed();
+                        c |= pfield(ui, pslider(&mut set.pieces, 2..=500).logarithmic(true).text("Pieces")).changed();
                         if m == 2 {
                             ui.horizontal(|ui| {
                                 ui.label("Grain along");
@@ -13696,31 +14336,31 @@ impl ProceduralFxStudioApp {
                                     c |= ui.selectable_value(&mut set.grain_axis, value, *label).changed();
                                 }
                             });
-                            c |= ui.add(egui::Slider::new(&mut set.splinter, 1.0..=20.0).text("Splinter length")).changed();
+                            c |= pfield(ui, pslider(&mut set.splinter, 1.0..=20.0).text("Splinter length")).changed();
                         }
                     }
                 }
-                c |= ui.add(egui::Slider::new(&mut set.separate, 0.0..=1.0).text("Explode view")).on_hover_text("Moves pieces apart to see the cracks").changed();
-                c |= ui.add(egui::Slider::new(&mut set.glue_strength, 0.0..=100_000.0).logarithmic(true).text("Glue strength")).on_hover_text("How hard the constraints between pieces hold in the RBD Bullet Solver").changed();
+                c |= pfield(ui, pslider(&mut set.separate, 0.0..=1.0).text("Explode view")).on_hover_text("Moves pieces apart to see the cracks").changed();
+                c |= pfield(ui, pslider(&mut set.glue_strength, 0.0..=100_000.0).logarithmic(true).text("Glue strength")).on_hover_text("How hard the constraints between pieces hold in the RBD Bullet Solver").changed();
                 ui.small("Outputs: 1 pieces · 2 glue constraints (lines between neighbouring pieces) · 3 proxy collision shapes. Wire all three into an RBD Bullet Solver.");
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::RbdBullet(set) => {
                 ui.small("Inputs: 1 pieces (piece attribute) · 2 glue constraints · 3 proxy collision shapes · 4 static collision geometry. Wire Material Fracture's three outputs straight in. Outputs the moved pieces, the constraints still holding, and the moved proxies.");
-                c |= ui.add(egui::Slider::new(&mut set.density, 0.01..=100.0).logarithmic(true).text("Density")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.friction, 0.0..=2.0).text("Friction")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.bounce, 0.0..=1.0).text("Bounce")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.gravity, -30.0..=30.0).text("Gravity")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.glue_scale, 0.0..=100.0).logarithmic(true).text("Glue strength ×")).on_hover_text("Scales every constraint's strength; 0 breaks all glue at the start").changed();
-                c |= ui.add(egui::Slider::new(&mut set.substeps, 1..=32).text("Substeps")).changed();
+                c |= pfield(ui, pslider(&mut set.density, 0.01..=100.0).logarithmic(true).text("Density")).changed();
+                c |= pfield(ui, pslider(&mut set.friction, 0.0..=2.0).text("Friction")).changed();
+                c |= pfield(ui, pslider(&mut set.bounce, 0.0..=1.0).text("Bounce")).changed();
+                c |= pfield(ui, pslider(&mut set.gravity, -30.0..=30.0).text("Gravity")).changed();
+                c |= pfield(ui, pslider(&mut set.glue_scale, 0.0..=100.0).logarithmic(true).text("Glue strength ×")).on_hover_text("Scales every constraint's strength; 0 breaks all glue at the start").changed();
+                c |= pfield(ui, pslider(&mut set.substeps, 1..=32).text("Substeps")).changed();
                 c |= ui.checkbox(&mut set.ground, "Ground plane").changed();
                 if set.ground {
-                    c |= ui.add(egui::DragValue::new(&mut set.ground_height).speed(0.01).prefix("Ground height: ")).changed();
+                    c |= pfield(ui, pdrag(&mut set.ground_height).speed(0.01).prefix("Ground height: ")).changed();
                 }
                 ui.horizontal(|ui| {
                     ui.label("Initial velocity");
                     for k in 0..3 {
-                        c |= ui.add(egui::DragValue::new(&mut set.velocity[k]).speed(0.05)).changed();
+                        c |= pfield(ui, pdrag(&mut set.velocity[k]).speed(0.05)).changed();
                     }
                 });
                 ui.small("RBD Configure sets density, friction, bounce, active and velocity per piece.");
@@ -13734,7 +14374,7 @@ impl ProceduralFxStudioApp {
                 ] {
                     ui.horizontal(|ui| {
                         c |= ui.checkbox(on, "").changed();
-                        c |= ui.add_enabled(*on, egui::Slider::new(value, range).text(label)).changed();
+                        c |= ui.add_enabled(*on, pslider(value, range).text(label)).changed();
                     });
                 }
                 ui.horizontal(|ui| {
@@ -13746,7 +14386,7 @@ impl ProceduralFxStudioApp {
                     ui.add_enabled_ui(set.set_velocity, |ui| {
                         ui.label("Velocity");
                         for k in 0..3 {
-                            c |= ui.add(egui::DragValue::new(&mut set.velocity[k]).speed(0.05)).changed();
+                            c |= pfield(ui, pdrag(&mut set.velocity[k]).speed(0.05)).changed();
                         }
                     });
                 });
@@ -13777,24 +14417,24 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.display, value, *label).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.speed, 0.0..=10.0).text("Walk speed")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.speed_variance, 0.0..=1.0).text("Speed variance")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.turn_rate, 1.0..=720.0).text("Turn rate°/s")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.personal_space, 0.05..=5.0).text("Personal space")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.separation, 0.0..=10.0).text("Separation")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.alignment, 0.0..=5.0).text("Alignment")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.cohesion, 0.0..=5.0).text("Cohesion")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.wander, 0.0..=5.0).text("Wander")).changed();
+                c |= pfield(ui, pslider(&mut set.speed, 0.0..=10.0).text("Walk speed")).changed();
+                c |= pfield(ui, pslider(&mut set.speed_variance, 0.0..=1.0).text("Speed variance")).changed();
+                c |= pfield(ui, pslider(&mut set.turn_rate, 1.0..=720.0).text("Turn rate°/s")).changed();
+                c |= pfield(ui, pslider(&mut set.personal_space, 0.05..=5.0).text("Personal space")).changed();
+                c |= pfield(ui, pslider(&mut set.separation, 0.0..=10.0).text("Separation")).changed();
+                c |= pfield(ui, pslider(&mut set.alignment, 0.0..=5.0).text("Alignment")).changed();
+                c |= pfield(ui, pslider(&mut set.cohesion, 0.0..=5.0).text("Cohesion")).changed();
+                c |= pfield(ui, pslider(&mut set.wander, 0.0..=5.0).text("Wander")).changed();
                 ui.horizontal(|ui| {
                     ui.label("Goal");
                     for k in 0..3 {
-                        c |= ui.add(egui::DragValue::new(&mut set.goal[k]).speed(0.1)).changed();
+                        c |= pfield(ui, pdrag(&mut set.goal[k]).speed(0.1)).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.goal_weight, 0.0..=10.0).text("Goal strength")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.avoid_distance, 0.0..=10.0).text("Obstacle look-ahead")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.agent_height, 0.1..=5.0).text("Agent height")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.goal_weight, 0.0..=10.0).text("Goal strength")).changed();
+                c |= pfield(ui, pslider(&mut set.avoid_distance, 0.0..=10.0).text("Obstacle look-ahead")).changed();
+                c |= pfield(ui, pslider(&mut set.agent_height, 0.1..=5.0).text("Agent height")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::Skeleton(set) => {
                 ui.small("A KineFX skeleton: joints as points with `parent` and `transform`. Pose it with Rig Pose, Two Bone IK or Procedural Motion; skin a mesh with Joint Capture and Bone Deform.");
@@ -13803,10 +14443,10 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.preset, value, *label).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.scale, 0.01..=10.0).logarithmic(true).text("Scale")).changed();
+                c |= pfield(ui, pslider(&mut set.scale, 0.01..=10.0).logarithmic(true).text("Scale")).changed();
                 if set.preset != 0 {
-                    c |= ui.add(egui::Slider::new(&mut set.joints, 2..=200).text("Joints")).changed();
-                    c |= ui.add(egui::Slider::new(&mut set.length, 0.01..=50.0).logarithmic(true).text("Length")).changed();
+                    c |= pfield(ui, pslider(&mut set.joints, 2..=200).text("Joints")).changed();
+                    c |= pfield(ui, pslider(&mut set.length, 0.01..=50.0).logarithmic(true).text("Length")).changed();
                 }
             }
             NodeKind::RigPose(pose) => {
@@ -13822,7 +14462,7 @@ impl ProceduralFxStudioApp {
                         ui.horizontal(|ui| {
                             ui.label(label);
                             for k in range {
-                                c |= ui.add(egui::DragValue::new(&mut v[k]).speed(if k < 3 { 0.5 } else { 0.01 })).changed();
+                                c |= pfield(ui, pdrag(&mut v[k]).speed(if k < 3 { 0.5 } else { 0.01 })).changed();
                             }
                         });
                     }
@@ -13837,13 +14477,13 @@ impl ProceduralFxStudioApp {
                     ui.horizontal(|ui| {
                         ui.label(label);
                         for k in 0..3 {
-                            c |= ui.add(egui::DragValue::new(&mut value[k]).speed(0.01)).changed();
+                            c |= pfield(ui, pdrag(&mut value[k]).speed(0.01)).changed();
                         }
                     });
                 }
                 c |= ui.checkbox(&mut set.use_pole, "Bend towards the pole").changed();
                 c |= ui.checkbox(&mut set.keep_tip, "Keep the tip's orientation").changed();
-                c |= ui.add(egui::Slider::new(&mut set.blend, 0.0..=1.0).text("Blend")).changed();
+                c |= pfield(ui, pslider(&mut set.blend, 0.0..=1.0).text("Blend")).changed();
             }
             NodeKind::ProceduralMotion(set) => {
                 egui::ComboBox::from_label("Motion").selected_text(kinefx::MOTIONS[set.motion.min(2)]).show_ui(ui, |ui| {
@@ -13851,12 +14491,12 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.motion, value, *label).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.rate, 0.0..=5.0).text("Cycles per second")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.amplitude, 0.0..=3.0).text("Amplitude")).changed();
+                c |= pfield(ui, pslider(&mut set.rate, 0.0..=5.0).text("Cycles per second")).changed();
+                c |= pfield(ui, pslider(&mut set.amplitude, 0.0..=3.0).text("Amplitude")).changed();
                 match set.motion {
-                    0 => c |= ui.add(egui::Slider::new(&mut set.travel, 0.0..=5.0).text("Forward speed")).changed(),
+                    0 => c |= pfield(ui, pslider(&mut set.travel, 0.0..=5.0).text("Forward speed")).changed(),
                     1 => {
-                        c |= ui.add(egui::Slider::new(&mut set.lag, 0.0..=3.0).text("Lag per joint")).changed();
+                        c |= pfield(ui, pslider(&mut set.lag, 0.0..=3.0).text("Lag per joint")).changed();
                         ui.horizontal(|ui| {
                             ui.label("Bend about");
                             for (value, label) in sops::AXES.iter().enumerate() {
@@ -13869,12 +14509,12 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::SkeletonBlend { weight } => {
                 ui.small("Blends two poses of the same skeleton (input 1 at 0, input 2 at 1).");
-                c |= ui.add(egui::Slider::new(weight, 0.0..=1.0).text("Blend")).changed();
+                c |= pfield(ui, pslider(weight, 0.0..=1.0).text("Blend")).changed();
             }
             NodeKind::JointCapture(set) => {
                 ui.small("Input 1: mesh • Input 2: skeleton in its rest pose. Writes capture weights for Bone Deform.");
-                c |= ui.add(egui::Slider::new(&mut set.influences, 1..=kinefx::MAX_INFLUENCES).text("Joints per point")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.falloff, 0.5..=12.0).text("Falloff")).on_hover_text("Higher: sharper transitions between bones").changed();
+                c |= pfield(ui, pslider(&mut set.influences, 1..=kinefx::MAX_INFLUENCES).text("Joints per point")).changed();
+                c |= pfield(ui, pslider(&mut set.falloff, 0.5..=12.0).text("Falloff")).on_hover_text("Higher: sharper transitions between bones").changed();
                 c |= ui.checkbox(&mut set.visualize, "Colour by joint").changed();
             }
             NodeKind::BoneDeform => {
@@ -13886,7 +14526,7 @@ impl ProceduralFxStudioApp {
                     ui.horizontal(|ui| {
                         ui.label(label);
                         for k in 0..3 {
-                            c |= ui.add(egui::DragValue::new(&mut point[k]).speed(0.01)).changed();
+                            c |= pfield(ui, pdrag(&mut point[k]).speed(0.01)).changed();
                         }
                     });
                 }
@@ -13895,38 +14535,38 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.profile, value, *label).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.radius, 0.005..=2.0).logarithmic(true).text("Belly radius")).changed();
+                c |= pfield(ui, pslider(&mut set.radius, 0.005..=2.0).logarithmic(true).text("Belly radius")).changed();
                 if set.profile == 1 {
-                    c |= ui.add(egui::Slider::new(&mut set.flatness, 1.0..=10.0).text("Flatness")).changed();
-                    c |= ui.add(egui::Slider::new(&mut set.twist, -180.0..=180.0).text("Twist°")).changed();
+                    c |= pfield(ui, pslider(&mut set.flatness, 1.0..=10.0).text("Flatness")).changed();
+                    c |= pfield(ui, pslider(&mut set.twist, -180.0..=180.0).text("Twist°")).changed();
                 }
-                c |= ui.add(egui::Slider::new(&mut set.tendon, 0.0..=0.45).text("Tendon length")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.activation, 0.0..=1.0).text("Activation")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.contraction, 0.0..=0.8).text("Max contraction")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.segments, 2..=128).text("Segments")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.sides, 3..=64).text("Sides")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.id, 0..=999).text("Muscle id")).changed();
+                c |= pfield(ui, pslider(&mut set.tendon, 0.0..=0.45).text("Tendon length")).changed();
+                c |= pfield(ui, pslider(&mut set.activation, 0.0..=1.0).text("Activation")).changed();
+                c |= pfield(ui, pslider(&mut set.contraction, 0.0..=0.8).text("Max contraction")).changed();
+                c |= pfield(ui, pslider(&mut set.segments, 2..=128).text("Segments")).changed();
+                c |= pfield(ui, pslider(&mut set.sides, 3..=64).text("Sides")).changed();
+                c |= pfield(ui, pslider(&mut set.id, 0..=999).text("Muscle id")).changed();
             }
             NodeKind::MuscleSolver(set) => {
                 ui.small("Jiggle on animated muscles (flexing or moved by their bones). The origin and insertion tips stay pinned.");
-                c |= ui.add(egui::Slider::new(&mut set.stiffness, 1.0..=2000.0).logarithmic(true).text("Firmness")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.damping, 0.0..=50.0).text("Damping")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.smoothing, 0..=50).text("Coherence")).on_hover_text("Higher wobbles more as one body").changed();
-                c |= ui.add(egui::Slider::new(&mut set.substeps, 1..=16).text("Substeps")).changed();
+                c |= pfield(ui, pslider(&mut set.stiffness, 1.0..=2000.0).logarithmic(true).text("Firmness")).changed();
+                c |= pfield(ui, pslider(&mut set.damping, 0.0..=50.0).text("Damping")).changed();
+                c |= pfield(ui, pslider(&mut set.smoothing, 0..=50).text("Coherence")).on_hover_text("Higher wobbles more as one body").changed();
+                c |= pfield(ui, pslider(&mut set.substeps, 1..=16).text("Substeps")).changed();
             }
             NodeKind::MuscleSkin(set) => {
                 ui.small("Input 1: skin • Input 2: muscles (animated). The skin follows how the muscles move from frame 0.");
-                c |= ui.add(egui::Slider::new(&mut set.falloff, 0.001..=5.0).logarithmic(true).text("Reach")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.influences, 1..=16).text("Influences")).changed();
+                c |= pfield(ui, pslider(&mut set.falloff, 0.001..=5.0).logarithmic(true).text("Reach")).changed();
+                c |= pfield(ui, pslider(&mut set.influences, 1..=16).text("Influences")).changed();
             }
             NodeKind::Terrain(set) => {
                 ui.small("A flat heightfield grid. Shape it with Terrain Noise, Erode and Terrace.");
                 ui.horizontal(|ui| {
                     ui.label("Size");
-                    c |= ui.add(egui::DragValue::new(&mut set.size[0]).speed(0.1).range(0.01..=10_000.0)).changed();
-                    c |= ui.add(egui::DragValue::new(&mut set.size[1]).speed(0.1).range(0.01..=10_000.0)).changed();
+                    c |= pfield(ui, pdrag(&mut set.size[0]).speed(0.1).range(0.01..=10_000.0)).changed();
+                    c |= pfield(ui, pdrag(&mut set.size[1]).speed(0.1).range(0.01..=10_000.0)).changed();
                 });
-                c |= ui.add(egui::Slider::new(&mut set.resolution, 2..=2048).logarithmic(true).text("Resolution")).on_hover_text("Grid cells along the longer side").changed();
+                c |= pfield(ui, pslider(&mut set.resolution, 2..=2048).logarithmic(true).text("Resolution")).on_hover_text("Grid cells along the longer side").changed();
             }
             NodeKind::TerrainNoise(set) => {
                 egui::ComboBox::from_label("Noise").selected_text(terrain::NOISE_TYPES[set.kind.min(4)]).show_ui(ui, |ui| {
@@ -13939,38 +14579,38 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.blend, value, *label).changed();
                     }
                 });
-                c |= ui.add(egui::Slider::new(&mut set.amplitude, -10.0..=10.0).text("Height")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.element_size, 0.05..=100.0).logarithmic(true).text("Element size")).on_hover_text("Size of the largest features").changed();
-                c |= ui.add(egui::Slider::new(&mut set.octaves, 1..=12).text("Octaves")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.roughness, 0.0..=1.0).text("Roughness")).changed();
+                c |= pfield(ui, pslider(&mut set.amplitude, -10.0..=10.0).text("Height")).changed();
+                c |= pfield(ui, pslider(&mut set.element_size, 0.05..=100.0).logarithmic(true).text("Element size")).on_hover_text("Size of the largest features").changed();
+                c |= pfield(ui, pslider(&mut set.octaves, 1..=12).text("Octaves")).changed();
+                c |= pfield(ui, pslider(&mut set.roughness, 0.0..=1.0).text("Roughness")).changed();
                 ui.horizontal(|ui| {
                     ui.label("Offset");
-                    c |= ui.add(egui::DragValue::new(&mut set.offset[0]).speed(0.05)).changed();
-                    c |= ui.add(egui::DragValue::new(&mut set.offset[1]).speed(0.05)).changed();
+                    c |= pfield(ui, pdrag(&mut set.offset[0]).speed(0.05)).changed();
+                    c |= pfield(ui, pdrag(&mut set.offset[1]).speed(0.05)).changed();
                 });
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
                 c |= ui.checkbox(&mut set.positive, "Positive only (0 to Height)").changed();
                 c |= ui.checkbox(&mut set.use_mask, "Only where masked").on_hover_text("Uses the `mask` attribute from Terrain Mask or Attribute Paint").changed();
             }
             NodeKind::TerrainErode(set) => {
                 ui.small("Hydraulic erosion carves rivers and gullies; thermal erosion crumbles steep slopes. Writes `flow` and `debris` for Terrain Mask.");
                 ui.label("Hydraulic");
-                c |= ui.add(egui::Slider::new(&mut set.droplets, 0..=2_000_000).logarithmic(true).text("Raindrops")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.erosion, 0.0..=1.0).text("Erosion rate")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.deposition, 0.0..=1.0).text("Deposition rate")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.capacity, 0.0..=20.0).text("Sediment capacity")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.evaporation, 0.0..=0.5).text("Evaporation")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.inertia, 0.0..=0.95).text("Inertia")).on_hover_text("Higher: straighter, wider rivers").changed();
-                c |= ui.add(egui::Slider::new(&mut set.radius, 1..=8).text("Erosion radius (cells)")).changed();
+                c |= pfield(ui, pslider(&mut set.droplets, 0..=2_000_000).logarithmic(true).text("Raindrops")).changed();
+                c |= pfield(ui, pslider(&mut set.erosion, 0.0..=1.0).text("Erosion rate")).changed();
+                c |= pfield(ui, pslider(&mut set.deposition, 0.0..=1.0).text("Deposition rate")).changed();
+                c |= pfield(ui, pslider(&mut set.capacity, 0.0..=20.0).text("Sediment capacity")).changed();
+                c |= pfield(ui, pslider(&mut set.evaporation, 0.0..=0.5).text("Evaporation")).changed();
+                c |= pfield(ui, pslider(&mut set.inertia, 0.0..=0.95).text("Inertia")).on_hover_text("Higher: straighter, wider rivers").changed();
+                c |= pfield(ui, pslider(&mut set.radius, 1..=8).text("Erosion radius (cells)")).changed();
                 ui.label("Thermal");
-                c |= ui.add(egui::Slider::new(&mut set.thermal_iterations, 0..=500).text("Iterations")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.talus_angle, 1.0..=89.0).text("Talus angle°")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+                c |= pfield(ui, pslider(&mut set.thermal_iterations, 0..=500).text("Iterations")).changed();
+                c |= pfield(ui, pslider(&mut set.talus_angle, 1.0..=89.0).text("Talus angle°")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::TerrainTerrace(set) => {
-                c |= ui.add(egui::Slider::new(&mut set.step, 0.01..=10.0).logarithmic(true).text("Step height")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.offset, -5.0..=5.0).text("Offset")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.sharpness, 0.0..=1.0).text("Sharpness")).on_hover_text("1: flat steps with sheer walls").changed();
+                c |= pfield(ui, pslider(&mut set.step, 0.01..=10.0).logarithmic(true).text("Step height")).changed();
+                c |= pfield(ui, pslider(&mut set.offset, -5.0..=5.0).text("Offset")).changed();
+                c |= pfield(ui, pslider(&mut set.sharpness, 0.0..=1.0).text("Sharpness")).on_hover_text("1: flat steps with sheer walls").changed();
                 c |= ui.checkbox(&mut set.use_mask, "Only where masked").changed();
             }
             NodeKind::TerrainMask(set) => {
@@ -13985,10 +14625,10 @@ impl ProceduralFxStudioApp {
                     1 => "slope°",
                     _ => "value",
                 };
-                c |= ui.add(egui::DragValue::new(&mut set.min).speed(0.05).prefix(format!("min {unit} "))).changed();
-                c |= ui.add(egui::DragValue::new(&mut set.max).speed(0.05).prefix(format!("max {unit} "))).changed();
-                c |= ui.add(egui::Slider::new(&mut set.falloff, 0.0..=50.0).text("Falloff")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.blur, 0..=100).text("Blur passes")).changed();
+                c |= pfield(ui, pdrag(&mut set.min).speed(0.05).prefix(format!("min {unit} "))).changed();
+                c |= pfield(ui, pdrag(&mut set.max).speed(0.05).prefix(format!("max {unit} "))).changed();
+                c |= pfield(ui, pslider(&mut set.falloff, 0.0..=50.0).text("Falloff")).changed();
+                c |= pfield(ui, pslider(&mut set.blur, 0..=100).text("Blur passes")).changed();
                 egui::ComboBox::from_label("Combine with existing mask").selected_text(terrain::MASK_COMBINE[set.combine.min(4)]).show_ui(ui, |ui| {
                     for (value, label) in terrain::MASK_COMBINE.iter().enumerate() {
                         c |= ui.selectable_value(&mut set.combine, value, *label).changed();
@@ -14005,10 +14645,10 @@ impl ProceduralFxStudioApp {
                         ui.label(label);
                     });
                 }
-                c |= ui.add(egui::Slider::new(&mut set.sand_level, 0.0..=1.0).text("Sand up to")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.snow_level, 0.0..=1.0).text("Snow from")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.rock_slope, 0.0..=90.0).text("Rock slope°")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.blend, 0.0..=0.5).text("Blend")).changed();
+                c |= pfield(ui, pslider(&mut set.sand_level, 0.0..=1.0).text("Sand up to")).changed();
+                c |= pfield(ui, pslider(&mut set.snow_level, 0.0..=1.0).text("Snow from")).changed();
+                c |= pfield(ui, pslider(&mut set.rock_slope, 0.0..=90.0).text("Rock slope°")).changed();
+                c |= pfield(ui, pslider(&mut set.blend, 0.0..=0.5).text("Blend")).changed();
             }
             NodeKind::UvTexture(set) => {
                 egui::ComboBox::from_label("Projection").selected_text(sops::UV_PROJECTIONS[set.projection.min(3)]).show_ui(ui, |ui| {
@@ -14026,11 +14666,11 @@ impl ProceduralFxStudioApp {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Scale");
-                    c |= ui.add(egui::DragValue::new(&mut set.scale[0]).speed(0.01)).changed();
-                    c |= ui.add(egui::DragValue::new(&mut set.scale[1]).speed(0.01)).changed();
+                    c |= pfield(ui, pdrag(&mut set.scale[0]).speed(0.01)).changed();
+                    c |= pfield(ui, pdrag(&mut set.scale[1]).speed(0.01)).changed();
                     ui.label("Offset");
-                    c |= ui.add(egui::DragValue::new(&mut set.offset[0]).speed(0.01)).changed();
-                    c |= ui.add(egui::DragValue::new(&mut set.offset[1]).speed(0.01)).changed();
+                    c |= pfield(ui, pdrag(&mut set.offset[0]).speed(0.01)).changed();
+                    c |= pfield(ui, pdrag(&mut set.offset[1]).speed(0.01)).changed();
                 });
                 ui.small("Writes vertex:uv. Follow with UV Quick Shade to see them.");
             }
@@ -14038,11 +14678,11 @@ impl ProceduralFxStudioApp {
                 for (label, value) in [("Translate", &mut set.translate), ("Scale", &mut set.scale), ("Pivot", &mut set.pivot)] {
                     ui.horizontal(|ui| {
                         ui.label(label);
-                        c |= ui.add(egui::DragValue::new(&mut value[0]).speed(0.01)).changed();
-                        c |= ui.add(egui::DragValue::new(&mut value[1]).speed(0.01)).changed();
+                        c |= pfield(ui, pdrag(&mut value[0]).speed(0.01)).changed();
+                        c |= pfield(ui, pdrag(&mut value[1]).speed(0.01)).changed();
                     });
                 }
-                c |= ui.add(egui::Slider::new(&mut set.rotate, -180.0..=180.0).text("Rotate")).changed();
+                c |= pfield(ui, pslider(&mut set.rotate, -180.0..=180.0).text("Rotate")).changed();
             }
             NodeKind::UvQuickShade { file } => {
                 ui.small("Shows a texture on the UVs in the viewport. Leave the file empty for a checker grid.");
@@ -14075,21 +14715,21 @@ impl ProceduralFxStudioApp {
                 });
                 ui.strong("Constraints");
                 if set.kind != 3 {
-                    c |= ui.add(egui::Slider::new(&mut set.stretch_stiffness, 1.0..=1e8).logarithmic(true).text("Stretch stiffness")).changed();
+                    c |= pfield(ui, pslider(&mut set.stretch_stiffness, 1.0..=1e8).logarithmic(true).text("Stretch stiffness")).changed();
                 }
                 if matches!(set.kind, 0 | 1) {
-                    c |= ui.add(egui::Slider::new(&mut set.bend_stiffness, 1e-3..=1e5).logarithmic(true).text("Bend stiffness")).changed();
+                    c |= pfield(ui, pslider(&mut set.bend_stiffness, 1e-3..=1e5).logarithmic(true).text("Bend stiffness")).changed();
                 }
                 if set.kind == 2 {
-                    c |= ui.add(egui::Slider::new(&mut set.shape_stiffness, 0.0..=1.0).text("Shape stiffness")).changed();
+                    c |= pfield(ui, pslider(&mut set.shape_stiffness, 0.0..=1.0).text("Shape stiffness")).changed();
                 }
-                c |= ui.add(egui::Slider::new(&mut set.mass, 1e-3..=100.0).logarithmic(true).text("Mass per point")).changed();
+                c |= pfield(ui, pslider(&mut set.mass, 1e-3..=100.0).logarithmic(true).text("Mass per point")).changed();
                 let thickness_label = if set.kind == 3 { "Grain radius (pscale overrides)" } else { "Thickness" };
-                c |= ui.add(egui::Slider::new(&mut set.thickness, 1e-3..=0.5).logarithmic(true).text(thickness_label)).changed();
+                c |= pfield(ui, pslider(&mut set.thickness, 1e-3..=0.5).logarithmic(true).text(thickness_label)).changed();
                 ui.strong("Forces and collisions");
-                c |= ui.add(egui::Slider::new(&mut set.gravity, -30.0..=10.0).text("Gravity")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.damping, 0.0..=5.0).text("Damping")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.friction, 0.0..=1.0).text("Friction")).changed();
+                c |= pfield(ui, pslider(&mut set.gravity, -30.0..=10.0).text("Gravity")).changed();
+                c |= pfield(ui, pslider(&mut set.damping, 0.0..=5.0).text("Damping")).changed();
+                c |= pfield(ui, pslider(&mut set.friction, 0.0..=1.0).text("Friction")).changed();
                 c |= ui.checkbox(&mut set.ground, "Ground plane (y = 0)").changed();
                 c |= ui.checkbox(&mut set.self_collision, "Self collision").on_hover_text("Point-based: keeps points apart by their thickness").changed();
                 c |= ui
@@ -14097,11 +14737,10 @@ impl ProceduralFxStudioApp {
                     .on_hover_text("Pinned points track the animated input (e.g. hair roots on a moving head)")
                     .changed();
                 ui.strong("Solver");
-                c |= ui
-                    .add(egui::Slider::new(&mut set.substeps, 1..=100).text("Substeps"))
+                c |= pfield(ui, pslider(&mut set.substeps, 1..=100).text("Substeps"))
                     .on_hover_text("Raise this first if cloth stretches: small steps converge better than extra iterations")
                     .changed();
-                c |= ui.add(egui::Slider::new(&mut set.iterations, 1..=200).text("Constraint iterations")).changed();
+                c |= pfield(ui, pslider(&mut set.iterations, 1..=200).text("Constraint iterations")).changed();
             }
             NodeKind::RbdSolver(set) => {
                 ui.heading("RBD Bullet Solver");
@@ -14115,15 +14754,15 @@ impl ProceduralFxStudioApp {
                 if set.shape == 1 {
                     ui.weak("Convex decomposition fits concave pieces but is slow to build.");
                 }
-                c |= ui.add(egui::Slider::new(&mut set.density, 0.01..=10.0).logarithmic(true).text("Density")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.friction, 0.0..=2.0).text("Friction")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.bounce, 0.0..=1.0).text("Bounce")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.gravity, -20.0..=30.0).text("Gravity")).changed();
-                c |= ui.add(egui::Slider::new(&mut set.substeps, 1..=16).text("Substeps")).changed();
+                c |= pfield(ui, pslider(&mut set.density, 0.01..=10.0).logarithmic(true).text("Density")).changed();
+                c |= pfield(ui, pslider(&mut set.friction, 0.0..=2.0).text("Friction")).changed();
+                c |= pfield(ui, pslider(&mut set.bounce, 0.0..=1.0).text("Bounce")).changed();
+                c |= pfield(ui, pslider(&mut set.gravity, -20.0..=30.0).text("Gravity")).changed();
+                c |= pfield(ui, pslider(&mut set.substeps, 1..=16).text("Substeps")).changed();
                 ui.horizontal(|ui| {
                     c |= ui.checkbox(&mut set.ground, "Ground plane").changed();
                     if set.ground {
-                        c |= ui.add(egui::DragValue::new(&mut set.ground_height).speed(0.05).prefix("Height ")).changed();
+                        c |= pfield(ui, pdrag(&mut set.ground_height).speed(0.05).prefix("Height ")).changed();
                     }
                 });
                 c |= vec3_ui(ui, "Initial velocity", &mut set.velocity, 0.05);
@@ -14139,7 +14778,7 @@ impl ProceduralFxStudioApp {
                     );
                 }
                 ui.label("Each step cooks this node's network with Prev_Frame set to the previous step's result, so changes accumulate over time. Input_1 is the solver's input at the current step.");
-                c |= ui.add(egui::Slider::new(substeps, 1..=16).text("Substeps per frame")).changed();
+                c |= pfield(ui, pslider(substeps, 1..=16).text("Substeps per frame")).changed();
                 if ui.button("Enter solver network").clicked() {
                     self.current_network = Some(id);
                     self.context = AppContext::Obj;
@@ -14205,7 +14844,7 @@ impl ProceduralFxStudioApp {
                     }
                 });
                 c |= prim_path_ui(ui, "Prim path", path);
-                c |= ui.add(egui::Slider::new(size, 0.01..=10.0).logarithmic(true).text("Size (radius)")).changed();
+                c |= pfield(ui, pslider(size, 0.01..=10.0).logarithmic(true).text("Size (radius)")).changed();
                 c |= vec3_ui(ui, "Translate", t, 0.05);
             }
             NodeKind::LopTransform { pattern, t, r, s } => {
@@ -14232,7 +14871,7 @@ impl ProceduralFxStudioApp {
                     ui.label("Color");
                     c |= ui.color_edit_button_rgb(color).changed();
                 });
-                c |= ui.add(egui::Slider::new(intensity, 0.0..=20.0).text("Intensity")).changed();
+                c |= pfield(ui, pslider(intensity, 0.0..=20.0).text("Intensity")).changed();
                 let size_label = match *kind {
                     0 => Some("Angle (degrees)"),
                     1 => Some("Radius"),
@@ -14240,7 +14879,7 @@ impl ProceduralFxStudioApp {
                     _ => None,
                 };
                 if let Some(label) = size_label {
-                    c |= ui.add(egui::Slider::new(size, 0.0..=20.0).text(label)).changed();
+                    c |= pfield(ui, pslider(size, 0.0..=20.0).text(label)).changed();
                 }
             }
             NodeKind::LopCamera { path, position, target, focal, aperture } => {
@@ -14248,8 +14887,8 @@ impl ProceduralFxStudioApp {
                 c |= prim_path_ui(ui, "Prim path", path);
                 c |= vec3_ui(ui, "Position", position, 0.05);
                 c |= vec3_ui(ui, "Look at", target, 0.05);
-                c |= ui.add(egui::Slider::new(focal, 8.0..=300.0).logarithmic(true).text("Focal length (mm)")).changed();
-                c |= ui.add(egui::Slider::new(aperture, 5.0..=70.0).text("Horizontal aperture (mm)")).changed();
+                c |= pfield(ui, pslider(focal, 8.0..=300.0).logarithmic(true).text("Focal length (mm)")).changed();
+                c |= pfield(ui, pslider(aperture, 5.0..=70.0).text("Horizontal aperture (mm)")).changed();
                 if ui.button("Copy from viewport").clicked() {
                     (*position, *target) = viewport_view;
                     c = true;
@@ -14306,7 +14945,7 @@ impl ProceduralFxStudioApp {
                     c |= ui.selectable_value(mode, 1, "Volume (fog)").changed();
                 });
                 if *mode == 0 {
-                    c |= ui.add(egui::Slider::new(iso, -1.0..=1.0).text("Isovalue")).changed();
+                    c |= pfield(ui, pslider(iso, -1.0..=1.0).text("Isovalue")).changed();
                     ui.small("Level sets: distance from the surface (0 = the surface). Fog volumes and Pyro: density threshold, e.g. 0.5.");
                 } else {
                     ui.small("Level sets become fog densities (1 inside); fog volumes pass through. Drawn as a soft volume.");
@@ -14319,7 +14958,7 @@ impl ProceduralFxStudioApp {
                     c |= ui.add(egui::TextEdit::singleline(file).hint_text("/path/to/model.$F4.obj").desired_width(220.0)).changed();
                     if ui.button("Browse…").clicked() {
                         if let Some(chosen) = FileDialog::new()
-                            .add_filter("Geometry", &["obj", "fbx", "stl", "usd", "usda", "usdc", "usdz", "vdb"])
+                            .add_filter("Geometry", &["obj", "fbx", "abc", "stl", "usd", "usda", "usdc", "usdz", "vdb"])
                             .pick_file()
                         {
                             *file = chosen.to_string_lossy().into_owned();
@@ -14334,7 +14973,7 @@ impl ProceduralFxStudioApp {
                     usd::forget_loaded_files();
                     c = true;
                 }
-                ui.small("Reads .obj, .fbx, .stl, USD (.usd .usda .usdc .usdz) and .vdb. $F / $F4 insert the frame number for sequences. Separate objects get a piece attribute.");
+                ui.small("Reads .obj, .fbx, Alembic (.abc, animated: read at the current time), .stl, USD (.usd .usda .usdc .usdz) and .vdb. $F / $F4 insert the frame number for sequences. Separate objects get a piece attribute.");
             }
             NodeKind::FileExport { file } => {
                 ui.heading("File Export");
@@ -14343,7 +14982,7 @@ impl ProceduralFxStudioApp {
                     if ui.button("Choose…").clicked() {
                         if let Some(chosen) = FileDialog::new()
                             .set_file_name("geometry.obj")
-                            .add_filter("Geometry", &["obj", "fbx", "stl", "usd", "usda", "usdc", "vdb"])
+                            .add_filter("Geometry", &["obj", "fbx", "abc", "stl", "usd", "usda", "usdc", "vdb"])
                             .save_file()
                         {
                             *file = chosen.to_string_lossy().into_owned();
@@ -14355,16 +14994,17 @@ impl ProceduralFxStudioApp {
                     if ui.add_enabled(!file.trim().is_empty(), egui::Button::new("💾 Write current frame")).clicked() {
                         self.file_export_request = Some((id, false));
                     }
-                    let can_range = fileio::has_frame_token(file);
+                    // Alembic keeps the whole range in one file; other formats need $F for one file per frame.
+                    let can_range = fileio::has_frame_token(file) || fileio::extension(file.trim()) == "abc";
                     if ui
                         .add_enabled(can_range, egui::Button::new("Write timeline range"))
-                        .on_disabled_hover_text("Add $F or $F4 to the file name to write one file per frame")
+                        .on_disabled_hover_text("Add $F or $F4 to the file name to write one file per frame, or write an .abc (one animated file)")
                         .clicked()
                     {
                         self.file_export_request = Some((id, true));
                     }
                 });
-                ui.small("The extension picks the format: .obj, .fbx, .stl, .usd/.usda/.usdc or .vdb (VDB input). The geometry passes through unchanged.");
+                ui.small("The extension picks the format: .obj, .fbx, .abc (Alembic: the timeline range goes in one animated file), .stl, .usd/.usda/.usdc or .vdb (VDB input). The geometry passes through unchanged.");
             }
             NodeKind::Merge | NodeKind::Null => {
                 ui.label("No parameters.");
@@ -14394,26 +15034,29 @@ impl ProceduralFxStudioApp {
                             self.graph_editor.frame_all();
                         }
                     });
-                    egui::Grid::new(("animation_grid", id)).num_columns(3).striped(true).show(ui, |ui| {
+                    egui::Grid::new(("animation_grid", id)).num_columns(4).striped(true).show(ui, |ui| {
                         for (target, name) in &targets {
                             let channel_id = ChannelId { node: id, target: *target };
                             let value = self.graph.channel_value(channel_id).unwrap_or(0.0);
+                            let expression = self.graph.channels.get(&channel_id).and_then(|ch| ch.expression.clone());
                             let state = self.graph.channels.get(&channel_id).map(|ch| ch.has_key_at(self.time));
-                            let (symbol, hover) = match state {
-                                Some(true) => ("◆", "Key at this frame: click to delete it"),
-                                Some(false) => ("◇", "Animated: click to key this frame"),
-                                None => ("○", "Click to animate: keys this frame"),
+                            let (symbol, hover) = match (&expression, state) {
+                                (Some(_), _) => ("=", "Driven by its expression"),
+                                (None, Some(true)) => ("◆", "Key at this frame: click to delete it"),
+                                (None, Some(false)) => ("◇", "Animated: click to key this frame"),
+                                (None, None) => ("○", "Click to animate: keys this frame"),
                             };
-                            let colour = match state {
-                                Some(true) => egui::Color32::from_rgb(255, 200, 60),
-                                Some(false) => egui::Color32::from_rgb(120, 200, 120),
-                                None => egui::Color32::GRAY,
+                            let colour = match (&expression, state) {
+                                (Some(_), _) => egui::Color32::from_rgb(110, 170, 255),
+                                (None, Some(true)) => egui::Color32::from_rgb(255, 200, 60),
+                                (None, Some(false)) => egui::Color32::from_rgb(120, 200, 120),
+                                (None, None) => egui::Color32::GRAY,
                             };
-                            if ui.add(egui::Button::new(egui::RichText::new(symbol).color(colour)).small()).on_hover_text(hover).clicked() {
+                            if ui.add_enabled(expression.is_none(), egui::Button::new(egui::RichText::new(symbol).color(colour)).small()).on_hover_text(hover).on_disabled_hover_text(hover).clicked() {
                                 if state == Some(true) {
                                     if let Some(channel) = self.graph.channels.get_mut(&channel_id) {
                                         channel.remove_key_at(self.time);
-                                        if channel.keys.is_empty() {
+                                        if channel.is_empty() {
                                             self.graph.channels.remove(&channel_id);
                                         }
                                     }
@@ -14424,10 +15067,34 @@ impl ProceduralFxStudioApp {
                             }
                             ui.label(name);
                             ui.monospace(format!("{value:.3}"));
+                            // An expression drives the parameter at every frame, e.g. $F for Scatter's seed.
+                            let mut text = expression.clone().unwrap_or_default();
+                            let error = expression.as_deref().and_then(|e| vex::eval_expression(e, self.time).err());
+                            let mut edit = egui::TextEdit::singleline(&mut text).hint_text("expression").desired_width(110.0).font(egui::TextStyle::Monospace);
+                            if error.is_some() {
+                                edit = edit.text_color(egui::Color32::from_rgb(240, 110, 110));
+                            }
+                            let response = ui.add(edit).on_hover_text(error.clone().unwrap_or_else(|| {
+                                "Expression (VEX): $F frame, $FF fractional frame, $T seconds, $FPS; e.g. $F, $FF * 0.1, sin($T * 2) * 0.5, rand($F) * 10".into()
+                            }));
+                            if response.changed() {
+                                let trimmed = text.trim();
+                                if trimmed.is_empty() {
+                                    if let Some(channel) = self.graph.channels.get_mut(&channel_id) {
+                                        channel.expression = None;
+                                        if channel.is_empty() {
+                                            self.graph.channels.remove(&channel_id);
+                                        }
+                                    }
+                                } else {
+                                    self.graph.channels.entry(channel_id).or_default().expression = Some(text.clone());
+                                }
+                                c = true;
+                            }
                             ui.end_row();
                         }
                     });
-                    ui.small("Edits to animated parameters (panel or gizmo) key the current frame automatically.");
+                    ui.small("Edits to animated parameters (panel or gizmo) key the current frame automatically. An expression replaces the keys.");
                 });
         }
         if self.graph.nodes.get(&id).is_some_and(|n| n.kind.is_lop()) {
@@ -14931,6 +15598,12 @@ impl ProceduralFxStudioApp {
     fn viewport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let (response, painter) =
             ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+        // The flipbook captures this rect of the main window (not a popped-out viewport).
+        if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+            self.viewport_rect = Some(response.rect);
+        }
+        // A flipbook shows the scene only: no info text, axes or handles.
+        let recording = self.flipbook_recording.is_some();
         painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(self.viewport_bg));
         // IMG: the viewport shows the composite.
         if self.context == AppContext::Img {
@@ -15068,6 +15741,7 @@ impl ProceduralFxStudioApp {
                 }
             }
         }
+        if !recording {
         painter.circle_filled(gizmo_center, 30.0, egui::Color32::from_black_alpha(150));
         painter.circle_stroke(
             gizmo_center,
@@ -15095,6 +15769,7 @@ impl ProceduralFxStudioApp {
             egui::FontId::proportional(13.0),
             egui::Color32::from_rgb(90, 140, 240),
         );
+        }
 
         // Transform world coordinate into 3D camera space (+Z in front of camera)
         let to_cam = |p: Vec3| -> Vec3 {
@@ -15241,6 +15916,12 @@ impl ProceduralFxStudioApp {
                 p.z - near_plane
             };
 
+            // In front of the near plane: unchanged, corners in their own order (the
+            // loop below starts from the second corner, which would misplace corner
+            // colours, uvs and polygon edges).
+            if vertices.iter().all(|v| plane_dist(0, *v) >= 0.0) {
+                return vertices.to_vec();
+            }
             let mut polygon = vertices.to_vec();
             // Keep only near-plane clipping in camera space. The viewport
             // rectangle clips the projected polygon and remains correct
@@ -15305,8 +15986,8 @@ impl ProceduralFxStudioApp {
         if self.template.is_some() && self.template_mesh.indices.len() <= 20_000 {
             let ts = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(230, 80, 200, 140));
             let tm = &self.template_mesh;
-            for t in &tm.indices {
-                for k in 0..3 {
+            for (t, shown) in tm.indices.iter().zip(poly::outline_edges(tm)) {
+                for k in (0..3).filter(|k| shown[*k]) {
                     line3d(tm.vertices[t[k]], tm.vertices[t[(k + 1) % 3]], ts);
                 }
             }
@@ -15335,6 +16016,8 @@ impl ProceduralFxStudioApp {
                 (c.z >= near_plane).then(|| (project_cam(c), c.z))
             })
             .collect();
+        // Polygon diagonals: hidden in the wireframe, so not pickable as edges either.
+        let diagonals: HashSet<(usize, usize)> = mesh.indices.iter().zip(poly::outline_edges(mesh)).flat_map(|(t, shown)| (0..3).filter(move |k| !shown[*k]).map(move |k| (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3])))).collect();
         let mut pending_edge_loop = None;
         let mut clear_selection_on_miss = false;
         let box_selecting = ctx.input(|i| i.modifiers.shift);
@@ -15374,7 +16057,7 @@ impl ProceduralFxStudioApp {
                             })
                             .collect();
                         if !additive { self.selected_triangles.clear(); }
-                        self.selected_triangles.extend(selected);
+                        self.selected_triangles.extend(poly::whole_polygons(&mesh, &selected));
                         self.selected_triangles.sort_unstable();
                         self.selected_triangles.dedup();
                     }
@@ -15383,6 +16066,7 @@ impl ProceduralFxStudioApp {
                         let mut seen = HashSet::new();
                         for tri in &mesh.indices {
                             for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                                if diagonals.contains(&(a.min(b), a.max(b))) { continue; }
                                 let edge = (a.min(b), a.max(b));
                                 if !seen.insert(edge) { continue; }
                                 if let (Some((pa, _)), Some((pb, _))) = (projected[a], projected[b]) {
@@ -15407,6 +16091,7 @@ impl ProceduralFxStudioApp {
                 let mut best = None;
                 for tri in &mesh.indices {
                     for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                        if diagonals.contains(&(a.min(b), a.max(b))) { continue; }
                         let (Some((pa, _)), Some((pb, _))) = (projected[a], projected[b]) else { continue };
                         let ab = pb - pa;
                         let t = if ab.length_sq() > 1e-6 {
@@ -15500,10 +16185,12 @@ impl ProceduralFxStudioApp {
                         });
                         let hit = candidates.first().map(|(_, i)| *i);
                         if let Some(i) = hit {
-                            if let Some(position) = self.selected_triangles.iter().position(|&v| v == i) {
-                                self.selected_triangles.remove(position);
+                            // Clicking picks (or unpicks) the whole polygon.
+                            let face = poly::whole_polygons(&mesh, &[i]);
+                            if self.selected_triangles.contains(&i) {
+                                self.selected_triangles.retain(|t| !face.contains(t));
                             } else {
-                                self.selected_triangles.push(i);
+                                self.selected_triangles.extend(face);
                             }
                         } else {
                             clear_selection_on_miss = true;
@@ -15513,6 +16200,7 @@ impl ProceduralFxStudioApp {
                         let mut best: Option<(f32, f32, (usize, usize))> = None;
                         for tri in &mesh.indices {
                             for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                                if diagonals.contains(&(a.min(b), a.max(b))) { continue; }
                                 let Some((pa, za)) = projected[a] else { continue };
                                 let Some((pb, zb)) = projected[b] else { continue };
                                 let ab = pb - pa;
@@ -15595,6 +16283,8 @@ impl ProceduralFxStudioApp {
             colors: [egui::Color32; 3],
             // Texture coordinates when the mesh is quick-shaded.
             uv: Option<[egui::Pos2; 3]>,
+            // Which edges (0-1, 1-2, 2-0) the wireframe draws: polygon outlines, not their diagonals.
+            edges: [bool; 3],
         }
         let cd = mesh.point_attributes.get("Cd");
         let cd_color = |index: usize| -> Option<egui::Color32> {
@@ -15652,6 +16342,7 @@ impl ProceduralFxStudioApp {
             ))
         };
         let mut queue: Vec<Poly> = Vec::with_capacity(mesh.indices.len());
+        let outlines = poly::outline_edges(&mesh);
         for (tri_index, tri) in mesh.indices.iter().enumerate() {
             if self.isolate_selection {
                 let keep = match self.selection_mode {
@@ -15737,8 +16428,9 @@ impl ProceduralFxStudioApp {
                     continue;
                 }
                 queue.push(Poly {
-                    // Near-plane clipped pieces fall back to untextured shading.
+                    // Near-plane clipped pieces fall back to untextured shading (and show all their edges).
                     uv: if clipped.len() == 3 { uv } else { None },
+                    edges: if clipped.len() == 3 { outlines[tri_index] } else { [true; 3] },
                     pts: [a, b, c],
                     depth: [first.z, clipped[i].z, clipped[i + 1].z],
                     colors: if clipped.len() == 3 {
@@ -15789,7 +16481,7 @@ impl ProceduralFxStudioApp {
             let lines: Vec<raster::Line> = match wire {
                 Some(colour) => queue
                     .iter()
-                    .flat_map(|p| [(0, 1), (1, 2), (2, 0)].map(|(a, b)| raster::Line { a: to_pixel(p.pts[a], p.depth[a]), b: to_pixel(p.pts[b], p.depth[b]), rgba: colour }))
+                    .flat_map(|p| [(0, 1), (1, 2), (2, 0)].into_iter().filter(|(a, _)| p.edges[*a]).map(|(a, b)| raster::Line { a: to_pixel(p.pts[a], p.depth[a]), b: to_pixel(p.pts[b], p.depth[b]), rgba: colour }))
                     .collect(),
                 None => Vec::new(),
             };
@@ -16136,10 +16828,10 @@ impl ProceduralFxStudioApp {
         let disp = match view_display {
             None => "No display node — enter a geometry node and double-click a node".to_string(),
             Some(id) => format!(
-                "{}  |  {} pts  {} tris  |  cook {:.1} ms  |  t = {:.2}  |  cache {}/{} \n{}{}",
+                "{}  |  {} pts  {} prims  |  cook {:.1} ms  |  t = {:.2}  |  cache {}/{} \n{}{}",
                 self.graph.nodes.get(&id).map_or_else(|| format!("?{id}"), |n| n.title(id)),
                 mesh.vertices.len(),
-                mesh.indices.len(),
+                poly::count(&mesh),
                 self.cook_ms,
                 self.time,
                 self.frame_cache_hits,
@@ -16152,17 +16844,19 @@ impl ProceduralFxStudioApp {
                 }
             ),
         };
-        painter.text(
-            response.rect.left_top() + egui::vec2(10.0, 10.0),
-            egui::Align2::LEFT_TOP,
-            disp,
-            egui::FontId::monospace(12.0),
-            egui::Color32::from_gray(210),
-        );
+        if !recording {
+            painter.text(
+                response.rect.left_top() + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                disp,
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_gray(210),
+            );
+        }
         // The gizmo for the selected node, drawn at its pivot with a constant screen size:
         // move/rotate/scale handles, or a domain box with a handle on each face.
         let mut gizmo_frame = None;
-        if let Some(target) = self.gizmo_target().filter(|_| self.show_gizmos) {
+        if let Some(target) = self.gizmo_target().filter(|_| self.show_gizmos && !recording) {
             let xform = target.value;
             let pivot = target.point(Vec3::from_arr(xform.t));
             let cam_right = Vec3::new(cos_y, 0.0, -sin_y);
@@ -16465,6 +17159,7 @@ impl eframe::App for ProceduralFxStudioApp {
             self.save_scene();
         }
         self.update_window_title(ctx);
+        self.confirm_quit(ctx);
 
         self.poll_moonray_render();
         self.advance_sequence();
@@ -16479,9 +17174,18 @@ impl eframe::App for ProceduralFxStudioApp {
             self.status = self.write_cop_output(id, range).unwrap_or_else(|e| format!("File Output failed: {e}"));
         }
 
+        self.flipbook_step(ctx);
         if self.dirty || self.simulation_rx.is_some() {
             self.rebuild_graph();
             self.dirty = false;
+        }
+        // Flipbook: once this frame has cooked (simulations too), capture the window as drawn.
+        if let Some(recording) = self.flipbook_recording.as_mut() {
+            if !recording.waiting && self.simulation_rx.is_none() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                recording.waiting = true;
+            }
+            ctx.request_repaint();
         }
         if self.simulation_rx.is_some() || self.moonray_rx.is_some() || self.sequence.is_some() {
             ctx.request_repaint();
@@ -16489,6 +17193,12 @@ impl eframe::App for ProceduralFxStudioApp {
 
         // The panes: a dock the user can rearrange, split, float and pop out (see Pane).
         self.show_panes(ctx);
+        if let Some(viewer) = self.flipbook_viewer.as_mut() {
+            viewer.show(ctx);
+            if !viewer.open {
+                self.flipbook_viewer = None;
+            }
+        }
         if self.dirty {
             ctx.request_repaint();
         }
@@ -16588,7 +17298,7 @@ impl eframe::App for ProceduralFxStudioApp {
                     if mesh.point_attributes.is_empty() {
                         ui.small("None");
                     } else {
-                        let mut names: Vec<_> = mesh.point_attributes.keys().collect();
+                        let mut names: Vec<_> = mesh.point_attributes.keys().filter(|k| !poly::is_internal(k)).collect();
                         names.sort();
                         for name in names {
                             let values = &mesh.point_attributes[name];
@@ -16671,6 +17381,13 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1400.0, 900.0])
             .with_title("ProceduralFX Studio")
             .with_icon(app_icon()),
+        // macOS: winit's default app menu quits on Cmd+Q without asking the window,
+        // which would skip "Save changes before quitting?"; the app handles Cmd+Q itself.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            builder.with_default_menu(false);
+        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -16806,9 +17523,9 @@ mod tests {
         assert_eq!(headers(SheetDomain::Detail), vec!["count"]);
         let columns = sheet_columns(&mesh, SheetDomain::Points);
         let group = columns.iter().find(|c| c.header == "group").unwrap();
-        assert_eq!(sheet_cell(&mesh, &[], &group.source, 3), "3");
+        assert_eq!(sheet_cell(&mesh, &[], &SheetPolys::new(&mesh), &group.source, 3), "3");
         let mass = columns.iter().find(|c| c.header == "mass").unwrap();
-        assert_eq!(sheet_cell(&mesh, &[], &mass.source, 1), "2.500");
+        assert_eq!(sheet_cell(&mesh, &[], &SheetPolys::new(&mesh), &mass.source, 1), "2.500");
     }
 
 
@@ -16970,7 +17687,15 @@ mod tests {
             let geo_prim = stage.prims.keys().find(|p| p.starts_with("/geo/geometry")).unwrap();
             let (a, b) = (stage.prims[geo_prim].mesh.as_ref().unwrap(), loaded.prims[geo_prim].mesh.as_ref().unwrap());
             assert_eq!(a.vertices, b.vertices, "{extension}: points come back in app space");
-            assert_eq!(a.indices, b.indices, "{extension}: winding survives the mirror");
+            // Faces come back as the same polygons, wound the same way (a quad may split along its other diagonal).
+            let outlines = |m: &Mesh| -> Vec<Vec<usize>> {
+                poly::faces(m).iter().map(|f| {
+                    let pts: Vec<usize> = f.corners.iter().map(|c| c.0).collect();
+                    let start = (0..pts.len()).min_by_key(|&i| pts[i]).unwrap_or(0);
+                    pts[start..].iter().chain(&pts[..start]).copied().collect()
+                }).collect()
+            };
+            assert_eq!(outlines(a), outlines(b), "{extension}: polygons and their winding survive the mirror");
             assert_eq!(loaded.world_xform("/shapes/ball")[3], [1.0, 2.0, 0.0, 1.0], "{extension}");
             assert_eq!(loaded.prims["/shapes/ball"].float("radius"), Some(0.5), "{extension}");
             assert!(!loaded.prims["/lights/key"].visible, "{extension}");
@@ -17671,14 +18396,16 @@ mod group_node_tests {
         // Blast a primitive group.
         let mut g = Graph::default();
         let grid = g.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
-        let make = g.add(group_create("top", groups::GroupDomain::Prims, "@P.z>0"), egui::pos2(0.0, 0.0));
+        let make = g.add(group_create("top", groups::GroupDomain::Prims, "@P.z>0.1"), egui::pos2(0.0, 0.0));
         let blast = g.add(NodeKind::Blast { component: 0, indices: Vec::new(), invert: false }, egui::pos2(0.0, 0.0));
         g.connect(grid, make, 0);
         g.connect(make, blast, 0);
         g.nodes.get_mut(&blast).unwrap().group = groups::NodeGroup { pattern: "top".into(), kind: 0 };
         let full = g.cook(make, 0.0, &mut HashMap::new());
         let blasted = g.cook(blast, 0.0, &mut HashMap::new());
-        assert_eq!(blasted.indices.len(), full.indices.len() / 2);
+        // The 3×3 grid's quads: only the top row's centres have z > 0.
+        assert_eq!((poly::count(&full), poly::count(&blasted)), (9, 6));
+        assert_eq!(blasted.indices.len(), full.indices.len() - 6);
         // Scatter only on that group.
         let scatter = g.add(NodeKind::Scatter(sops::ScatterSettings { count: 200, seed: 3, relax_iterations: 0, volume: false }), egui::pos2(0.0, 0.0));
         g.connect(make, scatter, 0);
@@ -17742,7 +18469,8 @@ mod group_node_tests {
         app.set_group_pick_domain(groups::GroupDomain::Prims);
         app.selected_triangles = vec![4, 5];
         app.finish_group_pick(true);
-        assert_eq!(app.graph.nodes[&transform].group, groups::NodeGroup { pattern: "4-5".into(), kind: 2 });
+        // Triangles 4 and 5 are the grid's third quad.
+        assert_eq!(app.graph.nodes[&transform].group, groups::NodeGroup { pattern: "2".into(), kind: 2 });
     }
 
     #[test]
@@ -17765,7 +18493,16 @@ mod raster_view_tests {
     #[test]
     #[ignore]
     fn cone_renders_with_depth() {
-        let mesh = node_cone(1.0, 2.0, 1, 32, true);
+        // PFX_MESH=tube draws a capped tube instead, to check polygon outlines.
+        let mesh = match std::env::var("PFX_MESH").as_deref() {
+            Ok("tube") => node_tube(1.0, 1.0, 2.0, 3, 12, true),
+            // The cone of a scene's Material Fracture (20 concrete pieces).
+            Ok("fracture") => {
+                let g = Graph::deserialize("pfs 2\nnode 8 0 0 0 obj cone 1 2 1 32 1\nnode 10 0 0 0 obj material_fracture 0 20 1 0 0 0 4 9 1 5 0 200\nlink 8 10 0\nnext 11\n");
+                g.cook(10, 0.0, &mut HashMap::new())
+            }
+            _ => node_cone(1.0, 2.0, 1, 32, true),
+        };
         let rot_x: f32 = std::env::var("PFX_ROTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.35);
         let (rot_y, zoom, focal) = (0.6f32, 6.0f32, 900.0f32);
         let (sin_x, cos_x) = rot_x.sin_cos();
@@ -17779,26 +18516,28 @@ mod raster_view_tests {
         };
         let (w, h) = (640usize, 560usize);
         let mut r = raster::Raster::new(w, h, false);
-        let normals = mesh.compute_normals();
+        // The viewport's shading normals.
+        let corners = sops::corner_normals(&mesh);
         let light = Vec3::new(0.4, 0.8, -0.5).normalize();
         let project = |p: Vec3| {
             let c = to_cam(p);
             raster::ScreenVertex { x: w as f32 / 2.0 + c.x / c.z * focal, y: h as f32 / 2.0 - c.y / c.z * focal, z: c.z }
         };
         let wire = std::env::var("PFX_WIRE").is_ok();
-        for tri in &mesh.indices {
+        for (t, tri) in mesh.indices.iter().enumerate() {
             // The base cap (all corners on the lowest plane) in red, to see where it shows.
             let cap = tri.iter().all(|&i| (mesh.vertices[i].y - mesh.bounds().unwrap().0.y).abs() < 1e-4);
-            let shade = tri.map(|i| {
-                let l = 0.15 + 0.8 * normals[i].dot(light).max(0.0);
+            let shade = [0, 1, 2].map(|k| {
+                let l = 0.15 + 0.8 * corners[t][k].dot(light).max(0.0);
                 if cap { [l.max(0.4), 0.1, 0.1] } else { [l; 3] }
             });
             r.triangle(tri.map(|i| project(mesh.vertices[i])), shade, None);
         }
         if wire {
-            for tri in &mesh.indices {
-                for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-                    r.line(project(mesh.vertices[tri[a]]), project(mesh.vertices[tri[b]]), [0, 0, 0, 110]);
+            // Polygon outlines only, as the viewport draws them.
+            for (tri, shown) in mesh.indices.iter().zip(poly::outline_edges(&mesh)) {
+                for (a, b) in [(0, 1), (1, 2), (2, 0)].into_iter().filter(|(a, _)| shown[*a]) {
+                    r.line(project(mesh.vertices[tri[a]]), project(mesh.vertices[tri[b]]), [0, 0, 0, 160]);
                 }
             }
         }
@@ -18473,14 +19212,15 @@ mod material_sop_tests {
         app.graph.set_display(assign);
         let cooked = app.graph.cook(assign, 0.0, &mut HashMap::new());
         let ids = &cooked.point_attributes[PRIM_MATERIAL];
+        // "0-5" is the first six quads: twelve triangles.
         assert_eq!(ids.len(), 18);
-        assert!(ids[..6].iter().all(|v| *v == gold as f32 + 1.0) && ids[6..].iter().all(|v| *v == 0.0));
+        assert!(ids[..12].iter().all(|v| *v == gold as f32 + 1.0) && ids[12..].iter().all(|v| *v == 0.0));
         // Render: two parts, gold on the group and the object's red on the rest.
         app.render_at = Some(0.0);
         let scene = app.render_scene().unwrap();
         let mut parts: Vec<(usize, Option<NodeId>)> = scene.parts.iter().map(|(m, pm)| (m.indices.len(), match pm { PartMaterial::Node(n) => Some(*n), _ => None })).collect();
         parts.sort();
-        assert_eq!(parts, vec![(6, Some(gold)), (12, Some(red))]);
+        assert_eq!(parts, vec![(6, Some(red)), (12, Some(gold))]);
         // Viewport: each primitive shows its own material's colour.
         let shown = app.graph.cook_display(&[geo], 0.0, &mut HashMap::new());
         let cd = &shown.point_attributes["prim:Cd"];
@@ -18853,6 +19593,23 @@ mod flow_node_tests {
         assert!(node_errors(|e| e.get(&own).cloned()).is_some());
         let loaded = Graph::deserialize(&app.graph.serialize());
         assert!(matches!(&loaded.nodes[&merge].kind, NodeKind::ObjectMerge { sources, into_this: false } if sources == &vec![Some(source)]));
+
+        // A node in its own network: in place, as built (the object's transform cancels out).
+        let sphere = add_in(&mut app, target, NodeKind::Sphere { radius: 1.0, rows: 4, cols: 6 });
+        let local = add_in(&mut app, target, NodeKind::ObjectMerge { sources: vec![Some(sphere)], into_this: true });
+        let merged = app.graph.cook(local, 0.0, &mut HashMap::new());
+        let original = app.graph.cook(sphere, 0.0, &mut HashMap::new());
+        assert_eq!(merged.vertices.len(), original.vertices.len());
+        assert!(merged.vertices.iter().zip(&original.vertices).all(|(a, b)| a.sub(*b).length() < 1e-5));
+        // What's downstream of a merge can't feed it; nested nodes are named by their path.
+        let after = add_in(&mut app, target, NodeKind::Transform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] });
+        app.graph.connect(local, after, 0);
+        let downstream = app.graph.downstream(local);
+        assert!(downstream.contains(&after) && !downstream.contains(&sphere));
+        assert_eq!(app.graph.path_in_object(sphere), app.graph.nodes[&sphere].title(sphere));
+        app.graph.nodes.get_mut(&sphere).unwrap().parent = Some(after);
+        assert_eq!(app.graph.path_in_object(sphere), format!("{} / {}", app.graph.nodes[&after].title(after), app.graph.nodes[&sphere].title(sphere)));
+        assert_eq!(app.graph.enclosing_geometry(sphere), Some(target));
     }
 }
 
@@ -19033,5 +19790,295 @@ mod hydra_render_tests {
         let brightest = image.pixels().map(|p| p[0]).fold(0.0, f32::max);
         println!("{lit} lit pixels, brightest {brightest}");
         assert!(lit > image.pixels().len() / 20 && brightest > 0.3, "the cube is lit like the MoonRay render");
+    }
+}
+
+#[cfg(test)]
+mod polygon_tests {
+    use super::*;
+
+    fn quads() -> Mesh {
+        node_grid(2.0, 2.0, 3, 3)
+    }
+
+    #[test]
+    fn generators_make_quads_and_ngon_caps() {
+        assert_eq!(poly::count(&node_box(1.0, 1)), 6);
+        assert_eq!(poly::count(&node_box(1.0, 2)), 24);
+        assert_eq!(poly::count(&node_torus(1.0, 0.25, 4, 6)), 24);
+        // A capped tube: 3 × 8 side quads and two 8-sided caps.
+        let tube = node_tube(1.0, 1.0, 2.0, 3, 8, true);
+        assert_eq!(poly::count(&tube), 24 + 2);
+        let caps: Vec<usize> = poly::runs(&tube).iter().filter(|r| r.len() == 8).map(|r| poly::boundary(&tube, r).unwrap().len()).collect();
+        assert_eq!(caps, vec![8, 8], "each cap's outline is the ring");
+        // A sphere: quads, with one triangle per pole cell.
+        let sphere = node_sphere(1.0, 4, 6);
+        let sizes: Vec<usize> = poly::runs(&sphere).iter().map(|r| r.len()).collect();
+        assert_eq!(sizes.iter().filter(|n| **n == 2).count(), 6 * 2, "two rows of quads");
+        assert_eq!(sizes.iter().filter(|n| **n == 1).count(), 6 * 2, "a triangle fan at each pole");
+    }
+
+    #[test]
+    fn vex_runs_once_per_polygon() {
+        // @primnum counts polygons, and what one writes covers both its triangles.
+        let out = node_wrangle(quads(), "f@n = @primnum; f@np = @numprim; f@r = rand(@primnum + 0.5);", 0.0, 1, None, None);
+        assert_eq!(out.point_attributes["prim:n"], vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert!(out.point_attributes["prim:np"].iter().all(|v| *v == 4.0));
+        let r = &out.point_attributes["prim:r"];
+        assert!(r.chunks(2).all(|pair| pair[0] == pair[1]));
+        // @P is the polygon's centre; removeprim removes the whole quad.
+        let out = node_wrangle(quads(), "if (@P.x > 0 && @P.z > 0) removeprim(0, @primnum, 1);", 0.0, 1, None, None);
+        assert_eq!((poly::count(&out), out.indices.len(), out.vertices.len()), (3, 6, 8));
+        // Point domain functions see polygons too.
+        let out = node_wrangle(quads(), "i@n = nprimitives(0); i@c = len(primpoints(0, 0)); i@p = len(pointprims(0, 4));", 0.0, 2, None, None);
+        assert_eq!((out.point_attributes["n"][0], out.point_attributes["c"][0], out.point_attributes["p"][0]), (4.0, 4.0, 4.0));
+        // addprim adds one polygon of any number of points.
+        let out = node_wrangle(quads(), "int a = addpoint(0, {0, 1, 0}); addprim(0, \"poly\", 0, 1, 2, 5, a);", 0.0, 0, None, None);
+        assert_eq!((poly::count(&out), out.indices.len()), (5, 8 + 3));
+        let out = node_wrangle(quads(), "int pts[] = array(0, 1, 2); addprim(0, \"poly\", pts);", 0.0, 0, None, None);
+        assert_eq!(out.indices.len(), 9);
+        // xyzdist gives a polygon and a uv that primuv reads back.
+        let out = node_wrangle(quads(), "int prim; vector uv; xyzdist(0, {0.7, 0.3, 0.6}, prim, uv); i@hit = prim; v@back = primuv(0, \"P\", prim, uv);", 0.0, 0, None, None);
+        assert_eq!(out.point_attributes["detail:hit"][0], 3.0);
+        let back = &out.point_attributes["detail:back"];
+        assert!((back[0] - 0.7).abs() < 1e-4 && back[1].abs() < 1e-4 && (back[2] - 0.6).abs() < 1e-4, "{back:?}");
+    }
+
+    #[test]
+    fn files_keep_quads() {
+        let grid = quads();
+        let obj = fileio::write_obj(&grid);
+        assert_eq!(obj.lines().filter(|l| l.starts_with("f ")).count(), 4);
+        assert!(obj.lines().filter(|l| l.starts_with("f ")).all(|l| l.split_whitespace().count() == 5));
+        let back = fileio::read_obj(&obj).unwrap();
+        assert_eq!((poly::count(&back), back.indices.len()), (4, 8));
+        let mut stage = usd::Stage::default();
+        stage.define("/geo", "Mesh").mesh = Some(Arc::new(grid));
+        let text = usd::to_usda(&stage);
+        assert!(text.contains("faceVertexCounts = [4, 4, 4, 4]"), "{text}");
+        assert!(!text.contains("__poly"));
+    }
+
+    #[test]
+    fn subdivide_mirror_and_blast_keep_faces() {
+        let mut grid = quads();
+        grid.point_attributes.insert("prim:tag".into(), (0..8).map(|t| (t / 2) as f32).collect());
+        // Each quad becomes four quads, keeping its primitive attributes.
+        let fine = node_subdivide(grid.clone(), 1);
+        assert_eq!((poly::count(&fine), fine.indices.len()), (16, 32));
+        assert_eq!(fine.point_attributes["prim:tag"][..8], [0.0; 8]);
+        // A mirror's copy keeps its own polygons.
+        let mirrored = node_mirror(grid.clone(), 1);
+        assert_eq!(poly::count(&mirrored), 8);
+        // Blast keeps the primitive attributes of what's left.
+        let blasted = node_blast(grid, 1, &[0, 1], false);
+        assert_eq!(blasted.point_attributes["prim:tag"], vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert_eq!(poly::count(&blasted), 3);
+    }
+
+    #[test]
+    fn spreadsheet_rows_are_polygons() {
+        let mut grid = quads();
+        grid.point_attributes.insert("prim:tag".into(), (0..8).map(|t| (t / 2) as f32 * 10.0).collect());
+        assert_eq!(SheetDomain::Primitives.count(&grid), 4);
+        let columns = sheet_columns(&grid, SheetDomain::Primitives);
+        assert!(columns.iter().all(|c| !c.header.contains("__poly")));
+        let polys = SheetPolys::new(&grid);
+        let points = columns.iter().find(|c| c.header == "Points").unwrap();
+        assert_eq!(sheet_cell(&grid, &[], &polys, &points.source, 3).split(' ').count(), 4);
+        let tag = columns.iter().find(|c| c.header == "tag").unwrap();
+        assert_eq!(sheet_cell(&grid, &[], &polys, &tag.source, 3), "30");
+    }
+}
+
+#[cfg(test)]
+mod expression_tests {
+    use super::*;
+
+    #[test]
+    fn expressions_evaluate_with_frame_variables() {
+        // Frames count from 1 at time 0, at SIM_FPS.
+        let frame_of = |t: f32| t * sims::SIM_FPS + 1.0;
+        assert_eq!(vex::eval_expression("$F", 0.0), Ok(1.0));
+        assert_eq!(vex::eval_expression("$F", 1.0), Ok(frame_of(1.0)));
+        let t = 0.52;
+        assert!((vex::eval_expression("$FF * 2", t).unwrap() - frame_of(t) * 2.0).abs() < 1e-4);
+        assert!((vex::eval_expression("sin($T) + $FPS", t).unwrap() - (t.sin() + sims::SIM_FPS)).abs() < 1e-4);
+        assert_eq!(vex::eval_expression(" 7.5 ", 3.0), Ok(7.5));
+        assert!(vex::eval_expression("fit($F, 1, 11, 0, 1)", 0.0).is_ok());
+        assert!(vex::eval_expression("nosuchfunction($F)", 0.0).is_err());
+        assert!(vex::eval_expression("$F +", 0.0).is_err());
+    }
+
+    #[test]
+    fn typing_an_expression_into_a_field_makes_the_parameter_follow_it() {
+        let parse = typed_parser(3.0, true);
+        EXPRESSION_TIME.with(|t| t.set(1.0 / sims::SIM_FPS));
+        assert_eq!(parse("$FF"), Some(2.0));
+        assert!(matches!(TYPED.with(|t| t.borrow_mut().take()), Some(Typed::Expression(e)) if e == "$FF"));
+        // Same value as the field: still a change, so the field can be found.
+        assert_eq!(typed_parser(2.0, true)("$F"), Some(3.0));
+        assert_eq!(parse("12"), Some(12.0));
+        assert!(matches!(TYPED.with(|t| t.borrow_mut().take()), Some(Typed::Number)));
+        assert_eq!(parse("$F +"), None);
+
+        // The panel gives the expression to the parameter the typing changed (Scatter's seed).
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let scatter = app.graph.add(NodeKind::Scatter(sops::ScatterSettings { count: 20, seed: 3, relax_iterations: 0, volume: false }), egui::pos2(0.0, 0.0));
+        let before = (scatter, app.graph.nodes[&scatter].kind.params(), app.graph.nodes[&scatter].xform);
+        if let NodeKind::Scatter(s) = &mut app.graph.nodes.get_mut(&scatter).unwrap().kind {
+            s.seed = 2;
+        }
+        app.apply_typed(before.clone(), Typed::Expression("$FF".into()));
+        let seed = ChannelTarget::Param(before.1.iter().position(|v| *v == 3.0).unwrap());
+        let channel = ChannelId { node: scatter, target: seed };
+        assert_eq!(app.graph.channels[&channel].expression.as_deref(), Some("$FF"));
+        let seed_at = |g: &Graph, t: f32| match g.kind_at(scatter, t).as_ref() { NodeKind::Scatter(s) => s.seed, _ => 0 };
+        assert_eq!((seed_at(&app.graph, 0.0), seed_at(&app.graph, 2.0 / sims::SIM_FPS)), (1, 3));
+        // Typing a number replaces the expression.
+        let before = (scatter, app.graph.nodes[&scatter].kind.params(), app.graph.nodes[&scatter].xform);
+        if let NodeKind::Scatter(s) = &mut app.graph.nodes.get_mut(&scatter).unwrap().kind {
+            s.seed = 7;
+        }
+        app.apply_typed(before, Typed::Number);
+        assert!(!app.graph.channels.contains_key(&channel));
+        // Delete Channel on the field showing the seed: the expression goes, the value stays.
+        app.graph.channels.entry(channel).or_default().expression = Some("$F * 5".into());
+        app.graph.apply_animation(0.0);
+        let shown = match &app.graph.nodes[&scatter].kind { NodeKind::Scatter(s) => s.seed as f32, _ => 0.0 };
+        assert_eq!(shown, 5.0);
+        let before = (scatter, app.graph.nodes[&scatter].kind.params(), app.graph.nodes[&scatter].xform);
+        app.apply_typed(before.clone(), Typed::Delete(4.0));
+        assert!(app.graph.channels.contains_key(&channel), "a field with another value isn't it");
+        app.apply_typed(before, Typed::Delete(shown));
+        assert!(!app.graph.channels.contains_key(&channel));
+        assert!(matches!(&app.graph.nodes[&scatter].kind, NodeKind::Scatter(s) if s.seed == 5));
+    }
+
+    #[test]
+    fn a_seed_expression_changes_the_scatter_every_frame() {
+        let mut g = Graph::default();
+        let grid = g.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
+        let scatter = g.add(NodeKind::Scatter(sops::ScatterSettings { count: 20, seed: 3, relax_iterations: 0, volume: false }), egui::pos2(0.0, 0.0));
+        g.connect(grid, scatter, 0);
+        let (seed, _) = g.nodes[&scatter].kind.animatable().into_iter().find(|(_, n)| n == "seed").unwrap();
+        let channel = ChannelId { node: scatter, target: seed };
+        g.channels.entry(channel).or_default().expression = Some("$F * 10".into());
+        let seed_at = |g: &Graph, t: f32| match g.kind_at(scatter, t).as_ref() {
+            NodeKind::Scatter(s) => s.seed,
+            _ => unreachable!(),
+        };
+        assert_eq!((seed_at(&g, 0.0), seed_at(&g, 1.0 / sims::SIM_FPS)), (10, 20));
+        let a = g.cook(scatter, 0.0, &mut HashMap::new());
+        let b = g.cook(scatter, 1.0 / sims::SIM_FPS, &mut HashMap::new());
+        assert_ne!(a.vertices, b.vertices, "a new seed each frame");
+        // Saved with the scene, characters and all; edits don't key over it.
+        g.channels.get_mut(&channel).unwrap().expression = Some("floor($FF) * 0.5".into());
+        let loaded = Graph::deserialize(&g.serialize());
+        assert_eq!(loaded.channels[&channel].expression.as_deref(), Some("floor($FF) * 0.5"));
+        let text = anim::Channel { keys: Vec::new(), expression: Some("a; b c".into()) }.to_text();
+        assert_eq!(anim::Channel::from_text(&text).expression.as_deref(), Some("a; b c"));
+        g.apply_animation(0.0);
+        if let NodeKind::Scatter(s) = &mut g.nodes.get_mut(&scatter).unwrap().kind {
+            s.seed = 99;
+        }
+        assert!(!g.commit_animation_edits(0.0));
+        assert!(g.channels[&channel].keys.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unsaved_tests {
+    use super::*;
+
+    #[test]
+    fn edits_are_unsaved_until_saved_and_playback_is_not_an_edit() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.mark_saved();
+        assert!(!app.has_unsaved_changes());
+        let grid = app.graph.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
+        assert!(app.has_unsaved_changes());
+        // Saving (or opening) clears it.
+        app.mark_saved();
+        assert!(!app.has_unsaved_changes());
+        // An animated parameter: playing it back isn't a change.
+        app.graph.channels.entry(ChannelId { node: grid, target: ChannelTarget::Param(0) }).or_default().expression = Some("1 + $T".into());
+        app.mark_saved();
+        app.graph.apply_animation(2.0);
+        assert!(!app.has_unsaved_changes());
+        app.graph.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        assert!(app.has_unsaved_changes());
+    }
+}
+
+#[cfg(test)]
+mod closed_shape_tests {
+    use super::*;
+
+    fn volume(m: &Mesh, tris: impl Iterator<Item = usize>) -> f32 {
+        tris.map(|t| { let [a, b, c] = m.indices[t].map(|i| m.vertices[i]); a.dot(b.cross(c)) / 6.0 }).sum()
+    }
+
+    // Directed edges without their opposite: 0 for a closed, consistently wound surface.
+    fn open_edges(m: &Mesh) -> usize {
+        let mut e: HashMap<(usize, usize), i32> = HashMap::new();
+        for x in &m.indices {
+            for k in 0..3 {
+                *e.entry((x[k], x[(k + 1) % 3])).or_default() += 1;
+            }
+        }
+        e.iter().filter(|((a, b), n)| e.get(&(*b, *a)).copied().unwrap_or(0) != **n).count()
+    }
+
+    #[test]
+    fn closed_generators_are_closed_and_face_outwards() {
+        for (name, m) in [
+            ("box", node_box(2.0, 2)),
+            ("sphere", node_sphere(1.0, 8, 12)),
+            ("tube", node_tube(1.0, 0.5, 2.0, 2, 12, true)),
+            ("torus", node_torus(1.0, 0.3, 8, 12)),
+            ("capsule", node_capsule(0.5, 1.0, 8, 12)),
+            ("cone", node_cone(1.0, 2.0, 3, 12, true)),
+            ("cone, one row", node_cone(1.0, 2.0, 1, 32, true)),
+        ] {
+            assert_eq!(open_edges(&m), 0, "{name} has holes or flipped faces");
+            assert!(volume(&m, 0..m.indices.len()) > 0.0, "{name} is inside out");
+        }
+        // The cone narrows to one apex point, and its base is one polygon.
+        let cone = node_cone(1.0, 2.0, 1, 32, true);
+        assert_eq!(cone.vertices.iter().filter(|v| (v.y - 1.0).abs() < 1e-6).count(), 1);
+        assert_eq!(poly::count(&cone), 32 + 1);
+    }
+
+    #[test]
+    fn a_fractured_cone_keeps_its_volume() {
+        let g = Graph::deserialize("pfs 2\nnode 8 0 0 0 obj cone 1 2 1 32 1\nnode 10 0 0 0 obj material_fracture 0 20 1 0 0 0 4 9 1 5 0 200\nlink 8 10 0\nnext 11\n");
+        let cone = g.cook(8, 0.0, &mut HashMap::new());
+        let pieces = g.cook(10, 0.0, &mut HashMap::new());
+        let (whole, cut) = (volume(&cone, 0..cone.indices.len()), volume(&pieces, 0..pieces.indices.len()));
+        assert!((whole - cut).abs() < 1e-3 * whole, "the pieces add up to the cone: {cut} vs {whole}");
+        let piece = &pieces.point_attributes["prim:piece"];
+        let count = piece.iter().map(|p| *p as i64).collect::<HashSet<_>>().len();
+        assert_eq!(count, 20);
+        for p in 0..20 {
+            let v = volume(&pieces, (0..pieces.indices.len()).filter(|&t| piece[t] as i64 == p));
+            assert!(v > 0.0, "piece {p} is inside out: {v}");
+        }
+    }
+
+    #[test]
+    fn viewport_shading_keeps_sharp_edges_sharp() {
+        // A box's corners shade flat (no N attribute); a sphere stays smooth.
+        let cube = node_box(2.0, 1);
+        for (t, corners) in sops::corner_normals(&cube).iter().enumerate() {
+            let [a, b, c] = cube.indices[t].map(|i| cube.vertices[i]);
+            let face = b.sub(a).cross(c.sub(a)).normalize();
+            assert!(corners.iter().all(|n| n.dot(face) > 0.999));
+        }
+        let sphere = node_sphere(1.0, 16, 24);
+        let corners = sops::corner_normals(&sphere);
+        let smooth = sphere.indices.iter().zip(&corners).all(|(tri, n)| (0..3).all(|k| n[k].dot(sphere.vertices[tri[k]].normalize()) > 0.99));
+        assert!(smooth);
     }
 }

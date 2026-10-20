@@ -1079,7 +1079,7 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("setprimattrib", 4, 5, "Geometry", "setprimattrib(0, \"name\", primnum, value [, mode])"),
     ("setdetailattrib", 3, 4, "Geometry", "setdetailattrib(0, \"name\", value [, mode])"),
     ("addpoint", 2, 2, "Geometry", "addpoint(0, pos | ptnum) returns the new point number"),
-    ("addprim", 5, 6, "Geometry", "addprim(0, \"poly\", pt0, pt1, pt2 [, pt3])"),
+    ("addprim", 3, 66, "Geometry", "addprim(0, \"poly\", pt0, pt1, pt2, ...) or addprim(0, \"poly\", int points[])"),
     ("removepoint", 2, 2, "Geometry", "removepoint(0, ptnum) also removes its triangles"),
     ("removeprim", 2, 3, "Geometry", "removeprim(0, primnum [, andpoints])"),
     ("nearpoint", 2, 3, "Geometry", "nearpoint(0, pos [, maxdist]) or -1"),
@@ -2011,7 +2011,8 @@ enum WriteMode {
 #[derive(Default)]
 struct Pending {
     add_points: Vec<[f32; 3]>,
-    add_prims: Vec<[usize; 3]>,
+    // Polygons added by addprim (their points, in order).
+    add_prims: Vec<Vec<usize>>,
     remove_points: HashSet<usize>,
     remove_prims: HashSet<usize>,
     // Points of removed primitives to delete if nothing else uses them (removeprim andpoints).
@@ -2057,6 +2058,21 @@ struct Runtime<'a> {
     // pcopen handles for the current element (cleared when the element changes).
     pc_handles: Vec<PcHandle>,
     pc_elem: usize,
+    // Primitives are polygons: the input's polygons (their triangles), each
+    // triangle's polygon, and the polygon being run over (`elem` is its first triangle).
+    polys: Vec<std::ops::Range<usize>>,
+    poly_of: Vec<usize>,
+    prim: usize,
+}
+
+// A polygon's uv names a point on one of its triangles: u spans the triangles
+// in turn (u·n = triangle + its barycentric u), v is that triangle's v. A
+// single triangle's uv is its own barycentric uv.
+fn poly_uv_to_triangle(run: &std::ops::Range<usize>, uv: [f32; 3]) -> (usize, [f32; 2]) {
+    let n = run.len().max(1);
+    let scaled = uv[0].max(0.0) * n as f32;
+    let k = (scaled.floor() as usize).min(n - 1);
+    (run.start + k, [scaled - k as f32, uv[1]])
 }
 
 fn vec3(v: [f32; 3]) -> Vec3 {
@@ -3190,28 +3206,28 @@ impl<'a> Runtime<'a> {
         Ok(match attr.kind {
             AttrKind::Ptnum => int(self.point_index().unwrap_or(0)),
             AttrKind::Primnum => int(match self.domain {
-                Domain::Prim => self.elem,
-                Domain::Vertex => self.elem / 3,
+                Domain::Prim => self.prim,
+                Domain::Vertex => self.poly_of.get(self.elem / 3).copied().unwrap_or(self.elem / 3),
                 _ => 0,
             }),
             AttrKind::Vtxnum => int(if self.domain == Domain::Vertex { self.elem } else { 0 }),
             AttrKind::Numpt => int(self.input.vertices.len()),
-            AttrKind::Numprim => int(self.input.indices.len()),
+            AttrKind::Numprim => int(self.polys.len()),
             AttrKind::Numvtx => int(self.input.indices.len() * 3),
-            AttrKind::Elemnum => int(self.elem),
-            AttrKind::Numelem => int(self.count),
+            AttrKind::Elemnum => int(if self.domain == Domain::Prim { self.prim } else { self.elem }),
+            AttrKind::Numelem => int(if self.domain == Domain::Prim { self.polys.len() } else { self.count }),
             AttrKind::Time => Value::Float(self.time),
             AttrKind::TimeInc => Value::Float(self.time_inc),
             // Frames count from 1 at time 0, as in Houdini.
             AttrKind::Frame => Value::Float(self.time * crate::sims::SIM_FPS + 1.0),
             AttrKind::P => match self.domain {
                 Domain::Point | Domain::Vertex => Value::Vec(arr3(self.out.vertices[self.point_index().unwrap_or(0)])),
-                Domain::Prim => Value::Vec(arr3(tri_centroid(&self.out, self.out.indices[self.elem]))),
+                Domain::Prim => Value::Vec(arr3(crate::poly::centroid(&self.out, &self.polys[self.prim]))),
                 Domain::Detail => read_storage(&self.out, &self.keys[id], 0, 1, Some(Ty::Vector)),
             },
             AttrKind::N => match self.domain {
                 Domain::Point | Domain::Vertex => point_normal(&self.out, self.normals, self.point_index().unwrap_or(0)),
-                Domain::Prim => Value::Vec(arr3(tri_normal(&self.out, self.out.indices[self.elem]))),
+                Domain::Prim => Value::Vec(arr3(crate::poly::normal(&self.out, &self.polys[self.prim]))),
                 Domain::Detail => read_storage(&self.out, &self.keys[id], 0, 1, Some(Ty::Vector)),
             },
             _ => read_storage(&self.out, &self.keys[id], self.elem, self.count, attr.hint),
@@ -3227,10 +3243,10 @@ impl<'a> Runtime<'a> {
                 self.out.vertices[pt] = vec3(value.vec()?);
             }
             (AttrKind::P, Domain::Prim) => {
-                // Moving a primitive's centre moves its three points.
-                let tri = self.out.indices[self.elem];
-                let delta = vec3(value.vec()?).sub(tri_centroid(&self.out, tri));
-                for pt in tri {
+                // Moving a polygon's centre moves its points.
+                let run = self.polys[self.prim].clone();
+                let delta = vec3(value.vec()?).sub(crate::poly::centroid(&self.out, &run));
+                for pt in crate::poly::points(&self.out, &run) {
                     self.out.vertices[pt] = self.out.vertices[pt].add(delta);
                 }
             }
@@ -3247,8 +3263,20 @@ impl<'a> Runtime<'a> {
     // Reads an attribute of the input geometry (point(), prim(), vertex(), detail()).
     fn input_attr(&self, domain: Domain, name: &str, index: i32) -> Value {
         let mesh = self.input;
-        let count = domain.count(mesh);
         let hint = known_hint(name);
+        // Primitive numbers are polygons: read the polygon's first triangle.
+        if domain == Domain::Prim {
+            let Some(run) = usize::try_from(index).ok().and_then(|p| self.polys.get(p)) else {
+                return hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value);
+            };
+            return match name {
+                "primnum" => Value::Int(index),
+                "P" => Value::Vec(arr3(crate::poly::centroid(mesh, run))),
+                "N" => Value::Vec(arr3(crate::poly::normal(mesh, run))),
+                _ => read_storage(mesh, &format!("prim:{name}"), run.start, mesh.indices.len(), hint),
+            };
+        }
+        let count = domain.count(mesh);
         let Some(index) = usize::try_from(index).ok().filter(|i| *i < count) else {
             return hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value);
         };
@@ -3288,13 +3316,11 @@ impl<'a> Runtime<'a> {
             "xyzdist" => {
                 let p = vec3(a[1].vec()?);
                 match closest_on_surface(self.input, p) {
-                    Some(hit) => (
-                        Value::Float(hit.position.sub(p).length()),
-                        vec![
-                            (2, Value::Int(if hit.prim == usize::MAX { -1 } else { hit.prim as i32 })),
-                            (3, Value::Vec([hit.uv[0], hit.uv[1], 0.0])),
-                        ],
-                    ),
+                    Some(hit) if hit.prim == usize::MAX => (Value::Float(hit.position.sub(p).length()), vec![(2, Value::Int(-1)), (3, Value::Vec([hit.uv[0], hit.uv[1], 0.0]))]),
+                    Some(hit) => {
+                        let (prim, uv) = self.triangle_to_poly_uv(hit.prim, hit.uv);
+                        (Value::Float(hit.position.sub(p).length()), vec![(2, Value::Int(prim as i32)), (3, Value::Vec(uv))])
+                    }
                     None => (Value::Float(-1.0), vec![(2, Value::Int(-1))]),
                 }
             }
@@ -3302,10 +3328,10 @@ impl<'a> Runtime<'a> {
                 let origin = vec3(a[1].vec()?);
                 let dir = vec3(a[2].vec()?);
                 match ray_hit(self.input, origin, dir) {
-                    Some(hit) => (
-                        Value::Int(hit.prim as i32),
-                        vec![(3, Value::Vec(arr3(hit.position))), (4, Value::Vec([hit.uv[0], hit.uv[1], 0.0]))],
-                    ),
+                    Some(hit) => {
+                        let (prim, uv) = self.triangle_to_poly_uv(hit.prim, hit.uv);
+                        (Value::Int(prim as i32), vec![(3, Value::Vec(arr3(hit.position))), (4, Value::Vec(uv))])
+                    }
                     None => (Value::Int(-1), vec![(3, Value::Vec(arr3(origin.add(dir))))]),
                 }
             }
@@ -3387,6 +3413,22 @@ impl<'a> Runtime<'a> {
             }
             lists
         })
+    }
+
+    // A point's number, or every triangle of a polygon (what setprimattrib & co. write to).
+    fn elements_of(&self, domain: Domain, index: usize) -> Vec<usize> {
+        match domain {
+            Domain::Prim => self.polys.get(index).map_or_else(Vec::new, |run| run.clone().collect()),
+            _ => vec![index],
+        }
+    }
+
+    // A hit on a triangle as its polygon and a polygon uv (see poly_uv_to_triangle).
+    fn triangle_to_poly_uv(&self, tri: usize, uv: [f32; 2]) -> (usize, [f32; 3]) {
+        let p = self.poly_of.get(tri).copied().unwrap_or(tri);
+        let run = self.polys.get(p).cloned().unwrap_or(tri..tri + 1);
+        let n = run.len() as f32;
+        (p, [((tri - run.start) as f32 + uv[0]) / n, uv[1], 0.0])
     }
 
     fn point_prim_lists(&mut self) -> &Vec<Vec<usize>> {
@@ -3627,7 +3669,7 @@ impl<'a> Runtime<'a> {
             }
 
             "npoints" => Int(self.input.vertices.len() as i32),
-            "nprimitives" => Int(self.input.indices.len() as i32),
+            "nprimitives" => Int(self.polys.len() as i32),
             "nvertices" => Int(self.input.indices.len() as i32 * 3),
             "point" => self.input_attr(Domain::Point, &a[1].string()?, a[2].int()?),
             "prim" => self.input_attr(Domain::Prim, &a[1].string()?, a[2].int()?),
@@ -3649,7 +3691,10 @@ impl<'a> Runtime<'a> {
                 let domain = if name == "setpointgroup" { Domain::Point } else { Domain::Prim };
                 let index = index_of(&a[2])?;
                 let on = Value::Float(if a[3].truthy() { 1.0 } else { 0.0 });
-                self.pending.writes.push((domain, format!("group:{}", a[1].string()?), index, on, write_mode(None)?));
+                let key = format!("group:{}", a[1].string()?);
+                for element in self.elements_of(domain, index) {
+                    self.pending.writes.push((domain, key.clone(), element, on.clone(), write_mode(None)?));
+                }
                 Int(index as i32)
             }
             "hasprimattrib" => Int(self.input.point_attributes.contains_key(&format!("prim:{}", a[1].string()?)) as i32),
@@ -3657,7 +3702,10 @@ impl<'a> Runtime<'a> {
                 let domain = if name == "setpointattrib" { Domain::Point } else { Domain::Prim };
                 let index = index_of(&a[2])?;
                 let mode = write_mode(a.get(4))?;
-                self.pending.writes.push((domain, a[1].string()?.to_string(), index, a[3].clone(), mode));
+                let attr = a[1].string()?.to_string();
+                for element in self.elements_of(domain, index) {
+                    self.pending.writes.push((domain, attr.clone(), element, a[3].clone(), mode));
+                }
                 Int(index as i32)
             }
             "setdetailattrib" => {
@@ -3679,12 +3727,14 @@ impl<'a> Runtime<'a> {
                 if &*kind != "poly" {
                     return Err(format!("only \"poly\" primitives are supported, got \"{kind}\""));
                 }
-                let pts = a[2..].iter().map(index_of).collect::<R<Vec<usize>>>()?;
-                let index = self.input.indices.len() + self.pending.add_prims.len();
-                self.pending.add_prims.push([pts[0], pts[1], pts[2]]);
-                if let Some(&fourth) = pts.get(3) {
-                    self.pending.add_prims.push([pts[0], pts[2], fourth]);
-                }
+                // The points listed, or one array of them.
+                let pts = match &a[2] {
+                    Value::Arr(list) if a.len() == 3 => list.iter().map(index_of).collect::<R<Vec<usize>>>()?,
+                    _ => a[2..].iter().map(index_of).collect::<R<Vec<usize>>>()?,
+                };
+                // One polygon, of any number of points.
+                let index = self.polys.len() + self.pending.add_prims.len();
+                self.pending.add_prims.push(pts);
                 Int(index as i32)
             }
             "removepoint" => {
@@ -3694,12 +3744,10 @@ impl<'a> Runtime<'a> {
                 Int(1)
             }
             "removeprim" => {
-                if let Ok(prim) = usize::try_from(a[1].int()?) {
-                    self.pending.remove_prims.insert(prim);
+                if let Some(run) = usize::try_from(a[1].int()?).ok().and_then(|p| self.polys.get(p)).cloned() {
+                    self.pending.remove_prims.extend(run.clone());
                     if a.get(2).is_some_and(Value::truthy) {
-                        if let Some(tri) = self.input.indices.get(prim) {
-                            self.pending.orphan_candidates.extend(tri.iter().copied());
-                        }
+                        self.pending.orphan_candidates.extend(crate::poly::points(self.input, &run));
                     }
                 }
                 Int(1)
@@ -3855,10 +3903,10 @@ impl<'a> Runtime<'a> {
             "primuv" => {
                 let attr = a[1].string()?;
                 let prim = a[2].int()?;
-                let uv = a[3].vec()?;
-                let Some(tri) = usize::try_from(prim).ok().and_then(|p| self.input.indices.get(p)).copied() else {
+                let Some((t, uv)) = usize::try_from(prim).ok().and_then(|p| self.polys.get(p)).map(|run| poly_uv_to_triangle(run, a[3].vec().unwrap_or([0.0; 3]))) else {
                     return Ok(Float(0.0));
                 };
+                let tri = self.input.indices[t];
                 let weights = [1.0 - uv[0] - uv[1], uv[0], uv[1]];
                 let prim_key = format!("prim:{attr}");
                 if &*attr != "P" && self.input.point_attributes.contains_key(&prim_key) {
@@ -3893,21 +3941,25 @@ impl<'a> Runtime<'a> {
             }
             "primpoint" => Int(usize::try_from(a[1].int()?)
                 .ok()
-                .and_then(|p| self.input.indices.get(p))
-                .and_then(|tri| usize::try_from(a[2].int().ok()?).ok().and_then(|v| tri.get(v)))
-                .map_or(-1, |&p| p as i32)),
-            "primvertexcount" => Int(usize::try_from(a[1].int()?).ok().filter(|&p| p < self.input.indices.len()).map_or(0, |_| 3)),
+                .and_then(|p| self.polys.get(p))
+                .map(|run| crate::poly::points(self.input, run))
+                .and_then(|pts| usize::try_from(a[2].int().ok()?).ok().and_then(|v| pts.get(v).copied()))
+                .map_or(-1, |p| p as i32)),
+            "primvertexcount" => Int(usize::try_from(a[1].int()?).ok().and_then(|p| self.polys.get(p)).map_or(0, |run| crate::poly::points(self.input, run).len() as i32)),
             "vertexpoint" => Int(usize::try_from(a[1].int()?).ok().and_then(|v| self.input.indices.get(v / 3).map(|t| t[v % 3])).map_or(-1, |p| p as i32)),
-            "vertexprim" => Int(usize::try_from(a[1].int()?).ok().filter(|v| v / 3 < self.input.indices.len()).map_or(-1, |v| (v / 3) as i32)),
+            "vertexprim" => Int(usize::try_from(a[1].int()?).ok().and_then(|v| self.poly_of.get(v / 3)).map_or(-1, |&p| p as i32)),
             "primintrinsic" => {
                 let which = a[1].string()?;
-                let Some(tri) = usize::try_from(a[2].int()?).ok().and_then(|p| self.input.indices.get(p)).copied() else {
+                let Some(run) = usize::try_from(a[2].int()?).ok().and_then(|p| self.polys.get(p)).cloned() else {
                     return Ok(Float(0.0));
                 };
-                let [p0, p1, p2] = tri.map(|i| self.input.vertices[i]);
+                let v = |i: usize| self.input.vertices[i];
                 match &*which {
-                    "measuredarea" => Float(p1.sub(p0).cross(p2.sub(p0)).length() * 0.5),
-                    "measuredperimeter" => Float(p1.sub(p0).length() + p2.sub(p1).length() + p0.sub(p2).length()),
+                    "measuredarea" => Float(self.input.indices[run.clone()].iter().map(|t| v(t[1]).sub(v(t[0])).cross(v(t[2]).sub(v(t[0]))).length() * 0.5).sum()),
+                    "measuredperimeter" => {
+                        let pts = crate::poly::points(self.input, &run);
+                        Float((0..pts.len()).map(|i| v(pts[(i + 1) % pts.len()]).sub(v(pts[i])).length()).sum())
+                    }
                     other => return Err(format!("unsupported intrinsic \"{other}\" (measuredarea, measuredperimeter)")),
                 }
             }
@@ -4061,13 +4113,16 @@ impl<'a> Runtime<'a> {
                 let list = usize::try_from(pt).ok().and_then(|pt| self.neighbour_lists().get(pt).cloned()).unwrap_or_default();
                 if name == "neighbourcount" { Int(list.len() as i32) } else { int_array(list) }
             }
-            "primpoints" => match usize::try_from(a[1].int()?).ok().and_then(|p| self.input.indices.get(p)) {
-                Some(tri) => int_array(tri.iter().copied()),
+            "primpoints" => match usize::try_from(a[1].int()?).ok().and_then(|p| self.polys.get(p)) {
+                Some(run) => int_array(crate::poly::points(self.input, run)),
                 None => int_array([]),
             },
             "pointprims" => {
                 let pt = a[1].int()?;
-                int_array(usize::try_from(pt).ok().and_then(|pt| self.point_prim_lists().get(pt).cloned()).unwrap_or_default())
+                let tris = usize::try_from(pt).ok().and_then(|pt| self.point_prim_lists().get(pt).cloned()).unwrap_or_default();
+                let mut polys: Vec<usize> = tris.iter().map(|&t| self.poly_of[t]).collect();
+                polys.dedup();
+                int_array(polys)
             }
             "getbbox_min" => V(arr3(self.bounds().0)),
             "getbbox_max" => V(arr3(self.bounds().1)),
@@ -4139,14 +4194,18 @@ fn apply_pending(mesh: &mut Mesh, pending: Pending, log: &mut Vec<String>) -> R<
     mesh.vertices.extend(add_points.into_iter().map(vec3));
 
     let point_count = mesh.vertices.len();
-    let (valid, invalid): (Vec<[usize; 3]>, Vec<[usize; 3]>) = add_prims.into_iter().partition(|tri| tri.iter().all(|&p| p < point_count));
+    let (valid, invalid): (Vec<Vec<usize>>, Vec<Vec<usize>>) = add_prims.into_iter().partition(|pts| pts.len() >= 3 && pts.iter().all(|&p| p < point_count));
     if !invalid.is_empty() {
-        log.push(format!("Warning: skipped {} primitive(s) that use point numbers that do not exist", invalid.len()));
+        log.push(format!("Warning: skipped {} primitive(s) with fewer than 3 points or point numbers that do not exist", invalid.len()));
     }
     let old_prims = mesh.indices.len();
-    grow_attributes(mesh, Domain::Prim, old_prims, valid.len());
-    grow_attributes(mesh, Domain::Vertex, old_prims * 3, valid.len() * 3);
-    mesh.indices.extend(valid);
+    let added: usize = valid.iter().map(|pts| pts.len() - 2).sum();
+    grow_attributes(mesh, Domain::Prim, old_prims, added);
+    grow_attributes(mesh, Domain::Vertex, old_prims * 3, added * 3);
+    for pts in &valid {
+        mesh.indices.extend((1..pts.len() - 1).map(|i| [pts[0], pts[i], pts[i + 1]]));
+    }
+    crate::poly::tag(mesh, old_prims, valid.iter().map(|pts| pts.len() - 2));
 
     for (domain, name, index, value, mode) in writes {
         let count = domain.count(mesh);
@@ -4255,6 +4314,29 @@ pub fn check(code: &str) -> Result<(), String> {
 pub type Channels = std::collections::BTreeMap<String, [f32; 3]>;
 
 // `mask` limits the run to some elements of the domain (a node's group); None runs on all.
+// A parameter expression, as typed into a parameter: VEX, with Houdini's
+// variables $F (frame, whole), $FF (frame, fractional), $T (seconds) and $FPS.
+// Frames count from 1 at time 0.
+pub fn eval_expression(expr: &str, time: f32) -> Result<f32, String> {
+    let expr = expr.trim();
+    if let Ok(v) = expr.parse::<f32>() {
+        return Ok(v);
+    }
+    let fps = crate::sims::SIM_FPS;
+    let frame = time * fps + 1.0;
+    let source = expr
+        .replace("$FPS", &format!("({fps:?})"))
+        .replace("$FF", &format!("({frame:?})"))
+        .replace("$F", &format!("({:?})", frame.round()))
+        .replace("$T", &format!("({time:?})"));
+    let code = format!("f@__value = {source};");
+    let (mesh, report) = run_masked(Mesh::default(), &code, time, 1.0 / fps, 0, None, None);
+    if let Some(error) = report.error {
+        return Err(error.replace("f@__value = ", ""));
+    }
+    mesh.point_attributes.get("detail:__value").and_then(|v| v.first().copied()).filter(|v| v.is_finite()).ok_or_else(|| "the expression has no value".to_string())
+}
+
 pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>, channels: Option<&Channels>) -> Mesh {
     let start = Instant::now();
     let (mesh, mut report) = run_masked(mesh, code, time, time_inc, domain_index, mask, channels);
@@ -4321,6 +4403,9 @@ fn run_masked(
         channels,
         pc_handles: Vec::new(),
         pc_elem: usize::MAX,
+        polys: crate::poly::runs(&input),
+        poly_of: crate::poly::of_triangles(&input),
+        prim: 0,
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
     let missing: Vec<String> = program
@@ -4341,17 +4426,39 @@ fn run_masked(
         Domain::Vertex => "vertex",
     };
     let mut failure = None;
-    for elem in 0..count {
+    // Over primitives, each polygon runs once, on its first triangle.
+    let elements: Vec<usize> = if domain == Domain::Prim { rt.polys.iter().map(|run| run.start).collect() } else { (0..count).collect() };
+    for (number, &elem) in elements.iter().enumerate() {
         if mask.is_some_and(|m| !m.get(elem).copied().unwrap_or(true)) {
             continue;
         }
         rt.elem = elem;
+        rt.prim = if domain == Domain::Prim { number } else { 0 };
         let mut frame = Frame { vals: defaults.clone(), types: &program.main.slot_types };
         if let Err(error) = rt.exec_block(&program.main.body, &mut frame) {
-            failure = Some(if domain == Domain::Detail { error } else { format!("{error} (at {element_name} {elem})") });
+            failure = Some(if domain == Domain::Detail { error } else { format!("{error} (at {element_name} {number})") });
             break;
         }
     }
+    // What a polygon's run wrote to its first triangle applies to all of its triangles.
+    if domain == Domain::Prim && failure.is_none() {
+        let written: Vec<String> = program.attrs.iter().zip(&rt.keys).filter(|(a, k)| a.written && k.starts_with("prim:")).map(|(_, k)| k.clone()).collect();
+        let tris = rt.out.indices.len();
+        for key in written {
+            let Some(values) = rt.out.point_attributes.get_mut(&key) else { continue };
+            if tris == 0 || values.len() % tris != 0 {
+                continue;
+            }
+            let width = values.len() / tris;
+            for run in rt.polys.iter().filter(|r| r.len() > 1) {
+                let first: Vec<f32> = values[run.start * width..(run.start + 1) * width].to_vec();
+                for t in run.start + 1..run.end {
+                    values[t * width..(t + 1) * width].copy_from_slice(&first);
+                }
+            }
+        }
+    }
+    let count = elements.len();
     if !rt.partial_line.is_empty() {
         let rest = std::mem::take(&mut rt.partial_line);
         rt.push_log(rest);
@@ -4403,7 +4510,7 @@ pub const EXAMPLES: &[(&str, usize, &str)] = &[
     (
         "Random colors per face (primitives)",
         1,
-        "// Run over Primitives: one random color per triangle\n@Cd = rand(@primnum);\n",
+        "// Run over Primitives: one random color per polygon\n@Cd = rand(@primnum);\n",
     ),
     (
         "Spiral of points (detail, while)",
@@ -4644,6 +4751,9 @@ mod tests {
             channels: None,
             pc_handles: Vec::new(),
             pc_elem: usize::MAX,
+            polys: crate::poly::runs(&input),
+            poly_of: crate::poly::of_triangles(&input),
+            prim: 0,
         };
         for (name, min, ..) in BUILTINS {
             if MUTATING.contains(name) {

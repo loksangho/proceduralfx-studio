@@ -103,11 +103,32 @@ pub fn corner_normals(mesh: &Mesh) -> Vec<[Vec3; 3]> {
     if let Some(v) = mesh.point_attributes.get("vertex:N").filter(|v| v.len() == tris * 9) {
         return (0..tris).map(|t| [0, 1, 2].map(|k| read(v, t * 3 + k))).collect();
     }
-    let point: Vec<Vec3> = match mesh.point_attributes.get("N").filter(|v| v.len() == mesh.vertices.len() * 3) {
-        Some(v) => (0..mesh.vertices.len()).map(|i| read(v, i)).collect(),
-        None => mesh.compute_normals(),
-    };
-    mesh.indices.iter().map(|tri| tri.map(|i| point[i])).collect()
+    if let Some(v) = mesh.point_attributes.get("N").filter(|v| v.len() == mesh.vertices.len() * 3) {
+        return mesh.indices.iter().map(|tri| tri.map(|i| read(v, i))).collect();
+    }
+    cusped_corner_normals(mesh, 60.0)
+}
+
+// Without stored normals, shade as Houdini does: each corner averages the faces
+// around its point within `cusp` degrees of its own, so curved surfaces look
+// smooth and edges sharper than that (a box, a fractured piece's cuts) stay sharp.
+pub fn cusped_corner_normals(mesh: &Mesh, cusp: f32) -> Vec<[Vec3; 3]> {
+    let faces: Vec<Vec3> = (0..mesh.indices.len()).map(|t| face_normal(mesh, t)).collect();
+    let mut faces_of: Vec<Vec<usize>> = vec![Vec::new(); mesh.vertices.len()];
+    for (t, tri) in mesh.indices.iter().enumerate() {
+        for &v in tri {
+            faces_of[v].push(t);
+        }
+    }
+    let cos_cusp = cusp.clamp(0.0, 180.0).to_radians().cos();
+    mesh.indices
+        .iter()
+        .enumerate()
+        .map(|(t, tri)| {
+            let own = unit(faces[t]);
+            tri.map(|v| unit(faces_of[v].iter().filter(|&&o| unit(faces[o]).dot(own) >= cos_cusp - 1e-6).fold(Vec3::zero(), |acc, &o| acc.add(faces[o]))))
+        })
+        .collect()
 }
 
 // --------------------------------------------------------------------------

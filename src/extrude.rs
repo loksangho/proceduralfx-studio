@@ -93,10 +93,15 @@ pub fn extrude(input: &Mesh, selected: Option<&[bool]>, set: &ExtrudeSettings) -
     let mut out = Mesh { vertices: input.vertices.clone(), ..Mesh::default() };
     // Where each new point and face comes from, for attributes.
     let mut point_source: Vec<usize> = (0..np).collect();
-    let mut faces: Vec<([usize; 3], usize, u8)> = Vec::new(); // (corners, source face, 0 kept / 1 front / 2 side / 3 back)
+    // (corners, source face, 0 kept / 1 front / 2 side / 3 back, output polygon).
+    // Kept, front and back faces are their source polygon's; each wall quad is its own.
+    let polygon_of = crate::poly::of_triangles(input);
+    let mut faces: Vec<([usize; 3], usize, u8, usize)> = Vec::new();
+    let mut walls = 0usize;
+    let face_polygon = |kind: u8, t: usize| kind as usize * nt + polygon_of[t];
     for t in 0..nt {
         if !chosen[t] {
-            faces.push((input.indices[t], t, 0));
+            faces.push((input.indices[t], t, 0, face_polygon(0, t)));
         }
     }
     // Layers of moved points: layer[k][p] for k in 1..=divisions (layer 0 is the original point).
@@ -105,10 +110,11 @@ pub fn extrude(input: &Mesh, selected: Option<&[bool]>, set: &ExtrudeSettings) -
         point_source.push(from);
         out.vertices.len() - 1
     };
+    // Individual: each polygon extrudes on its own.
     let regions: Vec<Vec<usize>> = if set.connected {
         vec![(0..nt).filter(|t| chosen[*t]).collect()]
     } else {
-        (0..nt).filter(|t| chosen[*t]).map(|t| vec![t]).collect()
+        crate::poly::runs(input).into_iter().map(|run| run.filter(|t| chosen[*t]).collect::<Vec<_>>()).filter(|r| !r.is_empty()).collect()
     };
     for region in regions {
         if region.is_empty() {
@@ -144,13 +150,15 @@ pub fn extrude(input: &Mesh, selected: Option<&[bool]>, set: &ExtrudeSettings) -
             layers.push(layer);
         }
         let top = &layers[divisions];
-        for &t in &region {
-            let tri = input.indices[t];
-            if set.output_front {
-                faces.push((tri.map(|v| top[&v]), t, 1));
+        if set.output_front {
+            for &t in &region {
+                faces.push((input.indices[t].map(|v| top[&v]), t, 1, face_polygon(1, t)));
             }
-            if set.output_back {
-                faces.push(([tri[2], tri[1], tri[0]], t, 3));
+        }
+        if set.output_back {
+            for &t in &region {
+                let tri = input.indices[t];
+                faces.push(([tri[2], tri[1], tri[0]], t, 3, face_polygon(3, t)));
             }
         }
         if set.output_side {
@@ -170,8 +178,10 @@ pub fn extrude(input: &Mesh, selected: Option<&[bool]>, set: &ExtrudeSettings) -
                     }
                     for k in 0..divisions {
                         let (a0, b0, a1, b1) = (layers[k][&a], layers[k][&b], layers[k + 1][&a], layers[k + 1][&b]);
-                        faces.push(([a0, b0, b1], t, 2));
-                        faces.push(([a0, b1, a1], t, 2));
+                        let wall = 4 * nt + walls;
+                        walls += 1;
+                        faces.push(([a0, b0, b1], t, 2, wall));
+                        faces.push(([a0, b1, a1], t, 2, wall));
                     }
                 }
             }
@@ -217,6 +227,17 @@ pub fn extrude(input: &Mesh, selected: Option<&[bool]>, set: &ExtrudeSettings) -
         }
     }
     out.point_attributes.remove("N");
+    // Output polygons: runs of faces from the same polygon.
+    let mut ids = Vec::with_capacity(faces.len());
+    let mut next = 0.0f32;
+    for (i, f) in faces.iter().enumerate() {
+        if i == 0 || faces[i - 1].3 != f.3 {
+            next += 1.0;
+        }
+        ids.push(next);
+    }
+    out.point_attributes.insert(crate::poly::KEY.into(), ids);
+    crate::poly::normalize(&mut out);
     out
 }
 
@@ -266,9 +287,15 @@ mod tests {
         assert_eq!(no_sides.indices.len(), 2);
         let divided = extrude(&square(), None, &ExtrudeSettings { divisions: 3, ..ExtrudeSettings::defaults() });
         assert_eq!(divided.indices.len(), 2 + 8 * 3);
-        // Individual faces each get all three walls.
+        // The square is one quad: a front quad and four wall quads.
+        assert_eq!(crate::poly::count(&open), 1 + 4);
         let individual = extrude(&square(), None, &ExtrudeSettings { connected: false, ..ExtrudeSettings::defaults() });
-        assert_eq!(individual.indices.len(), 2 + 2 * 3 * 2);
+        assert_eq!((individual.indices.len(), crate::poly::count(&individual)), (2 + 4 * 2, 5));
+        // As two separate triangles, each gets all three walls.
+        let mut triangles = square();
+        crate::poly::clear(&mut triangles);
+        let individual = extrude(&triangles, None, &ExtrudeSettings { connected: false, ..ExtrudeSettings::defaults() });
+        assert_eq!((individual.indices.len(), crate::poly::count(&individual)), (2 + 2 * 3 * 2, 2 + 6));
         // Only the group: the other face is untouched.
         let one = extrude(&square(), Some(&[true, false]), &ExtrudeSettings::defaults());
         assert_eq!(one.indices.len(), 1 + 1 + 6);

@@ -503,6 +503,9 @@ pub fn boolean(a: &Mesh, b: &Mesh, set: &BooleanSettings) -> Result<Mesh, String
 // `b_takes_a`: B is only a cutter (Material Fracture's cells), so its faces take A's
 // attributes instead of B's.
 pub fn boolean_with(a: &Mesh, b: &Mesh, set: &BooleanSettings, b_takes_a: bool) -> Result<Mesh, String> {
+    // Cut faces come out as triangles: polygons don't survive being split.
+    let (a, b) = (crate::poly::without(a), crate::poly::without(b));
+    let (a, b) = (a.as_ref(), b.as_ref());
     if a.indices.is_empty() {
         return Err("input A (left) has no polygons".into());
     }

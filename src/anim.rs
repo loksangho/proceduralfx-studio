@@ -52,9 +52,25 @@ pub struct Key {
 pub struct Channel {
     // Sorted by time.
     pub keys: Vec<Key>,
+    // When set, the parameter follows this expression instead of the keys
+    // (VEX, with $F, $FF, $T and $FPS; see vex::eval_expression).
+    pub expression: Option<String>,
 }
 
 impl Channel {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.expression.is_none()
+    }
+
+    // The value at `t`: the expression's, else the keys'. None when there's
+    // neither, or the expression doesn't evaluate (the parameter keeps its own value).
+    pub fn value(&self, t: f32) -> Option<f32> {
+        match &self.expression {
+            Some(expr) => crate::vex::eval_expression(expr, t).ok(),
+            None => (!self.keys.is_empty()).then(|| self.eval(t)),
+        }
+    }
+
     pub fn constant(t: f32, v: f32) -> Channel {
         let mut channel = Channel::default();
         channel.set_key(t, v);
@@ -154,10 +170,11 @@ impl Channel {
     }
 
     // `t,v,interp,in,out;...`
+    // Keys separated by ';'; an expression goes first as "expr:" and its UTF-8 in hex.
     pub fn to_text(&self) -> String {
-        self.keys
-            .iter()
-            .map(|k| format!("{},{},{},{},{}", k.t, k.v, k.interp.code(), k.in_slope, k.out_slope))
+        let expression = self.expression.iter().map(|e| format!("expr:{}", e.bytes().map(|b| format!("{b:02x}")).collect::<String>()));
+        expression
+            .chain(self.keys.iter().map(|k| format!("{},{},{},{},{}", k.t, k.v, k.interp.code(), k.in_slope, k.out_slope)))
             .collect::<Vec<_>>()
             .join(";")
     }
@@ -165,6 +182,11 @@ impl Channel {
     pub fn from_text(text: &str) -> Channel {
         let mut channel = Channel::default();
         for key in text.split(';') {
+            if let Some(hex) = key.strip_prefix("expr:") {
+                let bytes: Option<Vec<u8>> = (0..hex.len() / 2).map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()).collect();
+                channel.expression = bytes.and_then(|b| String::from_utf8(b).ok());
+                continue;
+            }
             let f: Vec<f32> = key.split(',').filter_map(|v| v.parse().ok()).collect();
             if f.len() == 5 && f[0].is_finite() && f[1].is_finite() {
                 channel.keys.push(Key { t: f[0], v: f[1], interp: Interp::from_code(f[2] as u8), in_slope: f[3], out_slope: f[4] });

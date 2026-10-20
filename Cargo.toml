@@ -1,6 +1,6 @@
 [package]
 name = "proceduralfx_studio"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -24,6 +24,11 @@ ron = "0.10"
 default = []
 native-openvdb = []
 native-usd = []
+native-alembic = []
+
+# The same winit eframe uses: turns off its macOS default menu (see main()).
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
 
 [build-dependencies]
 cc = "1.1"

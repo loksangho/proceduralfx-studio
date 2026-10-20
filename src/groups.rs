@@ -10,7 +10,8 @@
 //   ^token            remove that token's elements (a leading ^ starts from everything)
 //   !token            add everything *not* in that token
 
-use super::{hash01, Mesh, Vec3};
+use super::{hash01, poly, Mesh, Vec3};
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupDomain {
@@ -89,7 +90,8 @@ pub fn guess_domain(mesh: &Mesh, pattern: &str) -> GroupDomain {
     }
 }
 
-fn element_value(mesh: &Mesh, domain: GroupDomain, attr: &str, i: usize) -> Option<f32> {
+// Primitive patterns count polygons: `polys` are their triangles (None: one per triangle).
+fn element_value(mesh: &Mesh, domain: GroupDomain, attr: &str, i: usize, polys: Option<&[Range<usize>]>) -> Option<f32> {
     let (name, component) = match attr.split_once('.') {
         Some((n, c)) => (n, match c {
             "x" | "r" | "u" => 0,
@@ -103,6 +105,15 @@ fn element_value(mesh: &Mesh, domain: GroupDomain, attr: &str, i: usize) -> Opti
         },
     };
     let pick = |v: Vec3| [v.x, v.y, v.z][component];
+    if let (GroupDomain::Prims, Some(polys)) = (domain, polys) {
+        let run = &polys[i];
+        match name {
+            "primnum" => return Some(i as f32),
+            "P" => return Some(pick(poly::centroid(mesh, run))),
+            "N" => return Some(pick(poly::normal(mesh, run))),
+            _ => return element_value(mesh, domain, attr, run.start, None),
+        }
+    }
     match (domain, name) {
         (GroupDomain::Points, "ptnum") | (GroupDomain::Prims, "primnum") => return Some(i as f32),
         (GroupDomain::Points, "P") => return Some(pick(mesh.vertices[i])),
@@ -130,7 +141,7 @@ fn element_value(mesh: &Mesh, domain: GroupDomain, attr: &str, i: usize) -> Opti
     values.get(i * width + component.min(width - 1)).copied()
 }
 
-fn expression(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize) -> Result<Vec<bool>, String> {
+fn expression(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize, polys: Option<&[Range<usize>]>) -> Result<Vec<bool>, String> {
     let body = &token[1..];
     let ops = ["==", "!=", ">=", "<=", ">", "<", "="];
     let (at, op) = ops
@@ -142,7 +153,7 @@ fn expression(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize) -> Re
     let value: f32 = value.trim().parse().map_err(|_| format!("'{token}': '{value}' is not a number"))?;
     let mut out = vec![false; count];
     for (i, slot) in out.iter_mut().enumerate() {
-        let Some(v) = element_value(mesh, domain, attr, i) else {
+        let Some(v) = element_value(mesh, domain, attr, i, polys) else {
             return Err(format!("'{token}': no attribute '{attr}' on the {}", if domain == GroupDomain::Points { "points" } else { "primitives" }));
         };
         *slot = match op {
@@ -157,12 +168,12 @@ fn expression(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize) -> Re
     Ok(out)
 }
 
-fn token_set(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize) -> Result<Vec<bool>, String> {
+fn token_set(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize, polys: Option<&[Range<usize>]>) -> Result<Vec<bool>, String> {
     if token == "*" {
         return Ok(vec![true; count]);
     }
     if token.starts_with('@') {
-        return expression(mesh, domain, token, count);
+        return expression(mesh, domain, token, count, polys);
     }
     if token.starts_with(|c: char| c.is_ascii_digit()) {
         let (range, step) = match token.split_once(':') {
@@ -186,7 +197,8 @@ fn token_set(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize) -> Res
     if matched.is_empty() && !token.contains('*') {
         return Err(format!("no {} group named '{token}'", if domain == GroupDomain::Points { "point" } else { "primitive" }));
     }
-    let mut out = vec![false; count];
+    let triangles = if polys.is_some() { mesh.indices.len() } else { count };
+    let mut out = vec![false; triangles];
     for name in matched {
         if let Some(values) = mesh.point_attributes.get(&key(name, domain)) {
             for (slot, v) in out.iter_mut().zip(values) {
@@ -194,30 +206,44 @@ fn token_set(mesh: &Mesh, domain: GroupDomain, token: &str, count: usize) -> Res
             }
         }
     }
-    Ok(out)
+    // A polygon is in a group when any of its triangles is.
+    Ok(match polys {
+        Some(polys) => poly::collapse(polys, &out),
+        None => out,
+    })
 }
 
 // Membership of each point (or primitive) in `pattern`.
+// Primitives are polygons here (numbers, @primnum, @P), and the result is per triangle.
 pub fn evaluate(mesh: &Mesh, pattern: &str, domain: GroupDomain) -> Result<Vec<bool>, String> {
-    let count = if domain == GroupDomain::Points { mesh.vertices.len() } else { mesh.indices.len() };
+    let polys = (domain == GroupDomain::Prims && poly::has_polygons(mesh)).then(|| poly::runs(mesh));
+    let polys = polys.as_deref();
+    let count = match (domain, polys) {
+        (GroupDomain::Points, _) => mesh.vertices.len(),
+        (GroupDomain::Prims, Some(polys)) => polys.len(),
+        (GroupDomain::Prims, None) => mesh.indices.len(),
+    };
     let tokens: Vec<&str> = pattern.split_whitespace().collect();
     let mut set = vec![tokens.first().is_some_and(|t| t.starts_with('^')); count];
     for token in tokens {
         if let Some(rest) = token.strip_prefix('^') {
-            for (s, r) in set.iter_mut().zip(token_set(mesh, domain, rest, count)?) {
+            for (s, r) in set.iter_mut().zip(token_set(mesh, domain, rest, count, polys)?) {
                 *s &= !r;
             }
         } else if let Some(rest) = token.strip_prefix('!') {
-            for (s, r) in set.iter_mut().zip(token_set(mesh, domain, rest, count)?) {
+            for (s, r) in set.iter_mut().zip(token_set(mesh, domain, rest, count, polys)?) {
                 *s |= !r;
             }
         } else {
-            for (s, r) in set.iter_mut().zip(token_set(mesh, domain, token, count)?) {
+            for (s, r) in set.iter_mut().zip(token_set(mesh, domain, token, count, polys)?) {
                 *s |= r;
             }
         }
     }
-    Ok(set)
+    Ok(match polys {
+        Some(polys) => poly::expand(polys, &set, mesh.indices.len()),
+        None => set,
+    })
 }
 
 fn resolve_domain(mesh: &Mesh, group: &NodeGroup) -> GroupDomain {
@@ -355,8 +381,21 @@ pub fn ranges(sorted: &[usize]) -> String {
 
 // The shortest group pattern for exactly these elements: `*`, an existing
 // group's name, number ranges, or everything except some ranges.
+// Selected primitives are triangles; the pattern numbers polygons.
 pub fn describe(mesh: &Mesh, selected: &[usize], domain: GroupDomain) -> String {
-    let count = if domain == GroupDomain::Points { mesh.vertices.len() } else { mesh.indices.len() };
+    let polys = (domain == GroupDomain::Prims && poly::has_polygons(mesh)).then(|| poly::runs(mesh));
+    let selected: Vec<usize> = match &polys {
+        Some(_) => {
+            let of = poly::of_triangles(mesh);
+            selected.iter().filter_map(|t| of.get(*t).copied()).collect()
+        }
+        None => selected.to_vec(),
+    };
+    let count = match (&polys, domain) {
+        (Some(polys), _) => polys.len(),
+        (None, GroupDomain::Points) => mesh.vertices.len(),
+        (None, GroupDomain::Prims) => mesh.indices.len(),
+    };
     let mut chosen: Vec<usize> = selected.iter().copied().filter(|&i| i < count).collect();
     chosen.sort_unstable();
     chosen.dedup();
@@ -372,7 +411,11 @@ pub fn describe(mesh: &Mesh, selected: &[usize], domain: GroupDomain) -> String 
     }
     let (points, prims) = names(mesh);
     for name in if domain == GroupDomain::Points { points } else { prims } {
-        if evaluate(mesh, &name, domain).is_ok_and(|m| m == members) {
+        let named = evaluate(mesh, &name, domain).map(|m| match &polys {
+            Some(polys) => poly::collapse(polys, &m),
+            None => m,
+        });
+        if named.is_ok_and(|m| m == members) {
             return name;
         }
     }
@@ -413,13 +456,12 @@ pub fn group_create(input: &Mesh, set: &GroupCreateSettings) -> Result<Mesh, Str
     if name.is_empty() || name.contains(char::is_whitespace) || name.contains(':') || name.contains('*') {
         return Err("give the group a single-word name".into());
     }
-    let count = if set.domain == GroupDomain::Points { input.vertices.len() } else { input.indices.len() };
+    // Primitives are polygons: each is chosen as a whole, then stored on its triangles.
+    let polys = poly::runs(input);
+    let count = if set.domain == GroupDomain::Points { input.vertices.len() } else { polys.len() };
     let position = |i: usize| match set.domain {
         GroupDomain::Points => input.vertices[i],
-        GroupDomain::Prims => {
-            let [a, b, c] = input.indices[i].map(|v| input.vertices[v]);
-            a.add(b).add(c).scale(1.0 / 3.0)
-        }
+        GroupDomain::Prims => poly::centroid(input, &polys[i]),
     };
     let mut members: Vec<bool> = match set.method {
         0 => (0..count)
@@ -439,19 +481,19 @@ pub fn group_create(input: &Mesh, set: &GroupCreateSettings) -> Result<Mesh, Str
             let cos = set.spread.clamp(0.0, 180.0).to_radians().cos();
             let normals: Vec<Vec3> = match set.domain {
                 GroupDomain::Points => input.compute_normals(),
-                GroupDomain::Prims => input
-                    .indices
-                    .iter()
-                    .map(|t| {
-                        let [a, b, c] = t.map(|v| input.vertices[v]);
-                        b.sub(a).cross(c.sub(a)).normalize()
-                    })
-                    .collect(),
+                GroupDomain::Prims => polys.iter().map(|run| poly::normal(input, run)).collect(),
             };
             normals.iter().map(|n| n.dot(d) >= cos - 1e-6).collect()
         }
-        _ => evaluate(input, &set.expression, set.domain)?,
+        _ => match set.domain {
+            GroupDomain::Points => evaluate(input, &set.expression, set.domain)?,
+            GroupDomain::Prims => poly::collapse(&polys, &evaluate(input, &set.expression, set.domain)?),
+        },
     };
+    if set.domain == GroupDomain::Prims {
+        members = poly::expand(&polys, &members, input.indices.len());
+    }
+    let count = if set.domain == GroupDomain::Points { input.vertices.len() } else { input.indices.len() };
     if set.invert {
         for m in &mut members {
             *m = !*m;

@@ -53,7 +53,7 @@ fn point_attr<'a>(mesh: &'a Mesh, name: &str, comps: usize) -> Option<&'a Vec<f3
 }
 
 // Per-corner values (3 components) from a vertex: attribute, else the point attribute.
-fn corner_values(mesh: &Mesh, name: &str) -> Option<Vec<[f32; 3]>> {
+pub fn corner_values(mesh: &Mesh, name: &str) -> Option<Vec<[f32; 3]>> {
     let corners = mesh.indices.len() * 3;
     if let Some(v) = mesh.point_attributes.get(&format!("vertex:{name}")).filter(|v| v.len() == corners * 3 && corners > 0) {
         return Some(v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect());
@@ -102,6 +102,8 @@ pub fn read_obj(text: &str) -> Result<Mesh, String> {
     let mut current_piece = 0.0f32;
     let mut pieces_seen = 0usize;
     let mut faces_in_piece = 0usize;
+    // Triangles of each face: faces stay polygons (quads, n-gons).
+    let mut face_sizes: Vec<usize> = Vec::new();
     for (line_number, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         let mut tokens = line.split_whitespace();
@@ -157,6 +159,7 @@ pub fn read_obj(text: &str) -> Result<Mesh, String> {
                         piece[p] = current_piece;
                     }
                 }
+                face_sizes.push(corners.len().saturating_sub(2));
                 faces_in_piece += 1;
             }
             _ => {}
@@ -171,6 +174,9 @@ pub fn read_obj(text: &str) -> Result<Mesh, String> {
     if pieces_seen > 1 {
         mesh.point_attributes.insert("piece".into(), piece);
         mesh.point_attributes.insert("prim:piece".into(), prim_piece);
+    }
+    if face_sizes.iter().any(|n| *n > 1) {
+        crate::poly::tag(&mut mesh, 0, face_sizes);
     }
     Ok(mesh)
 }
@@ -191,13 +197,16 @@ pub fn write_obj(mesh: &Mesh) -> String {
             let _ = writeln!(out, "vt {} {}", uv[0], uv[1]);
         }
     }
-    for (t, tri) in mesh.indices.iter().enumerate() {
-        // Corner order 0, 2, 1 restores right-handed winding.
-        let corner = |k: usize| match &uvs {
-            Some(_) => format!("{}/{}", tri[k] + 1, t * 3 + k + 1),
-            None => format!("{}", tri[k] + 1),
-        };
-        let _ = writeln!(out, "f {} {} {}", corner(0), corner(2), corner(1));
+    // One face per polygon; reversed corners restore right-handed winding.
+    for face in crate::poly::faces(mesh) {
+        let corners: Vec<String> = face
+            .mirrored()
+            .map(|(p, corner)| match &uvs {
+                Some(_) => format!("{}/{}", p + 1, corner + 1),
+                None => format!("{}", p + 1),
+            })
+            .collect();
+        let _ = writeln!(out, "f {}", corners.join(" "));
     }
     out
 }
@@ -280,6 +289,8 @@ pub fn read_fbx(path: &str) -> Result<Mesh, String> {
     let (mut colors, mut uvs, mut piece, mut prim_piece) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut any_color, mut any_uv) = (false, false);
     let mut triangle_corners: Vec<u32> = Vec::new();
+    // Triangles of each face: faces stay polygons (quads, n-gons).
+    let mut face_sizes: Vec<usize> = Vec::new();
     for (piece_index, node) in scene.nodes.iter().filter(|n| n.mesh.is_some()).enumerate() {
         let mesh = node.mesh.as_ref().expect("filtered");
         let to_world = node.geometry_to_world;
@@ -291,6 +302,7 @@ pub fn read_fbx(path: &str) -> Result<Mesh, String> {
         }
         for face in mesh.faces.iter() {
             let count = ufbx::triangulate_face_vec(&mut triangle_corners, mesh, *face) as usize;
+            face_sizes.push(count);
             for tri in triangle_corners[..count * 3].chunks_exact(3) {
                 // Corners 0, 2, 1: the mirror flips the winding.
                 let corners = [tri[0], tri[2], tri[1]].map(|c| c as usize);
@@ -327,6 +339,9 @@ pub fn read_fbx(path: &str) -> Result<Mesh, String> {
     if prim_piece.iter().any(|p| *p > 0.0) {
         out.point_attributes.insert("piece".into(), piece);
         out.point_attributes.insert("prim:piece".into(), prim_piece);
+    }
+    if face_sizes.iter().any(|n| *n > 1) {
+        crate::poly::tag(&mut out, 0, face_sizes);
     }
     Ok(out)
 }

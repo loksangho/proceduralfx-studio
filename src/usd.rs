@@ -493,12 +493,15 @@ fn write_mesh(out: &mut String, mesh: &Mesh, inner: &str) {
     let _ = write!(out, "{inner}point3f[] points = ");
     write_array(out, points, fmt_v3);
     out.push('\n');
+    // One face per polygon. Mirroring Z flips the winding back to USD's
+    // right-handed convention, so corners go in reverse.
+    let faces = crate::poly::faces(mesh);
+    let corners: Vec<(usize, usize)> = faces.iter().flat_map(|f| f.mirrored()).collect();
     let _ = write!(out, "{inner}int[] faceVertexCounts = ");
-    write_array(out, mesh.indices.iter(), |_| "3".to_string());
+    write_array(out, faces.iter(), |f| f.corners.len().to_string());
     out.push('\n');
-    // Mirroring Z flips the winding back to USD's right-handed convention.
     let _ = write!(out, "{inner}int[] faceVertexIndices = ");
-    write_array(out, mesh.indices.iter().flat_map(|t| [t[0], t[2], t[1]]), |i| i.to_string());
+    write_array(out, corners.iter(), |c| c.0.to_string());
     out.push('\n');
     if let Some((lo, hi)) = mesh.bounds() {
         let _ = writeln!(out, "{inner}float3[] extent = [{}, {}]", fmt_v3([lo.x, lo.y, -hi.z]), fmt_v3([hi.x, hi.y, -lo.z]));
@@ -506,39 +509,35 @@ fn write_mesh(out: &mut String, mesh: &Mesh, inner: &str) {
     let _ = writeln!(out, "{inner}uniform token subdivisionScheme = \"none\"");
     // Attributes become primvars with the matching interpolation.
     let (points, tris) = (mesh.vertices.len(), mesh.indices.len());
-    let mut keys: Vec<&String> = mesh.point_attributes.keys().collect();
+    let mut keys: Vec<&String> = mesh.point_attributes.keys().filter(|k| !crate::poly::is_internal(k)).collect();
     keys.sort();
     for key in keys {
         let values = &mesh.point_attributes[key];
-        let (interpolation, name, count) = if let Some(n) = key.strip_prefix("prim:") {
-            ("uniform", n, tris)
+        // Stored per triangle / triangle corner / point; written per face / face corner / point.
+        let (interpolation, name, stored, elements): (&str, &str, usize, Vec<usize>) = if let Some(n) = key.strip_prefix("prim:") {
+            ("uniform", n, tris, faces.iter().map(|f| f.tris.start).collect())
         } else if let Some(n) = key.strip_prefix("vertex:") {
-            ("faceVarying", n, tris * 3)
+            ("faceVarying", n, tris * 3, corners.iter().map(|c| c.1).collect())
         } else if let Some(n) = key.strip_prefix("detail:") {
-            ("constant", n, 1)
+            ("constant", n, 1, vec![0])
         } else {
-            ("vertex", key.as_str(), points)
+            ("vertex", key.as_str(), points, (0..points).collect())
         };
-        if count == 0 || values.len() % count != 0 || name == "id" {
+        if stored == 0 || values.len() % stored != 0 || name == "id" {
             continue;
         }
-        let comps = values.len() / count;
+        let comps = values.len() / stored;
         let name = if name == "Cd" { "displayColor".to_string() } else { sanitize_name(name) };
-        // faceVarying data follows the swapped winding.
-        let reorder = |i: usize| if interpolation == "faceVarying" { i / 3 * 3 + [0, 2, 1][i % 3] } else { i };
         let _ = write!(out, "{inner}");
         match comps {
             1 => {
                 let _ = write!(out, "float[] primvars:{name} = ");
-                write_array(out, 0..count, |i| fmt_f(values[reorder(i)]));
+                write_array(out, elements.iter(), |&i| fmt_f(values[i]));
             }
             3 => {
                 let ty = if name == "displayColor" { "color3f" } else { "float3" };
                 let _ = write!(out, "{ty}[] primvars:{name} = ");
-                write_array(out, 0..count, |i| {
-                    let j = reorder(i) * 3;
-                    fmt_v3([values[j], values[j + 1], values[j + 2]])
-                });
+                write_array(out, elements.iter(), |&i| fmt_v3([values[i * 3], values[i * 3 + 1], values[i * 3 + 2]]));
             }
             _ => continue,
         }
@@ -648,7 +647,10 @@ fn triangulate(points: &[Vec3], counts: &[usize], indices: &[usize], colour: Opt
     let mut face_of_tri = Vec::new();
     let mut corner_of = Vec::new();
     let mut offset = 0;
+    // Triangles of each face: faces stay polygons (quads, n-gons).
+    let mut face_sizes = Vec::with_capacity(counts.len());
     for (face, &count) in counts.iter().enumerate() {
+        let before = mesh.indices.len();
         let face_indices = &indices[offset.min(indices.len())..(offset + count).min(indices.len())];
         for k in 1..count.saturating_sub(1) {
             let corners = [0, k, k + 1];
@@ -660,7 +662,11 @@ fn triangulate(points: &[Vec3], counts: &[usize], indices: &[usize], colour: Opt
                 corner_of.push(order.map(|o| offset + corners[o]));
             }
         }
+        face_sizes.push(mesh.indices.len() - before);
         offset += count;
+    }
+    if face_sizes.iter().any(|n| *n > 1) {
+        crate::poly::tag(&mut mesh, 0, face_sizes);
     }
     if let Some((interpolation, values)) = colour {
         let rgb = |i: usize| values.get(i * 3..i * 3 + 3).map(|c| [c[0], c[1], c[2]]);

@@ -278,6 +278,13 @@ do_freetype() {
     -DFT_DISABLE_ZLIB=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_PNG=ON -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON
 }
 
+# Alembic (Ogawa, no HDF5), static: linked into the app for .abc import and export.
+do_alembic() {
+  fetch alembic https://github.com/alembic/alembic/archive/refs/tags/1.8.12.tar.gz b6d916c40446e8c502c84273092ab3d98f3f7f6094f8a2b8203d23e2f1d2a4a0
+  cmake_build alembic "$SRC/alembic" -DALEMBIC_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DUSE_BINARIES=OFF -DUSE_TESTS=OFF -DUSE_HDF5=OFF -DUSE_PYALEMBIC=OFF -DUSE_ARNOLD=OFF -DUSE_PRMAN=OFF -DUSE_MAYA=OFF
+}
+
 do_moonray() {
   # Same source and options as the current build, against PREFIX. Makefiles, not Ninja (duplicate outputs).
   # Boost.Python is only needed with USD's Python bindings, which this USD doesn't have.
@@ -353,6 +360,7 @@ step usd do_usd
 step openssl do_openssl
 step freetype do_freetype
 step moonray do_moonray
+step alembic do_alembic
 
 # Everything in PREFIX should now need macOS 14 or older.
 echo "== check"

@@ -40,9 +40,15 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("sop_solver", "Runs its network once per step on the previous step's result (Prev_Frame), for custom simulations."),
     ("solver_input", "Inside a SOP Solver: Prev_Frame (the last step) or Input_1 (the solver's input)."),
     // Import / export
-    ("file", "Reads geometry: OBJ, FBX, STL, USD (usd/usda/usdc/usdz) or VDB. $F in the name reads one file per frame."),
-    ("file_export", "Writes its input to OBJ, FBX, STL, USD or VDB (the current frame, or one file per frame with $F)."),
-    ("object_merge", "Brings in other objects' geometry (their display node), or nodes in other networks, optionally moved into this object's space."),
+    ("file", "Reads geometry: OBJ, FBX, Alembic (animated .abc is read at the current time), STL, USD (usd/usda/usdc/usdz) or VDB. $F in the name reads one file per frame."),
+    ("file_export", "Writes its input to OBJ, FBX, Alembic, STL, USD or VDB (the current frame, or one file per frame with $F). Alembic writes the whole frame range into one animated .abc."),
+    ("extract_centroid", "One point per piece (whole geometry, piece/name attribute or connected pieces) at its average point or bounding box centre, with a piece attribute."),
+    ("match_size", "Moves geometry so a side or centre per axis lines up with a target (input 2's bounding box, or a point/box you give), optionally scaling it to fit, uniformly or per axis."),
+    ("convert_line", "Turns every polygon edge into a two-point line (a curve) with restlength; quad diagonals are skipped."),
+    ("metaball", "Soft blobs around the input's points (pscale scales each, or one ball at the origin), blended into one surface; lower thresholds are fatter."),
+    ("connectivity", "Numbers connected pieces 0, 1, 2… in a point or primitive attribute (class by default)."),
+    ("resample", "Evenly spaced points along curves, by maximum segment length or a number of segments; point attributes are interpolated."),
+    ("object_merge", "Brings in an object's geometry (its display output) or any node inside an object, including other nodes in this network, optionally moved into this object's space. Pick sources from a menu per object."),
     // Volumes
     ("vdb", "VDB from polygons: a level set (or fog) volume of a closed mesh, with smoothing, dilate and erode."),
     ("convert_vdb", "Converts volumes: to polygons at an iso value, or to a fog volume."),
@@ -56,7 +62,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("bevel", "Bevels edges."),
     ("peak", "Moves points along their normals."),
     ("ripple", "Animated ripples."),
-    ("jitter", "Moves points randomly."),
+    ("jitter", "Point Jitter: moves each point by a random offset of up to Amount, scaled per axis."),
     ("point_deform", "Makes geometry (input 1) follow points from rest (input 2) to deformed (input 3): each point follows its nearest points, bending and turning with them."),
     ("transform_pieces", "Moves each piece (piece or name attribute) rigidly with a template point's P, orient/transform and pscale (input 2), optionally relative to rest points (input 3)."),
     // Topology
@@ -109,7 +115,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("terrain_colorize", "Colours sand, grass, rock and snow by height and slope."),
     // Attributes, groups, UV
     ("attribute_create", "Creates an attribute (id, pscale, Cd, orient) with a value."),
-    ("attribute_randomize", "Randomizes an attribute."),
+    ("attribute_randomize", "Random values for an attribute: id, pscale, Cd or orient presets, or any custom attribute on points, primitives or the detail, with 1 to 4 components between Min and Max, set or added."),
     ("attribute_delete", "Deletes an attribute."),
     ("wrangle", "Runs VEX code over points, primitives, vertices or the detail. See the VEX section."),
     ("attribute_vop", "VEX built from nodes: double-click to build a network of VOPs (see below)."),
@@ -364,6 +370,14 @@ push_up(@P, smoothpulse(@P.x, 0.2));</pre>
 vector sum = 0;
 foreach (int pt; near) sum += point(0, "P", pt);
 @P = sum / max(1, len(near));</pre>
+<h4>Primitives are polygons</h4>
+<p>Over primitives, a wrangle runs once per polygon (a quad, an n-gon or a triangle): <code>@primnum</code>, <code>@numprim</code> and <code>nprimitives()</code> count polygons, <code>@P</code> is the polygon's centre, and what it writes covers the whole polygon. <code>primpoints()</code> lists its points in order, and <code>addprim(0, "poly", ...)</code> takes any number of points.</p>
+<h4>Expressions in parameters</h4>
+<p>Type an expression into any number field (click it to type) and the parameter follows it at every frame, instead of keys; typing a plain number replaces it, and right-click → <b>Delete Channel</b> removes it (and any keys), keeping the current value. The node's <b>Animation</b> section shows each parameter's expression, for editing or clearing. Expressions are VEX, with Houdini's variables <code>$F</code> (frame), <code>$FF</code> (fractional frame), <code>$T</code> (seconds) and <code>$FPS</code>.</p>
+<pre>$F                    // Scatter's seed: a new pattern every frame
+sin($T * 2) * 0.5     // a wobbling value
+fit($F, 1, 48, 0, 10) // ramps from 0 to 10 over two seconds
+rand($F) * 360        // a random angle per frame</pre>
 "#;
 
 #[cfg(test)]

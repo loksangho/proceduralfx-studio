@@ -101,6 +101,7 @@ pub fn pack(input: &Mesh, set: &PackSettings) -> Result<Mesh, String> {
         };
         piece.vertices.iter_mut().for_each(|v| *v = v.sub(pivot));
         piece.point_attributes.retain(|k, _| !k.starts_with("detail:"));
+        crate::poly::normalize(&mut piece);
         ids.push(put(piece) as f32);
         out.vertices.push(pivot);
         transforms.extend([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
