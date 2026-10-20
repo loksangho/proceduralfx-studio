@@ -20,10 +20,13 @@ use rfd::FileDialog;
 mod render_viewer;
 mod anim;
 mod boolean;
+mod bullet;
 mod cops;
 mod crowd;
+mod deform;
 mod docs;
 mod envlight;
+mod extrude;
 mod fileio;
 mod flow;
 mod fracture;
@@ -32,6 +35,7 @@ mod groups;
 mod kinefx;
 mod measure;
 mod muscle;
+mod packed;
 mod paint;
 mod raster;
 mod sims;
@@ -560,6 +564,11 @@ fn node_fuse(mesh: Mesh, tol: f32) -> Mesh {
 }
 
 fn node_transform(mut mesh: Mesh, t: [f32; 3], r: [f32; 3], s: [f32; 3]) -> Mesh {
+    // Packed points and skeleton joints turn and scale with the geometry.
+    if mesh.point_attributes.contains_key("transform") {
+        let scale = [Vec3::new(s[0], 0.0, 0.0), Vec3::new(0.0, s[1], 0.0), Vec3::new(0.0, 0.0, s[2])];
+        packed::turn_frames(&mut mesh, &kinefx::mm(&scale, &kinefx::euler(r)));
+    }
     let (t, s) = (Vec3::from_arr(t), Vec3::from_arr(s));
     for v in mesh.vertices.iter_mut() {
         *v = v.mul(s).rotate_deg(r).add(t);
@@ -2013,85 +2022,6 @@ fn node_flip(
     sims::run(key, sims::step_count(time, per_frame), per_frame * 12, init, Clone::clone, Clone::clone, step, output)
 }
 
-fn node_extrude(mesh: Mesh, dist: f32, inset: f32, mode: usize) -> Mesh {
-    if mesh.indices.is_empty() {
-        return mesh;
-    }
-    let inset_scale = (1.0 - inset).max(0.0);
-    let mut out = Mesh::default();
-    let mut edge_counts = HashMap::<(usize, usize), usize>::new();
-    for tri in &mesh.indices {
-        for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-            let edge = if a < b { (a, b) } else { (b, a) };
-            *edge_counts.entry(edge).or_default() += 1;
-        }
-    }
-    if mode == 1 {
-        let mut normals = vec![Vec3::zero(); mesh.vertices.len()];
-        for tri in &mesh.indices {
-            let n = mesh.vertices[tri[1]]
-                .sub(mesh.vertices[tri[0]])
-                .cross(mesh.vertices[tri[2]].sub(mesh.vertices[tri[0]]));
-            for &vertex in tri {
-                normals[vertex] = normals[vertex].add(n);
-            }
-        }
-        let center = mesh.bounds().map(|(lo, hi)| lo.add(hi).scale(0.5)).unwrap_or(Vec3::zero());
-        let offset: Vec<Vec3> = mesh.vertices.iter().enumerate().map(|(i, &vertex)| {
-            center
-                .add(vertex.sub(center).scale(inset_scale))
-                .add(normals[i].normalize().scale(dist))
-        }).collect();
-        let base = mesh.vertices.len();
-        out.vertices.extend_from_slice(&mesh.vertices);
-        out.vertices.extend_from_slice(&offset);
-        for tri in &mesh.indices {
-            out.indices.push([tri[2], tri[1], tri[0]]);
-            out.indices.push([tri[0] + base, tri[1] + base, tri[2] + base]);
-        }
-        for tri in &mesh.indices {
-            for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-                let edge = if a < b { (a, b) } else { (b, a) };
-                if edge_counts.get(&edge) == Some(&1) {
-                    out.indices.push([a, b, b + base]);
-                    out.indices.push([a, b + base, a + base]);
-                }
-            }
-        }
-        return out;
-    }
-    for tri in &mesh.indices {
-        let v0 = mesh.vertices[tri[0]];
-        let v1 = mesh.vertices[tri[1]];
-        let v2 = mesh.vertices[tri[2]];
-        let n = v1.sub(v0).cross(v2.sub(v0)).normalize();
-        let centroid = v0.add(v1).add(v2).scale(1.0 / 3.0);
-
-        let inset_scale = (1.0 - inset).max(0.0);
-        let e0 = centroid.add(v0.sub(centroid).scale(inset_scale)).add(n.scale(dist));
-        let e1 = centroid.add(v1.sub(centroid).scale(inset_scale)).add(n.scale(dist));
-        let e2 = centroid.add(v2.sub(centroid).scale(inset_scale)).add(n.scale(dist));
-
-        let base = out.vertices.len();
-        out.vertices.extend_from_slice(&[v0, v1, v2, e0, e1, e2]);
-
-        // Preserve the original surface and add the offset cap.
-        out.indices.push([base + 2, base + 1, base]);
-        out.indices.push([base + 3, base + 4, base + 5]);
-
-        // Side quads (2 triangles each)
-        out.indices.push([base + 0, base + 1, base + 4]);
-        out.indices.push([base + 0, base + 4, base + 3]);
-
-        out.indices.push([base + 1, base + 2, base + 5]);
-        out.indices.push([base + 1, base + 5, base + 4]);
-
-        out.indices.push([base + 2, base + 0, base + 3]);
-        out.indices.push([base + 2, base + 3, base + 5]);
-    }
-    node_fuse(out, 1e-5)
-}
-
 fn node_clip(mesh: Mesh, axis: usize, offset: f32, invert: bool) -> Mesh {
     let mut out = Mesh {
         vertices: mesh.vertices.clone(),
@@ -2512,6 +2442,8 @@ struct RenderOpts {
     range_step: f32,
     // Render the STAGE network's displayed USD stage instead of the OBJ objects.
     stage: bool,
+    // Render that stage through Hydra (hd_render with MoonRay's delegate, hdMoonray).
+    hydra: bool,
     // In-scattering light samples per volume step: the main cost of smoke and fire renders.
     volume_samples: usize,
 }
@@ -2529,9 +2461,17 @@ impl Default for RenderOpts {
             range_end: 1.0,
             range_step: 0.1,
             stage: false,
+            hydra: false,
             volume_samples: 2,
         }
     }
+}
+
+// "Through Hydra" for a STAGE render; true when it changed.
+fn hydra_checkbox(ui: &mut egui::Ui, opts: &mut RenderOpts) -> bool {
+    ui.add_enabled(opts.stage, egui::Checkbox::new(&mut opts.hydra, "Through Hydra (hdMoonray)"))
+        .on_hover_text("Renders the stage with hd_render and MoonRay's Hydra render delegate, as USD-native apps do: the stage is written as USD and read by Hydra, instead of being translated by ProceduralFX Studio")
+        .changed()
 }
 
 // Timeline times covered by a frame range, capped to keep runaway ranges bounded.
@@ -2758,6 +2698,32 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 // Runs `cmd` with stdout and stderr written to `log_path`, killing it once `cancel` is set.
+// hd_render: next to the MoonRay binary, in the app bundle, in a MoonRay build
+// tree (PFX_HD_RENDER), or on PATH.
+fn find_hd_render(moonray: &std::path::Path) -> Option<PathBuf> {
+    let mut candidates = vec![moonray.with_file_name("hd_render")];
+    if let Some(contents) = std::env::current_exe().ok().and_then(|exe| exe.parent()?.parent().map(|p| p.to_path_buf())) {
+        candidates.extend([contents.join("Resources/hd_render"), contents.join("bin/hd_render")]);
+    }
+    if let Some(path) = std::env::var_os("PFX_HD_RENDER") {
+        candidates.insert(0, path.into());
+    }
+    if let Some(dirs) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&dirs).map(|dir| dir.join("hd_render")));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+// Where hdMoonray's USD plugin (plugInfo.json) is, when hd_render runs from a
+// MoonRay install or build tree; the app bundles it with USD's own plugins.
+fn hydra_plugin_path(hd_render: &std::path::Path) -> Option<String> {
+    if let Some(path) = std::env::var_os("PFX_HYDRA_PLUGIN_PATH") {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    let dirs: Vec<PathBuf> = hd_render.ancestors().skip(1).take(8).flat_map(|dir| [dir.join("plugin/pxr"), dir.join("plugin/usd")]).collect();
+    dirs.into_iter().find(|dir| dir.join("hd_moonray_debug/plugInfo.json").is_file()).map(|dir| dir.to_string_lossy().into_owned())
+}
+
 fn run_logged(cmd: &mut Command, log_path: &std::path::Path, cancel: &AtomicBool) -> Result<std::process::ExitStatus, String> {
     let log = File::create(log_path).map_err(|e| format!("Could not create render log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
@@ -3073,7 +3039,7 @@ enum NodeKind {
     // Spray, foam and bubbles from a FLIP fluid. Input 1: fluid particles (with v), input 2: optional collider.
     WhitewaterSolver(whitewater::WhitewaterSettings),
     ParticleSurface { radius: f32, join_distance: f32, resolution: usize, smoothing: usize },
-    Extrude { dist: f32, inset: f32, mode: usize },
+    Extrude(extrude::ExtrudeSettings),
     Clip { axis: usize, offset: f32, invert: bool },
     Blast { component: usize, indices: Vec<usize>, invert: bool },
     Cache { cache_id: usize, mode: usize },
@@ -3130,6 +3096,10 @@ enum NodeKind {
     Normal(sops::NormalSettings),
     // Points on (or inside) the input's surface.
     Scatter(sops::ScatterSettings),
+    // Input 1 follows the motion of points: rest (input 2) to deformed (input 3).
+    PointDeform(deform::PointDeformSettings),
+    // Moves each piece of input 1 rigidly with its template point (input 2), optionally from rest (input 3).
+    TransformPieces,
     // Area, perimeter, curvature, gradient, volume or curve length as attributes.
     Measure(measure::MeasureSettings),
     // Flow control (see flow.rs): For-Each and Compile blocks are Begin/End pairs.
@@ -3143,6 +3113,13 @@ enum NodeKind {
     MaterialAssign { slots: Vec<(String, Option<NodeId>)> },
     // Union / intersection / subtraction of two closed meshes.
     Boolean(boolean::BooleanSettings),
+    // Rigid pieces with breakable glue. Inputs: geometry, constraints, proxy, collision; outputs the first three.
+    RbdBullet(bullet::BulletSettings),
+    // Per-piece density, friction, bounce, active and velocity for the RBD Bullet Solver.
+    RbdConfigure(bullet::ConfigureSettings),
+    // Packs pieces into one point each (geometry stored once); Unpack turns them back.
+    Pack(packed::PackSettings),
+    Unpack { transfer: bool },
     // Breaks a closed mesh into concrete, glass or wood pieces (with `piece` for RBD).
     MaterialFracture(fracture::FractureSettings),
     // Agents walking with steering. Inputs: start points, optional ground, optional obstacles.
@@ -3261,7 +3238,9 @@ impl NodeKind {
             | NodeKind::Blast { .. }
             | NodeKind::Scatter(_)
             | NodeKind::HairGuides(_)
-            | NodeKind::HairGenerate(_) => GroupSupport::Native,
+            | NodeKind::HairGenerate(_)
+            | NodeKind::RbdConfigure(_)
+            | NodeKind::Extrude(_) => GroupSupport::Native,
             NodeKind::VellumSolver(_) => GroupSupport::Pin,
             _ => GroupSupport::None,
         }
@@ -3296,6 +3275,109 @@ impl NodeKind {
     }
 
     // Parameters that can be keyframed, with their channel names.
+    // Each parameter's name, in params() order (empty: not for keyframing, e.g. ids and painted values).
+    fn param_names(&self) -> Vec<String> {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Table-driven nodes: an operation number, then each table parameter (colours as .r .g .b).
+        let table = |params: &[shading::Param]| -> Vec<String> {
+            params.iter().flat_map(|p| if p.width() == 3 { vec![format!("{}.r", p.key), format!("{}.g", p.key), format!("{}.b", p.key)] } else { vec![p.key.to_owned()] }).collect()
+        };
+        match self {
+            NodeKind::Grid { .. } | NodeKind::Plane { .. } => names(&["size", "resolution"]),
+            NodeKind::Cone { .. } => names(&["radius", "height", "rows", "columns", "caps"]),
+            NodeKind::Capsule { .. } => names(&["radius", "length", "rows", "columns"]),
+            NodeKind::Box { .. } => names(&["size", "divisions"]),
+            NodeKind::Sphere { .. } => names(&["radius", "rows", "columns"]),
+            NodeKind::Torus { .. } => names(&["major_radius", "minor_radius", "rows", "columns"]),
+            NodeKind::Noise { .. } => names(&["frequency", "amplitude"]),
+            NodeKind::Taper { .. } => names(&["taper"]),
+            NodeKind::Twist { .. } => names(&["twist_angle"]),
+            NodeKind::Bend { .. } => names(&["bend_angle"]),
+            NodeKind::Smooth { .. } => names(&["iterations", "strength"]),
+            NodeKind::Bevel { .. } => names(&["amount", "segments"]),
+            NodeKind::Fuse { .. } => names(&["distance"]),
+            NodeKind::Mirror { .. } => names(&["axis"]),
+            NodeKind::Copy { .. } => names(&["copies", "t.x", "t.y", "t.z", "r.x", "r.y", "r.z", "uniform_scale"]),
+            NodeKind::CopyToPoints { .. } => names(&["scale", "r.x", "r.y", "r.z"]),
+            NodeKind::AttributeCreate { .. } => names(&["attribute", "value"]),
+            NodeKind::AttributeRandomize { .. } => names(&["attribute", "amount", "seed"]),
+            NodeKind::AttributeDelete { .. } => names(&["attribute"]),
+            NodeKind::AttributeVop { .. } => names(&["run_over"]),
+            NodeKind::Tube { .. } => names(&["bottom_radius", "top_radius", "height", "rows", "columns", "caps"]),
+            NodeKind::Peak { .. } => names(&["distance"]),
+            NodeKind::Ripple { .. } => names(&["frequency", "amplitude", "speed"]),
+            NodeKind::Jitter { .. } => names(&["amount", "seed"]),
+            NodeKind::Particles { .. } => names(&["max_particles", "birth_rate", "lifetime", "speed", "spread", "gravity", "seed", "drag", "bounce", "friction", "radius", "substeps", "along_normals"]),
+            NodeKind::Flip { .. } => names(&["particles", "grid_resolution", "flip_blend", "viscosity", "gravity", "max_timestep", "substeps", "seed", "domain_center.x", "domain_center.y", "domain_center.z", "domain_size.x", "domain_size.y", "domain_size.z"]),
+            NodeKind::ParticleSurface { .. } => names(&["particle_radius", "join_distance", "resolution", "smoothing"]),
+            NodeKind::Extrude(_) => names(&["distance", "inset", "connected", "divisions", "output_front", "output_back", "output_side", "output_groups"]),
+            NodeKind::Clip { .. } => names(&["axis", "offset", "invert"]),
+            NodeKind::Blast { .. } => names(&["component", "invert"]),
+            NodeKind::Cache { .. } => names(&["", "mode"]),
+            NodeKind::Vdb { .. } => names(&["voxel_size", "padding", "operation", "iterations", "output"]),
+            NodeKind::ConvertVdb { .. } => names(&["mode", "iso"]),
+            NodeKind::Switch { .. } => names(&["input"]),
+            NodeKind::Pyro(_) => names(&["resolution", "center.x", "center.y", "center.z", "size.x", "size.y", "size.z", "substeps", "density", "temperature", "fuel", "buoyancy", "dissipation", "cooling", "vorticity", "turbulence", "burn_rate", "wind.x", "wind.y", "wind.z", "opacity"]),
+            NodeKind::RbdSolver(_) => names(&["shape", "density", "friction", "bounce", "gravity", "substeps", "ground", "ground_height", "velocity.x", "velocity.y", "velocity.z", "spin.x", "spin.y", "spin.z"]),
+            NodeKind::HairGuides(_) => names(&["count", "length", "length_variance", "segments", "droop", "seed"]),
+            NodeKind::GuideProcess(_) => names(&["operation", "amount", "frequency", "seed"]),
+            NodeKind::HairDeform(_) => names(&["rest_frame"]),
+            NodeKind::HairGenerate(_) => names(&["count", "segments", "clump", "length_variance", "frizz", "root_width", "tip_width", "seed"]),
+            NodeKind::Normal(_) => names(&["domain", "cusp_angle", "weighting", "reverse"]),
+            NodeKind::GroupCreate(_) => names(&["primitives", "method", "bbox_min.x", "bbox_min.y", "bbox_min.z", "bbox_max.x", "bbox_max.y", "bbox_max.z", "percent", "seed", "direction.x", "direction.y", "direction.z", "spread", "combine", "invert"]),
+            NodeKind::AttributePaint { .. } => names(&["paint_value", "default_value", "brush_radius", "brush_strength", "mode", "visualize"]),
+            NodeKind::Scatter(_) => names(&["count", "seed", "relax_iterations", "fill_volume"]),
+            NodeKind::Boolean(_) => names(&["operation", "method", "voxel_resolution"]),
+            NodeKind::Measure(_) => names(&["measure", "curvature", "summary"]),
+            NodeKind::PointDeform(_) => names(&["influences", "fit_neighbours", "follow_rotation"]),
+            NodeKind::ForEachEnd(_) => names(&["loop_over", "iterations", "start_value", "increment", "single_pass", "multithread"]),
+            NodeKind::ObjectMerge { .. } => names(&["into_this_object"]),
+            NodeKind::MaterialFracture(_) => names(&["material", "pieces", "seed", "impact.x", "impact.y", "impact.z", "crack_rings", "radial_cracks", "grain_axis", "splinter_length", "explode", "glue_strength"]),
+            NodeKind::WhitewaterSolver(_) => names(&["max_particles", "emission_rate", "trapped_air", "wave_crests", "min_speed", "full_emission_speed", "foam_lifespan", "spray_drag", "bubble_buoyancy", "bubble_drag", "spray_neighbours", "bubble_neighbours", "gravity", "particle_size", "substeps", "seed"]),
+            NodeKind::MuscleSolver(_) => names(&["firmness", "damping", "coherence", "substeps"]),
+            NodeKind::MuscleSkin(_) => names(&["reach", "influences"]),
+            NodeKind::Skeleton(_) => names(&["preset", "scale", "joints", "length"]),
+            NodeKind::ProceduralMotion(_) => names(&["motion", "cycles_per_second", "amplitude", "forward_speed", "lag", "axis"]),
+            NodeKind::JointCapture(_) => names(&["joints_per_point", "falloff", "colour_by_joint"]),
+            NodeKind::Terrain(_) => names(&["size.x", "size.z", "resolution"]),
+            NodeKind::TerrainNoise(_) => names(&["noise", "blend", "height", "element_size", "octaves", "roughness", "offset.x", "offset.z", "seed", "positive", "use_mask"]),
+            NodeKind::TerrainErode(_) => names(&["raindrops", "erosion_rate", "deposition_rate", "sediment_capacity", "evaporation", "inertia", "erosion_radius", "thermal_iterations", "talus_angle", "seed"]),
+            NodeKind::TerrainTerrace(_) => names(&["step_height", "offset", "sharpness", "use_mask"]),
+            NodeKind::TerrainMask(_) => names(&["source", "min", "max", "falloff", "blur", "invert", "combine", "visualize"]),
+            NodeKind::TerrainColorize(_) => names(&["sand.r", "sand.g", "sand.b", "grass.r", "grass.g", "grass.b", "rock.r", "rock.g", "rock.b", "snow.r", "snow.g", "snow.b", "sand_level", "snow_level", "rock_slope", "blend"]),
+            NodeKind::UvTexture(_) => names(&["projection", "axis", "scale.u", "scale.v", "offset.u", "offset.v"]),
+            NodeKind::UvTransform(_) => names(&["translate.u", "translate.v", "rotate", "scale.u", "scale.v", "pivot.u", "pivot.v"]),
+            NodeKind::VellumSolver(_) => names(&["type", "stretch_stiffness", "bend_stiffness", "shape_stiffness", "mass", "thickness", "gravity", "damping", "friction", "substeps", "iterations", "ground", "self_collision", "pin_to_animation"]),
+            NodeKind::SopSolver { .. } => names(&["substeps"]),
+            NodeKind::LopPrimitive { .. } => names(&["shape", "size", "t.x", "t.y", "t.z"]),
+            NodeKind::LopTransform { .. } => names(&["t.x", "t.y", "t.z", "r.x", "r.y", "r.z", "s.x", "s.y", "s.z"]),
+            NodeKind::LopLight { .. } => names(&["type", "position.x", "position.y", "position.z", "target.x", "target.y", "target.z", "color.r", "color.g", "color.b", "intensity", "size"]),
+            NodeKind::LopCamera { .. } => names(&["position.x", "position.y", "position.z", "target.x", "target.y", "target.z", "focal", "aperture"]),
+            NodeKind::LopPrune { .. } => names(&["hide"]),
+            NodeKind::LopReference { .. } => names(&["sublayer"]),
+            NodeKind::Subdivide { .. } => names(&["levels"]),
+            NodeKind::Remesh { .. } => names(&["target_triangles"]),
+            NodeKind::SolverInput { .. } => names(&[""]),
+            NodeKind::Add { .. } => names(&["point_count", "spacing", "layout", "delete_geometry"]),
+            NodeKind::Transform { .. } => XFORM_NAMES.iter().map(|s| s.to_string()).collect(),
+            NodeKind::RbdBullet(_) => names(&["density", "friction", "bounce", "gravity", "substeps", "ground", "ground_height", "glue_strength_scale", "velocity.x", "velocity.y", "velocity.z"]),
+            NodeKind::RbdConfigure(_) => names(&["density", "friction", "bounce", "active", "velocity.x", "velocity.y", "velocity.z", "", "", "", "", ""]),
+            NodeKind::Pack(_) => names(&["pack", "pivot"]),
+            NodeKind::Unpack { .. } => names(&["transfer_attributes"]),
+            NodeKind::CrowdSolver(_) => names(&["speed", "speed_variance", "turn_rate", "personal_space", "separation", "alignment", "cohesion", "goal.x", "goal.y", "goal.z", "goal_weight", "wander", "obstacle_lookahead", "agent_height", "display", "seed"]),
+            NodeKind::Muscle(_) => names(&["origin.x", "origin.y", "origin.z", "insertion.x", "insertion.y", "insertion.z", "radius", "shape", "flatness", "tendon", "activation", "contraction", "segments", "sides", "twist", "muscle_id"]),
+            NodeKind::TwoBoneIk(_) => names(&["goal.x", "goal.y", "goal.z", "pole.x", "pole.y", "pole.z", "use_pole", "blend", "keep_tip"]),
+            NodeKind::SkeletonBlend { .. } => names(&["weight"]),
+            NodeKind::Shader(v) => std::iter::once(String::new()).chain(table(v.table.params())).collect(),
+            NodeKind::ShaderNode(n) if n.op == shading::SURFACE_OUTPUT => [String::new(), String::new()].into_iter().chain(table(shading::PRINCIPLED)).collect(),
+            NodeKind::ShaderNode(n) => std::iter::once(String::new()).chain(table(n.def().params)).collect(),
+            NodeKind::Cop(n) => std::iter::once(String::new()).chain(table(n.def().params)).collect(),
+            NodeKind::Top(n) => std::iter::once(String::new()).chain(n.def().params.iter().map(|p| if matches!(p.key, "node" | "param") { String::new() } else { p.key.to_owned() })).collect(),
+            NodeKind::Material { .. } => names(&["", "color.r", "color.g", "color.b", "roughness", "value"]),
+            _ => Vec::new(),
+        }
+    }
+
     fn animatable(&self) -> Vec<(ChannelTarget, String)> {
         let named = |list: &[(usize, &str)]| list.iter().map(|(i, n)| (ChannelTarget::Param(*i), n.to_string())).collect();
         match self {
@@ -3328,7 +3410,8 @@ impl NodeKind {
             NodeKind::TwoBoneIk(_) => named(&[(0, "goal.x"), (1, "goal.y"), (2, "goal.z"), (3, "pole.x"), (4, "pole.y"), (5, "pole.z"), (7, "blend")]),
             NodeKind::SkeletonBlend { .. } => named(&[(0, "weight")]),
             NodeKind::Wrangle { .. } | NodeKind::MoonRayRender { .. } | NodeKind::AttributeVop { .. } | NodeKind::Vop(_) => Vec::new(),
-            other => (0..other.params().len()).map(|i| (ChannelTarget::Param(i), format!("parm{i}"))).collect(),
+            // Every other node: its parameters by name (params() order); unnamed ones aren't animatable.
+            other => other.param_names().into_iter().enumerate().filter(|(_, n)| !n.is_empty()).map(|(i, n)| (ChannelTarget::Param(i), n)).collect(),
         }
     }
 
@@ -3350,6 +3433,7 @@ impl NodeKind {
             NodeKind::MaterialAssign { slots } => slots.iter().map(|(g, _)| g.clone()).collect(),
             NodeKind::ForEachEnd(f) => vec![f.attribute.clone()],
             NodeKind::Measure(m) => vec![m.name.clone(), m.source.clone()],
+            NodeKind::Extrude(e) => vec![e.front_group.clone(), e.side_group.clone(), e.back_group.clone()],
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
@@ -3390,6 +3474,11 @@ impl NodeKind {
                 next(&mut m.name);
                 next(&mut m.source);
             }
+            NodeKind::Extrude(e) => {
+                next(&mut e.front_group);
+                next(&mut e.side_group);
+                next(&mut e.back_group);
+            }
             NodeKind::EnvironmentLight { file, .. } => next(file),
             NodeKind::GroupCreate(g) => {
                 next(&mut g.name);
@@ -3426,6 +3515,7 @@ impl NodeKind {
                 | NodeKind::WhitewaterSolver(_)
                 | NodeKind::CrowdSolver(_)
                 | NodeKind::MuscleSolver(_)
+                | NodeKind::RbdBullet(_)
                 | NodeKind::Pyro(_)
                 | NodeKind::RbdSolver(_)
                 | NodeKind::VellumSolver(_)
@@ -3632,6 +3722,8 @@ impl NodeKind {
                     NodeKind::Taper { factor: 0.3 },
                     NodeKind::Twist { angle: 1.0 },
                     NodeKind::Bend { angle: 0.5 },
+                    NodeKind::PointDeform(deform::PointDeformSettings::defaults()),
+                    NodeKind::TransformPieces,
                     NodeKind::Smooth { iterations: 5, strength: 0.5 },
                     NodeKind::Bevel { amount: 0.25, segments: 2 },
                     NodeKind::Peak { dist: 0.1 },
@@ -3648,11 +3740,13 @@ impl NodeKind {
                     NodeKind::Mirror { axis: 0 },
                     NodeKind::Copy { count: 5, t: [1.5, 0.0, 0.0], r: [0.0; 3], s: 1.0 },
                     NodeKind::CopyToPoints { scale: 1.0, rotation: [0.0; 3] },
-                    NodeKind::Extrude { dist: 0.2, inset: 0.2, mode: 0 },
+                    NodeKind::Extrude(extrude::ExtrudeSettings::defaults()),
                     NodeKind::Clip { axis: 1, offset: 0.0, invert: false },
                     NodeKind::Blast { component: 1, indices: Vec::new(), invert: false },
                     NodeKind::Scatter(sops::ScatterSettings { count: 1000, seed: 1, relax_iterations: 5, volume: false }),
                     NodeKind::Boolean(boolean::BooleanSettings { operation: 2, mode: 0, resolution: 128 }),
+                    NodeKind::Pack(packed::PackSettings::defaults()),
+                    NodeKind::Unpack { transfer: true },
                     NodeKind::Cache { cache_id: 1, mode: 1 },
                     NodeKind::Reverse,
                     NodeKind::Switch { index: 0 },
@@ -3673,7 +3767,10 @@ impl NodeKind {
             ),
             (
                 "Destruction",
-                (0..fracture::MATERIALS.len()).map(|m| NodeKind::MaterialFracture(fracture::FractureSettings::defaults(m))).collect(),
+                (0..fracture::MATERIALS.len())
+                    .map(|m| NodeKind::MaterialFracture(fracture::FractureSettings::defaults(m)))
+                    .chain([NodeKind::RbdConfigure(bullet::ConfigureSettings::defaults()), NodeKind::RbdBullet(bullet::BulletSettings::defaults())])
+                    .collect(),
             ),
             (
                 "Crowds",
@@ -3851,7 +3948,7 @@ impl NodeKind {
             NodeKind::Flip { .. } => "flip",
             NodeKind::WhitewaterSolver(_) => "whitewater_solver",
             NodeKind::ParticleSurface { .. } => "particle_surface",
-            NodeKind::Extrude { .. } => "extrude",
+            NodeKind::Extrude(_) => "extrude",
             NodeKind::Clip { .. } => "clip",
             NodeKind::Blast { .. } => "blast",
             NodeKind::Cache { .. } => "cache",
@@ -3886,12 +3983,18 @@ impl NodeKind {
             NodeKind::Boolean(_) => "boolean",
             NodeKind::MaterialAssign { .. } => "material",
             NodeKind::Measure(_) => "measure",
+            NodeKind::PointDeform(_) => "point_deform",
+            NodeKind::TransformPieces => "transform_pieces",
             NodeKind::ForEachBegin => "foreach_begin",
             NodeKind::ForEachEnd(_) => "foreach_end",
             NodeKind::CompileBegin => "compile_begin",
             NodeKind::CompileEnd { .. } => "compile_end",
             NodeKind::ObjectMerge { .. } => "object_merge",
             NodeKind::MaterialFracture(_) => "material_fracture",
+            NodeKind::RbdBullet(_) => "rbd_bullet_solver",
+            NodeKind::RbdConfigure(_) => "rbd_configure",
+            NodeKind::Pack(_) => "pack",
+            NodeKind::Unpack { .. } => "unpack",
             NodeKind::CrowdSolver(_) => "crowd_solver",
             NodeKind::Muscle(_) => "muscle",
             NodeKind::MuscleSolver(_) => "muscle_solver",
@@ -3934,6 +4037,23 @@ impl NodeKind {
         }
     }
 
+    // Output ports: Material Fracture and RBD Bullet have geometry, constraints and proxy.
+    fn num_outputs(&self) -> usize {
+        match self {
+            NodeKind::MaterialFracture(_) | NodeKind::RbdBullet(_) | NodeKind::RbdConfigure(_) => 3,
+            _ => 1,
+        }
+    }
+
+    // Names of the input and output ports, where they have meaning beyond "input N".
+    fn port_names(&self) -> (&'static [&'static str], &'static [&'static str]) {
+        match self {
+            NodeKind::MaterialFracture(_) | NodeKind::RbdConfigure(_) => (&["Geometry", "Constraints", "Proxy"], &["Geometry", "Constraints", "Proxy"]),
+            NodeKind::RbdBullet(_) => (&["Geometry", "Constraints", "Proxy", "Collision"], &["Geometry", "Constraints", "Proxy"]),
+            _ => (&[], &[]),
+        }
+    }
+
     fn num_inputs(&self) -> usize {
         match self {
             NodeKind::Add { .. } => 1,
@@ -3948,6 +4068,10 @@ impl NodeKind {
             NodeKind::Terrain(_) => 0,
             NodeKind::Boolean(_) => 2,
             NodeKind::ObjectMerge { .. } => 0,
+            NodeKind::MaterialFracture(_) => 3,
+            NodeKind::RbdBullet(_) => 4,
+            NodeKind::RbdConfigure(_) => 3,
+            NodeKind::PointDeform(_) | NodeKind::TransformPieces => 3,
             NodeKind::CrowdSolver(_) => 3,
             NodeKind::MuscleSkin(_) => 2,
             NodeKind::Skeleton(_) => 0,
@@ -4121,7 +4245,7 @@ impl NodeKind {
             NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
                 vec![*radius, *join_distance, *resolution as f32, *smoothing as f32]
             }
-            NodeKind::Extrude { dist, inset, mode } => vec![*dist, *inset, *mode as f32],
+            NodeKind::Extrude(e) => e.to_params(),
             NodeKind::Clip { axis, offset, invert } => vec![*axis as f32, *offset, *invert as u8 as f32],
             NodeKind::Blast { component, indices, invert } => {
                 let mut params = vec![*component as f32, *invert as u8 as f32, indices.len() as f32];
@@ -4184,6 +4308,8 @@ impl NodeKind {
             // One value per slot: the material's node id + 1 (0: none).
             NodeKind::MaterialAssign { slots } => slots.iter().map(|(_, m)| m.map_or(0.0, |m| m as f32 + 1.0)).collect(),
             NodeKind::Measure(m) => vec![m.kind as f32, m.curvature as f32, m.summary as f32],
+            NodeKind::PointDeform(s) => vec![s.influences as f32, s.fit_neighbours as f32, s.rotate as u8 as f32],
+            NodeKind::TransformPieces => vec![],
             NodeKind::ForEachBegin | NodeKind::CompileBegin => vec![],
             NodeKind::ForEachEnd(f) => f.to_params(),
             NodeKind::CompileEnd { begin } => vec![begin.map_or(-1.0, |b| b as f32)],
@@ -4201,8 +4327,13 @@ impl NodeKind {
                 s.grain_axis as f32,
                 s.splinter,
                 s.separate,
+                s.glue_strength,
             ],
             NodeKind::CrowdSolver(s) => s.to_params(),
+            NodeKind::RbdBullet(s) => s.to_params(),
+            NodeKind::RbdConfigure(s) => s.to_params(),
+            NodeKind::Pack(s) => vec![s.mode as f32, s.pivot as f32],
+            NodeKind::Unpack { transfer } => vec![*transfer as u8 as f32],
             NodeKind::Muscle(s) => s.to_params(),
             NodeKind::MuscleSolver(s) => vec![s.stiffness, s.damping, s.smoothing as f32, s.substeps as f32],
             NodeKind::MuscleSkin(s) => vec![s.falloff, s.influences as f32],
@@ -4405,7 +4536,7 @@ impl NodeKind {
                 resolution: u(2).clamp(8, 96),
                 smoothing: u(3).min(3),
             },
-            "extrude" => NodeKind::Extrude { dist: g(0), inset: g(1), mode: u(2).min(1) },
+            "extrude" => NodeKind::Extrude(extrude::ExtrudeSettings::from_params(p)),
             "clip" => NodeKind::Clip { axis: u(0), offset: g(1), invert: g(2) > 0.5 },
             "blast" => {
                 let count = u(2).min(p.len().saturating_sub(3));
@@ -4520,6 +4651,12 @@ impl NodeKind {
                 mode: u(1).min(boolean::MODES.len() - 1),
                 resolution: u(2).clamp(16, 400),
             }),
+            "point_deform" => NodeKind::PointDeform(deform::PointDeformSettings {
+                influences: if p.is_empty() { 4 } else { u(0).clamp(1, 32) },
+                fit_neighbours: if p.len() > 1 { u(1).clamp(3, 64) } else { 6 },
+                rotate: p.get(2).is_none_or(|v| *v > 0.5),
+            }),
+            "transform_pieces" => NodeKind::TransformPieces,
             "measure" => NodeKind::Measure(measure::MeasureSettings {
                 kind: u(0).min(measure::KINDS.len() - 1),
                 curvature: u(1).min(1),
@@ -4547,6 +4684,7 @@ impl NodeKind {
                 grain_axis: u(8).min(2),
                 splinter: g(9).max(1.0),
                 separate: g(10).max(0.0),
+                glue_strength: if p.len() > 11 { g(11).max(0.0) } else { 200.0 },
             }),
             "skeleton" => NodeKind::Skeleton(kinefx::SkeletonSettings {
                 preset: u(0).min(kinefx::PRESETS.len() - 1),
@@ -4581,6 +4719,10 @@ impl NodeKind {
                 visualize: g(2) > 0.5,
             }),
             "bone_deform" => NodeKind::BoneDeform,
+            "rbd_bullet_solver" => NodeKind::RbdBullet(bullet::BulletSettings::from_params(p)),
+            "rbd_configure" => NodeKind::RbdConfigure(bullet::ConfigureSettings::from_params(p)),
+            "pack" => NodeKind::Pack(packed::PackSettings { mode: if p.is_empty() { 1 } else { u(0).min(2) }, pivot: u(1).min(1) }),
+            "unpack" => NodeKind::Unpack { transfer: p.first().is_none_or(|v| *v > 0.5) },
             "crowd_solver" => NodeKind::CrowdSolver(crowd::CrowdSettings::from_params(p)),
             "muscle" => NodeKind::Muscle(muscle::MuscleSettings::from_params(p)),
             "muscle_solver" => NodeKind::MuscleSolver(muscle::JiggleSettings {
@@ -4738,6 +4880,15 @@ struct Node {
 }
 
 impl Node {
+    // The kind of node, for showing next to a given name ("Box", "For-Each Point"…).
+    fn type_label(&self) -> String {
+        let name = self.kind.menu_name();
+        name.replace('_', " ").split(' ').map(|w| {
+            let mut c = w.chars();
+            c.next().map_or(String::new(), |f| f.to_uppercase().collect::<String>() + c.as_str())
+        }).collect::<Vec<_>>().join(" ")
+    }
+
     // What the node is called on screen: its given name, else the generated label.
     fn title(&self, id: NodeId) -> String {
         if self.name.trim().is_empty() { self.kind.label(id) } else { self.name.trim().to_owned() }
@@ -4790,6 +4941,13 @@ struct Link {
     from: NodeId,
     to: NodeId,
     slot: usize,
+    // Which of `from`'s outputs (most nodes have one; Material Fracture and RBD Bullet three).
+    out: usize,
+}
+
+// Cache key for a node's extra outputs (output 0 is the node id itself).
+fn out_key(id: NodeId, out: usize) -> NodeId {
+    if out == 0 { id } else { id ^ (out << 56) }
 }
 
 // An animated parameter: a numeric parameter (index into NodeKind::params) or a
@@ -4857,6 +5015,7 @@ impl Graph {
                     NodeKind::Flip { .. } => Some("FLIP"),
                     NodeKind::WhitewaterSolver(_) => Some("Whitewater"),
                     NodeKind::CrowdSolver(_) => Some("Crowd"),
+                    NodeKind::RbdBullet(_) => Some("RBD Bullet"),
                     NodeKind::MuscleSolver(_) => Some("Muscle"),
                     NodeKind::Pyro(_) => Some("Pyro"),
                     NodeKind::RbdSolver(_) => Some("RBD"),
@@ -5083,6 +5242,10 @@ impl Graph {
         let mut merged: Option<Mesh> = None;
         for id in ids {
             let mut mesh = self.cook(*id, time, cache);
+            // Packed geometry shows as itself.
+            if packed::is_packed(&mesh) {
+                mesh = packed::unpack(&mesh, true);
+            }
             // Level-set VDBs are shown as their surface, like Houdini; fog volumes stay soft splats.
             if volume::is_volume(&mesh) {
                 if let Some(grid) = volume::from_mesh(&mesh).ok().filter(|g| g.class == volume::Class::LevelSet) {
@@ -5197,7 +5360,7 @@ impl Graph {
         let links: Vec<Link> = self.links.clone();
         for l in links {
             if let (Some(a), Some(b)) = (map.get(&l.from), map.get(&l.to)) {
-                self.links.push(Link { from: *a, to: *b, slot: l.slot });
+                self.links.push(Link { from: *a, to: *b, slot: l.slot, out: l.out });
             }
         }
         if let Some(display) = self.displays.get(&from).and_then(|d| map.get(d)) {
@@ -5224,14 +5387,14 @@ impl Graph {
             if !is_geometry {
                 let inputs: Vec<Link> = self.links.iter().filter(|l| l.to == id).cloned().collect();
                 for l in inputs {
-                    self.links.push(Link { from: l.from, to: new, slot: l.slot });
+                    self.links.push(Link { from: l.from, to: new, slot: l.slot, out: l.out });
                 }
             }
             return Some(new);
         }
         let inputs: Vec<Link> = self.links.iter().filter(|l| l.to == id).cloned().collect();
         for l in inputs {
-            self.links.push(Link { from: l.from, to: new, slot: l.slot });
+            self.links.push(Link { from: l.from, to: new, slot: l.slot, out: l.out });
         }
         Some(new)
     }
@@ -5253,9 +5416,43 @@ impl Graph {
         if self.depends_on(from, to) {
             return false;
         }
+        self.connect_out(from, 0, to, slot)
+    }
+
+    // Connects output `out` of `from` to input `slot` of `to`.
+    fn connect_out(&mut self, from: NodeId, out: usize, to: NodeId, slot: usize) -> bool {
+        if self.depends_on(from, to) {
+            return false;
+        }
         self.links.retain(|l| !(l.to == to && l.slot == slot));
-        self.links.push(Link { from, to, slot });
+        self.links.push(Link { from, to, slot, out });
         true
+    }
+
+    // The node (and which of its outputs) connected to input `slot`.
+    fn input_link(&self, to: NodeId, slot: usize) -> Option<(NodeId, usize)> {
+        self.links.iter().find(|l| l.to == to && l.slot == slot).map(|l| (l.from, l.out))
+    }
+
+    // Output `out` of node `id`: extra outputs are cooked with output 0 and cached beside it.
+    fn cook_output(&self, id: NodeId, out: usize, time: f32, cache: &mut HashMap<NodeId, Mesh>) -> Mesh {
+        let first = self.cook(id, time, cache);
+        if out == 0 {
+            return first;
+        }
+        if let Some(m) = cache.get(&out_key(id, out)) {
+            return m.clone();
+        }
+        // Bypassed: each output passes its matching input through.
+        match self.input_link(id, out).filter(|_| self.nodes.get(&id).is_some_and(|n| n.bypass)) {
+            Some((src, o)) => self.cook_output(src, o, time, cache),
+            None => Mesh::default(),
+        }
+    }
+
+    // Input `slot` cooked on its own at `time`, from whichever output it's wired to.
+    fn cook_input_fresh(&self, id: NodeId, slot: usize, time: f32) -> Mesh {
+        self.input_link(id, slot).map(|(src, out)| self.cook_output(src, out, time, &mut HashMap::new())).unwrap_or_default()
     }
 
     /// True if this node or anything upstream animates with time.
@@ -5806,6 +6003,7 @@ impl Graph {
         inputs.sort_by_key(|l| l.slot);
         for link in inputs {
             link.slot.hash(hasher);
+            link.out.hash(hasher);
             self.hash_upstream(link.from, hasher, seen);
         }
         if node.kind.is_container() {
@@ -5830,6 +6028,7 @@ impl Graph {
                 | NodeKind::CrowdSolver(_)
                 | NodeKind::MuscleSolver(_)
                 | NodeKind::ProceduralMotion(_)
+                | NodeKind::RbdBullet(_)
                 | NodeKind::Cache { .. }
                 | NodeKind::Pyro(_)
                 | NodeKind::RbdSolver(_)
@@ -5863,6 +6062,21 @@ impl Graph {
 
     fn disconnect(&mut self, to: NodeId, slot: usize) {
         self.links.retain(|l| !(l.to == to && l.slot == slot));
+        // A Merge closes the gap: later inputs move up one.
+        if matches!(self.nodes.get(&to).map(|n| &n.kind), Some(NodeKind::Merge)) {
+            for l in self.links.iter_mut().filter(|l| l.to == to && l.slot > slot) {
+                l.slot -= 1;
+            }
+        }
+    }
+
+    // Input ports shown on a node: a Merge has one more than its connected inputs.
+    fn input_slots(&self, id: NodeId) -> usize {
+        match self.nodes.get(&id).map(|n| &n.kind) {
+            Some(NodeKind::Merge) => self.links.iter().filter(|l| l.to == id).map(|l| l.slot + 2).max().unwrap_or(2).max(2),
+            Some(kind) => kind.num_inputs(),
+            None => 0,
+        }
     }
 
     #[cfg(feature = "native-openvdb")]
@@ -5909,8 +6123,8 @@ impl Graph {
             return Mesh::default();
         };
         let input = |slot: usize, cache: &mut HashMap<NodeId, Mesh>| {
-            self.input_of(id, slot)
-                .map(|src| self.cook(src, time, cache))
+            self.input_link(id, slot)
+                .map(|(src, out)| self.cook_output(src, out, time, cache))
                 .unwrap_or_default()
         };
         let out = if node.bypass {
@@ -6016,7 +6230,13 @@ impl Graph {
                         Err(e) => self.report(id, Err(e)),
                     }
                 }
-                NodeKind::Merge => node_merge(input(0, cache), input(1, cache)),
+                NodeKind::Merge => {
+                    // Every connected input, in order.
+                    let mut slots: Vec<usize> = self.links.iter().filter(|l| l.to == id).map(|l| l.slot).collect();
+                    slots.sort_unstable();
+                    slots.dedup();
+                    slots.into_iter().fold(Mesh::default(), |acc, slot| node_merge(acc, input(slot, cache)))
+                }
                 NodeKind::Null => input(0, cache),
                 NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
                     node_tube(*r_bot, *r_top, *height, *rows, *cols, *caps)
@@ -6109,8 +6329,12 @@ impl Graph {
                         *smoothing,
                     )
                 }
-                NodeKind::Extrude { dist, inset, mode } => {
-                    node_extrude(input(0, cache), *dist, *inset, *mode)
+                NodeKind::Extrude(settings) => {
+                    let source = input(0, cache);
+                    match groups::prim_mask(&source, &node.group) {
+                        Ok(mask) => extrude::extrude(&source, mask.as_deref(), settings),
+                        Err(e) => self.report(id, Err(e)),
+                    }
                 }
                 NodeKind::Clip { axis, offset, invert } => node_clip(input(0, cache), *axis, *offset, *invert),
                 NodeKind::Blast { component, indices, invert } if !node.group.is_empty() => {
@@ -6269,9 +6493,44 @@ impl Graph {
                     };
                     self.report(id, result)
                 }
-                NodeKind::MaterialFracture(settings) => self.report(id, fracture::fracture(&input(0, cache), settings)),
+                NodeKind::RbdBullet(settings) => {
+                    let (geo, glue, proxy) = bullet::simulate(self.sim_key(id), settings, time, || {
+                        (self.cook_input_fresh(id, 0, 0.0), self.cook_input_fresh(id, 1, 0.0), self.cook_input_fresh(id, 2, 0.0), self.cook_input_fresh(id, 3, 0.0))
+                    });
+                    cache.insert(out_key(id, 1), glue);
+                    cache.insert(out_key(id, 2), proxy);
+                    geo
+                }
+                NodeKind::RbdConfigure(settings) => {
+                    let geo = input(0, cache);
+                    let (glue, proxy) = (input(1, cache), input(2, cache));
+                    cache.insert(out_key(id, 1), glue);
+                    cache.insert(out_key(id, 2), proxy);
+                    match groups::point_mask(&geo, &node.group) {
+                        Ok(mask) => bullet::configure(&geo, settings, mask.as_deref()),
+                        Err(e) => self.report(id, Err(e)),
+                    }
+                }
+                NodeKind::Pack(settings) => self.report(id, packed::pack(&input(0, cache), settings)),
+                NodeKind::Unpack { transfer } => packed::unpack(&input(0, cache), *transfer),
+                NodeKind::MaterialFracture(settings) => {
+                    let (geo, constraints, proxy) = (input(0, cache), input(1, cache), input(2, cache));
+                    match fracture::fracture_all(&geo, &constraints, &proxy, settings) {
+                        Ok((pieces, glue, shapes)) => {
+                            cache.insert(out_key(id, 1), glue);
+                            cache.insert(out_key(id, 2), shapes);
+                            self.report(id, Ok(pieces))
+                        }
+                        Err(e) => self.report(id, Err(e)),
+                    }
+                }
                 NodeKind::MaterialAssign { slots } => self.report(id, material_assign(&input(0, cache), slots)),
                 NodeKind::Measure(settings) => self.report(id, measure::measure(&input(0, cache), settings)),
+                NodeKind::PointDeform(settings) => self.report(id, deform::point_deform(&input(0, cache), &input(1, cache), &input(2, cache), settings)),
+                NodeKind::TransformPieces => {
+                    let rest = self.input_of(id, 2).map(|_| input(2, cache));
+                    self.report(id, deform::transform_pieces(&input(0, cache), &input(1, cache), rest.as_ref()))
+                }
                 NodeKind::ForEachBegin => match FOREACH_INPUT.with(|m| m.borrow().get(&id).cloned()) {
                     Some(iteration) => iteration,
                     // Viewed on its own: the first iteration.
@@ -6464,7 +6723,7 @@ impl Graph {
                 NodeKind::Wrangle { code, domain } => format!("{}:{}", domain, encode_text(code)),
                 NodeKind::MoonRayRender { executable, arguments, output, width, height, samples, opts } => {
                     format!(
-                        "mr:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                        "mr:{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                         encode_text(executable),
                         encode_text(arguments),
                         encode_text(output),
@@ -6488,6 +6747,7 @@ impl Graph {
                         opts.range_step,
                         opts.stage as u8,
                         opts.volume_samples,
+                        opts.hydra as u8,
                     )
                 }
                 kind => match kind.texts() {
@@ -6518,7 +6778,11 @@ impl Graph {
             );
         }
         for l in &self.links {
-            s += &format!("link {} {} {}\n", l.from, l.to, l.slot);
+            if l.out == 0 {
+                s += &format!("link {} {} {}\n", l.from, l.to, l.slot);
+            } else {
+                s += &format!("link {} {} {} {}\n", l.from, l.to, l.slot, l.out);
+            }
         }
         for id in self.nodes.keys().copied().collect::<std::collections::BTreeSet<_>>() {
             if let Some(parent) = self.nodes[&id].parent {
@@ -6659,6 +6923,7 @@ impl Graph {
                             range_step: fields.as_ref().and_then(|v| v.get(16)).and_then(|v| v.parse::<f32>().ok()).unwrap_or(defaults.range_step).max(1e-4),
                             stage: parse(17, 0) != 0,
                             volume_samples: parse(18, defaults.volume_samples).clamp(1, 16),
+                            hydra: parse(19, 0) != 0,
                         };
                         if let (Ok(id), Ok(x), Ok(y)) = (id.parse::<usize>(), x.parse::<f32>(), y.parse::<f32>()) {
                             g.nodes.insert(
@@ -6715,7 +6980,12 @@ impl Graph {
                 }
                 ["link", a, b, s] => {
                     if let (Ok(from), Ok(to), Ok(slot)) = (a.parse(), b.parse(), s.parse()) {
-                        g.links.push(Link { from, to, slot });
+                        g.links.push(Link { from, to, slot, out: 0 });
+                    }
+                }
+                ["link", a, b, s, o] => {
+                    if let (Ok(from), Ok(to), Ok(slot), Ok(out)) = (a.parse(), b.parse(), s.parse(), o.parse()) {
+                        g.links.push(Link { from, to, slot, out });
                     }
                 }
                 ["chan", id, name, x, y, z] => {
@@ -7099,6 +7369,13 @@ fn in_port(rect: egui::Rect, slot: usize, n: usize) -> egui::Pos2 {
 }
 fn out_port(rect: egui::Rect) -> egui::Pos2 {
     egui::pos2(rect.center().x, rect.bottom())
+}
+// Output `slot` of `n` along the bottom (one output: the centre).
+fn out_port_n(rect: egui::Rect, slot: usize, n: usize) -> egui::Pos2 {
+    if n <= 1 {
+        return out_port(rect);
+    }
+    egui::pos2(rect.left() + rect.width() * (slot as f32 + 1.0) / (n as f32 + 1.0), rect.bottom())
 }
 fn draw_wire(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, color: egui::Color32) {
     let d = ((b.y - a.y).abs() * 0.5).max(30.0);
@@ -7567,7 +7844,8 @@ struct GroupPick {
 struct ProceduralFxStudioApp {
     graph: Graph,
     selected: Option<NodeId>,
-    dragging_link: Option<NodeId>,
+    // The output being wired: (node, output).
+    dragging_link: Option<(NodeId, usize)>,
     graph_pan: egui::Vec2,
     graph_zoom: f32,
     menu_pos: egui::Pos2,
@@ -8784,6 +9062,7 @@ impl ProceduralFxStudioApp {
                     usd::AttrValue::Float(f) => format!("{f:.4}"),
                     usd::AttrValue::Vec3(v) => format!("{:.3}, {:.3}, {:.3}", v[0], v[1], v[2]),
                     usd::AttrValue::Token(t) => t.clone(),
+                    usd::AttrValue::Bool(b) => b.to_string(),
                 });
                 ui.end_row();
             }
@@ -9302,6 +9581,7 @@ impl ProceduralFxStudioApp {
                         });
                         ui.checkbox(&mut self.moonray_default_opts.stage, "Render the STAGE (USD) instead of the OBJ objects")
                             .on_hover_text("Uses the displayed LOP's stage: its meshes, materials, lights and (with the Auto camera) its first camera");
+                        hydra_checkbox(ui, &mut self.moonray_default_opts);
                     });
 
                     egui::CollapsingHeader::new("Sampling").default_open(true).show(ui, |ui| {
@@ -9499,6 +9779,20 @@ impl ProceduralFxStudioApp {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or_default();
+        // Through Hydra: hd_render reads the stage as USD, and renders through its first camera.
+        let hydra = self.render_opts.stage && self.render_opts.hydra;
+        let mut hydra_camera = None;
+        let scene_path = if hydra {
+            let usda = tmp.join(format!("proceduralfx_stage_{ts}.usda"));
+            match self.write_hydra_scene(&usda) {
+                Ok(camera) => hydra_camera = camera,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            }
+            usda
+        } else {
         let scene_filename = format!("proceduralfx_scene_{}.obj", ts);
         let scene_path = tmp.join(scene_filename);
         let scene = match self.render_scene() {
@@ -9527,7 +9821,8 @@ impl ProceduralFxStudioApp {
         let rdla_result = self.export_scene_rdla(&rdla_path, &scene, width, height, samples);
         // If RDLA export succeeded, use it as the scene input; otherwise
         // fall back to the OBJ we wrote above.
-        let scene_path = if rdla_result.is_ok() { rdla_path } else { scene_path };
+        if rdla_result.is_ok() { rdla_path } else { scene_path }
+        };
 
         let replace = |text: &str| {
             text.replace("{scene}", &scene_path.to_string_lossy())
@@ -9554,6 +9849,16 @@ impl ProceduralFxStudioApp {
                             break;
                         }
                     }
+                }
+            }
+        }
+
+        if hydra {
+            match find_hd_render(&exe_path) {
+                Some(path) => exe_path = path,
+                None => {
+                    self.status = "Render through Hydra: hd_render was not found (next to MoonRay, in the app, or on PATH)".into();
+                    return;
                 }
             }
         }
@@ -9648,9 +9953,10 @@ impl ProceduralFxStudioApp {
         self.render_log_path = Some(log_path.clone());
         self.render_started = Some(Instant::now());
         let extra_args = self.render_extra_args.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
-        self.status = format!("Rendering with MoonRay: {executable_to_run}");
+        self.status = format!("Rendering with {}: {executable_to_run}", if hydra { "Hydra (hdMoonray)" } else { "MoonRay" });
         // The Render Viewer opens on every render; bucket mode streams the image into it.
-        let progress = self.bucket_render.then(|| Arc::new(std::sync::Mutex::new(render_viewer::RenderProgress::new(width, height))));
+        // hd_render only writes the finished image.
+        let progress = (self.bucket_render && !hydra).then(|| Arc::new(std::sync::Mutex::new(render_viewer::RenderProgress::new(width, height))));
         match &progress {
             Some(progress) => self.viewer.watch(progress.clone()),
             None => self.viewer.show(),
@@ -9658,8 +9964,21 @@ impl ProceduralFxStudioApp {
         let exec_run = executable_to_run.clone();
         let copy_back_target_clone = copy_back_target.clone();
         let requested_output = output.clone();
+        let scene_for_hydra = scene_path.to_string_lossy().into_owned();
+        let hydra_env = hydra.then(|| hydra_plugin_path(&PathBuf::from(&exec_run))).flatten();
         std::thread::spawn(move || {
-                let raw_tokens = arguments.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+                // hd_render takes the stage and output directly; MoonRay's argument template doesn't apply.
+                let raw_tokens = if hydra {
+                    // hdMoonray's in-process renderer: the default one renders through Arras, which
+                    // runs MoonRay as a separate compute process with its own session setup.
+                    let mut tokens = vec!["-renderer".to_string(), "HdMoonrayRendererDebugPlugin".into(), "-in".into(), scene_for_hydra.clone(), "-out".into(), output_path.clone(), "-size".into(), width.to_string(), height.to_string()];
+                    if let Some(camera) = &hydra_camera {
+                        tokens.extend(["-camera".to_string(), camera.clone()]);
+                    }
+                    tokens
+                } else {
+                    arguments.split_whitespace().map(str::to_owned).collect::<Vec<_>>()
+                };
                 // Map common templates/flags to MoonRay CLI (-in, -out, -size).
                 let mut args = Vec::new();
                 let mut i = 0usize;
@@ -9750,7 +10069,10 @@ impl ProceduralFxStudioApp {
                     args.push(output_path.clone());
                 }
 
-                args.extend(extra_args);
+                // Extra flags are MoonRay's; hd_render rejects flags it doesn't know.
+                if !hydra {
+                    args.extend(extra_args);
+                }
                 let mut dso_paths: Option<String> = None;
                 // If running from inside an app bundle, help MoonRay find its
                 // RDL DSOs by setting RDL2_DSO_PATH to the bundle Resources
@@ -9787,6 +10109,11 @@ impl ProceduralFxStudioApp {
                     if let Some(paths) = &dso_paths {
                         cmd.env("RDL2_DSO_PATH", paths);
                     }
+                    // hdMoonray's USD plugin: the bundled one is found next to USD itself.
+                    if let Some(plugins) = &hydra_env {
+                        let existing = std::env::var("PXR_PLUGINPATH_NAME").unwrap_or_default();
+                        cmd.env("PXR_PLUGINPATH_NAME", if existing.is_empty() { plugins.clone() } else { format!("{plugins}:{existing}") });
+                    }
                     cmd
                 };
                 let outcome: Result<(), String> = match &progress {
@@ -9797,7 +10124,7 @@ impl ProceduralFxStudioApp {
                             if status.success() {
                                 Ok(())
                             } else {
-                                Err(format!("MoonRay exited with {status}: {}", read_log_tail(&log_path, 600).trim()))
+                                Err(format!("{} exited with {status}: {}", if hydra { "hd_render" } else { "MoonRay" }, read_log_tail(&log_path, 600).trim()))
                             }
                         }),
                 };
@@ -10756,6 +11083,28 @@ impl ProceduralFxStudioApp {
     }
 
     // Active geometries with their MAT assignment, regardless of which network the viewport shows.
+    // The displayed USD stage written for hd_render; returns the camera to render
+    // through (the stage's first camera with the Auto camera, else hd_render's own view).
+    fn write_hydra_scene(&self, path: &std::path::Path) -> Result<Option<String>, String> {
+        let display = self.graph.display_of(STAGE_NETWORK).ok_or("Render STAGE: no LOP node has the display flag in the STAGE network")?;
+        let time = self.render_at.unwrap_or(self.time);
+        let mut stage = (*self.graph.cook_stage(display, time, &mut HashMap::new())).clone();
+        // Light the stage as the MoonRay render does: normalized lights (brightness doesn't
+        // depend on their size; USD's default isn't), with the same sphere light scale.
+        for prim in stage.prims.values_mut().filter(|prim| prim.is_light() && prim.type_name != "DomeLight") {
+            prim.attrs.insert("normalize".into(), usd::AttrValue::Bool(true));
+            if prim.type_name == "SphereLight" {
+                if let Some(usd::AttrValue::Float(intensity)) = prim.attrs.get_mut("intensity") {
+                    *intensity *= POINT_LIGHT_SCALE;
+                }
+            }
+        }
+        std::fs::write(path, usd::to_usda(&stage)).map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+        let auto = self.render_opts.camera == RenderCamera::Auto;
+        // hd_render wants the camera path relative to the stage root.
+        Ok(stage.prims.iter().find(|(p, prim)| auto && prim.type_name == "Camera" && stage.is_shown(p)).map(|(p, _)| p.trim_start_matches('/').to_string()))
+    }
+
     fn render_scene_parts(&self) -> Vec<(Mesh, Option<NodeId>)> {
         let material_of = |id: NodeId| match self.graph.nodes.get(&id).map(|n| &n.kind) {
             Some(NodeKind::Geometry { material }) => *material,
@@ -10774,7 +11123,10 @@ impl ProceduralFxStudioApp {
         let mut cache = self.static_cache.clone();
         active
             .into_iter()
-            .map(|id| (self.graph.cook(id, time, &mut cache), material_of(id)))
+            .map(|id| {
+                let mesh = self.graph.cook(id, time, &mut cache);
+                (if packed::is_packed(&mesh) { packed::unpack(&mesh, true) } else { mesh }, material_of(id))
+            })
             .filter(|(mesh, _)| !mesh.indices.is_empty() || volume::is_volume(mesh) || groom::has_curves(mesh) || renders_points(mesh))
             .collect()
     }
@@ -11858,6 +12210,7 @@ impl ProceduralFxStudioApp {
         ui.heading(match &node.kind {
             NodeKind::Vop(v) => format!("{} · {title}", v.def().label),
             NodeKind::ShaderNode(n) => format!("{} · {title}", n.def().label),
+            _ if !node.name.trim().is_empty() => format!("{title} · {}", node.type_label()),
             _ => title,
         });
         let mut c = false;
@@ -12672,15 +13025,26 @@ impl ProceduralFxStudioApp {
                 c |= ui.add(egui::Slider::new(smoothing, 0..=3).text("Smoothing")).changed();
                 ui.small("Nearby particles are unioned into one fluid-like surface before polygon extraction.");
             }
-            NodeKind::Extrude { dist, inset, mode } => {
-                ui.horizontal(|ui| {
-                    ui.label("Mode:");
-                    c |= ui.selectable_value(mode, 0, "Individual polygons").changed();
-                    c |= ui.selectable_value(mode, 1, "Whole surface").changed();
-                });
-                c |= ui.add(egui::Slider::new(dist, -2.0..=2.0).text("Distance")).changed();
-                c |= ui.add(egui::Slider::new(inset, 0.0..=1.0).text("Inset")).changed();
-                ui.small("Whole surface shares vertices and creates walls only along open boundaries.");
+            NodeKind::Extrude(set) => {
+                ui.small("Extrudes the node's group (or everything) along the normals. Faces outside the group stay as they are.");
+                c |= ui.checkbox(&mut set.connected, "Keep shared points together").on_hover_text("On: connected faces extrude as one, with walls only around the outside. Off: every face on its own").changed();
+                c |= ui.add(egui::Slider::new(&mut set.distance, -10.0..=10.0).text("Distance")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.inset, 0.0..=1.0).text("Inset")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.divisions, 1..=50).text("Divisions")).changed();
+                ui.separator();
+                ui.strong("Output");
+                c |= ui.checkbox(&mut set.output_front, "Output front").changed();
+                c |= ui.checkbox(&mut set.output_back, "Output back").on_hover_text("Keep the original faces (flipped), closing the shape").changed();
+                c |= ui.checkbox(&mut set.output_side, "Output side").changed();
+                c |= ui.checkbox(&mut set.make_groups, "Output groups").changed();
+                if set.make_groups {
+                    for (label, name) in [("Front group", &mut set.front_group), ("Side group", &mut set.side_group), ("Back group", &mut set.back_group)] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            c |= ui.add(egui::TextEdit::singleline(name).desired_width(140.0)).changed();
+                        });
+                    }
+                }
             }
             NodeKind::Clip { axis, offset, invert } => {
                 ui.horizontal(|ui| {
@@ -12785,6 +13149,7 @@ impl ProceduralFxStudioApp {
                     render_camera_combo(ui, &mut opts.camera, &camera_ids);
                 });
                 c |= ui.checkbox(&mut opts.stage, "Render the STAGE (USD) instead of the OBJ objects").changed();
+                c |= hydra_checkbox(ui, opts);
                 c |= ui.add(egui::DragValue::new(width).range(1..=16384).prefix("Width ")).changed();
                 c |= ui.add(egui::DragValue::new(height).range(1..=16384).prefix("Height ")).changed();
                 c |= ui.add(egui::DragValue::new(samples).range(1..=4096).prefix("Samples per pixel ")).changed();
@@ -13134,6 +13499,15 @@ impl ProceduralFxStudioApp {
                     ui.small("Exact keeps sharp edges. Use Volume for very dense or leaky meshes.");
                 }
             }
+            NodeKind::PointDeform(set) => {
+                ui.small("Input 1: geometry • Input 2: rest points • Input 3: the same points, moved (a simulation, a lattice, an animated cloud). The geometry follows them, bending and turning.");
+                c |= ui.add(egui::Slider::new(&mut set.influences, 1..=32).text("Points followed")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.fit_neighbours, 3..=64).text("Rotation from neighbours")).changed();
+                c |= ui.checkbox(&mut set.rotate, "Follow rotation").changed();
+            }
+            NodeKind::TransformPieces => {
+                ui.small("Input 1: geometry with `piece` (or `name`) • Input 2: one point per piece with P, orient or transform, pscale • Input 3 (optional): the template points at rest. Each piece moves rigidly with its point.");
+            }
             NodeKind::Measure(set) => {
                 egui::ComboBox::from_label("Measure").selected_text(measure::KINDS[set.kind.min(6)]).show_ui(ui, |ui| {
                     for (value, label) in measure::KINDS.iter().enumerate() {
@@ -13327,7 +13701,73 @@ impl ProceduralFxStudioApp {
                     }
                 }
                 c |= ui.add(egui::Slider::new(&mut set.separate, 0.0..=1.0).text("Explode view")).on_hover_text("Moves pieces apart to see the cracks").changed();
+                c |= ui.add(egui::Slider::new(&mut set.glue_strength, 0.0..=100_000.0).logarithmic(true).text("Glue strength")).on_hover_text("How hard the constraints between pieces hold in the RBD Bullet Solver").changed();
+                ui.small("Outputs: 1 pieces · 2 glue constraints (lines between neighbouring pieces) · 3 proxy collision shapes. Wire all three into an RBD Bullet Solver.");
                 c |= ui.add(egui::Slider::new(&mut set.seed, 0..=9999).text("Seed")).changed();
+            }
+            NodeKind::RbdBullet(set) => {
+                ui.small("Inputs: 1 pieces (piece attribute) · 2 glue constraints · 3 proxy collision shapes · 4 static collision geometry. Wire Material Fracture's three outputs straight in. Outputs the moved pieces, the constraints still holding, and the moved proxies.");
+                c |= ui.add(egui::Slider::new(&mut set.density, 0.01..=100.0).logarithmic(true).text("Density")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.friction, 0.0..=2.0).text("Friction")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.bounce, 0.0..=1.0).text("Bounce")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.gravity, -30.0..=30.0).text("Gravity")).changed();
+                c |= ui.add(egui::Slider::new(&mut set.glue_scale, 0.0..=100.0).logarithmic(true).text("Glue strength ×")).on_hover_text("Scales every constraint's strength; 0 breaks all glue at the start").changed();
+                c |= ui.add(egui::Slider::new(&mut set.substeps, 1..=32).text("Substeps")).changed();
+                c |= ui.checkbox(&mut set.ground, "Ground plane").changed();
+                if set.ground {
+                    c |= ui.add(egui::DragValue::new(&mut set.ground_height).speed(0.01).prefix("Ground height: ")).changed();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Initial velocity");
+                    for k in 0..3 {
+                        c |= ui.add(egui::DragValue::new(&mut set.velocity[k]).speed(0.05)).changed();
+                    }
+                });
+                ui.small("RBD Configure sets density, friction, bounce, active and velocity per piece.");
+            }
+            NodeKind::RbdConfigure(set) => {
+                ui.small("Sets physical properties on the pieces in the node's group (all when empty), for the RBD Bullet Solver. Constraints and proxy pass through.");
+                for (on, label, value, range) in [
+                    (&mut set.set_density, "Density", &mut set.density, 0.01..=100.0),
+                    (&mut set.set_friction, "Friction", &mut set.friction, 0.0..=2.0),
+                    (&mut set.set_bounce, "Bounce", &mut set.bounce, 0.0..=1.0),
+                ] {
+                    ui.horizontal(|ui| {
+                        c |= ui.checkbox(on, "").changed();
+                        c |= ui.add_enabled(*on, egui::Slider::new(value, range).text(label)).changed();
+                    });
+                }
+                ui.horizontal(|ui| {
+                    c |= ui.checkbox(&mut set.set_active, "").changed();
+                    c |= ui.add_enabled(set.set_active, egui::Checkbox::new(&mut set.active, "Active (off: static, others still hit it)")).changed();
+                });
+                ui.horizontal(|ui| {
+                    c |= ui.checkbox(&mut set.set_velocity, "").changed();
+                    ui.add_enabled_ui(set.set_velocity, |ui| {
+                        ui.label("Velocity");
+                        for k in 0..3 {
+                            c |= ui.add(egui::DragValue::new(&mut set.velocity[k]).speed(0.05)).changed();
+                        }
+                    });
+                });
+            }
+            NodeKind::Pack(set) => {
+                ui.small("Turns each piece into one point (P, transform, piece) whose geometry is stored once: cheap to move, copy and merge. The viewport and renders show the real geometry; Unpack turns it back.");
+                egui::ComboBox::from_label("Pack").selected_text(packed::MODES[set.mode.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in packed::MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.mode, value, *label).changed();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pivot");
+                    for (value, label) in packed::PIVOTS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.pivot, value, *label).changed();
+                    }
+                });
+            }
+            NodeKind::Unpack { transfer } => {
+                ui.small("Turns packed points back into geometry at their transform (P, transform, or orient and pscale).");
+                c |= ui.checkbox(transfer, "Transfer the packed points' attributes (Cd, piece…)").changed();
             }
             NodeKind::CrowdSolver(set) => {
                 ui.small("Input 1: start points (e.g. Scatter on a grid) • Input 2: optional ground to walk on • Input 3: optional obstacles.");
@@ -14152,15 +14592,15 @@ impl ProceduralFxStudioApp {
             if let (Some(a), Some(b)) = (self.graph.nodes.get(&l.from), self.graph.nodes.get(&l.to)) {
                 if a.context != self.context || b.context != self.context { continue; }
                 if a.parent != view_parent || b.parent != view_parent { continue; }
-                let p0 = out_port(node_rect(a.pos, origin, self.graph_zoom));
-                let p1 = in_port(node_rect(b.pos, origin, self.graph_zoom), l.slot, b.kind.num_inputs());
+                let p0 = out_port_n(node_rect(a.pos, origin, self.graph_zoom), l.out, a.kind.num_outputs());
+                let p1 = in_port(node_rect(b.pos, origin, self.graph_zoom), l.slot, self.graph.input_slots(l.to));
                 draw_wire(&painter, p0, p1, egui::Color32::from_gray(170));
             }
         }
 
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let released = ui.input(|i| i.pointer.any_released());
-        let mut new_link: Option<(NodeId, NodeId, usize)> = None;
+        let mut new_link: Option<((NodeId, usize), NodeId, usize)> = None;
         let mut disconnects: Vec<(NodeId, usize)> = Vec::new();
 
         let mut ids: Vec<NodeId> = self
@@ -14231,16 +14671,24 @@ impl ProceduralFxStudioApp {
 
             let node = &self.graph.nodes[&id];
             let rect = node_rect(node.pos, origin, self.graph_zoom);
-            let n_in = node.kind.num_inputs();
+            let n_in = self.graph.input_slots(id);
 
-            let op = out_port(rect);
-            let op_resp = ui.interact(
-                egui::Rect::from_center_size(op, egui::vec2(16.0, 16.0)),
-                ui.id().with(("out", id)),
-                egui::Sense::drag(),
-            );
-            if op_resp.drag_started() {
-                self.dragging_link = Some(id);
+            let n_out = node.kind.num_outputs();
+            let (input_names, output_names) = node.kind.port_names();
+            for out in 0..n_out {
+                let op = out_port_n(rect, out, n_out);
+                let op_resp = ui.interact(
+                    egui::Rect::from_center_size(op, egui::vec2(16.0, 16.0)),
+                    ui.id().with(("out", id, out)),
+                    egui::Sense::drag(),
+                );
+                let op_resp = match output_names.get(out) {
+                    Some(name) => op_resp.on_hover_text(format!("Output: {name}")),
+                    None => op_resp,
+                };
+                if op_resp.drag_started() {
+                    self.dragging_link = Some((id, out));
+                }
             }
 
             for slot in 0..n_in {
@@ -14263,6 +14711,9 @@ impl ProceduralFxStudioApp {
                 };
                 if ip_resp.clicked() {
                     disconnects.push((id, slot));
+                }
+                if let Some(name) = input_names.get(slot) {
+                    let _ = ui.interact(egui::Rect::from_center_size(ip, egui::vec2(16.0, 16.0)), ui.id().with(("in-name", id, slot)), egui::Sense::hover()).on_hover_text(format!("Input: {name}"));
                 }
                 if let (Some(src), Some(p)) = (self.dragging_link, pointer) {
                     if released && p.distance(ip) < 16.0 {
@@ -14332,13 +14783,24 @@ impl ProceduralFxStudioApp {
                 painter.circle_filled(rect.right_center() - egui::vec2(14.0 * self.graph_zoom, 0.0), 6.0 * self.graph_zoom, swatch);
             }
             let label = format!("{}{}", node.title(id), if node.bypass { " (byp)" } else { "" });
+            let renamed = !node.name.trim().is_empty();
             painter.text(
-                rect.center(),
+                if renamed { rect.center() - egui::vec2(0.0, 6.0 * self.graph_zoom) } else { rect.center() },
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::proportional(14.0),
                 egui::Color32::WHITE,
             );
+            // A renamed node still says what it is.
+            if renamed {
+                painter.text(
+                    rect.center() + egui::vec2(0.0, 9.0 * self.graph_zoom),
+                    egui::Align2::CENTER_CENTER,
+                    node.type_label(),
+                    egui::FontId::proportional(10.5 * self.graph_zoom.max(0.5)),
+                    egui::Color32::from_gray(185),
+                );
+            }
             // TOP nodes: a dot per work item from the last cook, like Houdini's.
             if let Some(states) = self.top_results.get(&id).filter(|_| matches!(node.kind, NodeKind::Top(_))) {
                 let r = 3.0 * self.graph_zoom;
@@ -14361,7 +14823,10 @@ impl ProceduralFxStudioApp {
                     if hot { egui::Color32::YELLOW } else { egui::Color32::from_gray(200) },
                 );
             }
-            painter.circle_filled(op, 5.0, egui::Color32::from_gray(200));
+            let n_out = node.kind.num_outputs();
+            for out in 0..n_out {
+                painter.circle_filled(out_port_n(rect, out, n_out), 5.0, egui::Color32::from_gray(200));
+            }
         }
 
         for (id, slot) in disconnects {
@@ -14369,19 +14834,19 @@ impl ProceduralFxStudioApp {
             self.dirty = true;
         }
 
-        if let (Some(src), Some(p)) = (self.dragging_link, pointer) {
+        if let (Some((src, out)), Some(p)) = (self.dragging_link, pointer) {
             if let Some(n) = self.graph.nodes.get(&src) {
                 draw_wire(
                     &painter,
-                    out_port(node_rect(n.pos, origin, self.graph_zoom)),
+                    out_port_n(node_rect(n.pos, origin, self.graph_zoom), out, n.kind.num_outputs()),
                     p,
                     egui::Color32::YELLOW,
                 );
             }
         }
         if released {
-            if let Some((a, b, s)) = new_link {
-                if self.graph.connect(a, b, s) {
+            if let Some(((a, out), b, s)) = new_link {
+                if self.graph.connect_out(a, out, b, s) {
                     self.dirty = true;
                 } else {
                     self.status = "Connection refused: would create a cycle".into();
@@ -16235,6 +16700,7 @@ mod tests {
             range_end: 2.0,
             range_step: 0.25,
             stage: true,
+            hydra: true,
             volume_samples: 3,
         };
         let r = g.add(
@@ -18419,5 +18885,153 @@ mod add_measure_tests {
         g.connect(cube, measure, 0);
         let m = g.cook(measure, 0.0, &mut HashMap::new());
         assert!((m.point_attributes["detail:area"][0] - 6.0).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod param_name_tests {
+    use super::*;
+
+    #[test]
+    fn every_parameter_has_a_name() {
+        for (_, kinds) in NodeKind::templates() {
+            for kind in kinds {
+                let (params, names) = (kind.params(), kind.param_names());
+                assert!(names.len() <= params.len(), "{}: {} names for {} params", kind.name(), names.len(), params.len());
+                for (_, label) in kind.animatable() {
+                    assert!(!label.starts_with("parm"), "{} still has {label}", kind.name());
+                }
+                // Fixed-size nodes name every parameter (variable lists and table nodes may leave some unnamed).
+                let variable = matches!(kind, NodeKind::Add { .. } | NodeKind::Blast { .. } | NodeKind::AttributePaint { .. } | NodeKind::ObjectMerge { .. } | NodeKind::MaterialAssign { .. } | NodeKind::Cache { .. } | NodeKind::Wrangle { .. } | NodeKind::MoonRayRender { .. } | NodeKind::Vop(_) | NodeKind::CompileEnd { .. } | NodeKind::Geometry { .. } | NodeKind::LopSopImport { .. } | NodeKind::LopMaterial { .. } | NodeKind::Light { .. } | NodeKind::Camera { .. } | NodeKind::EnvironmentLight { .. } | NodeKind::RigPose(_) | NodeKind::SolverInput { .. } | NodeKind::AttributeVop { .. });
+                // Table nodes always store their operation first; only the rest needs names.
+                let table_only_op = matches!(kind, NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::ShaderNode(_));
+                if !variable && !table_only_op && !params.is_empty() {
+                    assert!(!kind.animatable().is_empty(), "{} has parameters but none named", kind.name());
+                }
+            }
+        }
+        let names: Vec<String> = NodeKind::Box { size: 1.0, div: 1 }.animatable().into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["size", "divisions"]);
+        let mut node = Graph::default();
+        let id = node.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        node.nodes.get_mut(&id).unwrap().name = "crate".into();
+        assert_eq!(node.nodes[&id].type_label(), "Box");
+    }
+}
+
+#[cfg(test)]
+mod destruction_chain_tests {
+    use super::*;
+
+    #[test]
+    fn fracture_outputs_feed_the_bullet_solver() {
+        let mut g = Graph::default();
+        g.next_id += 10_100;
+        let block = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let lift = g.add(NodeKind::Transform { t: [0.0, 2.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        g.connect(block, lift, 0);
+        let frac = g.add(NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 6, ..fracture::FractureSettings::defaults(0) }), egui::pos2(0.0, 0.0));
+        g.connect(lift, frac, 0);
+        let config = g.add(NodeKind::RbdConfigure(bullet::ConfigureSettings::defaults()), egui::pos2(0.0, 0.0));
+        let solver = g.add(NodeKind::RbdBullet(bullet::BulletSettings::defaults()), egui::pos2(0.0, 0.0));
+        for out in 0..3 {
+            assert!(g.connect_out(frac, out, config, out));
+            assert!(g.connect_out(config, out, solver, out));
+        }
+        // Each output is its own geometry.
+        let glue = g.cook_output(frac, 1, 0.0, &mut HashMap::new());
+        let proxy = g.cook_output(frac, 2, 0.0, &mut HashMap::new());
+        assert!(!glue.vertices.is_empty() && glue.point_attributes.contains_key(fracture::CONSTRAINT_PIECE));
+        assert!(!proxy.indices.is_empty());
+        assert_eq!(g.cook_output(config, 1, 0.0, &mut HashMap::new()).vertices.len(), glue.vertices.len(), "configure passes constraints through");
+        assert!(g.time_dependent(solver));
+        sims::clear_all();
+        let landed = g.cook(solver, 2.0, &mut HashMap::new());
+        assert!(node_errors(|e| e.get(&solver).cloned()).is_none());
+        let (lo, _) = landed.bounds().unwrap();
+        assert!(lo.y < 0.3 && lo.y > -0.05, "fell onto the ground: {}", lo.y);
+        let moved_proxy = g.cook_output(solver, 2, 2.0, &mut HashMap::new());
+        assert_eq!(moved_proxy.vertices.len(), proxy.vertices.len());
+        // Links remember their outputs through save and load.
+        let loaded = Graph::deserialize(&g.serialize());
+        assert_eq!(loaded.input_link(solver, 2), Some((config, 2)));
+        assert_eq!(loaded.input_link(config, 1), Some((frac, 1)));
+        // Merge takes any number of inputs, and closes gaps when one is removed.
+        let merge = g.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
+        for i in 0..3 {
+            let b = g.add(NodeKind::Box { size: 1.0 + i as f32, div: 1 }, egui::pos2(0.0, 0.0));
+            assert_eq!(g.input_slots(merge), (i + 1).max(2), "always one free port");
+            g.connect(b, merge, i);
+        }
+        assert_eq!(g.cook(merge, 0.0, &mut HashMap::new()).vertices.len(), 24);
+        assert_eq!(g.input_slots(merge), 4);
+        g.disconnect(merge, 0);
+        assert_eq!(g.input_slots(merge), 3, "the gap closed: two inputs and a free port");
+        assert!(g.input_link(merge, 0).is_some() && g.input_link(merge, 2).is_none());
+        // Pack, move, unpack: the pieces come back turned with their points.
+        let pack = g.add(NodeKind::Pack(packed::PackSettings::defaults()), egui::pos2(0.0, 0.0));
+        g.connect(frac, pack, 0);
+        let spin = g.add(NodeKind::Transform { t: [0.0; 3], r: [0.0, 90.0, 0.0], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        g.connect(pack, spin, 0);
+        let unpack = g.add(NodeKind::Unpack { transfer: true }, egui::pos2(0.0, 0.0));
+        g.connect(spin, unpack, 0);
+        let packed_points = g.cook(pack, 0.0, &mut HashMap::new());
+        assert!(packed::is_packed(&packed_points) && packed_points.indices.is_empty());
+        let direct = g.cook(frac, 0.0, &mut HashMap::new());
+        let turned = node_transform(direct.clone(), [0.0; 3], [0.0, 90.0, 0.0], [1.0; 3]);
+        let unpacked = g.cook(unpack, 0.0, &mut HashMap::new());
+        let key = |m: &Mesh| { let mut v: Vec<(i32, i32, i32)> = m.vertices.iter().map(|p| ((p.x * 1000.0).round() as i32, (p.y * 1000.0).round() as i32, (p.z * 1000.0).round() as i32)).collect(); v.sort(); v };
+        assert_eq!(key(&unpacked), key(&turned));
+    }
+}
+
+#[cfg(test)]
+mod hydra_render_tests {
+    use super::*;
+
+    // Renders a STAGE network through Hydra (hd_render + hdMoonray):
+    // `PFX_HD_RENDER=… PFX_HYDRA_PLUGIN_PATH=… RDL2_DSO_PATH=… cargo test -- --ignored stage_renders_through_hydra`.
+    #[test]
+    #[ignore]
+    fn stage_renders_through_hydra() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let cube = app.graph.add(NodeKind::Box { size: 2.0, div: 1 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&cube).unwrap().parent = Some(geo);
+        app.graph.set_display(cube);
+        let lops = [
+            NodeKind::LopSopImport { geometry: Some(geo), path: "/geo".into() },
+            NodeKind::LopLight { kind: 0, path: "/lights/sun".into(), position: [3.0, 5.0, 4.0], target: [0.0; 3], color: [1.0; 3], intensity: 2.0, size: 0.53 },
+            NodeKind::LopCamera { path: "/cam".into(), position: [3.0, 3.0, 6.0], target: [0.0; 3], focal: 35.0, aperture: 36.0 },
+        ];
+        let ids: Vec<NodeId> = lops.into_iter().map(|kind| app.graph.add(kind, egui::pos2(0.0, 0.0))).collect();
+        for pair in ids.windows(2) {
+            app.graph.connect(pair[0], pair[1], 0);
+        }
+        for id in &ids {
+            app.graph.nodes.get_mut(id).unwrap().context = AppContext::Stage;
+        }
+        app.graph.set_display(ids[2]);
+        app.render_opts = RenderOpts { stage: true, hydra: true, ..RenderOpts::default() };
+
+        let dir = std::env::temp_dir();
+        let usda = dir.join("pfx_hydra_test.usda");
+        let exr = dir.join("pfx_hydra_test.exr");
+        let camera = app.write_hydra_scene(&usda).unwrap();
+        assert_eq!(camera.as_deref(), Some("cam"));
+        assert!(std::fs::read_to_string(&usda).unwrap().contains("bool inputs:normalize = 1"));
+        let hd_render = find_hd_render(std::path::Path::new("moonray")).expect("set PFX_HD_RENDER");
+        let output = Command::new(&hd_render)
+            .env("PXR_PLUGINPATH_NAME", hydra_plugin_path(&hd_render).expect("set PFX_HYDRA_PLUGIN_PATH"))
+            .args(["-renderer", "HdMoonrayRendererDebugPlugin", "-in", usda.to_str().unwrap(), "-out", exr.to_str().unwrap(), "-size", "160", "120", "-camera", "cam"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let image = image::open(&exr).unwrap().to_rgb32f();
+        let lit = image.pixels().filter(|p| p[0] > 0.1).count();
+        let brightest = image.pixels().map(|p| p[0]).fold(0.0, f32::max);
+        println!("{lit} lit pixels, brightest {brightest}");
+        assert!(lit > image.pixels().len() / 20 && brightest > 0.3, "the cube is lit like the MoonRay render");
     }
 }

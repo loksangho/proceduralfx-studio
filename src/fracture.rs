@@ -14,7 +14,7 @@
 // `inside` (new cut faces) and `outside` (the original surface).
 
 use super::{hash01, Mesh, Vec3};
-use crate::boolean::{boolean, BooleanSettings};
+use crate::boolean::{boolean_with, BooleanSettings};
 
 pub const MATERIALS: [&str; 3] = ["Concrete", "Glass", "Wood"];
 
@@ -32,17 +32,21 @@ pub struct FractureSettings {
     pub splinter: f32,
     // Moves pieces apart (fraction of their size) to show the cracks.
     pub separate: f32,
+    // Force the glue constraints between neighbouring pieces hold before breaking.
+    pub glue_strength: f32,
 }
 
 impl FractureSettings {
     pub fn defaults(material: usize) -> Self {
-        FractureSettings { material, pieces: 20, seed: 1, impact: [0.0; 3], rings: 4, spokes: 9, grain_axis: 1, splinter: 5.0, separate: 0.0 }
+        FractureSettings { material, pieces: 20, seed: 1, impact: [0.0; 3], rings: 4, spokes: 9, grain_axis: 1, splinter: 5.0, separate: 0.0, glue_strength: 200.0 }
     }
 }
 
 // A convex polyhedron as convex polygons, wound counter-clockwise from outside.
 struct Convex {
     faces: Vec<Vec<Vec3>>,
+    // The seed whose bisector made each face (None: the outer box).
+    tags: Vec<Option<usize>>,
 }
 
 impl Convex {
@@ -59,15 +63,17 @@ impl Convex {
                 vec![c(0, 0, 0), c(0, 0, 1), c(0, 1, 1), c(0, 1, 0)],
                 vec![c(1, 0, 0), c(1, 1, 0), c(1, 1, 1), c(1, 0, 1)],
             ],
+            tags: vec![None; 6],
         }
     }
 
     // Keeps the part where n·x <= w and closes the cut with a cap face.
-    fn clip(&mut self, n: Vec3, w: f32) {
+    fn clip(&mut self, n: Vec3, w: f32, tag: usize) {
         let eps = 1e-6;
         let mut cut: Vec<Vec3> = Vec::new();
         let mut faces = Vec::with_capacity(self.faces.len() + 1);
-        for face in &self.faces {
+        let mut tags = Vec::with_capacity(self.faces.len() + 1);
+        for (face, face_tag) in self.faces.iter().zip(&self.tags) {
             let mut out = Vec::new();
             for i in 0..face.len() {
                 let (a, b) = (face[i], face[(i + 1) % face.len()]);
@@ -85,6 +91,7 @@ impl Convex {
             }
             if out.len() >= 3 {
                 faces.push(out);
+                tags.push(*face_tag);
             }
         }
         if cut.len() >= 3 {
@@ -100,9 +107,19 @@ impl Convex {
             cut.dedup_by(|a, b| a.sub(*b).length() < 1e-6);
             if cut.len() >= 3 {
                 faces.push(cut);
+                tags.push(Some(tag));
             }
         }
         self.faces = faces;
+        self.tags = tags;
+    }
+
+    // Seeds whose cells touch this one.
+    fn neighbours(&self) -> Vec<usize> {
+        let mut n: Vec<usize> = self.tags.iter().flatten().copied().collect();
+        n.sort_unstable();
+        n.dedup();
+        n
     }
 
     fn to_mesh(&self) -> Mesh {
@@ -170,6 +187,16 @@ fn seeds(mesh: &Mesh, set: &FractureSettings, lo: Vec3, hi: Vec3) -> Result<Vec<
 }
 
 pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
+    fracture_all(input, &Mesh::default(), &Mesh::default(), set).map(|(geo, ..)| geo)
+}
+
+// Point attribute naming the piece each constraint end holds.
+pub const CONSTRAINT_PIECE: &str = "constraint_piece";
+
+// All three outputs: the pieces; glue constraints between neighbouring pieces
+// (two-point lines from centre to centre, plus `constraints_in`); and proxy
+// collision shapes (`proxy_in` cut the same way, else each piece's convex hull).
+pub fn fracture_all(input: &Mesh, constraints_in: &Mesh, proxy_in: &Mesh, set: &FractureSettings) -> Result<(Mesh, Mesh, Mesh), String> {
     if input.indices.is_empty() {
         return Err("the input has no polygons to fracture".into());
     }
@@ -183,12 +210,18 @@ pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
     let mut out = Mesh::default();
     let (mut piece_points, mut piece_prims, mut inside) = (Vec::new(), Vec::new(), Vec::new());
     let mut piece = 0usize;
+    let proxy_work = if proxy_in.indices.is_empty() { None } else if stretch != 1.0 { Some(scale_axis(proxy_in, set.grain_axis, 1.0 / stretch)) } else { Some(proxy_in.clone()) };
+    // Per piece: its seed, its cell's neighbours, its centre, and the proxy shape.
+    let mut seed_piece: Vec<Option<usize>> = vec![None; seeds.len()];
+    let mut cell_neighbours: Vec<Vec<usize>> = Vec::new();
+    let mut centres: Vec<Vec3> = Vec::new();
+    let mut proxy = Mesh::default();
     for (i, s) in seeds.iter().enumerate() {
         let mut cell = Convex::cuboid(blo, bhi);
         // Nearest seeds first: they cut the most, so later clips have less to do.
-        let mut others: Vec<&Vec3> = seeds.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| p).collect();
-        others.sort_by(|a, b| a.sub(*s).length().partial_cmp(&b.sub(*s).length()).unwrap_or(std::cmp::Ordering::Equal));
-        for o in others {
+        let mut others: Vec<(usize, &Vec3)> = seeds.iter().enumerate().filter(|(j, _)| *j != i).collect();
+        others.sort_by(|a, b| a.1.sub(*s).length().partial_cmp(&b.1.sub(*s).length()).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, o) in others {
             let d = o.sub(*s);
             let len = d.length();
             if len < 1e-6 {
@@ -200,7 +233,7 @@ pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
             if reach < len * 0.5 {
                 continue;
             }
-            cell.clip(n, n.dot(s.add(d.scale(0.5))));
+            cell.clip(n, n.dot(s.add(d.scale(0.5))), j);
             if cell.faces.len() < 4 {
                 break;
             }
@@ -208,7 +241,8 @@ pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
         if cell.faces.len() < 4 {
             continue;
         }
-        let Ok(mut part) = boolean(&work, &cell.to_mesh(), &BooleanSettings { operation: 1, mode: 0, resolution: 64 }) else {
+        // The cell only cuts: its faces take the input's attributes (material, Cd, groups stay with A's faces).
+        let Ok(mut part) = boolean_with(&work, &cell.to_mesh(), &BooleanSettings { operation: 1, mode: 0, resolution: 64 }, true) else {
             continue;
         };
         if part.indices.is_empty() {
@@ -217,19 +251,41 @@ pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
         if stretch != 1.0 {
             part = scale_axis(&part, set.grain_axis, stretch);
         }
+        let mut offset = Vec3::zero();
         if set.separate > 0.0 {
             let (plo, phi) = part.bounds().unwrap();
             let (clo, chi) = input.bounds().unwrap();
-            let offset = plo.add(phi).scale(0.5).sub(clo.add(chi).scale(0.5)).scale(set.separate);
+            offset = plo.add(phi).scale(0.5).sub(clo.add(chi).scale(0.5)).scale(set.separate);
             part.vertices.iter_mut().for_each(|v| *v = v.add(offset));
         }
-        let cut = part.point_attributes.get("prim:group:b_faces").cloned().unwrap_or_default();
-        let base = out.vertices.len();
-        out.vertices.extend_from_slice(&part.vertices);
-        out.indices.extend(part.indices.iter().map(|t| t.map(|v| v + base)));
+        // The proxy: the proxy input cut by the same cell, else the piece's convex hull.
+        let mut shape = match &proxy_work {
+            Some(pw) => match boolean_with(pw, &cell.to_mesh(), &BooleanSettings { operation: 1, mode: 0, resolution: 64 }, true) {
+                Ok(mut p) => {
+                    if stretch != 1.0 {
+                        p = scale_axis(&p, set.grain_axis, stretch);
+                    }
+                    p.vertices.iter_mut().for_each(|v| *v = v.add(offset));
+                    p.point_attributes.retain(|k, _| !k.starts_with("prim:group:"));
+                    p
+                }
+                Err(_) => Mesh::default(),
+            },
+            None => convex_hull(&part.vertices),
+        };
+        shape.point_attributes.insert("piece".into(), vec![piece as f32; shape.vertices.len()]);
+        shape.point_attributes.insert("prim:piece".into(), vec![piece as f32; shape.indices.len()]);
+        proxy = super::node_merge(proxy, shape);
+        seed_piece[i] = Some(piece);
+        cell_neighbours.push(cell.neighbours());
+        centres.push(part.vertices.iter().fold(Vec3::zero(), |a, v| a.add(*v)).scale(1.0 / part.vertices.len().max(1) as f32));
+        let cut = part.point_attributes.remove("prim:group:b_faces").unwrap_or_default();
+        part.point_attributes.remove("prim:group:a_faces");
         piece_points.extend(std::iter::repeat_n(piece as f32, part.vertices.len()));
         piece_prims.extend(std::iter::repeat_n(piece as f32, part.indices.len()));
         inside.extend((0..part.indices.len()).map(|t| cut.get(t).copied().unwrap_or(0.0)));
+        // Merged with every attribute the piece carries (materials, Cd, uv, groups…).
+        out = super::node_merge(out, part);
         piece += 1;
     }
     if piece == 0 {
@@ -239,7 +295,44 @@ pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
     out.point_attributes.insert("prim:piece".into(), piece_prims);
     out.point_attributes.insert("prim:group:outside".into(), inside.iter().map(|v| 1.0 - v).collect());
     out.point_attributes.insert("prim:group:inside".into(), inside);
-    Ok(out)
+    // Glue between pieces whose cells touch: one two-point line per pair.
+    let mut constraints = Mesh::default();
+    let (mut ends, mut u) = (Vec::new(), Vec::new());
+    for (a, neighbours) in cell_neighbours.iter().enumerate() {
+        for &seed in neighbours {
+            if let Some(b) = seed_piece[seed].filter(|b| *b > a) {
+                constraints.vertices.extend([centres[a], centres[b]]);
+                ends.extend([a as f32, b as f32]);
+                u.extend([0.0, 1.0]);
+            }
+        }
+    }
+    let n = constraints.vertices.len();
+    constraints.point_attributes.insert(CONSTRAINT_PIECE.into(), ends);
+    constraints.point_attributes.insert(crate::groom::CURVEU.into(), u);
+    constraints.point_attributes.insert("strength".into(), vec![set.glue_strength; n]);
+    constraints.point_attributes.insert("group:glue".into(), vec![1.0; n]);
+    if !constraints_in.vertices.is_empty() {
+        constraints = super::node_merge(constraints_in.clone(), constraints);
+    }
+    Ok((out, constraints, proxy))
+}
+
+// A convex hull of points as a closed mesh (empty for fewer than four).
+fn convex_hull(points: &[Vec3]) -> Mesh {
+    if points.len() < 4 {
+        return Mesh::default();
+    }
+    let pts: Vec<rapier3d::math::Vector> = points.iter().map(|p| rapier3d::math::Vector::new(p.x, p.y, p.z)).collect();
+    let hull = std::panic::catch_unwind(|| rapier3d::parry::transformation::convex_hull(&pts));
+    match hull {
+        Ok((vertices, indices)) => Mesh {
+            vertices: vertices.iter().map(|v| Vec3::new(v.x, v.y, v.z)).collect(),
+            indices: indices.iter().map(|t| t.map(|i| i as usize)).collect(),
+            ..Mesh::default()
+        },
+        Err(_) => Mesh::default(),
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +370,46 @@ mod tests {
             assert!(inside.iter().any(|v| *v > 0.5) && inside.iter().any(|v| *v < 0.5));
         }
         assert!(fracture(&Mesh::default(), &FractureSettings::defaults(0)).is_err());
+    }
+
+    #[test]
+    fn constraints_link_neighbours_and_proxies_are_hulls() {
+        let cube = cuboid(Vec3::new(2.0, 2.0, 2.0));
+        let (geo, glue, proxy) = fracture_all(&cube, &Mesh::default(), &Mesh::default(), &FractureSettings { pieces: 8, ..FractureSettings::defaults(0) }).unwrap();
+        let pieces = piece_count(&geo);
+        let ends = &glue.point_attributes[CONSTRAINT_PIECE];
+        assert!(glue.vertices.len() >= 2 * (pieces - 1), "a connected set of {pieces} pieces needs {} constraints, got {}", pieces - 1, glue.vertices.len() / 2);
+        assert!(ends.chunks(2).all(|p| p[0] != p[1] && (p[0] as usize) < pieces && (p[1] as usize) < pieces));
+        assert_eq!(crate::groom::curves(&glue).len(), glue.vertices.len() / 2, "each constraint is a two-point line");
+        // One closed hull per piece, filling the cube (pieces are convex here).
+        assert_eq!(piece_count(&proxy), pieces);
+        assert!((volume(&proxy).abs() - 8.0).abs() < 0.05, "proxy volume {}", volume(&proxy));
+        // A proxy input is cut the same way.
+        let (_, _, cut) = fracture_all(&cube, &Mesh::default(), &cuboid(Vec3::new(1.0, 1.0, 1.0)), &FractureSettings { pieces: 8, ..FractureSettings::defaults(0) }).unwrap();
+        assert!((volume(&cut).abs() - 1.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn pieces_keep_materials_and_colours() {
+        let mut cube = cuboid(Vec3::new(2.0, 2.0, 2.0));
+        let n = cube.indices.len();
+        // Material on half the faces, Cd on every point, a primitive group.
+        cube.point_attributes.insert("prim:material".into(), (0..n).map(|t| if t < n / 2 { 5.0 } else { 9.0 }).collect());
+        cube.point_attributes.insert("Cd".into(), cube.vertices.iter().flat_map(|_| [0.2, 0.4, 0.6]).collect());
+        cube.point_attributes.insert("prim:group:shell".into(), vec![1.0; n]);
+        let out = fracture(&cube, &FractureSettings { pieces: 6, ..FractureSettings::defaults(0) }).unwrap();
+        let mats = &out.point_attributes["prim:material"];
+        assert_eq!(mats.len(), out.indices.len());
+        assert!(mats.iter().all(|m| *m == 5.0 || *m == 9.0), "every face, inside ones too, has one of the materials");
+        assert!(mats.contains(&5.0) && mats.contains(&9.0));
+        let cd = &out.point_attributes["Cd"];
+        assert!(cd.chunks(3).all(|c| (c[0] - 0.2).abs() < 1e-4 && (c[2] - 0.6).abs() < 1e-4), "Cd carried to every point");
+        // Groups stay with the original faces only.
+        let shell = &out.point_attributes["prim:group:shell"];
+        let inside = &out.point_attributes["prim:group:inside"];
+        for (s, i) in shell.iter().zip(inside) {
+            assert_eq!(*s, 1.0 - *i);
+        }
     }
 
     #[test]

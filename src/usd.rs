@@ -74,6 +74,7 @@ pub enum AttrValue {
     Float(f32),
     Vec3([f32; 3]),
     Token(String),
+    Bool(bool),
 }
 
 #[derive(Clone, Debug)]
@@ -467,7 +468,7 @@ fn write_prim(out: &mut String, stage: &Stage, path: &str, depth: usize) {
         if prim.type_name == "Material" {
             continue;
         }
-        let light_input = prim.is_light() && matches!(name.as_str(), "intensity" | "exposure" | "color" | "radius" | "angle" | "width" | "height");
+        let light_input = prim.is_light() && matches!(name.as_str(), "intensity" | "exposure" | "color" | "radius" | "angle" | "width" | "height" | "normalize");
         let full_name = if light_input { format!("inputs:{name}") } else { name.clone() };
         let _ = match value {
             AttrValue::Float(f) => {
@@ -476,6 +477,7 @@ fn write_prim(out: &mut String, stage: &Stage, path: &str, depth: usize) {
             }
             AttrValue::Vec3(v) => writeln!(out, "{inner}color3f {full_name} = {}", fmt_v3(*v)),
             AttrValue::Token(t) => writeln!(out, "{inner}uniform token {full_name} = \"{t}\""),
+            AttrValue::Bool(b) => writeln!(out, "{inner}bool {full_name} = {}", *b as u8),
         };
     }
     let children: Vec<String> = stage.children(path).map(|(p, _)| p.clone()).collect();

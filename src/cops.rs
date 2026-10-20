@@ -9,7 +9,7 @@
 // sRGB images as sRGB and the viewer shows sRGB.
 
 use super::{hash01, Mesh};
-use crate::shading::{c, f, t, Param};
+use crate::shading::{c, f, Param};
 
 pub const SIZE: &str = "cop:size";
 

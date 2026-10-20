@@ -57,6 +57,8 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("peak", "Moves points along their normals."),
     ("ripple", "Animated ripples."),
     ("jitter", "Moves points randomly."),
+    ("point_deform", "Makes geometry (input 1) follow points from rest (input 2) to deformed (input 3): each point follows its nearest points, bending and turning with them."),
+    ("transform_pieces", "Moves each piece (piece or name attribute) rigidly with a template point's P, orient/transform and pscale (input 2), optionally relative to rest points (input 3)."),
     // Topology
     ("subdivide", "Subdivides polygons (smooth)."),
     ("remesh", "Rebuilds the mesh with even triangles of a target count."),
@@ -64,15 +66,15 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("mirror", "Mirrors across an axis and keeps both halves."),
     ("copy", "Copies the input several times with a cumulative transform."),
     ("copy_to_points", "Copies input 1 onto the points of input 2, using pscale, orient, N/up and Cd."),
-    ("extrude", "Extrudes faces with inset."),
+    ("extrude", "Extrudes the node's group (or everything) along the normals with distance, inset and divisions; connected or individual faces. Output front, back and sides, each optionally in a group (extrudeFront, extrudeSide, extrudeBack)."),
     ("clip", "Cuts away one side of a plane."),
     ("blast", "Deletes points or primitives (the node's group, or picked in the viewport)."),
     ("scatter", "Points on a surface (or inside a closed mesh), relaxed for even spacing; they get N, pscale and sourceprim."),
-    ("boolean", "Union, intersect or subtract two closed meshes (exact BSP, or volume for messy input). Cut faces are in a_faces/b_faces."),
+    ("boolean", "Union, intersect or subtract two closed meshes (exact BSP, or volume for messy input). Faces keep their input's attributes (materials, Cd, UVs, groups; in Exact mode) and are grouped a_faces/b_faces."),
     ("cache", "Caches its input's frames in memory."),
     ("reverse", "Reverses polygon winding."),
     ("switch", "Passes one of its inputs through."),
-    ("merge", "Merges its inputs."),
+    ("merge", "Merges any number of inputs: a new input port appears as you connect one."),
     ("null", "Passes its input through (a named place in the network)."),
     // Flow control
     ("foreach_begin", "Start of a For-Each loop: puts out each iteration's piece, with detail attributes iteration, numiterations and value."),
@@ -81,7 +83,11 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("compile_end", "Compile Block: the block between Begin and End cooks as a unit with its result cached, and For-Each loops inside run in parallel."),
     // Shading and destruction
     ("material", "Assigns MAT materials to groups of primitives, overriding the object's material. Later slots win."),
-    ("material_fracture", "Breaks a closed mesh into pieces: concrete (Voronoi chunks), glass (cracks from an impact point) or wood (splinters along the grain). Pieces get `piece` for the RBD Solver."),
+    ("rbd_bullet_solver", "Rigid pieces held by breakable glue: inputs geometry (piece), constraints, proxy collision shapes and static collision geometry (Material Fracture's outputs plug straight in). Outputs the moved pieces, the constraints still holding and the moved proxies."),
+    ("rbd_configure", "Sets density, friction, bounce, active (static when off) and initial velocity on the pieces in its group, for the RBD Bullet Solver. Constraints and proxy pass through."),
+    ("pack", "Packs each piece (or the whole input) into one point with P, transform and piece; the geometry is stored once. Viewport and renders show it unpacked; Transform and Copy to Points turn it."),
+    ("unpack", "Turns packed points back into geometry at their transform, optionally carrying the points' attributes over."),
+    ("material_fracture", "Breaks a closed mesh into pieces: concrete (Voronoi chunks), glass (cracks from an impact point) or wood (splinters along the grain). Outputs pieces, glue constraints between neighbours and proxy collision shapes for the RBD Bullet Solver; pieces keep the input's materials, colours and UVs; cut faces are in the inside group (give them their own material with a Material node)."),
     // Crowds, KineFX, muscles
     ("crowd_solver", "Agents that walk, flock, seek a goal, keep their distance, follow a ground mesh and avoid obstacles. Shows walking mannequins or points."),
     ("skeleton", "A KineFX skeleton (biped, chain or tail): joints as points with parent and transform."),
@@ -124,7 +130,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("pyro_shader", "For smoke and fire volumes."),
     ("material_builder", "Build a material from texture nodes wired into a Surface Output (see Shader Nodes)."),
     // OUT
-    ("moonray_render", "Renders the scene with MoonRay: size, samples, camera, sequences, and the Render Viewer."),
+    ("moonray_render", "Renders the scene with MoonRay: size, samples, camera, sequences, and the Render Viewer. It can render the STAGE (USD) instead, optionally through Hydra: hd_render with MoonRay's Hydra delegate (hdMoonray) reads the stage as USD, as USD-native apps do."),
     // STAGE
     ("sop_import", "Brings OBJ geometry objects onto the USD stage as Mesh prims."),
     ("usd_reference", "References (or sublayers) a USD file."),
@@ -201,7 +207,7 @@ pub fn html(version: &str) -> String {
     for (name, what) in CONTEXTS {
         let _ = write!(body, "<tr><th>{name}</th><td>{}</td></tr>", esc(what));
     }
-    body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node.</p></section>");
+    body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node; a renamed node still shows its type under the name. Some nodes have several outputs (Material Fracture, RBD Configure, RBD Bullet Solver: geometry, constraints, proxy): drag a wire from the output you want; hover a port for its name. Any parameter can be keyframed: the animation editor lists each one by name (size, radius, t.x…).</p></section>");
     let _ = write!(nav, "<a href=\"#overview\">Overview</a>");
 
     // Nodes by context and menu.

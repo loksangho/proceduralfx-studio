@@ -52,6 +52,8 @@ struct Polygon {
     plane: Plane,
     // 0 = from input A, 1 = from input B.
     source: u8,
+    // The source triangle it was cut from, for carrying attributes over.
+    tri: usize,
 }
 
 impl Polygon {
@@ -117,10 +119,10 @@ fn split_polygon(
                 }
             }
             if f.len() >= 3 {
-                front.push(Polygon { verts: f, plane: poly.plane, source: poly.source });
+                front.push(Polygon { verts: f, plane: poly.plane, source: poly.source, tri: poly.tri });
             }
             if b.len() >= 3 {
-                back.push(Polygon { verts: b, plane: poly.plane, source: poly.source });
+                back.push(Polygon { verts: b, plane: poly.plane, source: poly.source, tri: poly.tri });
             }
         }
     }
@@ -248,9 +250,10 @@ impl Bsp {
 fn polygons(mesh: &Mesh, source: u8) -> Vec<Polygon> {
     mesh.indices
         .iter()
-        .filter_map(|t| {
+        .enumerate()
+        .filter_map(|(tri, t)| {
             let [a, b, c] = t.map(|i| mesh.vertices[i]);
-            Plane::from_points(a, b, c).map(|plane| Polygon { verts: vec![a, b, c], plane, source })
+            Plane::from_points(a, b, c).map(|plane| Polygon { verts: vec![a, b, c], plane, source, tri })
         })
         .collect()
 }
@@ -297,7 +300,136 @@ fn csg(a: &Mesh, b: &Mesh, operation: usize) -> Vec<Polygon> {
 }
 
 // Triangulates (fans) the polygons and welds coincident points.
-fn to_mesh(polys: &[Polygon]) -> Mesh {
+// Triangulates the result, then carries the inputs' attributes over (see transfer).
+fn to_mesh(polys: &[Polygon], a: &Mesh, b: &Mesh, b_takes_a: bool) -> Mesh {
+    let (mut mesh, origins) = triangulate(polys);
+    transfer(&mut mesh, &origins, a, b, b_takes_a);
+    mesh
+}
+
+// Weights of p in triangle (a, b, c), from its projection onto the triangle's plane.
+fn barycentric(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> [f32; 3] {
+    let (v0, v1, v2) = (b.sub(a), c.sub(a), p.sub(a));
+    let (d00, d01, d11, d20, d21) = (v0.dot(v0), v0.dot(v1), v1.dot(v1), v2.dot(v0), v2.dot(v1));
+    let den = d00 * d11 - d01 * d01;
+    if den.abs() < 1e-20 {
+        return [1.0, 0.0, 0.0];
+    }
+    let v = (d11 * d20 - d01 * d21) / den;
+    let w = (d00 * d21 - d01 * d20) / den;
+    [1.0 - v - w, v, w]
+}
+
+// Copies attributes from the source triangles onto the result: primitive attributes as
+// they were, point and vertex attributes (Cd, uv…) interpolated where each point lies on
+// its source triangle. With `b_takes_a` (Material Fracture, where B is a cutting cell),
+// faces cut by B take A's primitive attributes from a face of A in the same result (so
+// they keep A's material) and their points the nearest A point's attributes.
+fn transfer(out: &mut Mesh, origins: &[(u8, usize)], a: &Mesh, b: &Mesh, b_takes_a: bool) {
+    let class = |k: &str| if k.starts_with("prim:") { 1 } else if k.starts_with("vertex:") { 2 } else if k.starts_with("detail:") { 3 } else { 0 };
+    let (np, nt) = (out.vertices.len(), out.indices.len());
+    let src = |o: u8| if o == 0 { a } else { b };
+    // A face of A to stand in for B faces (fracture).
+    let stand_in = origins.iter().find(|(o, _)| *o == 0).map(|(_, t)| *t);
+    // Nearest A point, for B points in fracture (a plain search: cut faces are few).
+    let nearest_a = |p: Vec3| -> Option<usize> {
+        a.vertices.iter().enumerate().map(|(i, q)| (q.sub(p).length(), i)).min_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal)).map(|(_, i)| i)
+    };
+    let mut keys: Vec<String> = a.point_attributes.keys().chain(b.point_attributes.keys()).cloned().collect();
+    keys.sort();
+    keys.dedup();
+    // The first result triangle (and corner) using each point.
+    let mut first_use = vec![None; np];
+    for (t, tri) in out.indices.iter().enumerate() {
+        for (k, &v) in tri.iter().enumerate() {
+            first_use[v].get_or_insert((t, k));
+        }
+    }
+    let mut nearest_cache: Vec<Option<Option<usize>>> = vec![None; np];
+    for key in keys {
+        if key == "prim:group:a_faces" || key == "prim:group:b_faces" {
+            continue;
+        }
+        let width_in = |m: &Mesh| -> Option<usize> {
+            let v = m.point_attributes.get(&key)?;
+            let count = match class(&key) {
+                0 => m.vertices.len(),
+                1 => m.indices.len(),
+                2 => m.indices.len() * 3,
+                _ => return Some(v.len()),
+            };
+            (count > 0 && v.len() % count == 0 && !v.is_empty()).then(|| v.len() / count)
+        };
+        let (wa, wb) = (width_in(a), width_in(b));
+        let Some(width) = wa.or(wb) else { continue };
+        // Where a result triangle reads from: (mesh, triangle), or None for zeros.
+        let reads = |t: usize| -> Option<(&Mesh, usize)> {
+            let (o, tri) = origins[t];
+            let own = if o == 0 { wa } else { wb };
+            if own == Some(width) {
+                Some((src(o), tri))
+            } else if o == 1 && b_takes_a && wa == Some(width) && !key.starts_with("prim:group:") {
+                stand_in.map(|s| (a, s))
+            } else {
+                None
+            }
+        };
+        let values: Vec<f32> = match class(&key) {
+            3 => a.point_attributes.get(&key).or_else(|| b.point_attributes.get(&key)).cloned().unwrap_or_default(),
+            1 => (0..nt)
+                .flat_map(|t| match reads(t) {
+                    Some((m, tri)) => m.point_attributes[&key][tri * width..tri * width + width].to_vec(),
+                    None => vec![0.0; width],
+                })
+                .collect(),
+            2 => (0..nt)
+                .flat_map(|t| {
+                    let corners: Vec<f32> = match reads(t).filter(|(m, _)| std::ptr::eq(*m, src(origins[t].0))) {
+                        Some((m, tri)) => {
+                            let [pa, pb, pc] = m.indices[tri].map(|i| m.vertices[i]);
+                            let vals = &m.point_attributes[&key];
+                            out.indices[t]
+                                .iter()
+                                .flat_map(|&v| {
+                                    let w = barycentric(out.vertices[v], pa, pb, pc);
+                                    (0..width).map(move |c| (0..3).map(|k| vals[(tri * 3 + k) * width + c] * w[k]).sum::<f32>()).collect::<Vec<_>>()
+                                })
+                                .collect()
+                        }
+                        None => vec![0.0; width * 3],
+                    };
+                    corners
+                })
+                .collect(),
+            _ => (0..np)
+                .flat_map(|v| {
+                    let Some((t, _)) = first_use[v] else { return vec![0.0; width] };
+                    let (o, tri) = origins[t];
+                    let own = if o == 0 { wa } else { wb };
+                    if own == Some(width) {
+                        let m = src(o);
+                        let [ia, ib, ic] = m.indices[tri];
+                        let w = barycentric(out.vertices[v], m.vertices[ia], m.vertices[ib], m.vertices[ic]);
+                        let vals = &m.point_attributes[&key];
+                        (0..width).map(|c| vals[ia * width + c] * w[0] + vals[ib * width + c] * w[1] + vals[ic * width + c] * w[2]).collect()
+                    } else if b_takes_a && wa == Some(width) && !key.starts_with("group:") {
+                        let near = *nearest_cache[v].get_or_insert_with(|| nearest_a(out.vertices[v]));
+                        match near {
+                            Some(i) => a.point_attributes[&key][i * width..i * width + width].to_vec(),
+                            None => vec![0.0; width],
+                        }
+                    } else {
+                        vec![0.0; width]
+                    }
+                })
+                .collect(),
+        };
+        out.point_attributes.insert(key, values);
+    }
+}
+
+fn triangulate(polys: &[Polygon]) -> (Mesh, Vec<(u8, usize)>) {
+    let mut origins = Vec::new();
     let mut mesh = Mesh::default();
     let mut index: HashMap<[i64; 3], usize> = HashMap::new();
     let mut from_a = Vec::new();
@@ -316,12 +448,13 @@ fn to_mesh(polys: &[Polygon]) -> Mesh {
             if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
                 mesh.indices.push(tri);
                 from_a.push(poly.source == 0);
+                origins.push((poly.source, poly.tri));
             }
         }
     }
     mesh.point_attributes.insert("prim:group:a_faces".into(), from_a.iter().map(|a| *a as u8 as f32).collect());
     mesh.point_attributes.insert("prim:group:b_faces".into(), from_a.iter().map(|a| !*a as u8 as f32).collect());
-    mesh
+    (mesh, origins)
 }
 
 fn volume_boolean(a: &Mesh, b: &Mesh, set: &BooleanSettings) -> Result<Mesh, String> {
@@ -364,6 +497,12 @@ fn volume_boolean(a: &Mesh, b: &Mesh, set: &BooleanSettings) -> Result<Mesh, Str
 }
 
 pub fn boolean(a: &Mesh, b: &Mesh, set: &BooleanSettings) -> Result<Mesh, String> {
+    boolean_with(a, b, set, false)
+}
+
+// `b_takes_a`: B is only a cutter (Material Fracture's cells), so its faces take A's
+// attributes instead of B's.
+pub fn boolean_with(a: &Mesh, b: &Mesh, set: &BooleanSettings, b_takes_a: bool) -> Result<Mesh, String> {
     if a.indices.is_empty() {
         return Err("input A (left) has no polygons".into());
     }
@@ -375,14 +514,14 @@ pub fn boolean(a: &Mesh, b: &Mesh, set: &BooleanSettings) -> Result<Mesh, String
     }
     // Clipping is iterative, but run on a big stack anyway: very fragmented
     // inputs make long polygon lists.
-    let (a, b, op) = (a.clone(), b.clone(), set.operation);
+    let (ca, cb, op) = (a.clone(), b.clone(), set.operation);
     let polys = std::thread::Builder::new()
         .stack_size(64 << 20)
-        .spawn(move || csg(&a, &b, op))
+        .spawn(move || csg(&ca, &cb, op))
         .map_err(|e| e.to_string())?
         .join()
         .map_err(|_| "the boolean failed".to_owned())?;
-    Ok(to_mesh(&polys))
+    Ok(to_mesh(&polys, a, b, b_takes_a))
 }
 
 #[cfg(test)]

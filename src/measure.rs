@@ -120,7 +120,7 @@ pub fn measure(input: &Mesh, set: &MeasureSettings) -> Result<Mesh, String> {
                 for t in 0..nt {
                     let [a, b, c] = input.indices[t];
                     let [pa, pb, pc] = tri(input, t);
-                    for (i, j, k, pi, pj, pk) in [(a, b, c, pa, pb, pc), (b, c, a, pb, pc, pa), (c, a, b, pc, pa, pb)] {
+                    for (_, j, k, pi, pj, pk) in [(a, b, c, pa, pb, pc), (b, c, a, pb, pc, pa), (c, a, b, pc, pa, pb)] {
                         // The edge j-k gets the cotangent of the angle at i.
                         let w = cot(pi, pj, pk) * 0.5;
                         lap[j] = lap[j].add(pk.sub(pj).scale(w));
