@@ -132,16 +132,51 @@ fn agent() -> ureq::Agent {
 
 fn fetch_latest() -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let mut response = agent()
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(404) => "No releases have been published yet.".to_owned(),
-            other => format!("Could not reach GitHub: {other}"),
-        })?;
+    let mut response = match agent().get(&url).header("Accept", "application/vnd.github+json").call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => return Err("No releases have been published yet.".to_owned()),
+        // GitHub limits API requests without a login to 60 an hour per network address
+        // (403 or 429 once used up); the release pages themselves aren't limited that way.
+        Err(ureq::Error::StatusCode(403 | 429)) => {
+            return fetch_latest_from_pages().map_err(|e| format!("GitHub's API is rate limited for this network right now, and the release page couldn't be read either: {e}"));
+        }
+        Err(other) => return Err(format!("Could not reach GitHub: {other}")),
+    };
     let json: serde_json::Value = response.body_mut().read_json().map_err(|e| format!("Unexpected reply from GitHub: {e}"))?;
     parse_release(&json).ok_or_else(|| "The latest release has no version tag.".to_owned())
+}
+
+// The latest release from github.com's pages: releases/latest redirects to the
+// newest tag, and its asset list links each download. No notes or checksums
+// (those come from the API); Mac updates are still checked for the signing team.
+fn fetch_latest_from_pages() -> Result<Release, String> {
+    use ureq::ResponseExt;
+    let response = agent().get(&format!("https://github.com/{REPO}/releases/latest")).call().map_err(|e| e.to_string())?;
+    let page = response.get_uri().to_string();
+    let tag = page.rsplit_once("/releases/tag/").map(|(_, tag)| tag.trim_end_matches('/').to_owned()).ok_or("No releases have been published yet.")?;
+    parse_version(&tag).ok_or("The latest release has no version tag.")?;
+    let html = agent()
+        .get(&format!("https://github.com/{REPO}/releases/expanded_assets/{tag}"))
+        .call()
+        .map_err(|e| e.to_string())?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    Ok(Release { version: tag.trim_start_matches(['v', 'V']).to_owned(), notes: String::new(), page, assets: parse_asset_links(&html, &tag) })
+}
+
+// Download links in a release's asset list.
+fn parse_asset_links(html: &str, tag: &str) -> Vec<Asset> {
+    let prefix = format!("/{REPO}/releases/download/{tag}/");
+    let mut assets: Vec<Asset> = Vec::new();
+    for piece in html.split("href=\"").skip(1) {
+        let Some(link) = piece.split('"').next().filter(|link| link.starts_with(&prefix)) else { continue };
+        let name = &link[prefix.len()..];
+        if !name.is_empty() && !assets.iter().any(|a| a.name == name) {
+            assets.push(Asset { name: name.to_owned(), url: format!("https://github.com{link}"), size: 0, sha256: None });
+        }
+    }
+    assets
 }
 
 // Streams `asset` to `dest`, reporting progress and checking GitHub's SHA-256 digest.
@@ -695,6 +730,21 @@ mod tests {
     }
 
     #[test]
+    fn reads_asset_links_from_the_release_page() {
+        let html = format!(
+            r#"<a href="/{REPO}/releases/download/v0.7.0/ProceduralFxStudio.zip" rel="nofollow">zip</a>
+               <a href="/{REPO}/releases/download/v0.7.0/ProceduralFxStudio.zip">again</a>
+               <a href="/{REPO}/archive/refs/tags/v0.7.0.zip">source</a>
+               <a href="/{REPO}/releases/download/v0.7.0/ProceduralFxStudio-x86_64.flatpak">flatpak</a>"#
+        );
+        let assets = parse_asset_links(&html, "v0.7.0");
+        let names: Vec<&str> = assets.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["ProceduralFxStudio.zip", "ProceduralFxStudio-x86_64.flatpak"]);
+        assert_eq!(assets[0].url, format!("https://github.com/{REPO}/releases/download/v0.7.0/ProceduralFxStudio.zip"));
+        assert!(assets.iter().all(|a| a.sha256.is_none()));
+    }
+
+    #[test]
     fn prefs_round_trip() {
         assert!(Prefs::parse("").auto_check);
         let prefs = Prefs { auto_check: false, skipped: Some("0.3.0".into()), last_check: 1234 };
@@ -712,5 +762,7 @@ mod live {
             Ok(release) => println!("latest: v{} with {} assets", release.version, release.assets.len()),
             Err(e) => println!("check result: {e}"),
         }
+        let release = super::fetch_latest_from_pages().unwrap();
+        println!("from the pages: v{} with {:?}", release.version, release.assets.iter().map(|a| &a.name).collect::<Vec<_>>());
     }
 }
