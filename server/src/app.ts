@@ -211,11 +211,23 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     }),
   );
 
-  async function customerOf(user: User) {
-    if (user.stripeCustomer) return user.stripeCustomer;
+  async function customerOf(user: User, fresh = false) {
+    if (user.stripeCustomer && !fresh) return user.stripeCustomer;
     const id = await billing!.createCustomer(user.email, user.id);
     await store.setCustomer(user.id, id);
+    user.stripeCustomer = id;
     return id;
+  }
+
+  // Runs a Stripe call for the user's customer, making a new customer once if Stripe
+  // doesn't know the saved one.
+  async function withCustomer(user: User, call: (customer: string) => Promise<string>) {
+    try {
+      return await call(await customerOf(user));
+    } catch (e) {
+      if (!billing!.missingCustomer(e)) throw e;
+      return call(await customerOf(user, true));
+    }
   }
 
   app.post(
@@ -225,16 +237,15 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       if (!billing) return fail(res, 503, "unavailable", "Payments aren't set up yet.");
       const u = req.user!;
       const { plan: planId, topup } = req.body ?? {};
-      const customer = await customerOf(u);
       if (typeof planId === "string") {
         const plan = config.plans.find((p) => p.id === planId);
         if (!plan) return fail(res, 400, "invalid_request_error", "No such plan.");
         // Already subscribed: changing plan happens in Stripe's portal.
-        if (u.plan) return res.json({ url: await billing.portal(customer, config.publicUrl) });
-        return res.json({ url: await billing.checkoutPlan(customer, u.id, plan.priceId, config.publicUrl) });
+        if (u.plan) return res.json({ url: await withCustomer(u, (c) => billing.portal(c, config.publicUrl)) });
+        return res.json({ url: await withCustomer(u, (c) => billing.checkoutPlan(c, u.id, plan.priceId, config.publicUrl)) });
       }
       if (typeof topup === "number" && config.topups.includes(topup)) {
-        return res.json({ url: await billing.checkoutTopup(customer, u.id, topup, config.publicUrl) });
+        return res.json({ url: await withCustomer(u, (c) => billing.checkoutTopup(c, u.id, topup, config.publicUrl)) });
       }
       fail(res, 400, "invalid_request_error", "Choose a plan or a top-up.");
     }),
@@ -245,7 +256,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     signedIn,
     wrap(async (req, res) => {
       if (!billing) return fail(res, 503, "unavailable", "Payments aren't set up yet.");
-      res.json({ url: await billing.portal(await customerOf(req.user!), config.publicUrl) });
+      res.json({ url: await withCustomer(req.user!, (c) => billing.portal(c, config.publicUrl)) });
     }),
   );
 

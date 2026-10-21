@@ -24,6 +24,9 @@ export interface Billing {
   priceLabel(priceId: string): Promise<string | null>;
   // Verifies the signature (throws if it's wrong) and reads the event.
   parseEvent(raw: Buffer, signature: string): BillingEvent;
+  // Whether an error means Stripe doesn't know the customer (e.g. one made in test mode
+  // before switching to live keys).
+  missingCustomer(error: unknown): boolean;
 }
 
 function customerId(c: string | { id: string } | null): string {
@@ -125,5 +128,10 @@ export class StripeBilling implements Billing {
 
   parseEvent(raw: Buffer, signature: string) {
     return interpret(this.stripe.webhooks.constructEvent(raw, signature, this.webhookSecret));
+  }
+
+  missingCustomer(error: unknown) {
+    const e = error as { code?: string; param?: string; message?: string } | null;
+    return e?.code === "resource_missing" && (e.param === "customer" || /customer/i.test(e.message ?? ""));
   }
 }

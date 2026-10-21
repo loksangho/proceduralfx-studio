@@ -45,13 +45,26 @@ function fakeMessage(model: string, usage: Partial<Anthropic.Beta.BetaUsage>): A
 class FakeBilling implements Billing {
   next: BillingEvent = { kind: "ignored" };
   active: string | null = null;
+  // Customers Stripe knows; others fail like a test-mode customer under live keys.
+  known = new Set<string>();
+  made = 0;
   async createCustomer() {
-    return "cus_1";
+    const id = this.made++ === 0 ? "cus_1" : `cus_${this.made}`;
+    this.known.add(id);
+    return id;
   }
-  async checkoutPlan(_c: string, _u: string, priceId: string) {
+  private check(c: string) {
+    if (!this.known.has(c)) throw Object.assign(new Error(`No such customer: '${c}'`), { code: "resource_missing", param: "customer" });
+  }
+  missingCustomer(e: unknown) {
+    return (e as { code?: string }).code === "resource_missing";
+  }
+  async checkoutPlan(c: string, _u: string, priceId: string) {
+    this.check(c);
     return `https://stripe.test/plan/${priceId}`;
   }
-  async checkoutTopup(_c: string, _u: string, dollars: number) {
+  async checkoutTopup(c: string, _u: string, dollars: number) {
+    this.check(c);
     return `https://stripe.test/topup/${dollars}`;
   }
   async portal() {
@@ -176,6 +189,11 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     const stats = await (await fetch(`${t.base}/admin/stats`, { headers: { authorization: "Bearer admin" } })).json();
     assert.deepEqual(stats, { users: 1, requests: 2, anthropic_cost_usd: 0.12, charged_usd: 0.15, margin_usd: 0.03, topups_paid_usd: 10 });
     assert.equal((await fetch(`${t.base}/admin/stats`)).status, 404);
+
+    // A customer Stripe no longer knows (made with test keys) is replaced.
+    t.billing.known.clear();
+    assert.equal((await (await t.post("/v1/checkout", { topup: 5 }, token)).json()).url, "https://stripe.test/topup/5");
+    assert.equal((await t.store.userById(user.id))!.stripeCustomer, "cus_2");
 
     // Signing out ends the session.
     await t.post("/v1/logout", {}, token);
