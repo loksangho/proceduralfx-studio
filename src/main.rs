@@ -30,6 +30,7 @@ mod deform;
 mod docs;
 mod envlight;
 mod extrude;
+mod fields;
 mod fileio;
 mod flipbook;
 mod flow;
@@ -37,9 +38,11 @@ mod fracture;
 mod groom;
 mod groups;
 mod kinefx;
+mod lsystem;
 mod measure;
 mod muscle;
 mod packed;
+mod perf;
 mod paint;
 mod poly;
 mod randomize;
@@ -2638,6 +2641,110 @@ fn resolve_executable(executable: &str) -> Option<PathBuf> {
 
 // Sliders for the ch("name") parameters `code` uses (like Houdini's spare
 // parameters, created automatically); values unused by the code are dropped.
+// What new Volume and Heightfield Wrangles start with.
+const VOLUME_WRANGLE_EXAMPLE: &str = "// Thin the density towards the top of the volume.\n@density *= fit(@P.y, 0, 2, 1, 0);";
+const HEIGHTFIELD_WRANGLE_EXAMPLE: &str = "// Add ripples, stronger where the mask is.\n@height += sin(@P.x * 2) * 0.3 * (1 + @mask);";
+
+// (menu label, code) examples for the Volume and Heightfield Wrangles.
+const VOLUME_WRANGLE_EXAMPLES: [(&str, &str); 4] = [
+    ("Fade towards the top", VOLUME_WRANGLE_EXAMPLE),
+    ("Break up with noise", "@density *= fit(noise(@P * 2), 0.35, 0.65, 0, 1);"),
+    ("Blur (average the neighbours)", "vector i = volumepostoindex(0, \"density\", @P);\nfloat sum = @density;\nforeach (vector d; array(set(1,0,0), set(-1,0,0), set(0,1,0), set(0,-1,0), set(0,0,1), set(0,0,-1)))\n    sum += volumeindex(0, \"density\", i + d);\n@density = sum / 7;"),
+    ("Keep a sphere", "@density *= length(@P) < 1;"),
+];
+const HEIGHTFIELD_WRANGLE_EXAMPLES: [(&str, &str); 4] = [
+    ("Ripples", HEIGHTFIELD_WRANGLE_EXAMPLE),
+    ("Flatten above a height", "@height = min(@height, 2);"),
+    ("Mask from height", "@mask = fit(@height, 0, 3, 0, 1);"),
+    ("Smooth (average the neighbours)", "vector i = volumepostoindex(0, \"height\", @P);\n@height = (volumeindex(0, \"height\", i + set(1, 0, 0)) + volumeindex(0, \"height\", i - set(1, 0, 0))\n         + volumeindex(0, \"height\", i + set(0, 1, 0)) + volumeindex(0, \"height\", i - set(0, 1, 0))) / 4;"),
+];
+
+fn examples_menu(ui: &mut egui::Ui, code: &mut String, examples: &[(&str, &str)]) -> bool {
+    let mut changed = false;
+    ui.menu_button("Insert example ▾", |ui| {
+        for (label, example) in examples {
+            if ui.button(*label).on_hover_text("Replaces the current code").clicked() {
+                *code = example.to_string();
+                changed = true;
+                ui.close_menu();
+            }
+        }
+    });
+    changed
+}
+
+// The VEX editor the wrangles share: the code, its ch() parameters, errors, the last
+// run's report and output, and the language reference. `noun` names what it runs over.
+fn vex_editor_ui(ui: &mut egui::Ui, code: &mut String, domain: usize, noun: &str, channels: &mut vex::Channels, hint: &str) -> bool {
+    let mut c = false;
+    c |= ui.add(
+        egui::TextEdit::multiline(code)
+            .code_editor()
+            .desired_rows(14)
+            .desired_width(f32::INFINITY)
+            .hint_text(hint),
+    ).changed();
+    c |= channel_params_ui(ui, code, channels);
+
+    let report = vex::last_report(code, domain);
+    let error = match &report {
+        Some(report) => report.error.clone(),
+        None => vex::check(code).err(),
+    };
+    match error {
+        Some(error) => {
+            ui.colored_label(egui::Color32::from_rgb(240, 110, 110), format!("✖ {error}"));
+            // Show the offending source line under the message.
+            let line = error
+                .strip_prefix("line ")
+                .and_then(|rest| rest.split(|ch: char| !ch.is_ascii_digit()).next())
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(text) = line.and_then(|n| code.lines().nth(n.saturating_sub(1))) {
+                ui.monospace(format!("{:>4} | {}", line.unwrap_or(0), text.trim_end()));
+            }
+            if report.is_some() {
+                ui.small("The node passes its input through unchanged until the error is fixed.");
+            }
+        }
+        None => match &report {
+            Some(report) => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_GREEN,
+                    format!("✔ Ran over {} {noun} in {:.2} ms", report.elements, report.millis),
+                );
+            }
+            None => {
+                ui.weak("✔ Compiles. It runs when the node is part of the displayed network.");
+            }
+        },
+    }
+    if let Some(report) = report.as_ref().filter(|r| !r.output.is_empty()) {
+        egui::CollapsingHeader::new(format!("Output ({} lines)", report.output.len()))
+            .id_salt("wrangle_output")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
+                    for line in &report.output {
+                        ui.monospace(line);
+                    }
+                });
+            });
+    }
+    egui::CollapsingHeader::new("Language reference").id_salt("wrangle_reference").show(ui, |ui| {
+        ui.label(egui::RichText::new(vex::SYNTAX_HELP).monospace().small());
+        let mut group = "";
+        for (_, _, _, function_group, signature) in vex::BUILTINS {
+            if *function_group != group {
+                group = function_group;
+                ui.add_space(4.0);
+                ui.strong(group);
+            }
+            ui.label(egui::RichText::new(*signature).monospace().small());
+        }
+    });
+    c
+}
+
 fn channel_params_ui(ui: &mut egui::Ui, code: &str, channels: &mut vex::Channels) -> bool {
     let refs = vex::channel_refs(code);
     let mut changed = false;
@@ -3155,6 +3262,11 @@ enum NodeKind {
     AttributeRandomize(randomize::RandomizeSettings),
     AttributeDelete { attribute: usize },
     Wrangle { code: String, domain: usize },
+    // VEX over a volume's voxels (@density / @surface) or a terrain's points (@height, @mask).
+    VolumeWrangle { code: String },
+    HeightfieldWrangle { code: String },
+    // An L-system drawn as curves.
+    LSystem(lsystem::LSystemSettings),
     Merge,
     Null,
     Tube { r_bot: f32, r_top: f32, height: f32, rows: usize, cols: usize, caps: bool },
@@ -3402,7 +3514,8 @@ impl NodeKind {
             | NodeKind::HairGuides(_)
             | NodeKind::HairGenerate(_)
             | NodeKind::RbdConfigure(_)
-            | NodeKind::Extrude(_) => GroupSupport::Native,
+            | NodeKind::Extrude(_)
+            | NodeKind::HeightfieldWrangle { .. } => GroupSupport::Native,
             NodeKind::VellumSolver(_) => GroupSupport::Pin,
             _ => GroupSupport::None,
         }
@@ -3496,6 +3609,7 @@ impl NodeKind {
             NodeKind::Metaball(_) => names(&["radius", "threshold", "resolution"]),
             NodeKind::Connectivity(_) => names(&["class"]),
             NodeKind::Resample(_) => names(&["by_length", "length", "segments"]),
+            NodeKind::LSystem(_) => names(&["generations", "angle", "step", "step_scale", "thickness", "thickness_scale", "angle_random", "seed"]),
             NodeKind::PointDeform(_) => names(&["influences", "fit_neighbours", "follow_rotation"]),
             NodeKind::ForEachEnd(_) => names(&["loop_over", "iterations", "start_value", "increment", "single_pass", "multithread"]),
             NodeKind::ObjectMerge { .. } => names(&["into_this_object"]),
@@ -3576,7 +3690,12 @@ impl NodeKind {
                 .collect(),
             NodeKind::TwoBoneIk(_) => named(&[(0, "goal.x"), (1, "goal.y"), (2, "goal.z"), (3, "pole.x"), (4, "pole.y"), (5, "pole.z"), (7, "blend")]),
             NodeKind::SkeletonBlend { .. } => named(&[(0, "weight")]),
-            NodeKind::Wrangle { .. } | NodeKind::MoonRayRender { .. } | NodeKind::AttributeVop { .. } | NodeKind::Vop(_) => Vec::new(),
+            NodeKind::Wrangle { .. }
+            | NodeKind::VolumeWrangle { .. }
+            | NodeKind::HeightfieldWrangle { .. }
+            | NodeKind::MoonRayRender { .. }
+            | NodeKind::AttributeVop { .. }
+            | NodeKind::Vop(_) => Vec::new(),
             // Every other node: its parameters by name (params() order); unnamed ones aren't animatable.
             other => other.param_names().into_iter().enumerate().filter(|(_, n)| !n.is_empty()).map(|(i, n)| (ChannelTarget::Param(i), n)).collect(),
         }
@@ -3597,6 +3716,8 @@ impl NodeKind {
                 vec![file.clone()]
             }
             NodeKind::AttributePaint { attribute, .. } => vec![attribute.clone()],
+            NodeKind::VolumeWrangle { code } | NodeKind::HeightfieldWrangle { code } => vec![code.clone()],
+            NodeKind::LSystem(l) => vec![l.premise.clone(), l.rules.clone()],
             NodeKind::MaterialAssign { slots } => slots.iter().map(|(g, _)| g.clone()).collect(),
             NodeKind::ForEachEnd(f) => vec![f.attribute.clone()],
             NodeKind::Measure(m) => vec![m.name.clone(), m.source.clone()],
@@ -3637,6 +3758,11 @@ impl NodeKind {
                 next(file)
             }
             NodeKind::AttributePaint { attribute, .. } => next(attribute),
+            NodeKind::VolumeWrangle { code } | NodeKind::HeightfieldWrangle { code } => next(code),
+            NodeKind::LSystem(l) => {
+                next(&mut l.premise);
+                next(&mut l.rules);
+            }
             NodeKind::MaterialAssign { slots } => slots.iter_mut().for_each(|(g, _)| next(g)),
             NodeKind::ForEachEnd(f) => next(&mut f.attribute),
             NodeKind::Measure(m) => {
@@ -3804,6 +3930,7 @@ impl NodeKind {
                     NodeKind::Sphere { radius: 1.0, rows: 16, cols: 32 },
                     NodeKind::Torus { major: 1.0, minor: 0.35, rows: 16, cols: 32 },
                     NodeKind::Tube { r_bot: 0.5, r_top: 0.5, height: 2.0, rows: 8, cols: 24, caps: true },
+                    NodeKind::LSystem(lsystem::LSystemSettings::defaults()),
                     NodeKind::ParticleSurface {
                         radius: 0.12,
                         join_distance: 0.08,
@@ -3889,6 +4016,7 @@ impl NodeKind {
                 vec![
                     NodeKind::Vdb { voxel_size: 0.1, padding: 0, operation: 0, iterations: 1, output: 1 },
                     NodeKind::ConvertVdb { mode: 0, iso: 0.0 },
+                    NodeKind::VolumeWrangle { code: VOLUME_WRANGLE_EXAMPLE.into() },
                 ],
             ),
             (
@@ -3996,6 +4124,7 @@ impl NodeKind {
                         visualize: true,
                     }),
                     NodeKind::TerrainColorize(terrain::ColorizeSettings::defaults()),
+                    NodeKind::HeightfieldWrangle { code: HEIGHTFIELD_WRANGLE_EXAMPLE.into() },
                 ],
             ),
             (
@@ -4172,6 +4301,9 @@ impl NodeKind {
             NodeKind::Metaball(_) => "metaball",
             NodeKind::Connectivity(_) => "connectivity",
             NodeKind::Resample(_) => "resample",
+            NodeKind::VolumeWrangle { .. } => "volume_wrangle",
+            NodeKind::HeightfieldWrangle { .. } => "heightfield_wrangle",
+            NodeKind::LSystem(_) => "lsystem",
             NodeKind::PointDeform(_) => "point_deform",
             NodeKind::TransformPieces => "transform_pieces",
             NodeKind::ForEachBegin => "foreach_begin",
@@ -4281,7 +4413,8 @@ impl NodeKind {
             NodeKind::AttributeCreate { .. }
             | NodeKind::AttributeRandomize(_)
             | NodeKind::AttributeDelete { .. } => 1,
-            NodeKind::Wrangle { .. } => 1,
+            NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => 1,
+            NodeKind::LSystem(_) => 0,
             NodeKind::AttributeVop { .. } => 1,
             NodeKind::Vop(v) => v.def().inputs.len(),
             NodeKind::MoonRayRender { .. } => 0,
@@ -4325,7 +4458,9 @@ impl NodeKind {
                     | NodeKind::AttributeCreate { .. }
                     | NodeKind::AttributeRandomize(_)
                     | NodeKind::AttributeDelete { .. }
-                    | NodeKind::Wrangle { .. } => egui::Color32::from_rgb(200, 140, 60),
+                    | NodeKind::Wrangle { .. }
+                    | NodeKind::VolumeWrangle { .. }
+                    | NodeKind::HeightfieldWrangle { .. } => egui::Color32::from_rgb(200, 140, 60),
                 NodeKind::Null => egui::Color32::from_gray(150),
                 NodeKind::MoonRayRender { .. } => egui::Color32::from_rgb(100, 150, 210),
                 NodeKind::Camera { .. } => egui::Color32::from_rgb(80, 180, 220),
@@ -4374,7 +4509,8 @@ impl NodeKind {
             NodeKind::AttributeCreate { attribute, value } => vec![*attribute as f32, *value],
             NodeKind::AttributeRandomize(r) => r.to_params(),
             NodeKind::AttributeDelete { attribute } => vec![*attribute as f32],
-            NodeKind::Wrangle { .. } => vec![],
+            NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => vec![],
+            NodeKind::LSystem(l) => l.to_params(),
             NodeKind::AttributeVop { domain } => vec![*domain as f32],
             NodeKind::Vop(v) => vec![v.op as f32, v.ty as f32, v.value[0], v.value[1], v.value[2]],
             NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
@@ -4678,6 +4814,9 @@ impl NodeKind {
             "attribute_randomize" => NodeKind::AttributeRandomize(randomize::RandomizeSettings::from_params(p)),
             "attribute_delete" => NodeKind::AttributeDelete { attribute: u(0).min(3) },
             "wrangle" => NodeKind::Wrangle { code: String::new(), domain: u(0).min(3) },
+            "volume_wrangle" => NodeKind::VolumeWrangle { code: String::new() },
+            "heightfield_wrangle" => NodeKind::HeightfieldWrangle { code: String::new() },
+            "lsystem" => NodeKind::LSystem(lsystem::LSystemSettings::from_params(p)),
             "attribute_vop" => NodeKind::AttributeVop { domain: u(0).min(3) },
             "vop" => NodeKind::Vop(vop::VopNode {
                 op: u(0).min(vop::OPS.len() - 1),
@@ -6306,7 +6445,7 @@ impl Graph {
                 | NodeKind::SopSolver { .. }
                 | NodeKind::SolverInput { .. }
         ))
-            || matches!(&n.kind, NodeKind::Wrangle { code, .. } if code.contains("@Time") || code.contains("@Frame") || code.contains("@SimTime") || code.contains("@SimFrame"))
+            || matches!(&n.kind, NodeKind::Wrangle { code, .. } | NodeKind::VolumeWrangle { code } | NodeKind::HeightfieldWrangle { code } if ["@Time", "@Frame", "@SimTime", "@SimFrame"].iter().any(|t| code.contains(t)))
             || (matches!(n.kind, NodeKind::AttributeVop { .. })
                 && self.vop_code(id).is_ok_and(|code| ["@Time", "@Frame", "@SimTime", "@SimFrame"].iter().any(|t| code.contains(t))))
             || matches!(&n.kind, NodeKind::Cop(c) if c.time_dependent())
@@ -6404,6 +6543,12 @@ impl Graph {
         if let Some(m) = cache.get(&id) {
             return m.clone();
         }
+        // Timed for the performance monitor (cache hits above aren't).
+        let _timer = perf::start(id);
+        self.cook_uncached(id, time, cache)
+    }
+
+    fn cook_uncached(&self, id: NodeId, time: f32, cache: &mut HashMap<NodeId, Mesh>) -> Mesh {
         let Some(node) = self.nodes.get(&id) else {
             return Mesh::default();
         };
@@ -6516,6 +6661,19 @@ impl Graph {
                         Err(e) => self.report(id, Err(e)),
                     }
                 }
+                NodeKind::VolumeWrangle { code } => {
+                    let inc = SOLVER_TIME_INC.with(|inc| inc.get());
+                    self.report(id, fields::volume_wrangle(input(0, cache), code, time, inc, Some(&node.channels)))
+                }
+                NodeKind::HeightfieldWrangle { code } => {
+                    let source = input(0, cache);
+                    let inc = SOLVER_TIME_INC.with(|inc| inc.get());
+                    match groups::point_mask(&source, &node.group) {
+                        Ok(mask) => self.report(id, fields::heightfield_wrangle(source, code, time, inc, mask.as_deref(), Some(&node.channels))),
+                        Err(e) => self.report(id, Err(e)),
+                    }
+                }
+                NodeKind::LSystem(settings) => self.report(id, lsystem::generate(settings)),
                 NodeKind::Merge => {
                     // Every connected input, in order.
                     let mut slots: Vec<usize> = self.links.iter().filter(|l| l.to == id).map(|l| l.slot).collect();
@@ -8044,10 +8202,11 @@ enum Pane {
     Timeline,
     Spreadsheet,
     GraphEditor,
+    Performance,
 }
 
 impl Pane {
-    const ALL: [Pane; 6] = [Pane::Viewport, Pane::Network, Pane::Parameters, Pane::Timeline, Pane::Spreadsheet, Pane::GraphEditor];
+    const ALL: [Pane; 7] = [Pane::Viewport, Pane::Network, Pane::Parameters, Pane::Timeline, Pane::Spreadsheet, Pane::GraphEditor, Pane::Performance];
 
     fn title(self) -> &'static str {
         match self {
@@ -8057,6 +8216,7 @@ impl Pane {
             Pane::Timeline => "Timeline",
             Pane::Spreadsheet => "Geometry Spreadsheet",
             Pane::GraphEditor => "Graph Editor",
+            Pane::Performance => "Performance Monitor",
         }
     }
 }
@@ -8249,6 +8409,11 @@ struct ProceduralFxStudioApp {
     viewport_focal_px: f32,
     // Geometry node whose network is being edited; None shows the OBJ-level network.
     current_network: Option<NodeId>,
+    // Performance monitor: cook times drawn on nodes, the column it sorts by, and the
+    // interface's smoothed frame time (seconds).
+    show_cook_times: bool,
+    perf_sort: usize,
+    frame_time: f32,
 
     current_mesh: Mesh,
     cook_ms: f32,
@@ -8477,6 +8642,9 @@ impl Default for ProceduralFxStudioApp {
             sequence: None,
             viewport_focal_px: 720.0 * 1.2,
             current_network: None,
+            show_cook_times: false,
+            perf_sort: 0,
+            frame_time: 1.0 / 60.0,
             current_mesh: Mesh::default(),
             cook_ms: 0.0,
             dirty: true,
@@ -8727,6 +8895,7 @@ impl ProceduralFxStudioApp {
             Pane::Timeline => self.timeline_pane(ui),
             Pane::Spreadsheet => self.spreadsheet_pane(ui),
             Pane::GraphEditor => self.graph_editor_pane(ui),
+            Pane::Performance => self.performance_pane(ui),
         }
     }
 
@@ -8986,6 +9155,82 @@ impl ProceduralFxStudioApp {
                 ui.checkbox(&mut self.pause_on_edit, "Pause on edit").on_hover_text("Pause playback whenever the scene is edited: parameters, wiring, flags or gizmo drags");
             });
         });
+    }
+
+    // The performance monitor: each node's cook times, slowest first.
+    fn performance_pane(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let mut recording = perf::recording();
+            let label = if recording { "⏺ Recording" } else { "⏸ Paused" };
+            if ui.toggle_value(&mut recording, label).on_hover_text("Time every node cook").changed() {
+                perf::set_recording(recording);
+            }
+            if ui.button("Clear").on_hover_text("Forget the times so far").clicked() {
+                perf::clear();
+            }
+            ui.checkbox(&mut self.show_cook_times, "Show cook times on nodes");
+            let dt = self.frame_time.max(1e-4);
+            ui.weak(format!("Interface: {:.0} fps ({:.1} ms a frame)", 1.0 / dt, dt * 1000.0));
+        });
+        let mut stats: Vec<(NodeId, perf::Stat)> = perf::snapshot().into_iter().filter(|(id, _)| self.graph.nodes.contains_key(id)).collect();
+        if stats.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("Nothing has cooked since the times were cleared. Change a parameter, or play the timeline, and each node's cook time shows here.");
+            return;
+        }
+        let total: f64 = stats.iter().map(|(_, s)| s.total).sum();
+        let cooks: u64 = stats.iter().map(|(_, s)| s.cooks).sum();
+        ui.label(format!("{} nodes cooked {cooks} times: {} of their own work in all.", stats.len(), perf::ms(total)));
+        ui.weak("A node's own time leaves out the time its inputs took, so the slowest node is the one to look at. Click a node to go to it.");
+        match self.perf_sort {
+            1 => stats.sort_by(|a, b| b.1.last.total_cmp(&a.1.last)),
+            2 => stats.sort_by(|a, b| b.1.average().total_cmp(&a.1.average())),
+            3 => stats.sort_by(|a, b| b.1.max.total_cmp(&a.1.max)),
+            4 => stats.sort_by(|a, b| b.1.cooks.cmp(&a.1.cooks)),
+            _ => {}
+        }
+        let mut jump = None;
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("performance_grid").striped(true).num_columns(8).spacing([14.0, 4.0]).show(ui, |ui| {
+                ui.strong("Node");
+                ui.strong("Type");
+                for (column, label) in [(4, "Cooks"), (1, "Last"), (2, "Average"), (3, "Slowest"), (0, "Total")] {
+                    let text = if self.perf_sort == column { format!("{label} ▼") } else { label.to_string() };
+                    if ui.add(egui::Label::new(egui::RichText::new(text).strong()).sense(egui::Sense::click())).on_hover_text("Sort by this").clicked() {
+                        self.perf_sort = column;
+                    }
+                }
+                ui.strong("Share");
+                ui.end_row();
+                for (id, stat) in &stats {
+                    let node = &self.graph.nodes[id];
+                    let path = match self.graph.enclosing_geometry(*id) {
+                        Some(object) => format!("{} / {}", self.graph.nodes[&object].title(object), self.graph.path_in_object(*id)),
+                        None => node.title(*id),
+                    };
+                    if ui.link(path).on_hover_text("Go to this node").clicked() {
+                        jump = Some(*id);
+                    }
+                    ui.label(node.type_label());
+                    ui.label(stat.cooks.to_string());
+                    ui.label(perf::ms(stat.last)).on_hover_text(format!("{} including its inputs", perf::ms(stat.last_with_inputs)));
+                    ui.label(perf::ms(stat.average()));
+                    ui.label(perf::ms(stat.max));
+                    ui.label(perf::ms(stat.total));
+                    let share = if total > 0.0 { (stat.total / total) as f32 } else { 0.0 };
+                    ui.add(egui::ProgressBar::new(share).desired_width(90.0).text(format!("{:.0}%", share * 100.0)));
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(id) = jump {
+            let (parent, context) = self.graph.nodes.get(&id).map(|n| (n.parent, n.context)).unwrap_or((None, AppContext::Obj));
+            self.enter_network(parent);
+            if parent.is_none() {
+                self.context = context;
+            }
+            self.selected = Some(id);
+        }
     }
 
     fn spreadsheet_pane(&mut self, ui: &mut egui::Ui) {
@@ -13447,76 +13692,57 @@ impl ProceduralFxStudioApp {
                     });
                     ui.weak("Edits cook live");
                 });
-                c |= ui.add(
-                    egui::TextEdit::multiline(code)
-                        .code_editor()
-                        .desired_rows(14)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("@P.y += sin(@P.x * 3.0) * 0.2;"),
-                ).changed();
-                c |= channel_params_ui(ui, code, &mut node.channels);
-
-                let report = vex::last_report(code, *domain);
-                let error = match &report {
-                    Some(report) => report.error.clone(),
-                    None => vex::check(code).err(),
+                let noun = match *domain {
+                    0 => "detail",
+                    1 => "primitives",
+                    2 => "points",
+                    _ => "vertices",
                 };
-                match error {
-                    Some(error) => {
-                        ui.colored_label(egui::Color32::from_rgb(240, 110, 110), format!("✖ {error}"));
-                        // Show the offending source line under the message.
-                        let line = error
-                            .strip_prefix("line ")
-                            .and_then(|rest| rest.split(|ch: char| !ch.is_ascii_digit()).next())
-                            .and_then(|n| n.parse::<usize>().ok());
-                        if let Some(text) = line.and_then(|n| code.lines().nth(n.saturating_sub(1))) {
-                            ui.monospace(format!("{:>4} | {}", line.unwrap_or(0), text.trim_end()));
-                        }
-                        if report.is_some() {
-                            ui.small("The node passes its input through unchanged until the error is fixed.");
+                c |= vex_editor_ui(ui, code, *domain, noun, &mut node.channels, "@P.y += sin(@P.x * 3.0) * 0.2;");
+            }
+            NodeKind::VolumeWrangle { code } => {
+                ui.heading("Volume Wrangle");
+                ui.small("Runs over every voxel: @density (fog) or @surface (level set), with @P at the voxel's centre (read-only). volumesample(0, \"density\", pos) reads the volume anywhere; removepoint() switches a voxel off.");
+                c |= examples_menu(ui, code, &VOLUME_WRANGLE_EXAMPLES);
+                c |= vex_editor_ui(ui, code, 2, "voxels", &mut node.channels, "@density *= 0.5;");
+            }
+            NodeKind::HeightfieldWrangle { code } => {
+                ui.heading("Heightfield Wrangle");
+                ui.small("Runs over every point of a terrain: @height and @mask (and the terrain's other attributes), with @P's x and z fixed. volumesample(0, \"height\", pos) and volumeindex() read neighbouring heights.");
+                c |= examples_menu(ui, code, &HEIGHTFIELD_WRANGLE_EXAMPLES);
+                c |= vex_editor_ui(ui, code, 2, "points", &mut node.channels, "@height += 1;");
+            }
+            NodeKind::LSystem(set) => {
+                ui.small("Rewrites the premise by the rules, generation after generation, then draws it as curves.");
+                ui.menu_button("Presets ▾", |ui| {
+                    for (label, premise, rules, generations, angle, step) in lsystem::PRESETS {
+                        if ui.button(*label).clicked() {
+                            set.premise = premise.to_string();
+                            set.rules = rules.to_string();
+                            set.generations = *generations;
+                            set.angle = *angle;
+                            set.step = *step;
+                            c = true;
+                            ui.close_menu();
                         }
                     }
-                    None => match &report {
-                        Some(report) => {
-                            let noun = match *domain {
-                                0 => "detail",
-                                1 => "primitives",
-                                2 => "points",
-                                _ => "vertices",
-                            };
-                            ui.colored_label(
-                                egui::Color32::LIGHT_GREEN,
-                                format!("✔ Ran over {} {noun} in {:.2} ms", report.elements, report.millis),
-                            );
-                        }
-                        None => {
-                            ui.weak("✔ Compiles. It runs when the node is part of the displayed network.");
-                        }
-                    },
-                }
-                if let Some(report) = report.as_ref().filter(|r| !r.output.is_empty()) {
-                    egui::CollapsingHeader::new(format!("Output ({} lines)", report.output.len()))
-                        .id_salt("wrangle_output")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
-                                for line in &report.output {
-                                    ui.monospace(line);
-                                }
-                            });
-                        });
-                }
-                egui::CollapsingHeader::new("Language reference").id_salt("wrangle_reference").show(ui, |ui| {
-                    ui.label(egui::RichText::new(vex::SYNTAX_HELP).monospace().small());
-                    let mut group = "";
-                    for (_, _, _, function_group, signature) in vex::BUILTINS {
-                        if *function_group != group {
-                            group = function_group;
-                            ui.add_space(4.0);
-                            ui.strong(group);
-                        }
-                        ui.label(egui::RichText::new(*signature).monospace().small());
-                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Premise");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.premise).code_editor().desired_width(220.0)).changed();
+                });
+                ui.label("Rules (one per line, e.g. A=F[+A][-A])");
+                c |= ui.add(egui::TextEdit::multiline(&mut set.rules).code_editor().desired_rows(4).desired_width(f32::INFINITY)).changed();
+                c |= pfield(ui, pslider(&mut set.generations, 0..=12).text("Generations")).changed();
+                c |= pfield(ui, pslider(&mut set.angle, 0.0..=180.0).text("Angle")).changed();
+                c |= pfield(ui, pslider(&mut set.angle_random, 0.0..=45.0).text("Angle Randomness")).changed();
+                c |= pfield(ui, pslider(&mut set.step, 0.001..=5.0).logarithmic(true).text("Step Size")).changed();
+                c |= pfield(ui, pslider(&mut set.step_scale, 0.0..=1.5).text("Step Scale")).changed();
+                c |= pfield(ui, pslider(&mut set.thickness, 0.0..=1.0).text("Thickness")).changed();
+                c |= pfield(ui, pslider(&mut set.thickness_scale, 0.0..=1.5).text("Thickness Scale")).changed();
+                c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
+                egui::CollapsingHeader::new("Symbols").id_salt("lsystem_symbols").show(ui, |ui| {
+                    ui.label(egui::RichText::new(lsystem::SYMBOL_HELP).monospace().small());
                 });
             }
             NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
@@ -15564,6 +15790,26 @@ impl ProceduralFxStudioApp {
                     egui::Color32::from_gray(185),
                 );
             }
+            // Performance monitor: the node's latest own cook time, warmer the slower it is.
+            if self.show_cook_times {
+                if let Some(stat) = perf::get(id) {
+                    let ms = stat.last * 1000.0;
+                    let colour = if ms >= 100.0 {
+                        egui::Color32::from_rgb(240, 110, 110)
+                    } else if ms >= 10.0 {
+                        egui::Color32::from_rgb(240, 190, 90)
+                    } else {
+                        egui::Color32::from_gray(170)
+                    };
+                    painter.text(
+                        rect.right_center() + egui::vec2(8.0 * self.graph_zoom, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        perf::ms(stat.last),
+                        egui::FontId::proportional(11.0 * self.graph_zoom.max(0.6)),
+                        colour,
+                    );
+                }
+            }
             // TOP nodes: a dot per work item from the last cook, like Houdini's.
             if let Some(states) = self.top_results.get(&id).filter(|_| matches!(node.kind, NodeKind::Top(_))) {
                 let r = 3.0 * self.graph_zoom;
@@ -17224,6 +17470,10 @@ impl ProceduralFxStudioApp {
 
 impl eframe::App for ProceduralFxStudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let dt = ctx.input(|i| i.unstable_dt);
+        if dt.is_finite() && dt > 0.0 && dt < 1.0 {
+            self.frame_time += (dt - self.frame_time) * 0.1;
+        }
         self.shortcuts(ctx);
 
         // Keep the requested simulation time stable until the asynchronous
@@ -20291,5 +20541,91 @@ mod closed_shape_tests {
         let corners = sops::corner_normals(&sphere);
         let smooth = sphere.indices.iter().zip(&corners).all(|(tri, n)| (0..3).all(|k| n[k].dot(sphere.vertices[tri[k]].normalize()) > 0.99));
         assert!(smooth);
+    }
+}
+
+#[cfg(test)]
+mod field_node_tests {
+    use super::*;
+
+    #[test]
+    fn wrangle_examples_and_lsystem_presets_run() {
+        let mut voxels = Vec::new();
+        for x in -3..3 {
+            for y in 0..5 {
+                for z in -3..3 {
+                    voxels.push(([x, y, z], 1.0));
+                }
+            }
+        }
+        let fog = volume::encode_voxels(&voxels, volume::Class::Fog, 0.4, Vec3::zero(), 0.0);
+        for (label, code) in VOLUME_WRANGLE_EXAMPLES {
+            vex::check(code).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let out = fields::volume_wrangle(fog.clone(), code, 0.0, 1.0 / 24.0, None).unwrap();
+            assert!(vex::last_report(code, 2).unwrap().error.is_none(), "{label}: {:?}", vex::last_report(code, 2).unwrap().error);
+            assert_ne!(out.point_attributes["density"], fog.point_attributes["density"], "{label} changed nothing");
+        }
+        let terrain = terrain::terrain_noise(&terrain::terrain(&terrain::TerrainSettings { size: [10.0, 10.0], resolution: 32 }), &terrain::NoiseSettings::defaults()).unwrap();
+        for (label, code) in HEIGHTFIELD_WRANGLE_EXAMPLES {
+            vex::check(code).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let out = fields::heightfield_wrangle(terrain.clone(), code, 0.0, 1.0 / 24.0, None, None).unwrap();
+            assert!(vex::last_report(code, 2).unwrap().error.is_none(), "{label}: {:?}", vex::last_report(code, 2).unwrap().error);
+            let changed = out.vertices != terrain.vertices || out.point_attributes.get("mask") != terrain.point_attributes.get("mask");
+            assert!(changed, "{label} changed nothing");
+        }
+        for (label, premise, rules, generations, angle, step) in lsystem::PRESETS {
+            let set = lsystem::LSystemSettings { premise: premise.to_string(), rules: rules.to_string(), generations: *generations, angle: *angle, step: *step, ..lsystem::LSystemSettings::defaults() };
+            let mesh = lsystem::generate(&set).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(!groom::curves(&mesh).is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn new_nodes_save_and_load() {
+        let mut g = Graph::default();
+        let mut set = lsystem::LSystemSettings::defaults();
+        set.rules = "A=F[+A]".into();
+        set.premise = "A".into();
+        set.generations = 3;
+        let l = g.add(NodeKind::LSystem(set.clone()), egui::pos2(0.0, 0.0));
+        let v = g.add(NodeKind::VolumeWrangle { code: "@density = 2;".into() }, egui::pos2(0.0, 80.0));
+        let h = g.add(NodeKind::HeightfieldWrangle { code: "@height = 1;".into() }, egui::pos2(0.0, 160.0));
+        let loaded = Graph::deserialize(&g.serialize());
+        assert!(matches!(&loaded.nodes[&l].kind, NodeKind::LSystem(s) if *s == set));
+        assert!(matches!(&loaded.nodes[&v].kind, NodeKind::VolumeWrangle { code } if code == "@density = 2;"));
+        assert!(matches!(&loaded.nodes[&h].kind, NodeKind::HeightfieldWrangle { code } if code == "@height = 1;"));
+        // The L-system cooks on its own; the wrangles explain what they need.
+        let curves = g.cook(l, 0.0, &mut HashMap::new());
+        assert!(groom::has_curves(&curves));
+        g.cook(v, 0.0, &mut HashMap::new());
+        let error = node_errors(|errors| errors.get(&v).cloned());
+        assert!(error.as_deref().is_some_and(|e| e.contains("volume")), "{error:?}");
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    #[test]
+    fn cooking_records_each_nodes_own_time() {
+        let _guard = perf::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = Graph::default();
+        // Ids well clear of the other tests' graphs, which cook at the same time.
+        g.next_id = 50_000;
+        let grid = g.add(NodeKind::Grid { size: 4.0, res: 200 }, egui::pos2(0.0, 0.0));
+        let smooth = g.add(NodeKind::Smooth { iterations: 20, strength: 0.5 }, egui::pos2(0.0, 80.0));
+        g.connect(grid, smooth, 0);
+        let before = perf::get(smooth).map_or(0, |s| s.cooks);
+        g.cook(smooth, 0.0, &mut HashMap::new());
+        let (s, gs) = (perf::get(smooth).unwrap(), perf::get(grid).unwrap());
+        assert_eq!(s.cooks, before + 1);
+        // Smooth's own time leaves out the grid it waited for.
+        assert!(s.last_with_inputs >= s.last + gs.last * 0.99, "{s:?} {gs:?}");
+        // A cache hit isn't a cook.
+        let mut cache = HashMap::new();
+        g.cook(smooth, 0.0, &mut cache);
+        g.cook(smooth, 0.0, &mut cache);
+        assert_eq!(perf::get(smooth).unwrap().cooks, before + 2);
     }
 }

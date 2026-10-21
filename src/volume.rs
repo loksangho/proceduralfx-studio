@@ -225,6 +225,15 @@ pub fn to_mesh(volume: &Volume) -> Mesh {
     encode_voxels(&voxels, volume.class, volume.voxel, volume.origin, volume.background)
 }
 
+// How a voxel with value `v` looks in the viewport: (Alpha, Cd).
+pub fn display(class: Class, voxel: f32, v: f32) -> (f32, [f32; 3]) {
+    match class {
+        // Level sets show a translucent shell around the surface.
+        Class::LevelSet => ((0.35 * (1.0 - v.abs() / voxel)).clamp(0.0, 0.35), [0.62, 0.72, 0.85]),
+        Class::Fog => ((1.0 - (-v * 1.5).exp()).clamp(0.0, 0.9), [0.8, 0.8, 0.82]),
+    }
+}
+
 // Encodes sparse voxels (index, value); world position = origin + index · voxel.
 pub fn encode_voxels(voxels: &[([i64; 3], f32)], class: Class, voxel: f32, origin: Vec3, background: f32) -> Mesh {
     let mut mesh = Mesh::default();
@@ -236,11 +245,7 @@ pub fn encode_voxels(voxels: &[([i64; 3], f32)], class: Class, voxel: f32, origi
             origin.z + index[2] as f32 * voxel,
         ));
         values.push(*v);
-        let (a, c) = match class {
-            // Level sets show a translucent shell around the surface.
-            Class::LevelSet => ((0.35 * (1.0 - v.abs() / voxel)).clamp(0.0, 0.35), [0.62, 0.72, 0.85]),
-            Class::Fog => ((1.0 - (-v * 1.5).exp()).clamp(0.0, 0.9), [0.8, 0.8, 0.82]),
-        };
+        let (a, c) = display(class, voxel, *v);
         alpha.push(a);
         colors.extend(c);
     }

@@ -1083,6 +1083,11 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("removepoint", 2, 2, "Geometry", "removepoint(0, ptnum) also removes its triangles"),
     ("removeprim", 2, 3, "Geometry", "removeprim(0, primnum [, andpoints])"),
     ("nearpoint", 2, 3, "Geometry", "nearpoint(0, pos [, maxdist]) or -1"),
+    ("volumesample", 3, 3, "Volumes", "volumesample(0, \"density\", pos) a volume's (or terrain's \"height\"/\"mask\") value at pos, interpolated"),
+    ("volumegradient", 3, 3, "Volumes", "volumegradient(0, \"density\", pos) direction of fastest increase, per unit"),
+    ("volumeindex", 3, 3, "Volumes", "volumeindex(0, \"density\", set(ix, iy, iz)) a voxel's value (terrains: set(ix, iz, 0))"),
+    ("volumepostoindex", 3, 3, "Volumes", "volumepostoindex(0, \"density\", pos) voxel index of a position"),
+    ("volumeindextopos", 3, 3, "Volumes", "volumeindextopos(0, \"density\", index) position of a voxel index"),
     ("nearpoints", 3, 4, "Geometry", "nearpoints(0, pos, maxdist [, maxpts])"),
     ("neighbours", 2, 2, "Geometry", "neighbours(0, ptnum) connected points"),
     ("neighbourcount", 2, 2, "Geometry", "neighbourcount(0, ptnum)"),
@@ -2053,6 +2058,8 @@ struct Runtime<'a> {
     neighbours: Option<Vec<Vec<usize>>>,
     point_prims: Option<Vec<Vec<usize>>>,
     point_grid: Option<PointGrid>,
+    // Fields read with volumesample() and friends, by name.
+    fields: Vec<(String, crate::fields::Field)>,
     // Values of the node's ch() parameters.
     channels: Option<&'a Channels>,
     // pcopen handles for the current element (cleared when the element changes).
@@ -3963,6 +3970,23 @@ impl<'a> Runtime<'a> {
                     other => return Err(format!("unsupported intrinsic \"{other}\" (measuredarea, measuredperimeter)")),
                 }
             }
+            "volumesample" | "volumegradient" | "volumeindex" | "volumepostoindex" | "volumeindextopos" => {
+                let field_name = a[1].string()?;
+                let input = self.input;
+                if !self.fields.iter().any(|(n, _)| **n == *field_name) {
+                    let field = crate::fields::Field::from_mesh(input, &field_name).map_err(|e| format!("{name}(): {e}"))?;
+                    self.fields.push((field_name.to_string(), field));
+                }
+                let field = &self.fields.iter().find(|(n, _)| **n == *field_name).expect("just added").1;
+                let v = vec3(a[2].vec()?);
+                match name {
+                    "volumesample" => Float(field.sample(v)),
+                    "volumegradient" => V(arr3(field.gradient(v))),
+                    "volumeindex" => Float(field.at_index([v.x.round() as i64, v.y.round() as i64, v.z.round() as i64])),
+                    "volumepostoindex" => V(arr3(field.pos_to_index(v))),
+                    _ => V(arr3(field.index_to_pos(v))),
+                }
+            }
             "nearpoint" => {
                 let p = vec3(a[1].vec()?);
                 let max = a.get(2).map(Value::num).transpose()?.unwrap_or(f32::INFINITY);
@@ -4400,6 +4424,7 @@ fn run_masked(
         neighbours: None,
         point_prims: None,
         point_grid: None,
+        fields: Vec::new(),
         channels,
         pc_handles: Vec::new(),
         pc_elem: usize::MAX,
@@ -4748,6 +4773,7 @@ mod tests {
             neighbours: None,
             point_prims: None,
             point_grid: None,
+            fields: Vec::new(),
             channels: None,
             pc_handles: Vec::new(),
             pc_elem: usize::MAX,

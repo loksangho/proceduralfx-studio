@@ -47,9 +47,11 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("convert_line", "Turns every polygon edge into a two-point line (a curve) with restlength; quad diagonals are skipped."),
     ("metaball", "Soft blobs around the input's points (pscale scales each, or one ball at the origin), blended into one surface; lower thresholds are fatter."),
     ("connectivity", "Numbers connected pieces 0, 1, 2… in a point or primitive attribute (class by default)."),
+    ("lsystem", "An L-system: a premise rewritten by rules for a number of generations, then drawn by a 3D turtle as curves with a tapering width. F draws, + - & ^ \\ / turn, [ ] branch, ! thins; several rules for one symbol pick at random. Presets: trees, a fractal plant, grass, Koch and Hilbert curves."),
     ("resample", "Evenly spaced points along curves, by maximum segment length or a number of segments; point attributes are interpolated."),
     ("object_merge", "Brings in an object's geometry (its display output) or any node inside an object, including other nodes in this network, optionally moved into this object's space. Pick sources from a menu per object."),
     // Volumes
+    ("volume_wrangle", "Runs VEX over a volume's voxels: @density (fog) or @surface (level set), with @P at each voxel's centre. volumesample(), volumegradient() and volumeindex() read the volume anywhere; removepoint() switches voxels off. Positions don't move."),
     ("vdb", "VDB from polygons: a level set (or fog) volume of a closed mesh, with smoothing, dilate and erode."),
     ("convert_vdb", "Converts volumes: to polygons at an iso value, or to a fog volume."),
     // Deformers
@@ -113,6 +115,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("terrain_terrace", "Stepped plateaus."),
     ("terrain_mask", "A 0–1 mask from height, slope, flow or debris."),
     ("terrain_colorize", "Colours sand, grass, rock and snow by height and slope."),
+    ("heightfield_wrangle", "Runs VEX over a terrain's points: @height, @mask and its other attributes (x and z stay fixed). volumesample(0, \"height\", pos) and volumeindex() read neighbouring heights, e.g. to smooth. Works on its group's points."),
     // Attributes, groups, UV
     ("attribute_create", "Creates an attribute (id, pscale, Cd, orient) with a value."),
     ("attribute_randomize", "Random values for an attribute: id, pscale, Cd or orient presets, or any custom attribute on points, primitives or the detail, with 1 to 4 components between Min and Max, set or added."),
@@ -213,7 +216,7 @@ pub fn html(version: &str) -> String {
     for (name, what) in CONTEXTS {
         let _ = write!(body, "<tr><th>{name}</th><td>{}</td></tr>", esc(what));
     }
-    body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node; a renamed node still shows its type under the name. Some nodes have several outputs (Material Fracture, RBD Configure, RBD Bullet Solver: geometry, constraints, proxy): drag a wire from the output you want; hover a port for its name. Any parameter can be keyframed: the animation editor lists each one by name (size, radius, t.x…).</p></section>");
+    body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node; a renamed node still shows its type under the name. Some nodes have several outputs (Material Fracture, RBD Configure, RBD Bullet Solver: geometry, constraints, proxy): drag a wire from the output you want; hover a port for its name. Any parameter can be keyframed: the animation editor lists each one by name (size, radius, t.x…).</p><p><b>Windows → Performance Monitor</b> times every node cook: each node's own time (without its inputs), how often it cooked, its slowest and average cook and its share of the total, slowest first. Click a node to go to it; <i>Show cook times on nodes</i> writes each node's latest time next to it in the network.</p></section>");
     let _ = write!(nav, "<a href=\"#overview\">Overview</a>");
 
     // The AI assistant.

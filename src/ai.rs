@@ -63,6 +63,8 @@ fn template(name: &str) -> Option<NodeKind> {
 fn text_names(kind: &NodeKind) -> Vec<String> {
     let names: &[&str] = match kind {
         NodeKind::Wrangle { .. } => return vec!["code".into()],
+        NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => &["code"],
+        NodeKind::LSystem(_) => &["premise", "rules"],
         NodeKind::FileImport { .. } | NodeKind::FileExport { .. } | NodeKind::UvQuickShade { .. } => &["file"],
         NodeKind::AttributePaint { .. } => &["attribute"],
         NodeKind::ForEachEnd(_) => &["attribute"],
@@ -155,6 +157,9 @@ fn note(node: &str) -> Option<&'static str> {
         "copy_to_points" => "copies keep their own up direction (the points' N isn't used): set orient on the points (a quaternion, or degrees about Y) to tilt or turn copies; pscale scales each copy",
         "scatter" => "its points get N (the surface normal) and pscale (half their typical spacing), which Copy to Points then uses as the copy size: set pscale yourself to control it",
         "attribute_randomize" => "min, max, class, size and name only apply when attribute is \"Custom\"; the presets use amount (pscale adds a random value between -amount and +amount)",
+        "volume_wrangle" => "input must be a volume (vdb, pyro, convert_vdb output); code runs per voxel with @density (fog) or @surface (level set) and @P at the voxel centre (positions can't change); volumesample(0, \"density\", pos) reads neighbours",
+        "heightfield_wrangle" => "input must be a terrain (terrain node chain); code runs per grid point with @height and @mask; x and z stay fixed; volumesample(0, \"height\", pos) reads neighbouring heights",
+        "lsystem" => "premise is the start string and rules one per line like \"A=F[+A][-A]\"; F draws a step, + - turn (yaw), & ^ pitch, \\\\ / roll, [ ] branch, ! thins the width; grows up +Y from the origin as curves (curveu, width); keep generations low (each one multiplies the size)",
         "wrangle" => "run_over chooses what the code runs once per: \"points\" (the default), \"primitives\" (polygons), \"detail\" (once in all) or \"vertices\"",
         "material_fracture" => "glue_strength is how hard the glue between pieces is to break: the default 200 holds through a few-units drop; single digits shatter on impact. Feed all three outputs to rbd_bullet_solver's first three inputs",
         "rbd_bullet_solver" => "inputs: material_fracture's outputs 1, 2, 3 into inputs 1, 2, 3; optional static collision geometry into input 4. glue_strength_scale multiplies every glue strength. ground adds a floor at ground_height",
@@ -256,7 +261,8 @@ fn changed_params(kind: &NodeKind) -> Vec<String> {
         out.push(format!("code={code:?}"));
     }
     for (name, text) in text_names(kind).into_iter().zip(kind.texts()).filter(|(_, t)| !t.is_empty()) {
-        if name != "code" {
+        // A Wrangle's code is listed above, with its run_over.
+        if name != "code" || !matches!(kind, NodeKind::Wrangle { .. }) {
             out.push(format!("{name}={text:?}"));
         }
     }
