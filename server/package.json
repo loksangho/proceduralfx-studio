@@ -1,0 +1,33 @@
+{
+  "name": "pfx-ai-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ProceduralFX Studio credits: sign-in, Stripe plans and top-ups, and the metered Claude relay",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
+    "build": "tsc -p .",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.137.0",
+    "express": "^5.3.0",
+    "pg": "^8.23.1",
+    "stripe": "^23.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

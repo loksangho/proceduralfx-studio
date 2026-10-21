@@ -71,7 +71,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("fuse", "Merges points closer than a distance."),
     ("mirror", "Mirrors across an axis and keeps both halves."),
     ("copy", "Copies the input several times with a cumulative transform."),
-    ("copy_to_points", "Copies input 1 onto the points of input 2, using pscale, orient, N/up and Cd."),
+    ("copy_to_points", "Copies input 1 onto the points of input 2: each copy is scaled by the point's pscale, turned by its orient (a quaternion, or one number: a turn about Y in degrees) and coloured by its Cd. Copies keep their own up direction: the points' N isn't used (set orient to tilt them)."),
     ("extrude", "Extrudes the node's group (or everything) along the normals with distance, inset and divisions; connected or individual faces. Output front, back and sides, each optionally in a group (extrudeFront, extrudeSide, extrudeBack)."),
     ("clip", "Cuts away one side of a plane."),
     ("blast", "Deletes points or primitives (the node's group, or picked in the viewport)."),
@@ -80,7 +80,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("cache", "Caches its input's frames in memory."),
     ("reverse", "Reverses polygon winding."),
     ("switch", "Passes one of its inputs through."),
-    ("merge", "Merges any number of inputs: a new input port appears as you connect one."),
+    ("merge", "Merges any number of inputs: drop a wire anywhere on the node to add one (a free port is always shown)."),
     ("null", "Passes its input through (a named place in the network)."),
     // Flow control
     ("foreach_begin", "Start of a For-Each loop: puts out each iteration's piece, with detail attributes iteration, numiterations and value."),
@@ -146,7 +146,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("usd_transform", "Transforms prims matching a pattern."),
     ("assign_material", "Binds a material to prims matching a pattern."),
     ("usd_prune", "Removes or hides prims."),
-    ("usd_merge", "Merges two stages."),
+    ("usd_merge", "Merges any number of stages, each input layered over the ones before it; drop a wire on the node to add one."),
     ("usd_export", "Saves the stage to a USD file."),
     // IMG, TASKS
     ("cop_network", "A compositing network (IMG): build it from COP nodes; the viewport shows its output."),

@@ -19,7 +19,9 @@ use rfd::FileDialog;
 
 mod render_viewer;
 mod abc;
+mod ai;
 mod anim;
+mod assistant;
 mod boolean;
 mod bullet;
 mod cops;
@@ -43,6 +45,8 @@ mod poly;
 mod randomize;
 mod raster;
 mod sims;
+mod providers;
+mod snapshot;
 mod shading;
 mod sopkit;
 mod sops;
@@ -596,6 +600,17 @@ fn node_transform(mut mesh: Mesh, t: [f32; 3], r: [f32; 3], s: [f32; 3]) -> Mesh
     let (t, s) = (Vec3::from_arr(t), Vec3::from_arr(s));
     for v in mesh.vertices.iter_mut() {
         *v = v.mul(s).rotate_deg(r).add(t);
+    }
+    // Normals turn with the geometry (scaled inversely, so they stay perpendicular to it).
+    let inverse = Vec3::new(1.0 / s.x.abs().max(1e-12) * s.x.signum(), 1.0 / s.y.abs().max(1e-12) * s.y.signum(), 1.0 / s.z.abs().max(1e-12) * s.z.signum());
+    let (points, tris) = (mesh.vertices.len(), mesh.indices.len());
+    for (key, count) in [("N", points), ("vertex:N", tris * 3)] {
+        if let Some(normals) = mesh.point_attributes.get_mut(key).filter(|n| count > 0 && n.len() == count * 3) {
+            for c in normals.chunks_exact_mut(3) {
+                let n = Vec3::new(c[0], c[1], c[2]).mul(inverse).rotate_deg(r).normalize();
+                c.copy_from_slice(&[n.x, n.y, n.z]);
+            }
+        }
     }
     // Negative scale on an odd number of axes flips winding
     if s.x * s.y * s.z < 0.0 {
@@ -1200,15 +1215,32 @@ fn node_copy_to_points(piece: Mesh, points: Mesh, scale: f32, rotation: [f32; 3]
     let orientations = points.point_attributes.get("orient");
     let colors = points.point_attributes.get("Cd");
     let point_count = points.vertices.len();
+    // orient: a quaternion per point (as in Houdini), or one number, a turn about Y in degrees.
+    let quaternions = orientations.filter(|o| point_count > 0 && o.len() == point_count * 4);
     for (index, point) in points.vertices.into_iter().enumerate() {
         let point_scale = scales.and_then(|v| v.get(index)).copied().unwrap_or(1.0);
-        let point_rotation = orientations.and_then(|v| v.get(index)).copied().unwrap_or(0.0);
+        let point_rotation = if quaternions.is_some() { 0.0 } else { orientations.and_then(|v| v.get(index)).copied().unwrap_or(0.0) };
         let mut copy = node_transform(
             piece.clone(),
-            [point.x, point.y, point.z],
+            [0.0; 3],
             [rotation[0], rotation[1] + point_rotation, rotation[2]],
             [scale * point_scale; 3],
         );
+        if let Some(q) = quaternions {
+            let m = vexmath::q_to_m3(&[q[index * 4], q[index * 4 + 1], q[index * 4 + 2], q[index * 4 + 3]]);
+            let rows = [Vec3::new(m[0], m[1], m[2]), Vec3::new(m[3], m[4], m[5]), Vec3::new(m[6], m[7], m[8])];
+            copy.vertices.iter_mut().for_each(|v| *v = kinefx::vm(*v, &rows));
+            let (pts, tris) = (copy.vertices.len(), copy.indices.len());
+            for (key, count) in [("N", pts), ("vertex:N", tris * 3)] {
+                if let Some(normals) = copy.point_attributes.get_mut(key).filter(|n| count > 0 && n.len() == count * 3) {
+                    for c in normals.chunks_exact_mut(3) {
+                        let n = kinefx::vm(Vec3::new(c[0], c[1], c[2]), &rows);
+                        c.copy_from_slice(&[n.x, n.y, n.z]);
+                    }
+                }
+            }
+        }
+        copy.vertices.iter_mut().for_each(|v| *v = v.add(point));
         if let Some(values) = colors {
             let color = if values.len() >= point_count.saturating_mul(3) {
                 [
@@ -1374,8 +1406,30 @@ fn attribute_element_count(key: &str, points: usize, prims: usize) -> usize {
     }
 }
 
+// What an element without the attribute reads (Houdini's defaults for the common ones).
+fn attribute_default(key: &str) -> f32 {
+    let name = key.rsplit(':').next().unwrap_or(key);
+    if matches!(name, "Cd" | "pscale" | "Alpha" | "width") { 1.0 } else { 0.0 }
+}
+
+// Normals one side has and the other lacks: the other gets real ones, not zeros
+// (zero normals shade black).
+fn fill_missing_normals(a: &Mesh, b: &mut Mesh) {
+    let tris = b.indices.len();
+    if a.point_attributes.contains_key("N") && !b.point_attributes.contains_key("N") && !b.vertices.is_empty() {
+        let n = b.compute_normals();
+        b.point_attributes.insert("N".into(), n.iter().flat_map(|v| [v.x, v.y, v.z]).collect());
+    }
+    if a.point_attributes.contains_key("vertex:N") && !b.point_attributes.contains_key("vertex:N") && tris > 0 {
+        let corners = sops::corner_normals(b);
+        b.point_attributes.insert("vertex:N".into(), corners.iter().flatten().flat_map(|v| [v.x, v.y, v.z]).collect());
+    }
+}
+
 fn node_merge(mut a: Mesh, mut b: Mesh) -> Mesh {
     poly::offset_for_merge(&a, &mut b);
+    fill_missing_normals(&a, &mut b);
+    fill_missing_normals(&b, &mut a);
     let (a_points, a_prims) = (a.vertices.len(), a.indices.len());
     let (b_points, b_prims) = (b.vertices.len(), b.indices.len());
     a.vertices.extend(b.vertices);
@@ -1410,8 +1464,10 @@ fn node_merge(mut a: Mesh, mut b: Mesh) -> Mesh {
         let a_components = components_of(a_values, a_count);
         let b_components = components_of(b_values, b_count);
         let components = a_components.max(b_components);
-        let mut merged = vec![0.0; (a_count + b_count) * components];
-        // Elements missing the attribute stay zero; one-component values fill every component.
+        // Elements missing the attribute get its natural default (as in Houdini: white for
+        // Cd, 1 for pscale and Alpha, else 0); one-component values fill every component.
+        let default = attribute_default(&name);
+        let mut merged = vec![default; (a_count + b_count) * components];
         let mut copy = |values: Option<&Vec<f32>>, count: usize, from: usize, offset: usize| {
             let Some(values) = values else { return };
             for index in 0..count {
@@ -3615,6 +3671,11 @@ impl NodeKind {
     }
 
     // Nodes whose network lives in their children: Geometry objects and SOP Solvers.
+    // Nodes with any number of inputs (a free port is always shown).
+    fn is_multi_input(&self) -> bool {
+        matches!(self, NodeKind::Merge | NodeKind::LopMerge)
+    }
+
     fn is_container(&self) -> bool {
         matches!(
             self,
@@ -3943,7 +4004,7 @@ impl NodeKind {
                     NodeKind::AttributeCreate { attribute: 1, value: 1.0 },
                     NodeKind::AttributeRandomize(randomize::RandomizeSettings::defaults()),
                     NodeKind::AttributeDelete { attribute: 1 },
-                    NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 0 },
+                    NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
                     NodeKind::Measure(measure::MeasureSettings::new(0)),
@@ -5832,8 +5893,14 @@ impl Graph {
                     }
                 }
                 NodeKind::LopMerge => {
-                    let second = input(1, cache);
-                    stage.merge(&second);
+                    // Every further input, in order, each layered over the ones before.
+                    let mut slots: Vec<usize> = self.links.iter().filter(|l| l.to == id && l.slot > 0).map(|l| l.slot).collect();
+                    slots.sort_unstable();
+                    slots.dedup();
+                    for slot in slots {
+                        let layer = input(slot, cache);
+                        stage.merge(&layer);
+                    }
                 }
                 _ => {}
             }
@@ -6268,7 +6335,7 @@ impl Graph {
     fn disconnect(&mut self, to: NodeId, slot: usize) {
         self.links.retain(|l| !(l.to == to && l.slot == slot));
         // A Merge closes the gap: later inputs move up one.
-        if matches!(self.nodes.get(&to).map(|n| &n.kind), Some(NodeKind::Merge)) {
+        if self.nodes.get(&to).is_some_and(|n| n.kind.is_multi_input()) {
             for l in self.links.iter_mut().filter(|l| l.to == to && l.slot > slot) {
                 l.slot -= 1;
             }
@@ -6278,10 +6345,23 @@ impl Graph {
     // Input ports shown on a node: a Merge has one more than its connected inputs.
     fn input_slots(&self, id: NodeId) -> usize {
         match self.nodes.get(&id).map(|n| &n.kind) {
-            Some(NodeKind::Merge) => self.links.iter().filter(|l| l.to == id).map(|l| l.slot + 2).max().unwrap_or(2).max(2),
+            // Its inputs and one free spot.
+            Some(kind) if kind.is_multi_input() => self.links.iter().filter(|l| l.to == id).map(|l| l.slot + 2).max().unwrap_or(1),
             Some(kind) => kind.num_inputs(),
             None => 0,
         }
+    }
+
+    // Where a wire dropped on a node goes: a new input on a Merge, else the
+    // first free input (or the first input, replacing it, when all are used).
+    fn drop_slot(&self, id: NodeId) -> Option<usize> {
+        let kind = &self.nodes.get(&id)?.kind;
+        let used = |slot: usize| self.links.iter().any(|l| l.to == id && l.slot == slot);
+        if kind.is_multi_input() {
+            return Some(self.links.iter().filter(|l| l.to == id).map(|l| l.slot + 1).max().unwrap_or(0));
+        }
+        let n = kind.num_inputs();
+        (n > 0).then(|| (0..n).find(|s| !used(*s)).unwrap_or(0))
     }
 
     #[cfg(feature = "native-openvdb")]
@@ -8147,6 +8227,8 @@ struct ProceduralFxStudioApp {
     viewport_bg: u8,
     // Flipbook: the capture in progress, the viewer, and where the viewport is in the main window.
     flipbook_recording: Option<flipbook::Recording>,
+    // The AI assistant panel (bring your own Anthropic API key).
+    assistant: assistant::Panel,
     flipbook_viewer: Option<flipbook::Viewer>,
     viewport_rect: Option<egui::Rect>,
     grid_spacing: f32,
@@ -8377,6 +8459,7 @@ impl Default for ProceduralFxStudioApp {
             orthographic: false,
             viewport_bg: 45,
             flipbook_recording: None,
+            assistant: assistant::Panel::default(),
             flipbook_viewer: None,
             viewport_rect: None,
             grid_spacing: 0.5,
@@ -9546,6 +9629,9 @@ impl ProceduralFxStudioApp {
                 if ui.button("Render with MoonRay").clicked() {
                     self.start_moonray_render();
                     ui.close();
+                }
+                if ui.button("✨ AI").on_hover_text("Describe a setup and Claude builds it as nodes").clicked() {
+                    self.assistant.open = !self.assistant.open;
                 }
                 if ui.button("Render Settings…").clicked() {
                     self.show_moonray_settings = true;
@@ -14915,7 +15001,7 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::LopMerge => {
                 ui.heading("Merge");
-                ui.label("Layers the second input's prims over the first input's stage.");
+                ui.label("Layers each input's prims over the inputs before it (any number of inputs: drop wires on the node).");
             }
             NodeKind::LopExport { file } => {
                 ui.heading("USD Export");
@@ -15384,6 +15470,16 @@ impl ProceduralFxStudioApp {
                 }
                 if let (Some(src), Some(p)) = (self.dragging_link, pointer) {
                     if released && p.distance(ip) < 16.0 {
+                        // On a Merge every drop adds an input (as in Houdini), even on a used port.
+                        let slot = if node.kind.is_multi_input() { self.graph.drop_slot(id).unwrap_or(slot) } else { slot };
+                        new_link = Some((src, id, slot));
+                    }
+                }
+            }
+            // A wire dropped on the node itself (not a port): a new Merge input, else the first free input.
+            if let (Some(src), Some(p), None) = (self.dragging_link, pointer, new_link) {
+                if released && rect.contains(p) && src.0 != id {
+                    if let Some(slot) = self.graph.drop_slot(id) {
                         new_link = Some((src, id, slot));
                     }
                 }
@@ -15481,14 +15577,35 @@ impl ProceduralFxStudioApp {
                     painter.text(egui::pos2(rect.right(), rect.bottom() + r * 4.6), egui::Align2::RIGHT_CENTER, format!("+{}", states.len() - per_row * 2), egui::FontId::proportional(10.0 * self.graph_zoom), egui::Color32::from_gray(190));
                 }
             }
-            for slot in 0..n_in {
-                let ip = in_port(rect, slot, n_in);
-                let hot = self.dragging_link.is_some() && pointer.map_or(false, |p| p.distance(ip) < 16.0);
-                painter.circle_filled(
-                    ip,
-                    if hot { 7.0 } else { 5.0 },
-                    if hot { egui::Color32::YELLOW } else { egui::Color32::from_gray(200) },
-                );
+            if node.kind.is_multi_input() {
+                // A Merge takes any number of inputs, as in Houdini: one input bar across the
+                // top, a dot per connected input and a "+" where the next one goes. It lights
+                // up while a wire is dragged over the node; a wire dropped anywhere adds an input.
+                let hot = self.dragging_link.is_some_and(|(src, _)| src != id) && pointer.is_some_and(|p| rect.expand(10.0).contains(p));
+                let bar = egui::Rect::from_min_max(egui::pos2(rect.left() + 6.0, rect.top() - 3.5), egui::pos2(rect.right() - 6.0, rect.top() + 3.5));
+                painter.rect_filled(bar, egui::CornerRadius::same(4), if hot { egui::Color32::YELLOW } else { egui::Color32::from_gray(150) });
+                let connected: HashSet<usize> = self.graph.links.iter().filter(|l| l.to == id).map(|l| l.slot).collect();
+                for slot in 0..n_in {
+                    let ip = in_port(rect, slot, n_in);
+                    if connected.contains(&slot) {
+                        painter.circle_filled(ip, 4.5, egui::Color32::from_gray(235));
+                    } else {
+                        painter.text(ip, egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(11.0 * self.graph_zoom.max(0.6)), egui::Color32::from_gray(40));
+                    }
+                }
+                let _ = ui
+                    .interact(bar.expand2(egui::vec2(0.0, 5.0)), ui.id().with(("multi-input", id)), egui::Sense::hover())
+                    .on_hover_text("Any number of inputs: drop wires on the bar or anywhere on the node to add one; click a wire's dot to disconnect it");
+            } else {
+                for slot in 0..n_in {
+                    let ip = in_port(rect, slot, n_in);
+                    let hot = self.dragging_link.is_some() && pointer.map_or(false, |p| p.distance(ip) < 16.0);
+                    painter.circle_filled(
+                        ip,
+                        if hot { 7.0 } else { 5.0 },
+                        if hot { egui::Color32::YELLOW } else { egui::Color32::from_gray(200) },
+                    );
+                }
             }
             let n_out = node.kind.num_outputs();
             for out in 0..n_out {
@@ -17193,6 +17310,11 @@ impl eframe::App for ProceduralFxStudioApp {
 
         // The panes: a dock the user can rearrange, split, float and pop out (see Pane).
         self.show_panes(ctx);
+        if let Some(scene) = self.assistant.show(ctx, &self.graph, self.time) {
+            self.graph = scene;
+            self.dirty = true;
+            self.status = "AI changes applied (Ctrl+Z undoes them)".into();
+        }
         if let Some(viewer) = self.flipbook_viewer.as_mut() {
             viewer.show(ctx);
             if !viewer.open {
@@ -17503,8 +17625,9 @@ mod tests {
         b.point_attributes.insert("vertex:uvw".into(), vec![0.5; 6]);
         let merged = node_merge(a, b);
         let attrs = &merged.point_attributes;
-        assert_eq!(attrs["prim:Cd"], vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(attrs["pscale"], vec![0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0]);
+        // Missing colour reads white and missing pscale 1, as in Houdini.
+        assert_eq!(attrs["prim:Cd"], vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(attrs["pscale"], vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]);
         assert_eq!(attrs["vertex:uvw"].len(), 12);
         assert_eq!(attrs["detail:total"], vec![7.0]);
     }
@@ -18501,13 +18624,23 @@ mod raster_view_tests {
                 let g = Graph::deserialize("pfs 2\nnode 8 0 0 0 obj cone 1 2 1 32 1\nnode 10 0 0 0 obj material_fracture 0 20 1 0 0 0 4 9 1 5 0 200\nlink 8 10 0\nnext 11\n");
                 g.cook(10, 0.0, &mut HashMap::new())
             }
+            // PFX_MESH=scene:<file>: a saved scene's first object, as displayed.
+            Ok(m) if m.starts_with("scene:") => {
+                let g = Graph::deserialize(&std::fs::read_to_string(&m[6..]).unwrap());
+                let object = g.geometry_ids()[0];
+                // PFX_TIME: the frame's time in seconds.
+                let time: f32 = std::env::var("PFX_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0);
+                g.cook(object, time, &mut HashMap::new())
+            }
             _ => node_cone(1.0, 2.0, 1, 32, true),
         };
         let rot_x: f32 = std::env::var("PFX_ROTX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.35);
-        let (rot_y, zoom, focal) = (0.6f32, 6.0f32, 900.0f32);
+        // Framed on the geometry.
+        let (lo, hi) = mesh.bounds().unwrap();
+        let (rot_y, zoom, focal) = (0.6f32, hi.sub(lo).length() * 1.1, 900.0f32);
         let (sin_x, cos_x) = rot_x.sin_cos();
         let (sin_y, cos_y) = rot_y.sin_cos();
-        let target = Vec3::new(0.0, 0.5, 0.0);
+        let target = lo.add(hi).scale(0.5);
         let to_cam = |p: Vec3| {
             let v = p.sub(target);
             let rx = v.x * cos_y - v.z * sin_y;
@@ -19717,13 +19850,40 @@ mod destruction_chain_tests {
         let merge = g.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
         for i in 0..3 {
             let b = g.add(NodeKind::Box { size: 1.0 + i as f32, div: 1 }, egui::pos2(0.0, 0.0));
-            assert_eq!(g.input_slots(merge), (i + 1).max(2), "always one free port");
+            assert_eq!(g.input_slots(merge), i + 1, "always exactly one free spot");
             g.connect(b, merge, i);
         }
         assert_eq!(g.cook(merge, 0.0, &mut HashMap::new()).vertices.len(), 24);
         assert_eq!(g.input_slots(merge), 4);
         g.disconnect(merge, 0);
         assert_eq!(g.input_slots(merge), 3, "the gap closed: two inputs and a free port");
+        // A wire dropped on a Merge (body or a used port) always adds an input.
+        assert_eq!(g.drop_slot(merge), Some(2));
+        let xf = g.add(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        assert_eq!(g.drop_slot(xf), Some(0), "other nodes: the first free input");
+        let boolean = g.add(NodeKind::Boolean(boolean::BooleanSettings { operation: 2, mode: 0, resolution: 128 }), egui::pos2(0.0, 0.0));
+        let a = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        g.connect(a, boolean, 0);
+        assert_eq!(g.drop_slot(boolean), Some(1));
+
+        // The STAGE's Merge takes any number of inputs too, layering them in order.
+        let lops: Vec<NodeId> = ["/a", "/b", "/c"]
+            .iter()
+            .map(|path| {
+                let id = g.add(NodeKind::LopPrimitive { shape: 0, path: (*path).into(), size: 1.0, t: [0.0; 3] }, egui::pos2(0.0, 0.0));
+                g.nodes.get_mut(&id).unwrap().context = AppContext::Stage;
+                id
+            })
+            .collect();
+        let lop_merge = g.add(NodeKind::LopMerge, egui::pos2(0.0, 0.0));
+        g.nodes.get_mut(&lop_merge).unwrap().context = AppContext::Stage;
+        for (i, lop) in lops.iter().enumerate() {
+            assert_eq!(g.drop_slot(lop_merge), Some(i));
+            g.connect(*lop, lop_merge, i);
+        }
+        assert_eq!(g.input_slots(lop_merge), 4);
+        let stage = g.cook_stage(lop_merge, 0.0, &mut HashMap::new());
+        assert!(["/a", "/b", "/c"].iter().all(|p| stage.prims.contains_key(*p)), "every input's prims");
         assert!(g.input_link(merge, 0).is_some() && g.input_link(merge, 2).is_none());
         // Pack, move, unpack: the pieces come back turned with their points.
         let pack = g.add(NodeKind::Pack(packed::PackSettings::defaults()), egui::pos2(0.0, 0.0));
@@ -19857,6 +20017,57 @@ mod polygon_tests {
         let text = usd::to_usda(&stage);
         assert!(text.contains("faceVertexCounts = [4, 4, 4, 4]"), "{text}");
         assert!(!text.contains("__poly"));
+    }
+
+    #[test]
+    fn copies_turn_by_orient_quaternions_and_normals_follow() {
+        let piece = node_box(1.0, 1);
+        let mut points = Mesh::default();
+        points.vertices = vec![Vec3::new(5.0, 0.0, 0.0)];
+        // 90° about Z: (sin 45°, cos 45°) on the z axis.
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        points.point_attributes.insert("orient".into(), vec![0.0, 0.0, h, h]);
+        let mut tall = piece.clone();
+        tall.vertices.iter_mut().for_each(|v| v.y *= 3.0);
+        let copies = node_copy_to_points(tall, points.clone(), 1.0, [0.0; 3]);
+        let (lo, hi) = copies.bounds().unwrap();
+        assert!((hi.x - lo.x - 3.0).abs() < 1e-4 && (hi.y - lo.y - 1.0).abs() < 1e-4, "the tall box lies along x: {lo:?} {hi:?}");
+        assert!((lo.add(hi).scale(0.5).x - 5.0).abs() < 1e-4);
+        // A single-number orient still turns about Y in degrees.
+        points.point_attributes.insert("orient".into(), vec![90.0]);
+        let mut long = piece.clone();
+        long.vertices.iter_mut().for_each(|v| v.x *= 3.0);
+        let (lo, hi) = node_copy_to_points(long, points, 1.0, [0.0; 3]).bounds().unwrap();
+        assert!((hi.z - lo.z - 3.0).abs() < 1e-4);
+        // Transform turns normals.
+        let mut grid = quads();
+        grid.point_attributes.insert("N".into(), vec![0.0, 1.0, 0.0].repeat(9));
+        let turned = node_transform(grid, [0.0; 3], [90.0, 0.0, 0.0], [1.0, 2.0, 1.0]);
+        let n = &turned.point_attributes["N"];
+        assert!(n[1].abs() < 1e-4 && (n[0].powi(2) + n[2].powi(2) - 1.0).abs() < 1e-4, "{:?}", &n[..3]);
+    }
+
+    #[test]
+    fn merging_fills_missing_colour_with_white() {
+        let mut red = node_box(1.0, 1);
+        let n = red.vertices.len();
+        red.point_attributes.insert("Cd".into(), [1.0, 0.0, 0.0].repeat(n));
+        red.point_attributes.insert("mass".into(), vec![3.0; n]);
+        let merged = node_merge(quads(), red);
+        let cd = &merged.point_attributes["Cd"];
+        assert!(cd[..27].iter().all(|v| *v == 1.0), "the grid is white, not black");
+        assert!(merged.point_attributes["mass"][..9].iter().all(|v| *v == 0.0), "others default to 0");
+    }
+
+    #[test]
+    fn merging_with_normals_keeps_the_other_sides_lit() {
+        let mut rocks = node_sphere(1.0, 6, 8);
+        let n = rocks.compute_normals();
+        rocks.point_attributes.insert("N".into(), n.iter().flat_map(|v| [v.x, v.y, v.z]).collect());
+        let merged = node_merge(quads(), rocks);
+        let normals = &merged.point_attributes["N"];
+        // The grid (first 9 points) faces up, not zero.
+        assert!(normals[..27].chunks(3).all(|c| (c[1].abs() - 1.0).abs() < 1e-5), "{:?}", &normals[..27]);
     }
 
     #[test]
