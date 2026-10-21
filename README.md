@@ -18,7 +18,7 @@ Downloads are on the [Releases page](https://github.com/loksangho/proceduralfx-s
 
 | Platform | Download | Requirements |
 |---|---|---|
-| macOS | [ProceduralFxStudio.dmg](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio.dmg) | Apple Silicon Mac, macOS 27 or later |
+| macOS | [ProceduralFxStudio.dmg](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio.dmg) | Apple Silicon Mac, macOS 14 or later |
 | Linux | [ProceduralFxStudio-x86_64.flatpak](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-x86_64.flatpak) | x86_64 CPU with AVX2 (2013 or newer), Flatpak |
 | Windows | Use the Linux build under WSL 2 (see below) | Windows 11, or Windows 10 22H2 with the Store version of WSL |
 

@@ -44,11 +44,17 @@ export function messageCostMicros(message: Pick<Anthropic.Beta.BetaMessage, "mod
   return iterations.reduce((sum, it) => sum + tokensMicros(("model" in it && it.model) || message.model, it as Tokens), 0);
 }
 
-// What the user pays: cost plus margin, rounded up to the micro-dollar.
-export function chargeMicros(costMicros: number, margin: number): number {
-  return Math.ceil(costMicros * (1 + margin));
+// What the user pays, in the credit currency: the US-dollar cost converted at `usdRate`,
+// plus margin, rounded up to the micro-unit.
+export function chargeMicros(costMicros: number, margin: number, usdRate = 1): number {
+  return Math.ceil(costMicros * usdRate * (1 + margin));
 }
 
-export function usd(micros: number): number {
+// Micro-units to money, rounded to the cent.
+export function money(micros: number): number {
   return Math.round(micros / 1e4) / 100;
+}
+
+export function symbol(currency: string): string {
+  return ({ aud: "A$", usd: "$", nzd: "NZ$", cad: "CA$", eur: "€", gbp: "£" } as Record<string, string>)[currency] ?? `${currency.toUpperCase()} `;
 }

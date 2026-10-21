@@ -23,7 +23,7 @@ export function page(title: string, body: string): string {
 </style></head><body><main><div class="card"><h1>${escape(title)}</h1>${body}</div></main></body></html>`;
 }
 
-export function signInPage(code: string, error = ""): string {
+export function signInPage(code: string, error = "", site = ""): string {
   return page(
     "Sign in to ProceduralFX Studio",
     `${error ? `<p style="color:#d24">${escape(error)}</p>` : ""}
@@ -34,7 +34,8 @@ export function signInPage(code: string, error = ""): string {
        <label for="email">Email</label>
        <input id="email" type="email" name="email" autocomplete="email" required>
        <button>Email me a sign-in link</button>
-     </form>`,
+     </form>
+     ${site ? `<p class="muted" style="margin-top:16px">By signing in you agree to the <a href="${escape(site)}/terms">Terms of Service</a> and <a href="${escape(site)}/privacy">Privacy Policy</a>.</p>` : ""}`,
   );
 }
 

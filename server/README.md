@@ -7,7 +7,7 @@ The app keeps the other two options as well: a user's own Claude key, or any Ope
 ## How it works
 
 - **Signing in:** the app asks for a code and opens `/device` in the browser. The user enters their email and clicks the emailed link. The confirm page shows the code. The app then receives a session token, and the server stores only its SHA-256 hash.
-- **Credit:** each user has two balances.
+- **Credit:** in `CURRENCY`. Each user has two balances.
   - Plan credit is set to the plan's amount each time the monthly invoice is paid. Unused plan credit doesn't carry over.
   - Top-up credit never expires.
   - Requests spend plan credit first. A request is refused when the total is zero or less. A request that is already running can take the balance slightly below zero.
@@ -53,12 +53,13 @@ Do everything in Stripe's **test mode** first and switch to live keys at the end
 6. **Tax and legal.** You are the seller, so you may need to collect GST, VAT or sales tax. Stripe Tax can calculate it at Checkout. You also need terms of service, a privacy policy (emails, usage counts, prompts sent to Anthropic) and a refund policy. Link them from your site.
 7. **The app.** Build the release with `PFX_AI_SERVER=https://ai.yourdomain.com` set, so the credits option appears and becomes the default for new users.
 
-## Margins, roughly
+## Currency and margins
 
-A $5 top-up costs about $0.45 in Stripe fees. With `MARGIN=0.25`, $5 of credit costs you $4 in tokens, so you keep about $0.55 once it's all spent.
+Credit, plans and top-ups use `CURRENCY` (for example `aud`). Anthropic bills you in US dollars, so each request's cost is converted at `USD_RATE`, the number of units of your currency per US dollar, and then the margin is added. Set `USD_RATE` a little above the market rate as a buffer against exchange-rate swings, and review it every few months. Create Stripe plan prices in the same currency.
 
-An $8 plan that gives $8 of credit earns about $1.07 a month when fully used. Unused plan credit is extra, because it doesn't carry over.
+Roughly, with `CURRENCY=aud`, `USD_RATE=1.60` and `MARGIN=0.25`:
 
-Raise `MARGIN`, or give plans less credit than their price, to earn more per user. Credit is shown to users in dollars of usage, and the margin is already included in what each request costs them.
+- **A$5 top-up:** Stripe's fee is about A$0.40–0.50 (lower for Australian cards). Spending A$5 of credit costs you about A$4 in tokens, so you keep about A$0.50–0.60.
+- **A$12 plan with A$12 of credit:** earns about A$1.50–2.00 a month when fully used. Unused plan credit is extra, because it doesn't carry over.
 
-Prices per million tokens are in `src/pricing.ts`. Update them when Anthropic's prices change.
+Raise `MARGIN`, or give plans less credit than their price, to earn more per user. Prices per million tokens are in `src/pricing.ts`; update them when Anthropic's prices change. `/admin/stats` reports Anthropic's cost both in US dollars and converted at the current `USD_RATE`.

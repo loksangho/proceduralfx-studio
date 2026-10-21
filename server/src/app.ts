@@ -5,7 +5,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Billing } from "./billing.js";
 import type { Config, Plan } from "./config.js";
 import type { Mailer } from "./mail.js";
-import { chargeMicros, messageCostMicros, ALLOWED_MODELS, usd } from "./pricing.js";
+import { chargeMicros, messageCostMicros, ALLOWED_MODELS, money, symbol } from "./pricing.js";
 import { prepare, relayError, type Send } from "./relay.js";
 import { balanceMicros, type Store, type User } from "./store.js";
 import { hash, Limiter, normalizeEmail, normalizeUserCode, secret, userCode } from "./auth.js";
@@ -109,7 +109,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
   );
 
   app.get("/device", (req, res) => {
-    res.send(signInPage(normalizeUserCode(String(req.query.code ?? ""))));
+    res.send(signInPage(normalizeUserCode(String(req.query.code ?? "")), "", config.siteUrl));
   });
 
   app.post(
@@ -117,10 +117,10 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     wrap(async (req, res) => {
       const code = normalizeUserCode(String(req.body?.code ?? ""));
       const email = normalizeEmail(String(req.body?.email ?? ""));
-      if (!email) return res.status(400).send(signInPage(code, "That email doesn't look right."));
-      if (!perIp.allow(`device:${ip(req)}`) || !emails.allow(email)) return res.status(429).send(signInPage(code, "Too many attempts; try again later."));
+      if (!email) return res.status(400).send(signInPage(code, "That email doesn't look right.", config.siteUrl));
+      if (!perIp.allow(`device:${ip(req)}`) || !emails.allow(email)) return res.status(429).send(signInPage(code, "Too many attempts; try again later.", config.siteUrl));
       const device = await store.deviceByUserCode(code);
-      if (!device || device.userId) return res.status(400).send(signInPage(code, "That code isn't valid any more: start signing in again from the app."));
+      if (!device || device.userId) return res.status(400).send(signInPage(code, "That code isn't valid any more: start signing in again from the app.", config.siteUrl));
       const token = secret();
       await store.createLogin({ tokenHash: hash(token), email, userCode: code, expiresAt: Date.now() + DEVICE_MINUTES * 60_000 });
       const link = `${config.publicUrl}/login?t=${token}`;
@@ -133,7 +133,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
         );
       } catch (e) {
         console.error("Couldn't send the sign-in email:", e);
-        return res.status(502).send(signInPage(code, `We couldn't send the email (${e instanceof Error ? e.message : String(e)}). Please try again in a few minutes.`));
+        return res.status(502).send(signInPage(code, `We couldn't send the email (${e instanceof Error ? e.message : String(e)}). Please try again in a few minutes.`, config.siteUrl));
       }
       res.send(checkEmailPage(email));
     }),
@@ -171,7 +171,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     res.send(messagePage("Payment cancelled", "Nothing was charged. You can close this page."));
   });
   app.get("/", (_req, res) => {
-    res.send(messagePage("ProceduralFX Studio AI", "Credits for the AI assistant in ProceduralFX Studio. Sign in and buy credits from the assistant panel in the app."));
+    res.redirect(config.siteUrl);
   });
 
   // --- The account (the app, signed in) ------------------------------------------------
@@ -189,7 +189,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
   };
 
   async function planInfo(p: Plan, user: User) {
-    return { id: p.id, credit_usd: usd(p.creditMicros), price: billing ? await billing.priceLabel(p.priceId) : null, current: user.plan === p.id };
+    return { id: p.id, credit: money(p.creditMicros), price: billing ? await billing.priceLabel(p.priceId) : null, current: user.plan === p.id };
   }
 
   app.get(
@@ -199,10 +199,12 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       const u = req.user!;
       res.json({
         email: u.email,
+        currency: config.currency,
+        symbol: symbol(config.currency),
         plan: u.plan,
-        plan_usd: usd(u.planMicros),
-        topup_usd: usd(u.topupMicros),
-        balance_usd: usd(balanceMicros(u)),
+        plan_credit: money(u.planMicros),
+        topup_credit: money(u.topupMicros),
+        balance: money(balanceMicros(u)),
         plans: await Promise.all(config.plans.map((p) => planInfo(p, u))),
         topups: config.topups,
         models: ALLOWED_MODELS,
@@ -245,7 +247,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
         return res.json({ url: await withCustomer(u, (c) => billing.checkoutPlan(c, u.id, plan.priceId, config.publicUrl)) });
       }
       if (typeof topup === "number" && config.topups.includes(topup)) {
-        return res.json({ url: await withCustomer(u, (c) => billing.checkoutTopup(c, u.id, topup, config.publicUrl)) });
+        return res.json({ url: await withCustomer(u, (c) => billing.checkoutTopup(c, u.id, topup, config.currency, config.publicUrl)) });
       }
       fail(res, 400, "invalid_request_error", "Choose a plan or a top-up.");
     }),
@@ -291,7 +293,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
           return fail(res, status, "api_error", text);
         }
         const cost = messageCostMicros(message);
-        const charged = chargeMicros(cost, config.margin);
+        const charged = chargeMicros(cost, config.margin, config.usdRate);
         const usage = message.usage;
         const after = await store.charge({
           userId: u.id,
@@ -303,7 +305,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
           costMicros: Math.round(cost),
           chargedMicros: charged,
         });
-        res.json({ ...message, pfx_billing: { charged_usd: charged / 1e6, balance_usd: usd(balanceMicros(after)) } });
+        res.json({ ...message, pfx_billing: { charged: charged / 1e6, balance: money(balanceMicros(after)), currency: config.currency, symbol: symbol(config.currency) } });
       } finally {
         const n = (inFlight.get(u.id) ?? 1) - 1;
         if (n <= 0) inFlight.delete(u.id);
@@ -319,7 +321,17 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     wrap(async (req, res) => {
       if (!config.adminToken || req.headers.authorization !== `Bearer ${config.adminToken}`) return res.status(404).end();
       const s = await store.stats();
-      res.json({ users: s.users, requests: s.requests, anthropic_cost_usd: usd(s.costMicros), charged_usd: usd(s.chargedMicros), margin_usd: usd(s.chargedMicros - s.costMicros), topups_paid_usd: usd(s.paidMicros) });
+      // Anthropic's cost is in US dollars; the rest is in the credit currency.
+      res.json({
+        currency: config.currency,
+        users: s.users,
+        requests: s.requests,
+        anthropic_cost_usd: money(s.costMicros),
+        anthropic_cost: money(s.costMicros * config.usdRate),
+        charged: money(s.chargedMicros),
+        margin: money(s.chargedMicros - s.costMicros * config.usdRate),
+        topups_paid: money(s.paidMicros),
+      });
     }),
   );
 

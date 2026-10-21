@@ -2,6 +2,7 @@
 // portal for changing or cancelling a plan, and webhooks that turn payments into credit.
 
 import Stripe from "stripe";
+import { symbol } from "./pricing.js";
 
 // What a verified webhook means for the app.
 export type BillingEvent =
@@ -16,7 +17,7 @@ export type BillingEvent =
 export interface Billing {
   createCustomer(email: string, userId: string): Promise<string>;
   checkoutPlan(customerId: string, userId: string, priceId: string, returnUrl: string): Promise<string>;
-  checkoutTopup(customerId: string, userId: string, dollars: number, returnUrl: string): Promise<string>;
+  checkoutTopup(customerId: string, userId: string, amount: number, currency: string, returnUrl: string): Promise<string>;
   portal(customerId: string, returnUrl: string): Promise<string>;
   // The price of the customer's active subscription, if any.
   activePrice(customerId: string): Promise<string | null>;
@@ -89,13 +90,13 @@ export class StripeBilling implements Billing {
     return s.url!;
   }
 
-  async checkoutTopup(customer: string, userId: string, dollars: number, returnUrl: string) {
+  async checkoutTopup(customer: string, userId: string, amount: number, currency: string, returnUrl: string) {
     const s = await this.stripe.checkout.sessions.create({
       mode: "payment",
       customer,
       client_reference_id: userId,
-      line_items: [{ quantity: 1, price_data: { currency: "usd", unit_amount: dollars * 100, product_data: { name: `$${dollars} of ProceduralFX AI credit` } } }],
-      metadata: { user_id: userId, credit_micros: String(dollars * 1_000_000) },
+      line_items: [{ quantity: 1, price_data: { currency, unit_amount: amount * 100, product_data: { name: `${symbol(currency)}${amount} of ProceduralFX AI credit` } } }],
+      metadata: { user_id: userId, credit_micros: String(amount * 1_000_000) },
       success_url: `${returnUrl}/paid`,
       cancel_url: `${returnUrl}/cancelled`,
     });

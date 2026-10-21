@@ -63,9 +63,9 @@ class FakeBilling implements Billing {
     this.check(c);
     return `https://stripe.test/plan/${priceId}`;
   }
-  async checkoutTopup(c: string, _u: string, dollars: number) {
+  async checkoutTopup(c: string, _u: string, amount: number, currency: string) {
     this.check(c);
-    return `https://stripe.test/topup/${dollars}`;
+    return `https://stripe.test/topup/${amount}${currency}`;
   }
   async portal() {
     return "https://stripe.test/portal";
@@ -83,7 +83,7 @@ class FakeBilling implements Billing {
 }
 
 async function setup(makeStore: () => Promise<Store>) {
-  const config = loadConfig({ PLANS: "basic=price_basic=8", TOPUPS: "5,10", FREE_CREDIT: "0.05", MARGIN: "0.25", ADMIN_TOKEN: "admin" });
+  const config = loadConfig({ PLANS: "basic=price_basic=8", TOPUPS: "5,10", FREE_CREDIT: "0.05", MARGIN: "0.25", CURRENCY: "aud", USD_RATE: "1.6", ADMIN_TOKEN: "admin" });
   const store = await makeStore();
   const billing = new FakeBilling();
   const mails: string[] = [];
@@ -138,14 +138,16 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
   try {
     const token = await signIn(t);
     const account = await (await fetch(`${t.base}/v1/account`, { headers: { authorization: `Bearer ${token}` } })).json();
-    assert.equal(account.balance_usd, 0.05);
-    assert.deepEqual(account.plans, [{ id: "basic", credit_usd: 8, price: "$8/month", current: false }]);
+    assert.equal(account.balance, 0.05);
+    assert.equal(account.symbol, "A$");
+    assert.deepEqual(account.plans, [{ id: "basic", credit: 8, price: "$8/month", current: false }]);
 
-    // $0.06 at cost is $0.075 with the 25% margin: the free $0.05 goes below zero once.
+    // US$0.06 at cost is A$0.096 at 1.6, A$0.12 with the 25% margin: the free A$0.05 goes below zero once.
     const r = await (await t.post("/v1/messages", request, token)).json();
     assert.equal(r.content[0].text, "Made a box.");
-    assert.equal(r.pfx_billing.charged_usd, 0.075);
-    assert.equal(r.pfx_billing.balance_usd, -0.02);
+    assert.equal(r.pfx_billing.charged, 0.12);
+    assert.equal(r.pfx_billing.balance, -0.07);
+    assert.equal(r.pfx_billing.currency, "aud");
     assert.equal(t.sent[0].max_tokens, 16000);
     assert.equal((t.sent[0] as unknown as { fallbacks: string }).fallbacks, "default");
     assert.deepEqual(t.sent[0].betas, ["server-side-fallback-2026-07-01"]);
@@ -155,7 +157,7 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
 
     // A top-up: Checkout, then the webhook credits it once.
     const checkout = await (await t.post("/v1/checkout", { topup: 10 }, token)).json();
-    assert.equal(checkout.url, "https://stripe.test/topup/10");
+    assert.equal(checkout.url, "https://stripe.test/topup/10aud");
     const user = (await t.store.userByEmail("artist@example.com"))!;
     assert.equal(user.stripeCustomer, "cus_1");
     t.billing.next = { kind: "topup", id: "cs_1", userId: user.id, micros: 10_000_000 };
@@ -163,7 +165,7 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     assert.equal((await hook("bad")).status, 400);
     assert.equal((await hook("good")).status, 200);
     assert.equal((await hook("good")).status, 200);
-    assert.equal((await t.store.userById(user.id))!.topupMicros, 10_000_000 - 25_000);
+    assert.equal((await t.store.userById(user.id))!.topupMicros, 10_000_000 - 70_000);
 
     // A plan: its paid invoice fills plan credit, which is spent first.
     t.billing.active = "price_basic";
@@ -174,8 +176,8 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     assert.equal(u.planMicros, 8_000_000);
     await t.post("/v1/messages", request, token);
     u = (await t.store.userById(user.id))!;
-    assert.equal(u.planMicros, 8_000_000 - 75_000);
-    assert.equal(u.topupMicros, 10_000_000 - 25_000);
+    assert.equal(u.planMicros, 8_000_000 - 120_000);
+    assert.equal(u.topupMicros, 10_000_000 - 70_000);
     // Subscribed: the plan button now opens the portal.
     assert.equal((await (await t.post("/v1/checkout", { plan: "basic" }, token)).json()).url, "https://stripe.test/portal");
     // Cancelled: plan credit goes, top-ups stay.
@@ -184,15 +186,15 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     u = (await t.store.userById(user.id))!;
     assert.equal(u.plan, null);
     assert.equal(u.planMicros, 0);
-    assert.equal(u.topupMicros, 10_000_000 - 25_000);
+    assert.equal(u.topupMicros, 10_000_000 - 70_000);
 
     const stats = await (await fetch(`${t.base}/admin/stats`, { headers: { authorization: "Bearer admin" } })).json();
-    assert.deepEqual(stats, { users: 1, requests: 2, anthropic_cost_usd: 0.12, charged_usd: 0.15, margin_usd: 0.03, topups_paid_usd: 10 });
+    assert.deepEqual(stats, { currency: "aud", users: 1, requests: 2, anthropic_cost_usd: 0.12, anthropic_cost: 0.19, charged: 0.24, margin: 0.05, topups_paid: 10 });
     assert.equal((await fetch(`${t.base}/admin/stats`)).status, 404);
 
     // A customer Stripe no longer knows (made with test keys) is replaced.
     t.billing.known.clear();
-    assert.equal((await (await t.post("/v1/checkout", { topup: 5 }, token)).json()).url, "https://stripe.test/topup/5");
+    assert.equal((await (await t.post("/v1/checkout", { topup: 5 }, token)).json()).url, "https://stripe.test/topup/5aud");
     assert.equal((await t.store.userById(user.id))!.stripeCustomer, "cus_2");
 
     // Signing out ends the session.
@@ -231,6 +233,9 @@ test("pricing, plans and haiku", () => {
   assert.equal(messageCostMicros(msg), 4_000_000 + 25_000_000);
   assert.equal(chargeMicros(100, 0.25), 125);
   assert.equal(chargeMicros(1, 0.25), 2);
+  assert.equal(chargeMicros(100, 0.25, 1.6), 200);
+  assert.throws(() => loadConfig({ CURRENCY: "usd", USD_RATE: "1.6" }));
+  assert.throws(() => loadConfig({ CURRENCY: "dollars" }));
   assert.deepEqual(spend({ id: "1", email: "", plan: "p", planMicros: 50, topupMicros: 100, stripeCustomer: null }, 80), { id: "1", email: "", plan: "p", planMicros: 0, topupMicros: 70, stripeCustomer: null });
   assert.deepEqual(parsePlans("basic=price_1=8, pro=price_2=20.5"), [
     { id: "basic", priceId: "price_1", creditMicros: 8_000_000 },

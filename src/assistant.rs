@@ -287,7 +287,7 @@ pub struct Usage {
     pub output: u64,
     pub cache_write: u64,
     pub cache_read: u64,
-    // Credits: dollars charged, and the balance after the last call.
+    // Credits: the amount charged (in the server's currency), and the balance after the last call.
     pub charged: f64,
     pub balance: Option<f64>,
 }
@@ -302,8 +302,8 @@ impl Usage {
     }
 
     fn add_billing(&mut self, billing: &Value) {
-        self.charged += billing["charged_usd"].as_f64().unwrap_or(0.0);
-        if let Some(b) = billing["balance_usd"].as_f64() {
+        self.charged += billing["charged"].as_f64().unwrap_or(0.0);
+        if let Some(b) = billing["balance"].as_f64() {
             self.balance = Some(b);
         }
     }
@@ -757,7 +757,7 @@ impl Panel {
 
     fn finished(&mut self, usage: Usage) {
         if let (Some(balance), Some(account)) = (usage.balance, self.account.as_mut()) {
-            account["balance_usd"] = json!(balance);
+            account["balance"] = json!(balance);
         }
         if matches!(self.running, Some(Backend::Credits { .. })) {
             self.fetch_account();
@@ -849,6 +849,11 @@ impl Panel {
         }
     }
 
+    // The credits currency symbol (e.g. "A$"), as the server reports it.
+    fn symbol(&self) -> String {
+        self.account.as_ref().and_then(|a| a["symbol"].as_str()).unwrap_or("$").to_owned()
+    }
+
     fn credits_ui(&mut self, ui: &mut egui::Ui) {
         if self.settings.token.is_empty() {
             ui.label("Sign in with your email to use the assistant without an API key: pay with a monthly plan or top-ups.");
@@ -895,11 +900,12 @@ impl Panel {
             return;
         };
         let money = |k: &str| account[k].as_f64().unwrap_or(0.0);
+        let sym = self.symbol();
         ui.horizontal(|ui| {
             ui.label("Credit:");
-            ui.strong(format!("${:.2}", money("balance_usd")));
+            ui.strong(format!("{sym}{:.2}", money("balance")));
             if let Some(plan) = account["plan"].as_str() {
-                ui.weak(format!("({plan} plan ${:.2} this month, top-ups ${:.2})", money("plan_usd"), money("topup_usd")));
+                ui.weak(format!("({plan} plan {sym}{:.2} this month, top-ups {sym}{:.2})", money("plan_credit"), money("topup_credit")));
             }
         });
         if account["payments"] != true {
@@ -913,13 +919,13 @@ impl Panel {
             }
         } else {
             for plan in &plans {
-                let (id, credit) = (plan["id"].as_str().unwrap_or(""), plan["credit_usd"].as_f64().unwrap_or(0.0));
+                let (id, credit) = (plan["id"].as_str().unwrap_or(""), plan["credit"].as_f64().unwrap_or(0.0));
                 let price = plan["price"].as_str().map_or(String::new(), |p| format!("{p}: "));
                 let mut name = id.to_owned();
                 if let Some(first) = name.get_mut(0..1) {
                     first.make_ascii_uppercase();
                 }
-                if ui.button(format!("{name} plan, {price}${credit:.0} of credit every month")).clicked() {
+                if ui.button(format!("{name} plan, {price}{sym}{credit:.0} of credit every month")).clicked() {
                     self.pay("/v1/checkout", json!({"plan": id}));
                 }
             }
@@ -927,7 +933,7 @@ impl Panel {
         ui.horizontal(|ui| {
             ui.label("Top up:");
             for amount in account["topups"].as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_u64) {
-                if ui.button(format!("${amount}")).clicked() {
+                if ui.button(format!("{sym}{amount}")).clicked() {
                     self.pay("/v1/checkout", json!({"topup": amount}));
                 }
             }
@@ -1100,8 +1106,8 @@ impl Panel {
                                 }
                             }
                         });
-                        if let Some(balance) = self.account.as_ref().filter(|_| self.settings.provider == Provider::Credits).and_then(|a| a["balance_usd"].as_f64()) {
-                            ui.weak(format!("${balance:.2} left"));
+                        if let Some(balance) = self.account.as_ref().filter(|_| self.settings.provider == Provider::Credits).and_then(|a| a["balance"].as_f64()) {
+                            ui.weak(format!("{}{balance:.2} left", self.symbol()));
                         }
                     }
                     Provider::Compatible => {
@@ -1180,7 +1186,7 @@ impl Panel {
                 );
                 let charged = matches!(self.running, Some(Backend::Credits { .. }));
                 ui.weak(match self.last_cost {
-                    Some(cost) if charged => format!("{tokens}, charged ${cost:.3}. This session: ${:.2}.", self.session_cost),
+                    Some(cost) if charged => format!("{tokens}, charged {sym}{cost:.3}. This session: {sym}{:.2}.", self.session_cost, sym = self.symbol()),
                     Some(cost) => format!("{tokens}, about ${cost:.3}. This session: about ${:.2}.", self.session_cost),
                     None => format!("{tokens}."),
                 });
@@ -1402,7 +1408,7 @@ mod compatible {
         let (url, server) = fake_server(vec![json!({
             "content": [{"type": "text", "text": "Done."}], "stop_reason": "end_turn", "model": "claude-opus-5-5",
             "usage": {"input_tokens": 100, "output_tokens": 10},
-            "pfx_billing": {"charged_usd": 0.0123, "balance_usd": 4.5}
+            "pfx_billing": {"charged": 0.0123, "balance": 4.5, "currency": "aud", "symbol": "A$"}
         })]);
         let server_url = url.trim_end_matches("/v1").to_owned();
         let (tx, rx) = std::sync::mpsc::channel();
