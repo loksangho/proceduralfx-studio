@@ -99,6 +99,9 @@ if [[ ${1-} == "package-macos" ]]; then
   # Lowest macOS the Rust/C++ code itself targets. The bundle's real minimum
   # is the highest of this and every bundled library; the bundler reports it.
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+  # The ProceduralFX credits server built into release apps (the AI assistant's
+  # sign-in and metered requests; see server/).
+  export PFX_AI_SERVER="${PFX_AI_SERVER:-https://ai.build3dstudio.com}"
   # Ensure build.rs can find OpenVDB and tbb when building release
   OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" \
   cargo build --release --features "${APP_FEATURES:-native-openvdb native-usd}"

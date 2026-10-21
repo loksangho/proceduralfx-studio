@@ -216,6 +216,16 @@ pub fn html(version: &str) -> String {
     body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node; a renamed node still shows its type under the name. Some nodes have several outputs (Material Fracture, RBD Configure, RBD Bullet Solver: geometry, constraints, proxy): drag a wire from the output you want; hover a port for its name. Any parameter can be keyframed: the animation editor lists each one by name (size, radius, t.x…).</p></section>");
     let _ = write!(nav, "<a href=\"#overview\">Overview</a>");
 
+    // The AI assistant.
+    section(&mut body, "ai-assistant", "AI assistant");
+    body.push_str("<p>Click <b>✨ AI</b> in the toolbar and describe what you want, or a change to the current scene (e.g. <i>200 rocks of random sizes scattered on a hilly terrain</i>), then <b>Build</b>. The assistant works on a copy of the scene: it adds and wires real nodes, cooks them to check point counts and errors, looks at the result, and fixes what's wrong. When it's done, <b>Accept</b> uses the new scene (one undo step reverts it) or <b>Discard</b> drops it.</p>\
+<p>Choose how it runs under <b>⚙</b>:</p><table>\
+<tr><th>ProceduralFX credits</th><td>Sign in with your email; no API key needed. Pay with a monthly plan or top-ups from the same settings (payment happens in your browser). Plan credit refills monthly; top-ups never expire. The panel shows what each request cost.</td></tr>\
+<tr><th>Your own Claude API key</th><td>A key from console.anthropic.com, stored only on this computer. Opus 5.5 gives the best results; Sonnet and Haiku cost less.</td></tr>\
+<tr><th>Another service, or a model on your own computer</th><td>Any OpenAI-compatible server: OpenAI, Google Gemini, OpenRouter, Groq, Mistral or DeepSeek with their API key, or Ollama, LM Studio, llama.cpp or vLLM running locally (no key). <b>List models</b> fetches the server's models. Pick one that supports tool calling; turn off <i>The model can see images</i> for text-only models. For Ollama, raise the context length (e.g. OLLAMA_CONTEXT_LENGTH=32768).</td></tr>\
+</table><p>Terms, privacy and refunds for credits: <a href=\"https://www.build3dstudio.com\">www.build3dstudio.com</a>.</p></section>");
+    let _ = write!(nav, "<a href=\"#ai-assistant\">AI assistant</a>");
+
     // Nodes by context and menu.
     let templates = NodeKind::templates();
     for context in ["OBJ", "SOP", "MAT", "OUT", "STAGE", "IMG", "TASKS"] {

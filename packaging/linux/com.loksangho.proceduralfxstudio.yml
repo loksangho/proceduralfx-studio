@@ -507,6 +507,8 @@ modules:
         OPENVDB_ROOT: /app
         USD_ROOT: /app
         ALEMBIC_ROOT: /app
+        # The ProceduralFX credits server built into the app (server/).
+        PFX_AI_SERVER: https://ai.build3dstudio.com
     build-commands:
       - cargo --offline build --release --features "native-openvdb native-usd native-alembic"
       - install -Dm755 target/release/proceduralfx_studio /app/bin/proceduralfx_studio
