@@ -1,0 +1,44 @@
+# MoonRay for the Windows version: rendered in a WSL container (see moonray_wsl.cpp).
+# Built on the dependencies image (Containerfile.deps) by
+# .github/workflows/moonray-image.yml, and published as ghcr.io/loksangho/pfx-moonray.
+# The app pulls it the first time something is rendered.
+ARG DEPS_IMAGE
+FROM ${DEPS_IMAGE}
+
+LABEL org.opencontainers.image.source="https://github.com/loksangho/proceduralfx-studio"
+LABEL org.opencontainers.image.description="MoonRay (OpenMoonRay, Apache-2.0) for ProceduralFX Studio on Windows"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+# MoonRay, with its Hydra delegate (USD is in the dependencies). The render
+# regression suite (rats) needs the LFS test images, so it's left out.
+RUN sed -i 's/^add_subdirectory(rats)/# &/' /source/CMakeLists.txt && \
+    mkdir /build && cd /build && \
+    cmake /source \
+      -DCMAKE_PREFIX_PATH=/opt/MoonRay/installs \
+      -DPYTHON_EXECUTABLE=python3 \
+      -DBOOST_PYTHON_COMPONENT_NAME=python39 \
+      -DABI_VERSION=0 \
+      -DMOONRAY_USE_OPTIX=NO \
+      -DBUILD_QT_APPS=OFF \
+      -DBUILD_TESTING=OFF \
+      -DMOONRAY_BUILD_TESTING=OFF && \
+    cmake --build . -j"$(nproc)" && \
+    mkdir -p /installs/openmoonray && \
+    cmake --install . --prefix /installs/openmoonray && \
+    cd / && rm -rf /build /source
+
+# WSL containers block the mbind() and move_pages() system calls MoonRay makes for
+# memory placement; this shim turns them into no-ops (from Microsoft's WSLC MoonRay
+# sample, MIT).
+COPY nobind.c /tmp/nobind.c
+RUN gcc -shared -fPIC -o /usr/lib64/libnobind.so /tmp/nobind.c -ldl && rm /tmp/nobind.c
+ENV LD_PRELOAD=/usr/lib64/libnobind.so
+
+# setup.sh writes shader descriptions on first use, but image layers are read-only
+# at run time, so it runs once here.
+RUN bash -c 'source /installs/openmoonray/scripts/setup.sh'
+
+# Every command runs with MoonRay's environment (moonray, hd_render, plugin paths).
+RUN printf '#!/bin/bash\nsource /installs/openmoonray/scripts/setup.sh\nexec "$@"\n' > /entrypoint.sh && chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["moonray", "-help"]

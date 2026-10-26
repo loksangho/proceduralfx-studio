@@ -1,0 +1,26 @@
+# MoonRay's dependencies on Rocky Linux 9, for the Windows version's renderer (a WSL
+# container). Built once by .github/workflows/moonray-image.yml and published as
+# ghcr.io/loksangho/pfx-moonray:deps-<commit>; the MoonRay image builds on it.
+#
+# Follows OpenMoonRay's own Rocky 9 recipe (building/Rocky9), at the same OpenMoonRay
+# commit the Linux and macOS builds use.
+FROM rockylinux:9
+
+ARG OPENMOONRAY_COMMIT=b9b0ac29135b26e20a51edf9028558bb64df6700
+
+# The source, without the render-test images (stored in Git LFS, not needed).
+RUN dnf install -y git && \
+    GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/OpenMoonRay/openmoonray.git /source && \
+    cd /source && git checkout "$OPENMOONRAY_COMMIT" && \
+    GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+
+# System packages (no CUDA: rendering is on the CPU); downloads CMake 3.23.1 to /installs.
+RUN bash -c 'source /source/building/Rocky9/install_packages.sh --nocuda' && dnf clean all
+ENV PATH="/installs/cmake-3.23.1-linux-x86_64/bin:${PATH}"
+
+# The rest (OpenSubdiv, OpenEXR, Embree, OpenColorIO, OpenImageIO, TBB, OIDN, USD…)
+# from source, into /opt/MoonRay/installs.
+RUN mkdir /build && cd /build && \
+    cmake /source/building/Rocky9 && \
+    cmake --build . -- -j"$(nproc)" && \
+    cd / && rm -rf /build
