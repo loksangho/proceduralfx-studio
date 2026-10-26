@@ -2,8 +2,9 @@ name: Windows
 
 # Builds the Windows version: the app, pfx-render.exe (MoonRay through WSL containers,
 # packaging/windows/render) and the WSL Containers SDK's wslcsdk.dll, in one zip.
-# Signed with SSL.com eSigner when the repository has its secrets (ES_USERNAME,
-# ES_PASSWORD, ES_CREDENTIAL_ID, ES_TOTP_SECRET); unsigned otherwise.
+# Only releases (v* tags) are signed, with SSL.com eSigner (secrets ES_USERNAME,
+# ES_PASSWORD, ES_CREDENTIAL_ID, ES_TOTP_SECRET); test builds are unsigned unless a
+# manual run ticks "Sign".
 #
 # Tags attach the zip to the release; other runs keep it as a workflow artifact.
 
@@ -21,13 +22,18 @@ on:
       - 'packaging/windows/README.txt'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
+    inputs:
+      sign:
+        description: 'Sign this build (releases are signed anyway)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 env:
-  # Steps can't test secrets directly: this says whether signing is set up.
-  CAN_SIGN: ${{ secrets.ES_USERNAME != '' }}
+  # Sign releases, or a manual run that asks to; steps can't test secrets directly.
+  CAN_SIGN: ${{ secrets.ES_USERNAME != '' && (startsWith(github.ref, 'refs/tags/v') || inputs.sign == true) }}
   WSLC_SDK_VERSION: 3.0.3
   MOONRAY_IMAGE: ghcr.io/loksangho/pfx-moonray:latest
   ZIP: ProceduralFxStudio-windows-x64.zip
