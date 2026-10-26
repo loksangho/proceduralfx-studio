@@ -584,8 +584,7 @@ pub enum AccountMsg {
 }
 
 fn open_url(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = Command::new(opener).arg(url).spawn();
+    let _ = crate::platform::open(url);
 }
 
 // A JSON call to the credits server; errors carry the server's message.

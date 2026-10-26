@@ -1,4 +1,6 @@
 // ProceduralFX Studio — node-based procedural modeller
+// On Windows, a release build is a GUI program (no console window behind it).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 // Cargo.toml:  eframe = "0.27"   (same egui generation as your original code)
 
 use eframe::egui;
@@ -44,6 +46,7 @@ mod muscle;
 mod nodeinfo;
 mod packed;
 mod perf;
+mod platform;
 mod paint;
 mod poly;
 mod randomize;
@@ -63,6 +66,7 @@ mod vellum;
 mod usd;
 mod vex;
 mod vexsyntax;
+mod wslrender;
 mod vexmath;
 mod volume;
 mod vop;
@@ -2603,6 +2607,10 @@ fn bundled_moonray() -> Option<PathBuf> {
 // packaging the binary lives in the app bundle; during development it can be
 // placed in `native/moonray/macos/moonray` before packaging.
 fn detect_moonray_executable() -> String {
+    // Windows: MoonRay runs in a WSL container through the helper next to the app.
+    if let Some(helper) = wslrender::helper() {
+        return helper.to_string_lossy().into_owned();
+    }
     if let Some(bundled) = bundled_moonray() {
         return bundled.to_string_lossy().into_owned();
     }
@@ -2943,6 +2951,10 @@ fn viewport_texture(ctx: &egui::Context, image: egui::ColorImage) -> egui::Textu
 
 // Per-user settings folder (recent files, updater preferences).
 pub(crate) fn app_config_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        // %APPDATA%\ProceduralFX Studio (Windows doesn't set HOME).
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("ProceduralFX Studio"));
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "macos") {
         Some(home?.join("Library/Application Support/ProceduralFX Studio"))
@@ -3110,12 +3122,21 @@ fn pfield(ui: &mut egui::Ui, field: impl egui::Widget) -> egui::Response {
 fn run_logged(cmd: &mut Command, log_path: &std::path::Path, cancel: &AtomicBool) -> Result<std::process::ExitStatus, String> {
     let log = File::create(log_path).map_err(|e| format!("Could not create render log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut child = cmd.stdout(log).stderr(log_err).spawn().map_err(|e| e.to_string())?;
+    // Standard input stays open while rendering: closing it asks the Windows helper to
+    // stop its container before it's killed.
+    let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(log).stderr(log_err).spawn().map_err(|e| e.to_string())?;
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(status);
         }
         if cancel.load(Ordering::Relaxed) {
+            drop(child.stdin.take());
+            for _ in 0..50 {
+                if child.try_wait().ok().flatten().is_some() {
+                    return Err("Render cancelled".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err("Render cancelled".into());
@@ -7860,6 +7881,41 @@ fn inverse_xform(x: &ObjectXform, mut mesh: Mesh) -> Mesh {
 }
 
 // Writes the documentation page next to the app's settings and opens it in the browser.
+// Windows: installs WSL containers if they're missing, then downloads the MoonRay image,
+// sending each line the helper prints.
+fn start_render_setup(helper: PathBuf) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for step in ["--install", "--pull"] {
+            let mut command = Command::new(&helper);
+            platform::no_window(&mut command);
+            let child = command.arg(step).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn();
+            let mut child = match child {
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = tx.send(format!("[pfx-render] error couldn't run {}: {e}", helper.display()));
+                    return;
+                }
+            };
+            if let Some(err) = child.stderr.take() {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                    let _ = tx.send(line);
+                }
+            }
+            match child.wait() {
+                Ok(status) if status.success() => {}
+                _ => {
+                    let _ = tx.send("[pfx-render] status set-up stopped: see the message above".into());
+                    return;
+                }
+            }
+        }
+        let _ = tx.send("[pfx-render] status rendering on Windows is ready".into());
+    });
+    rx
+}
+
 fn open_documentation() -> Result<String, String> {
     open_documentation_at(None)
 }
@@ -7884,8 +7940,7 @@ fn open_documentation_at(anchor: Option<&str>) -> Result<String, String> {
         }
         None => path.clone(),
     };
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    Command::new(opener).arg(&target).spawn().map_err(|e| format!("{opener}: {e}"))?;
+    platform::open(&target.to_string_lossy()).map_err(|e| format!("couldn't open the documentation: {e}"))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -8661,6 +8716,10 @@ struct ProceduralFxStudioApp {
     render_started: Option<Instant>,
     render_cancel: Option<Arc<AtomicBool>>,
     render_log_path: Option<PathBuf>,
+    // When the render log was last read for the status bar, and the Windows set-up
+    // (installing WSL containers, downloading MoonRay) in progress.
+    render_log_checked: Option<Instant>,
+    render_setup: Option<mpsc::Receiver<String>>,
     last_render_log: String,
     last_render_summary: String,
     viewer: RenderViewer,
@@ -8882,6 +8941,8 @@ impl Default for ProceduralFxStudioApp {
             render_started: None,
             render_cancel: None,
             render_log_path: None,
+            render_log_checked: None,
+            render_setup: None,
             last_render_log: String::new(),
             last_render_summary: String::new(),
             viewer: RenderViewer::default(),
@@ -10165,6 +10226,14 @@ impl ProceduralFxStudioApp {
             self.viewer.show();
             ui.close();
         }
+        if let Some(helper) = wslrender::helper() {
+            ui.separator();
+            let busy = self.render_setup.is_some();
+            if ui.add_enabled(!busy, egui::Button::new("Set Up Rendering on Windows…")).on_hover_text("Installs WSL containers if needed and downloads MoonRay (a few GB, once)").clicked() {
+                self.render_setup = Some(start_render_setup(helper));
+                ui.close();
+            }
+        }
     }
 
     fn windows_menu(&mut self, ui: &mut egui::Ui) {
@@ -10962,7 +11031,16 @@ impl ProceduralFxStudioApp {
             }
         }
 
-        if hydra {
+        // Windows: the helper runs MoonRay or hd_render in a container, and the scene's
+        // own file paths (textures, HDRs) are rewritten to the container's view.
+        let wsl = wslrender::is_helper(&exe_path.to_string_lossy());
+        if wsl {
+            if let Err(error) = wslrender::prepare_scene(&scene_path) {
+                self.status = error;
+                return;
+            }
+        }
+        if hydra && !wsl {
             match find_hd_render(&exe_path) {
                 Some(path) => exe_path = path,
                 None => {
@@ -11065,7 +11143,8 @@ impl ProceduralFxStudioApp {
         self.status = format!("Rendering with {}: {executable_to_run}", if hydra { "Hydra (hdMoonray)" } else { "MoonRay" });
         // The Render Viewer opens on every render; bucket mode streams the image into it.
         // hd_render only writes the finished image.
-        let progress = (self.bucket_render && !hydra).then(|| Arc::new(std::sync::Mutex::new(render_viewer::RenderProgress::new(width, height))));
+        // (Not through the Windows helper: every bucket would start a container.)
+        let progress = (self.bucket_render && !hydra && !wsl).then(|| Arc::new(std::sync::Mutex::new(render_viewer::RenderProgress::new(width, height))));
         match &progress {
             Some(progress) => self.viewer.watch(progress.clone()),
             None => self.viewer.show(),
@@ -11214,6 +11293,13 @@ impl ProceduralFxStudioApp {
                 }
                 let make_cmd = |args: &[String]| {
                     let mut cmd = Command::new(&exec_run);
+                    platform::no_window(&mut cmd);
+                    if wsl {
+                        // The container has MoonRay's own environment.
+                        cmd.arg(if hydra { "hd_render" } else { "moonray" });
+                        cmd.args(args);
+                        return cmd;
+                    }
                     cmd.args(args);
                     if let Some(paths) = &dso_paths {
                         cmd.env("RDL2_DSO_PATH", paths);
@@ -11233,7 +11319,9 @@ impl ProceduralFxStudioApp {
                             if status.success() {
                                 Ok(())
                             } else {
-                                Err(format!("{} exited with {status}: {}", if hydra { "hd_render" } else { "MoonRay" }, read_log_tail(&log_path, 600).trim()))
+                                let tail = read_log_tail(&log_path, 600);
+                                let hint = wslrender::failure_hint(&tail).map(|h| format!("{h}. ")).unwrap_or_default();
+                                Err(format!("{hint}{} exited with {status}: {}", if hydra { "hd_render" } else { "MoonRay" }, tail.trim()))
                             }
                         }),
                 };
@@ -11280,7 +11368,16 @@ impl ProceduralFxStudioApp {
                 result: Err("MoonRay render worker disconnected".to_string()),
                 log: String::new(),
             },
-            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Empty) => {
+                // The Windows helper says what it's doing (downloading MoonRay the first time).
+                if self.render_log_checked.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(500)) {
+                    self.render_log_checked = Some(Instant::now());
+                    if let Some(step) = self.render_log_path.as_ref().map(|p| read_log_tail(p, 4096)).as_deref().and_then(wslrender::progress) {
+                        self.status = step;
+                    }
+                }
+                return;
+            }
         };
         self.moonray_rx = None;
         self.render_cancel = None;
@@ -11485,7 +11582,7 @@ impl ProceduralFxStudioApp {
                 tops::Job::Shell(command) => {
                     let (tx, rx) = mpsc::channel();
                     std::thread::spawn(move || {
-                        let result = Command::new("/bin/sh").arg("-c").arg(&command).output();
+                        let result = platform::shell(&command).output();
                         let _ = tx.send(match result {
                             Ok(out) => {
                                 let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).trim().to_owned();
@@ -17881,6 +17978,29 @@ impl ProceduralFxStudioApp {
 
 impl eframe::App for ProceduralFxStudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Windows rendering set-up: show what the helper is doing.
+        if let Some(rx) = &self.render_setup {
+            let mut lines = Vec::new();
+            let mut finished = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(line) => lines.push(line),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if let Some(line) = lines.last() {
+                self.status = wslrender::progress(line).unwrap_or_else(|| line.trim_start_matches("[pfx-render] ").replacen("error ", "Error: ", 1));
+            }
+            if finished {
+                self.render_setup = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
         let dt = ctx.input(|i| i.unstable_dt);
         if dt.is_finite() && dt > 0.0 && dt < 1.0 {
             self.frame_time += (dt - self.frame_time) * 0.1;

@@ -1,0 +1,119 @@
+name: Windows
+
+# Builds the Windows version: the app, pfx-render.exe (MoonRay through WSL containers,
+# packaging/windows/render) and the WSL Containers SDK's wslcsdk.dll, in one zip.
+# Signed with SSL.com eSigner when the repository has its secrets (ES_USERNAME,
+# ES_PASSWORD, ES_CREDENTIAL_ID, ES_TOTP_SECRET); unsigned otherwise.
+#
+# Tags attach the zip to the release; other runs keep it as a workflow artifact.
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths:
+      - 'packaging/windows/render/**'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Steps can't test secrets directly: this says whether signing is set up.
+  CAN_SIGN: ${{ secrets.ES_USERNAME != '' }}
+  WSLC_SDK_VERSION: 3.0.3
+  MOONRAY_IMAGE: ghcr.io/loksangho/pfx-moonray:latest
+  ZIP: ProceduralFxStudio-windows-x64.zip
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Build the app
+        run: |
+          rustup default stable
+          cargo build --release
+
+      # The WSL Containers SDK (MIT, from NuGet): header, import library and wslcsdk.dll.
+      - name: Get the WSL Containers SDK
+        shell: pwsh
+        run: |
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.wsl.containers/$env:WSLC_SDK_VERSION/microsoft.wsl.containers.$env:WSLC_SDK_VERSION.nupkg"
+          Invoke-WebRequest $url -OutFile wslc.zip
+          Expand-Archive wslc.zip -DestinationPath wslc-sdk
+
+      - name: Build pfx-render.exe
+        shell: pwsh
+        run: |
+          cmake -S packaging/windows/render -B build-render -A x64 `
+            "-DMicrosoft.WSL.Containers_DIR=$PWD/wslc-sdk/cmake" `
+            "-DPFX_MOONRAY_IMAGE=$env:MOONRAY_IMAGE"
+          cmake --build build-render --config Release
+
+      - name: Assemble
+        shell: pwsh
+        run: |
+          $out = "dist-windows/ProceduralFX Studio"
+          New-Item -ItemType Directory -Force "$out/licenses" | Out-Null
+          Copy-Item target/release/proceduralfx_studio.exe "$out/ProceduralFX Studio.exe"
+          Copy-Item build-render/Release/pfx-render.exe $out
+          Copy-Item wslc-sdk/runtimes/win-x64/native/wslcsdk.dll $out
+          Copy-Item wslc-sdk/NOTICE.txt "$out/licenses/WSL-Containers-SDK-NOTICE.txt"
+          Copy-Item assets/testgeo/README.md "$out/licenses/test-geometry.md"
+          Copy-Item packaging/windows/README.txt "$out/README.txt"
+
+      - name: Sign
+        if: env.CAN_SIGN == 'true'
+        uses: sslcom/esigner-codesign@v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/dist-windows/ProceduralFX Studio/ProceduralFX Studio.exe
+          override: true
+          environment_name: PROD
+
+      - name: Sign the renderer
+        if: env.CAN_SIGN == 'true'
+        uses: sslcom/esigner-codesign@v1.3.2
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/dist-windows/ProceduralFX Studio/pfx-render.exe
+          override: true
+          environment_name: PROD
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Get-AuthenticodeSignature "dist-windows/ProceduralFX Studio/*.exe", "dist-windows/ProceduralFX Studio/*.dll" | Format-Table Status, Path -AutoSize
+          Compress-Archive -Path "dist-windows/ProceduralFX Studio" -DestinationPath $env:ZIP
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: ${{ env.ZIP }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}

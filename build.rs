@@ -1,4 +1,5 @@
 fn main() {
+    windows_resources();
     println!("cargo:rerun-if-changed=native/openvdb_bridge.cpp");
     println!("cargo:rerun-if-changed=native/usd_bridge.cpp");
     println!("cargo:rerun-if-env-changed=USD_ROOT");
@@ -157,3 +158,22 @@ fn build_alembic_bridge() {
     println!("cargo:rustc-link-lib=dylib=Imath");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
 }
+
+// The Windows app's icon and file details.
+#[cfg(windows)]
+fn windows_resources() {
+    println!("cargo:rerun-if-changed=packaging/windows/app.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let mut resources = winresource::WindowsResource::new();
+    resources.set_icon("packaging/windows/app.ico");
+    resources.set("ProductName", "ProceduralFX Studio");
+    resources.set("FileDescription", "ProceduralFX Studio");
+    if let Err(error) = resources.compile() {
+        println!("cargo:warning=no Windows icon: {error}");
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_resources() {}
