@@ -7886,7 +7886,9 @@ fn inverse_xform(x: &ObjectXform, mut mesh: Mesh) -> Mesh {
 fn start_render_setup(helper: PathBuf) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let _ = tx.send(format!("[pfx-render] status running {}", helper.display()));
         for step in ["--install", "--pull"] {
+            let _ = tx.send(format!("[pfx-render] status step: pfx-render.exe {step}"));
             let mut command = Command::new(&helper);
             platform::no_window(&mut command);
             let child = command.arg(step).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn();
@@ -7905,8 +7907,12 @@ fn start_render_setup(helper: PathBuf) -> mpsc::Receiver<String> {
             }
             match child.wait() {
                 Ok(status) if status.success() => {}
-                _ => {
-                    let _ = tx.send("[pfx-render] status set-up stopped: see the message above".into());
+                Ok(status) => {
+                    let _ = tx.send(format!("[pfx-render] error set-up stopped: {}", setup_failure(status.code())));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("[pfx-render] error set-up stopped: {e}"));
                     return;
                 }
             }
@@ -7914,6 +7920,20 @@ fn start_render_setup(helper: PathBuf) -> mpsc::Receiver<String> {
         let _ = tx.send("[pfx-render] status rendering on Windows is ready".into());
     });
     rx
+}
+
+// What the helper's exit code means, when it stopped without explaining itself.
+fn setup_failure(code: Option<i32>) -> String {
+    match code {
+        Some(3) => "WSL containers aren't installed yet (see above)".into(),
+        Some(4) => "see the message above".into(),
+        // Windows' own codes for a program that couldn't start.
+        Some(c) if c as u32 == 0xC000_0135 => "pfx-render.exe couldn't load wslcsdk.dll: keep it in the same folder".into(),
+        Some(c) if c as u32 == 0xC000_007B => "pfx-render.exe or wslcsdk.dll is for the wrong kind of Windows (needs 64-bit x64)".into(),
+        Some(c) if c < 0 => format!("pfx-render.exe crashed (code 0x{:08X})", c as u32),
+        Some(c) => format!("pfx-render.exe exited with code {c}"),
+        None => "pfx-render.exe was stopped".into(),
+    }
 }
 
 fn open_documentation() -> Result<String, String> {
@@ -8720,6 +8740,9 @@ struct ProceduralFxStudioApp {
     // (installing WSL containers, downloading MoonRay) in progress.
     render_log_checked: Option<Instant>,
     render_setup: Option<mpsc::Receiver<String>>,
+    // The set-up window: what the helper said, and whether it's showing.
+    render_setup_log: Vec<String>,
+    render_setup_open: bool,
     last_render_log: String,
     last_render_summary: String,
     viewer: RenderViewer,
@@ -8943,6 +8966,8 @@ impl Default for ProceduralFxStudioApp {
             render_log_path: None,
             render_log_checked: None,
             render_setup: None,
+            render_setup_log: Vec::new(),
+            render_setup_open: false,
             last_render_log: String::new(),
             last_render_summary: String::new(),
             viewer: RenderViewer::default(),
@@ -10231,6 +10256,8 @@ impl ProceduralFxStudioApp {
             let busy = self.render_setup.is_some();
             if ui.add_enabled(!busy, egui::Button::new("Set Up Rendering on Windows…")).on_hover_text("Installs WSL containers if needed and downloads MoonRay (a few GB, once)").clicked() {
                 self.render_setup = Some(start_render_setup(helper));
+                self.render_setup_log.clear();
+                self.render_setup_open = true;
                 ui.close();
             }
         }
@@ -17995,10 +18022,45 @@ impl eframe::App for ProceduralFxStudioApp {
             if let Some(line) = lines.last() {
                 self.status = wslrender::progress(line).unwrap_or_else(|| line.trim_start_matches("[pfx-render] ").replacen("error ", "Error: ", 1));
             }
+            for line in lines {
+                // Download progress replaces the previous progress line.
+                let progress = line.starts_with("[pfx-render] download ");
+                if progress && self.render_setup_log.last().is_some_and(|l| l.starts_with("[pfx-render] download ")) {
+                    self.render_setup_log.pop();
+                }
+                self.render_setup_log.push(line);
+            }
             if finished {
                 self.render_setup = None;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
+        if self.render_setup_open {
+            let mut open = true;
+            let running = self.render_setup.is_some();
+            egui::Window::new("Set Up Rendering on Windows").open(&mut open).default_width(460.0).show(ctx, |ui| {
+                ui.label("Installs WSL containers if they're missing, then downloads MoonRay (about 1.3 GB, once).");
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).show(ui, |ui| {
+                    for line in &self.render_setup_log {
+                        let text = wslrender::progress(line).unwrap_or_else(|| line.trim_start_matches("[pfx-render] ").to_string());
+                        if line.contains("] error ") {
+                            ui.colored_label(egui::Color32::from_rgb(240, 110, 110), text.replacen("error ", "", 1));
+                        } else {
+                            ui.label(text);
+                        }
+                    }
+                });
+                if running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Working… a Windows permission prompt may appear.");
+                    });
+                }
+            });
+            if !open {
+                self.render_setup_open = false;
             }
         }
         let dt = ctx.input(|i| i.unstable_dt);
@@ -21167,6 +21229,13 @@ mod perf_tests {
 #[cfg(test)]
 mod search_tests {
     use super::*;
+
+    #[test]
+    fn set_up_failures_say_what_happened() {
+        assert!(setup_failure(Some(0xC000_0135u32 as i32)).contains("wslcsdk.dll"));
+        assert!(setup_failure(Some(3)).contains("aren't installed"));
+        assert!(setup_failure(Some(-5)).contains("crashed"));
+    }
 
     #[test]
     fn arrows_move_through_search_results() {

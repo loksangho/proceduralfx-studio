@@ -12,7 +12,13 @@ on:
     tags: ['v*']
     branches: [main]
     paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
       - 'packaging/windows/render/**'
+      - 'packaging/windows/README.txt'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
 
