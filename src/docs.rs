@@ -36,7 +36,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("whitewater_solver", "Spray, foam and bubbles from a FLIP fluid (input 1), with groups spray/foam/bubble. Renders as small spheres."),
     ("pyro", "Smoke and fire on a voxel grid (stable fluids, buoyancy, combustion, vorticity and turbulence), emitted from the source geometry. Drag its domain box in the viewport."),
     ("rbd_solver", "Rigid bodies (rapier, Bullet-style): each connected piece, or each value of `piece`, falls and collides. Input 2: static collider."),
-    ("vellum_solver", "XPBD cloth, hair, softbody or grains with a collider, a ground plane, self-collision and pinning (f@pin, a pin group or animated pins)."),
+    ("cloth_solver", "XPBD cloth, hair, softbody or grains with a collider, a ground plane, self-collision and pinning (f@pin, a pin group or animated pins)."),
     ("sop_solver", "Runs its network once per step on the previous step's result (Prev_Frame), for custom simulations."),
     ("solver_input", "Inside a SOP Solver: Prev_Frame (the last step) or Input_1 (the solver's input)."),
     // Import / export
@@ -47,6 +47,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("convert_line", "Turns every polygon edge into a two-point line (a curve) with restlength; quad diagonals are skipped."),
     ("metaball", "Soft blobs around the input's points (pscale scales each, or one ball at the origin), blended into one surface; lower thresholds are fatter."),
     ("connectivity", "Numbers connected pieces 0, 1, 2… in a point or primitive attribute (class by default)."),
+    ("test_geometry", "Ready-made shapes to start from: Spot (a cow), Bob (a rubber toy) and Blub (a fish) with their painted colours (Keenan Crane's public-domain models), the Platonic solids, a torus knot, a shader ball, and an animated character (Quaternius's public-domain human: Idle, Walk, Run, Jump, Punch, Death and Working, looping or not, in six looks), at a chosen size, on the ground or centred."),
     ("lsystem", "An L-system: a premise rewritten by rules for a number of generations, then drawn by a 3D turtle as curves with a tapering width. F draws, + - & ^ \\ / turn, [ ] branch, ! thins; several rules for one symbol pick at random. Presets: trees, a fractal plant, grass, Koch and Hilbert curves."),
     ("resample", "Evenly spaced points along curves, by maximum segment length or a number of segments; point attributes are interpolated."),
     ("object_merge", "Brings in an object's geometry (its display output) or any node inside an object, including other nodes in this network, optionally moved into this object's space. Pick sources from a menu per object."),
@@ -79,7 +80,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("blast", "Deletes points or primitives (the node's group, or picked in the viewport)."),
     ("scatter", "Points on a surface (or inside a closed mesh), relaxed for even spacing; they get N, pscale and sourceprim."),
     ("boolean", "Union, intersect or subtract two closed meshes (exact BSP, or volume for messy input). Faces keep their input's attributes (materials, Cd, UVs, groups; in Exact mode) and are grouped a_faces/b_faces."),
-    ("cache", "Caches its input's frames in memory."),
+    ("cache", "Caches its input's frames to disk (cache/cache_ID_frame.mcache, every attribute) and reads them back. Write saves each frame as it cooks; a Fetch TOP pointed at it writes its frame range (or the Fetch's work items), across wedges too. Read plays the files back."),
     ("reverse", "Reverses polygon winding."),
     ("switch", "Passes one of its inputs through."),
     ("merge", "Merges any number of inputs: drop a wire anywhere on the node to add one (a free port is always shown)."),
@@ -98,7 +99,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("material_fracture", "Breaks a closed mesh into pieces: concrete (Voronoi chunks), glass (cracks from an impact point) or wood (splinters along the grain). Outputs pieces, glue constraints between neighbours and proxy collision shapes for the RBD Bullet Solver; pieces keep the input's materials, colours and UVs; cut faces are in the inside group (give them their own material with a Material node)."),
     // Crowds, KineFX, muscles
     ("crowd_solver", "Agents that walk, flock, seek a goal, keep their distance, follow a ground mesh and avoid obstacles. Shows walking mannequins or points."),
-    ("skeleton", "A KineFX skeleton (biped, chain or tail): joints as points with parent and transform."),
+    ("skeleton", "A skeleton (biped, chain or tail): joints as points with parent and transform."),
     ("rig_pose", "Rotates and moves joints in their own axes; children follow. Keyframe it to animate."),
     ("two_bone_ik", "Bends a root → mid → tip chain so the tip reaches a goal, with a pole for the bend."),
     ("procedural_motion", "A biped walk cycle, a wave down a chain or tail, or idle breathing."),
@@ -196,11 +197,20 @@ fn section(out: &mut String, id: &str, title: &str) {
 }
 
 fn card(out: &mut String, title: &str, tags: &str, body: &str) {
+    card_with_id(out, &anchor(title), title, tags, body);
+}
+
+// Where a VEX function's card is on the page (F1 in a wrangle jumps there).
+pub fn vex_anchor(name: &str) -> String {
+    format!("vex-{}", anchor(name))
+}
+
+fn card_with_id(out: &mut String, id: &str, title: &str, tags: &str, body: &str) {
     let _ = write!(
         out,
         "<div class=\"card\" data-search=\"{}\"><h3 id=\"{}\">{}</h3><div class=\"tags\">{}</div><p>{}</p></div>",
         esc(&format!("{title} {tags} {body}").to_lowercase()),
-        anchor(title),
+        id,
         esc(title),
         tags,
         esc(body)
@@ -212,11 +222,11 @@ pub fn html(version: &str) -> String {
     let mut nav = String::new();
     // Overview.
     section(&mut body, "overview", "Overview");
-    body.push_str("<p>ProceduralFX Studio builds scenes from node networks, like Houdini. Each context has its own networks:</p><table>");
+    body.push_str("<p>ProceduralFX Studio builds scenes from node networks. Each context has its own networks:</p><table>");
     for (name, what) in CONTEXTS {
         let _ = write!(body, "<tr><th>{name}</th><td>{}</td></tr>", esc(what));
     }
-    body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node; a renamed node still shows its type under the name. Some nodes have several outputs (Material Fracture, RBD Configure, RBD Bullet Solver: geometry, constraints, proxy): drag a wire from the output you want; hover a port for its name. Any parameter can be keyframed: the animation editor lists each one by name (size, radius, t.x…).</p><p><b>Windows → Performance Monitor</b> times every node cook: each node's own time (without its inputs), how often it cooked, its slowest and average cook and its share of the total, slowest first. Click a node to go to it; <i>Show cook times on nodes</i> writes each node's latest time next to it in the network.</p></section>");
+    body.push_str("</table><p>Add nodes with a right-click (type to search) or TAB. Double-click a network node to enter it; U goes back up. F2 renames the selected node; a renamed node still shows its type under the name. Some nodes have several outputs (Material Fracture, RBD Configure, RBD Bullet Solver: geometry, constraints, proxy): drag a wire from the output you want; hover a port for its name. Any parameter can be keyframed: the animation editor lists each one by name (size, radius, t.x…).</p><p><b>Node Info:</b> hold the middle mouse button on a node (or click ℹ next to its name in the parameters, or right-click → Node Info) to see what it is and makes: its type, flags, inputs, cook time and errors, then point, primitive and vertex counts, bounds, attributes by class with their sizes, and groups with how many members. It also says whether the geometry is polygons, curves, points, packed primitives, a volume or a terrain.</p><p><b>Windows → Performance Monitor</b> times every node cook: each node's own time (without its inputs), how often it cooked, its slowest and average cook and its share of the total, slowest first. Click a node to go to it; <i>Show cook times on nodes</i> writes each node's latest time next to it in the network.</p></section>");
     let _ = write!(nav, "<a href=\"#overview\">Overview</a>");
 
     // The AI assistant.
@@ -308,7 +318,7 @@ pub fn html(version: &str) -> String {
         for (name, min, max, cat, doc) in crate::vex::BUILTINS.iter().filter(|b| b.3 == category) {
             let args = if min == max { format!("{min} argument{}", if *min == 1 { "" } else { "s" }) } else if *max > 100 { format!("{min}+ arguments") } else { format!("{min}–{max} arguments") };
             let _ = cat;
-            card(&mut body, name, &format!("<span>{}</span>", esc(&args)), doc);
+            card_with_id(&mut body, &vex_anchor(name), name, &format!("<span>{}</span>", esc(&args)), doc);
         }
     }
     body.push_str("</section>");
@@ -331,6 +341,8 @@ main {{ margin-left:230px; padding:22px 32px 80px; max-width:1100px; }}
 h1 {{ margin:0 0 4px; font-size:26px; }} h2 {{ margin:36px 0 10px; border-bottom:1px solid var(--line); padding-bottom:6px; }} h4 {{ margin:22px 0 8px; color:var(--muted); text-transform:uppercase; font-size:12px; letter-spacing:.06em; }}
 .cards {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:10px; }}
 .card {{ background:var(--card); border:1px solid var(--line); border-radius:9px; padding:10px 13px; margin:0 0 8px; }}
+.card:has(h3:target) {{ border-color:var(--accent); box-shadow:0 0 0 2px var(--accent); }}
+h3:target {{ scroll-margin-top:16px; }}
 .card h3 {{ margin:0; font-size:15px; }} .card p {{ margin:4px 0 0; color:var(--fg); font-size:14px; }}
 .tags span {{ display:inline-block; font-size:11.5px; background:var(--tag); color:var(--muted); border-radius:5px; padding:0 6px; margin:3px 5px 0 0; font-family:ui-monospace, Menlo, monospace; }}
 table {{ border-collapse:collapse; }} th, td {{ text-align:left; padding:5px 12px 5px 0; vertical-align:top; }} th {{ font-family:ui-monospace, Menlo, monospace; }}
@@ -340,7 +352,7 @@ pre, code {{ font-family:ui-monospace, Menlo, monospace; font-size:13px; }} pre 
 </style></head>
 <body>
 <nav><b>ProceduralFX Studio</b><input id="q" type="search" placeholder="Search nodes and VEX…" autofocus>{nav}</nav>
-<main><h1>Documentation</h1><p class="muted">Version {version}. Generated from the app, so it lists exactly what this version has.</p>{body}</main>
+<main><h1>Documentation</h1><p class="muted">Version {version}. Generated from the app, so it lists exactly what this version has.</p>{body}<p class="muted">Familiar if you've used Houdini. Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></main>
 <script>
 // Cards in each section sit in a grid; search hides those that don't match every word.
 document.querySelectorAll('section').forEach(sec => {{
@@ -411,6 +423,7 @@ mod tests {
         }
         for (name, ..) in crate::vex::BUILTINS {
             assert!(page.contains(&format!(">{}</h3>", esc(name))), "VEX {name}");
+            assert!(page.contains(&format!("id=\"{}\"", vex_anchor(name))), "VEX {name} anchor");
         }
         assert!(page.contains("Overloads") || page.contains("overloads"));
         assert!(page.starts_with("<!doctype html>") && page.ends_with("</html>"));

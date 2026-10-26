@@ -4,8 +4,9 @@
 // - Frame Range: one item per frame.
 // - Wedge: copies of every input item with a parameter of some node set to
 //   values spread between two numbers (render or export variations).
-// - Fetch: runs an OUT MoonRay render node or a File Export SOP for each item,
-//   at the item's frame and with its wedged parameters.
+// - Fetch: runs an OUT MoonRay render node, a File Export SOP or a Cache SOP for
+//   each item, at the item's frame and with its wedged parameters (a Cache writes
+//   that frame's cache file, like Houdini's ROP Fetch on a File Cache).
 // - Command: runs a shell command per item.
 // - File Pattern: one item per file matching a pattern.
 // - Wait for All: one item after all of its input's items.
@@ -59,7 +60,7 @@ pub const OPS: &[TopOp] = &[
     },
     TopOp {
         label: "Fetch",
-        help: "Runs a MoonRay render node (OUT) or a File Export node for each work item, at its frame and wedge.",
+        help: "Runs a MoonRay render node (OUT), a File Export node or a Cache node for each work item, at its frame and wedge. A Cache writes that frame's cache file (named by the cache, so the output file is ignored); with nothing connected, Fetch uses the node's own frame range.",
         inputs: 1,
         params: &[f("node", "Node", "", -1.0, 1e9, -1.0)],
         texts: &["Output file (optional)"],
@@ -169,6 +170,8 @@ pub enum Job {
     Render(usize),
     // A File Export node, writing `output`.
     Export(usize),
+    // A Cache node: cook its input at the item's frame and write the frame's cache file.
+    Cache(usize),
     Shell(String),
 }
 
@@ -227,6 +230,14 @@ pub struct FetchTarget {
     pub output: String,
     // The node's own frames, used when Fetch has no input items.
     pub frames: Vec<f32>,
+    // A Cache node's id: its files are named by frame, so the output can't be chosen.
+    pub cache: Option<usize>,
+}
+
+// Where a Cache node keeps a frame (time in seconds).
+pub fn cache_path(cache_id: usize, time: f32) -> std::path::PathBuf {
+    let frame = (time.max(0.0) * 1000.0).round() as u64;
+    std::path::PathBuf::from("cache").join(format!("cache_{cache_id:04}_{frame:08}.mcache"))
 }
 
 pub const FPS: f32 = 24.0;
@@ -281,8 +292,8 @@ pub fn generate(node: &TopNode, upstream: Option<&[WorkItem]>, fetch: impl Fn(us
             Ok(out)
         }
         FETCH => {
-            let target_id = node.node().ok_or("choose a node to fetch (a MoonRay render or a File Export)")?;
-            let target = fetch(target_id).ok_or("the fetched node must be a MoonRay render node or a File Export node")?;
+            let target_id = node.node().ok_or("choose a node to fetch (a MoonRay render, a File Export or a Cache)")?;
+            let target = fetch(target_id).ok_or("the fetched node must be a MoonRay render node, a File Export node or a Cache node")?;
             let template = if node.text(0).is_empty() { target.output.clone() } else { node.text(0).to_owned() };
             let base = match upstream {
                 Some(up) => up.to_vec(),
@@ -301,6 +312,11 @@ pub fn generate(node: &TopNode, upstream: Option<&[WorkItem]>, fetch: impl Fn(us
                         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
                         let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
                         output = path.with_file_name(format!("{stem}.@index{ext}")).to_string_lossy().into_owned();
+                    }
+                    if let Some(cache_id) = target.cache {
+                        next.output = cache_path(cache_id, next.time(FPS)).to_string_lossy().into_owned();
+                        next.job = Job::Cache(target_id);
+                        return next;
                     }
                     let frame_number = item.frame.round().max(0.0) as usize;
                     next.output = next.expand(&output.replace("####", &format!("{frame_number:04}")), FPS);
@@ -383,7 +399,20 @@ mod tests {
     use super::*;
 
     fn target(render: bool) -> impl Fn(usize) -> Option<FetchTarget> {
-        move |id| (id == 7).then(|| FetchTarget { render, output: "/out/beauty.$F4.exr".into(), frames: vec![1.0, 2.0] })
+        move |id| (id == 7).then(|| FetchTarget { render, output: "/out/beauty.$F4.exr".into(), frames: vec![1.0, 2.0], cache: None })
+    }
+
+    #[test]
+    fn fetch_writes_cache_frames() {
+        let mut fetch = TopNode::new(FETCH);
+        fetch.set("node", 3.0);
+        // Its own frame range when nothing is connected; the output is the cache's file.
+        let target = |id: usize| (id == 3).then(|| FetchTarget { render: false, output: String::new(), frames: vec![1.0, 2.0, 3.0], cache: Some(12) });
+        let items = generate(&fetch, None, target).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].job, Job::Cache(3));
+        assert_eq!(items[1].output, cache_path(12, 1.0 / FPS).to_string_lossy());
+        assert!(items[2].output.ends_with("cache_0012_00000083.mcache"), "{}", items[2].output);
     }
 
     #[test]

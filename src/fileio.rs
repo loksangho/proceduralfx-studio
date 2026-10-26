@@ -277,14 +277,164 @@ pub fn write_stl(mesh: &Mesh) -> Vec<u8> {
 // FBX
 // ============================================================================
 
-pub fn read_fbx(path: &str) -> Result<Mesh, String> {
-    let opts = ufbx::LoadOpts {
+// Loaded FBX scenes, kept per file (and modification time) so playing an animation
+// doesn't re-read the file every frame.
+thread_local! {
+    static FBX_SCENES: std::cell::RefCell<Vec<(String, Option<std::time::SystemTime>, std::rc::Rc<ufbx::SceneRoot>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn fbx_opts() -> ufbx::LoadOpts<'static> {
+    ufbx::LoadOpts {
         target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
         target_unit_meters: 1.0,
         space_conversion: ufbx::SpaceConversion::ModifyGeometry,
         ..Default::default()
+    }
+}
+
+// A loaded scene from the cache, or `load` it (keyed by file and modification time).
+fn fbx_cached(key: &str, modified: Option<std::time::SystemTime>, load: impl FnOnce() -> Result<ufbx::SceneRoot, String>) -> Result<std::rc::Rc<ufbx::SceneRoot>, String> {
+    if let Some(scene) = FBX_SCENES.with(|c| c.borrow().iter().find(|(p, m, _)| p == key && *m == modified).map(|(.., s)| s.clone())) {
+        return Ok(scene);
+    }
+    let scene = std::rc::Rc::new(load()?);
+    FBX_SCENES.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(p, ..)| p != key);
+        c.push((key.to_owned(), modified, scene.clone()));
+        if c.len() > 4 {
+            c.remove(0);
+        }
+    });
+    Ok(scene)
+}
+
+fn fbx_scene(path: &str) -> Result<std::rc::Rc<ufbx::SceneRoot>, String> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    fbx_cached(path, modified, || ufbx::load_file(path, fbx_opts()).map_err(|e| format!("could not read FBX: {}", e.description)))
+}
+
+// An FBX built into the app (`name` keys the cache).
+pub fn fbx_scene_from_memory(name: &str, bytes: &[u8]) -> Result<std::rc::Rc<ufbx::SceneRoot>, String> {
+    fbx_cached(name, None, || ufbx::load_memory(bytes, fbx_opts()).map_err(|e| format!("could not read FBX: {}", e.description)))
+}
+
+// One animation take (an FBX "animation stack"): its name (without the armature's
+// prefix) and time span in seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FbxTake {
+    pub name: String,
+    pub begin: f64,
+    pub end: f64,
+}
+
+// The takes worth playing: longer than one frame (exporters often leave a stray
+// one-frame action behind).
+pub fn fbx_takes(scene: &ufbx::Scene) -> Vec<(usize, FbxTake)> {
+    let frame = 1.0 / scene.settings.frames_per_second.max(1.0);
+    scene
+        .anim_stacks
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.time_end - s.time_begin > frame * 1.5)
+        .map(|(i, s)| {
+            let name = s.element.name.to_string();
+            let name = name.rsplit_once('|').map_or(name.clone(), |(_, n)| n.to_owned());
+            (i, FbxTake { name, begin: s.time_begin, end: s.time_end })
+        })
+        .collect()
+}
+
+// The span of the keyframes, for files that leave their take's range out.
+fn keyframe_span(scene: &ufbx::Scene) -> Option<(f64, f64)> {
+    let keys = scene.anim_curves.iter().filter(|c| c.keyframes.len() > 1);
+    let (lo, hi) = keys.fold((f64::MAX, f64::MIN), |(lo, hi), c| (lo.min(c.min_time), hi.max(c.max_time)));
+    (hi > lo).then_some((lo, hi))
+}
+
+// The animation to play and its span: stack `take`, or the first take worth playing,
+// or the default animation over its keyframes. None if nothing moves.
+fn fbx_animation(scene: &ufbx::Scene, take: Option<usize>) -> Option<(&ufbx::Anim, f64, f64)> {
+    if scene.anim_curves.is_empty() {
+        return None;
+    }
+    let stack = match take {
+        Some(i) => scene.anim_stacks.get(i),
+        None => fbx_takes(scene).first().and_then(|(i, _)| scene.anim_stacks.get(*i)),
     };
-    let scene = ufbx::load_file(path, opts).map_err(|e| format!("could not read FBX: {}", e.description))?;
+    if let Some(stack) = stack.filter(|s| s.time_end > s.time_begin) {
+        return Some((&*stack.anim, stack.time_begin, stack.time_end));
+    }
+    let (begin, end) = (scene.anim.time_begin, scene.anim.time_end);
+    if end > begin {
+        return Some((&*scene.anim, begin, end));
+    }
+    keyframe_span(scene).map(|(lo, hi)| (&*scene.anim, lo, hi))
+}
+
+fn fbx_animated(scene: &ufbx::Scene) -> bool {
+    fbx_animation(scene, None).is_some()
+}
+
+// Whether the FBX has animation (moving transforms, skinned bones, blend shapes).
+pub fn fbx_is_animated(path: &str) -> bool {
+    fbx_scene(path).is_ok_and(|s| fbx_animated(&s))
+}
+
+pub fn read_fbx(path: &str) -> Result<Mesh, String> {
+    read_fbx_at(path, 0.0)
+}
+
+// The FBX's meshes `seconds` into its first take (time 0 is the take's start; after
+// its end it holds the last pose): animated transforms, skinning and blend shapes
+// are applied. A file without animation gives its rest pose.
+pub fn read_fbx_at(path: &str, seconds: f32) -> Result<Mesh, String> {
+    let scene = fbx_scene(path)?;
+    fbx_evaluate(&scene, None, seconds, false)
+}
+
+// The take names of an FBX file worth playing, with their lengths in seconds.
+pub fn fbx_take_names(path: &str) -> Vec<(String, f64)> {
+    fbx_scene(path).map(|s| fbx_takes(&s).into_iter().map(|(_, t)| (t.name, t.end - t.begin)).collect()).unwrap_or_default()
+}
+
+// An FBX file's meshes `seconds` into the take called `take` (empty: the first one
+// worth playing), holding the last pose or starting over when `looping`.
+pub fn read_fbx_take(path: &str, take: &str, seconds: f32, looping: bool) -> Result<Mesh, String> {
+    let scene = fbx_scene(path)?;
+    let stack = if take.trim().is_empty() {
+        None
+    } else {
+        let takes = fbx_takes(&scene);
+        let found = takes.iter().find(|(_, t)| t.name == take.trim()).map(|(i, _)| *i);
+        Some(found.ok_or_else(|| {
+            let names: Vec<String> = takes.iter().map(|(_, t)| t.name.clone()).collect();
+            if names.is_empty() { format!("the file has no take called \"{take}\" (it has no animation)") } else { format!("the file has no take called \"{take}\" (it has: {})", names.join(", ")) }
+        })?)
+    };
+    fbx_evaluate(&scene, stack, seconds, looping)
+}
+
+// The scene's meshes `seconds` into take `take` (None: the first one worth playing),
+// holding the last pose after the end, or starting over when `looping`.
+pub fn fbx_evaluate(scene: &ufbx::Scene, take: Option<usize>, seconds: f32, looping: bool) -> Result<Mesh, String> {
+    let Some((anim, begin, end)) = fbx_animation(scene, take) else {
+        return fbx_mesh(scene);
+    };
+    let length = end - begin;
+    let into = seconds.max(0.0) as f64;
+    let t = begin + if looping && length > 0.0 { into % length } else { into.min(length) };
+    let opts = ufbx::EvaluateOpts { evaluate_skinning: true, evaluate_caches: true, ..Default::default() };
+    let evaluated = ufbx::evaluate_scene(scene, anim, t, opts).map_err(|e| format!("could not evaluate the FBX animation: {}", e.description))?;
+    fbx_mesh(&evaluated)
+}
+
+// The meshes as they are stored (bind pose), for scenes the caller evaluates itself.
+pub fn fbx_rest(scene: &ufbx::Scene) -> Result<Mesh, String> {
+    fbx_mesh(scene)
+}
+
+fn fbx_mesh(scene: &ufbx::Scene) -> Result<Mesh, String> {
     let mut out = Mesh::default();
     let (mut colors, mut uvs, mut piece, mut prim_piece) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut any_color, mut any_uv) = (false, false);
@@ -295,8 +445,13 @@ pub fn read_fbx(path: &str) -> Result<Mesh, String> {
         let mesh = node.mesh.as_ref().expect("filtered");
         let to_world = node.geometry_to_world;
         let base = out.vertices.len();
-        for v in mesh.vertices.iter() {
-            let p = ufbx::transform_position(&to_world, *v);
+        // Skinned (and blend-shaped) positions when the scene was evaluated: already in
+        // world space unless ufbx says they're local. Otherwise the stored vertices.
+        let skinned = mesh.skinned_position.values.len() == mesh.vertices.len();
+        let positions: &[ufbx::Vec3] = if skinned { &mesh.skinned_position.values } else { &mesh.vertices };
+        let local = !skinned || mesh.skinned_is_local;
+        for v in positions.iter() {
+            let p = if local { ufbx::transform_position(&to_world, *v) } else { *v };
             out.vertices.push(mirror(Vec3::new(p.x as f32, p.y as f32, p.z as f32)));
             piece.push(piece_index as f32);
         }
@@ -611,6 +766,109 @@ pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // An FBX (ASCII 7.4) with one triangle whose model moves +10 along X over a second.
+    const ANIMATED_FBX: &str = r#"; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
+}
+Objects:  {
+	Geometry: 1000, "Geometry::tri", "Mesh" {
+		Vertices: *9 {
+			a: 0,0,0,1,0,0,0,1,0
+		}
+		PolygonVertexIndex: *3 {
+			a: 0,1,-3
+		}
+		GeometryVersion: 124
+	}
+	Model: 2000, "Model::tri", "Mesh" {
+		Version: 232
+	}
+	AnimationStack: 3000, "AnimStack::Take 001", "" {
+		Properties70:  {
+			P: "LocalStop", "KTime", "Time", "",46186158000
+			P: "ReferenceStop", "KTime", "Time", "",46186158000
+		}
+	}
+	AnimationLayer: 4000, "AnimLayer::BaseLayer", "" {
+	}
+	AnimationCurveNode: 5000, "AnimCurveNode::T", "" {
+		Properties70:  {
+			P: "d|X", "Number", "", "A",0
+			P: "d|Y", "Number", "", "A",0
+			P: "d|Z", "Number", "", "A",0
+		}
+	}
+	AnimationCurve: 6000, "AnimCurve::", "" {
+		Default: 0
+		KeyVer: 4009
+		KeyTime: *2 {
+			a: 0,46186158000
+		}
+		KeyValueFloat: *2 {
+			a: 0,10
+		}
+		KeyAttrFlags: *1 {
+			a: 4
+		}
+		KeyAttrDataFloat: *4 {
+			a: 0,0,0,0
+		}
+		KeyAttrRefCount: *1 {
+			a: 2
+		}
+	}
+}
+Connections:  {
+	C: "OO",2000,0
+	C: "OO",1000,2000
+	C: "OO",4000,3000
+	C: "OO",5000,4000
+	C: "OP",5000,2000, "Lcl Translation"
+	C: "OP",6000,5000, "d|X"
+}
+"#;
+
+    #[test]
+    fn fbx_animation_is_evaluated_over_time() {
+        let path = std::env::temp_dir().join(format!("pfx_anim_{}.fbx", std::process::id()));
+        std::fs::write(&path, ANIMATED_FBX).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        assert!(fbx_is_animated(&path));
+        let min_x = |m: &Mesh| m.vertices.iter().map(|v| v.x).fold(f32::MAX, f32::min);
+        let start = read_fbx_at(&path, 0.0).unwrap();
+        let half = read_fbx_at(&path, 0.5).unwrap();
+        let end = read_fbx_at(&path, 1.0).unwrap();
+        let after = read_fbx_at(&path, 5.0).unwrap();
+        assert_eq!(start.vertices.len(), 3);
+        let (a, b, c) = (min_x(&start), min_x(&half), min_x(&end));
+        assert!((c - a - 10.0).abs() < 1e-3, "moves 10 units: {a} -> {c}");
+        assert!((b - a - 5.0).abs() < 0.5, "about halfway at 0.5 s: {b}");
+        assert!((min_x(&after) - c).abs() < 1e-4, "holds the last pose");
+        // The plain reader gives the start of the animation; a static file isn't animated.
+        assert_eq!(read_fbx(&path).unwrap().vertices, start.vertices);
+        let still = std::env::temp_dir().join(format!("pfx_still_{}.fbx", std::process::id()));
+        std::fs::write(&still, write_fbx(&crate::node_box(1.0, 1), "box")).unwrap();
+        assert!(!fbx_is_animated(&still.to_string_lossy()));
+        let _ = std::fs::remove_file(&still);
+        let _ = std::fs::remove_file(&path);
+    }
+
     use super::*;
 
     fn coloured_quad() -> Mesh {

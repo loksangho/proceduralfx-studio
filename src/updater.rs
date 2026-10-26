@@ -535,6 +535,11 @@ impl Updater {
     }
 
     // Menu-bar button shown while an update is waiting.
+    // Whether indicator() shows a button (for the top bar's layout).
+    pub fn has_indicator(&self) -> bool {
+        matches!(self.state, State::Available(_) | State::Downloading { .. } | State::Ready { .. })
+    }
+
     pub fn indicator(&mut self, ui: &mut egui::Ui) {
         let label = match &self.state {
             State::Available(r) => format!("⬆ Update to v{}", r.version),

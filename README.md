@@ -4,7 +4,7 @@
 
 <a href="https://buymeacoffee.com/sangstari"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=sangstari&button_colour=FFDD00&font_colour=000000&font_family=Inter&outline_colour=000000&coffee_colour=ffffff" height="40" alt="Buy me a coffee"></a>
 
-A node-based procedural 3D tool in the spirit of Houdini. You build geometry
+A node-based procedural 3D tool for macOS and Linux. You build geometry
 from networks of nodes, and the app includes:
 
 - modelling nodes and VEX wrangles;
@@ -115,3 +115,8 @@ The full builds include native OpenVDB and USD, plus a bundled MoonRay:
 - **Linux:** [packaging/linux](packaging/linux) contains the Flatpak manifest.
   [.github/workflows/flatpak.yml](.github/workflows/flatpak.yml) builds it on
   GitHub Actions, and publishes a release when a `v*` tag is pushed.
+
+---
+
+Familiar if you've used Houdini. Houdini is a trademark of Side Effects Software Inc.
+ProceduralFX Studio is not affiliated with or endorsed by SideFX.

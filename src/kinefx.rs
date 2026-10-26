@@ -99,7 +99,7 @@ impl Skeleton {
             .point_attributes
             .get("parent")
             .filter(|p| p.len() == n)
-            .ok_or("the input isn't a skeleton: start from a Skeleton node (KineFX menu)")?;
+            .ok_or("the input isn't a skeleton: start from a Skeleton node (Rigging menu)")?;
         let parent: Vec<i32> = parent.iter().map(|p| if *p < 0.0 || *p as usize >= n { -1 } else { *p as i32 }).collect();
         let m = match mesh.point_attributes.get("transform").filter(|t| t.len() == n * 9) {
             Some(t) => t.chunks(9).map(|c| [Vec3::new(c[0], c[1], c[2]), Vec3::new(c[3], c[4], c[5]), Vec3::new(c[6], c[7], c[8])]).collect(),

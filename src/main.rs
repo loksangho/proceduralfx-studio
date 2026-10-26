@@ -41,6 +41,7 @@ mod kinefx;
 mod lsystem;
 mod measure;
 mod muscle;
+mod nodeinfo;
 mod packed;
 mod perf;
 mod paint;
@@ -54,12 +55,14 @@ mod shading;
 mod sopkit;
 mod sops;
 mod terrain;
+mod testgeo;
 mod textures;
 mod tops;
 mod updater;
 mod vellum;
 mod usd;
 mod vex;
+mod vexsyntax;
 mod vexmath;
 mod volume;
 mod vop;
@@ -689,6 +692,7 @@ fn read_geometry_file(path: &str, time: f32) -> Result<Mesh, String> {
     match fileio::extension(path).as_str() {
         "usd" | "usda" | "usdc" | "usdz" => usd::load_file(path, time).map(|stage| stage.to_mesh()),
         "abc" => abc::read(path, time),
+        "fbx" => fileio::read_fbx_at(path, time),
         "vdb" => read_vdb_file(path),
         _ => fileio::read_geometry(path),
     }
@@ -1590,8 +1594,7 @@ fn node_particle_surface(
 }
 
 fn cache_file_path(cache_id: usize, time: f32) -> std::path::PathBuf {
-    let frame = (time.max(0.0) * 1000.0).round() as u64;
-    std::path::PathBuf::from("cache").join(format!("cache_{cache_id:04}_{frame:08}.mcache"))
+    tops::cache_path(cache_id, time)
 }
 
 fn load_mesh_cache(path: &std::path::Path) -> Option<Mesh> {
@@ -1624,9 +1627,7 @@ fn load_mesh_cache(path: &std::path::Path) -> Option<Mesh> {
             continue;
         };
         let attribute: Vec<f32> = values.filter_map(|value| value.parse().ok()).collect();
-        if attribute.len() == vertices {
-            mesh.point_attributes.insert(name.to_string(), attribute);
-        }
+        mesh.point_attributes.insert(name.to_string(), attribute);
     }
     Some(mesh)
 }
@@ -1642,14 +1643,17 @@ fn save_mesh_cache(path: &std::path::Path, mesh: &Mesh) -> std::io::Result<()> {
     for tri in &mesh.indices {
         text.push_str(&format!("{} {} {}\n", tri[0], tri[1], tri[2]));
     }
+    // Every attribute: point ones, and the primitive, vertex and detail ones (polygons,
+    // volume and terrain settings) that have other lengths.
     for (name, values) in &mesh.point_attributes {
-        if values.len() == mesh.vertices.len() {
-            text.push_str(&format!("@attr:{name}"));
-            for value in values {
-                text.push_str(&format!(" {value:.9}"));
-            }
-            text.push('\n');
+        if name.contains(char::is_whitespace) {
+            continue;
         }
+        text.push_str(&format!("@attr:{name}"));
+        for value in values {
+            text.push_str(&format!(" {value:.9}"));
+        }
+        text.push('\n');
     }
     std::fs::write(path, text)
 }
@@ -2641,6 +2645,97 @@ fn resolve_executable(executable: &str) -> Option<PathBuf> {
 
 // Sliders for the ch("name") parameters `code` uses (like Houdini's spare
 // parameters, created automatically); values unused by the code are dropped.
+// One group of toolbar controls that wraps to the next line as a whole when it doesn't
+// fit (its width is the one measured on the frame before).
+fn toolbar_group<R>(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let key = egui::Id::new(("toolbar_group", name));
+    let width: f32 = ui.ctx().data(|d| d.get_temp(key)).unwrap_or(0.0);
+    let at_row_start = ui.cursor().min.x <= ui.max_rect().left() + 1.0;
+    // What's left of this row (available_width() is a whole row's in a wrapping layout).
+    if width > 0.0 && ui.available_size_before_wrap().x < width && !at_row_start {
+        ui.end_row();
+    }
+    let response = ui.horizontal(add);
+    ui.ctx().data_mut(|d| d.insert_temp(key, response.response.rect.width()));
+    response.inner
+}
+
+// The searchable add-node list the right-click and Tab menus share. Type to search
+// every category; Down/Up move through the matches and Enter adds the highlighted
+// one (`pick`). With nothing typed, the categories are submenus.
+fn node_search_ui(ui: &mut egui::Ui, query: &mut String, pick: &mut usize, templates: &[(&'static str, Vec<NodeKind>)]) -> Option<NodeKind> {
+    // Taken before the field sees them (a one-line field would move its cursor).
+    let (down, up) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)));
+    let before = query.clone();
+    ui.add(egui::TextEdit::singleline(query).hint_text("Search nodes…").desired_width(f32::INFINITY)).request_focus();
+    if *query != before {
+        *pick = 0;
+    }
+    let mut chosen = None;
+    if !query.trim().is_empty() {
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let found: Vec<(&str, &NodeKind)> = templates
+            .iter()
+            .flat_map(|(cat, kinds)| kinds.iter().map(move |k| (*cat, k)))
+            .filter(|(cat, k)| node_matches(k, cat, query))
+            .collect();
+        if found.is_empty() {
+            ui.weak("No matching nodes");
+            return None;
+        }
+        *pick = search_step(*pick, found.len(), down, up);
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            for (i, (cat, kind)) in found.iter().enumerate() {
+                let row = ui.selectable_label(i == *pick, format!("{}   ({cat})", kind.menu_name()));
+                if i == *pick && (down || up) {
+                    row.scroll_to_me(None);
+                }
+                let row = match kind.menu_help() {
+                    Some(help) => row.on_hover_text(help),
+                    None => row,
+                };
+                if row.clicked() || (enter && i == *pick) {
+                    chosen = Some((*kind).clone());
+                }
+            }
+        });
+        return chosen;
+    }
+    ui.separator();
+    for (cat, kinds) in templates {
+        ui.menu_button(*cat, |ui| {
+            for kind in kinds {
+                let button = ui.button(kind.menu_name());
+                let button = match kind.menu_help() {
+                    Some(help) => button.on_hover_text(help),
+                    None => button,
+                };
+                if button.clicked() {
+                    chosen = Some(kind.clone());
+                    ui.close_menu();
+                }
+            }
+        });
+    }
+    chosen
+}
+
+// The highlighted result after Down/Up, kept within `count` results.
+fn search_step(pick: usize, count: usize, down: bool, up: bool) -> usize {
+    let last = count.saturating_sub(1);
+    let pick = pick.min(last);
+    if down {
+        (pick + 1).min(last)
+    } else if up {
+        pick.saturating_sub(1)
+    } else {
+        pick
+    }
+}
+
+// Where the focused VEX editor's id is kept, so Tab over the network doesn't steal its indent.
+const CODE_EDITOR_FOCUS: &str = "vex_code_editor_focus";
+
 // What new Volume and Heightfield Wrangles start with.
 const VOLUME_WRANGLE_EXAMPLE: &str = "// Thin the density towards the top of the volume.\n@density *= fit(@P.y, 0, 2, 1, 0);";
 const HEIGHTFIELD_WRANGLE_EXAMPLE: &str = "// Add ripples, stronger where the mask is.\n@height += sin(@P.x * 2) * 0.3 * (1 + @mask);";
@@ -2677,13 +2772,40 @@ fn examples_menu(ui: &mut egui::Ui, code: &mut String, examples: &[(&str, &str)]
 // run's report and output, and the language reference. `noun` names what it runs over.
 fn vex_editor_ui(ui: &mut egui::Ui, code: &mut String, domain: usize, noun: &str, channels: &mut vex::Channels, hint: &str) -> bool {
     let mut c = false;
-    c |= ui.add(
-        egui::TextEdit::multiline(code)
-            .code_editor()
-            .desired_rows(14)
-            .desired_width(f32::INFINITY)
-            .hint_text(hint),
-    ).changed();
+    let dark = ui.visuals().dark_mode;
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+        let mut job = vexsyntax::highlight(text.as_str(), font.clone(), dark);
+        job.wrap.max_width = wrap_width;
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let editor = egui::TextEdit::multiline(code)
+        .code_editor()
+        .desired_rows(14)
+        .desired_width(f32::INFINITY)
+        .hint_text(hint)
+        .layouter(&mut layouter)
+        .show(ui);
+    c |= editor.response.changed();
+    if editor.response.has_focus() {
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(CODE_EDITOR_FOCUS), editor.response.id));
+    }
+    // F1 on a function opens its help.
+    if editor.response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::F1)) {
+        let word = editor.cursor_range.and_then(|range| vexsyntax::word_at(code, range.primary.index));
+        let anchor = match word.as_deref() {
+            Some(name) if vexsyntax::is_builtin(name) => docs::vex_anchor(name),
+            // Keywords, types and anything else: the language guide.
+            _ => "vex".to_string(),
+        };
+        if let Err(e) = open_documentation_at(Some(&anchor)) {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("vex_help_error"), e));
+        }
+    }
+    if let Some(e) = ui.ctx().data(|d| d.get_temp::<String>(egui::Id::new("vex_help_error"))) {
+        ui.colored_label(egui::Color32::from_rgb(240, 110, 110), format!("Couldn't open the help: {e}"));
+    }
+    ui.weak("Put the text cursor on a function and press F1 for its help.");
     c |= channel_params_ui(ui, code, channels);
 
     let report = vex::last_report(code, domain);
@@ -3267,6 +3389,8 @@ enum NodeKind {
     HeightfieldWrangle { code: String },
     // An L-system drawn as curves.
     LSystem(lsystem::LSystemSettings),
+    // Ready-made shapes to start from (built-in models, Platonic solids, a torus knot).
+    TestGeometry(testgeo::TestGeoSettings),
     Merge,
     Null,
     Tube { r_bot: f32, r_top: f32, height: f32, rows: usize, cols: usize, caps: bool },
@@ -3309,13 +3433,15 @@ enum NodeKind {
     Extrude(extrude::ExtrudeSettings),
     Clip { axis: usize, offset: f32, invert: bool },
     Blast { component: usize, indices: Vec<usize>, invert: bool },
-    Cache { cache_id: usize, mode: usize },
+    // A frame cache; `range` (start, end, step frames) is what Fetch writes on its own.
+    Cache { cache_id: usize, mode: usize, range: [f32; 3] },
     // VDB from Polygons. output: 0 polygons (the surface directly), 1 VDB (a level set volume).
     Vdb { voxel_size: f32, padding: usize, operation: usize, iterations: usize, output: usize },
     // Converts a VDB or volume (VDB, Pyro, .vdb files). mode: 0 polygons at `iso`, 1 fog volume.
     ConvertVdb { mode: usize, iso: f32 },
     // Reads geometry from disk: .obj, .fbx, .stl, .usd/.usda/.usdc/.usdz and .vdb; $F is the frame.
-    FileImport { file: String },
+    // A file to read; for FBX, the take to play (by name, empty: the first) and whether it loops.
+    FileImport { file: String, take: String, looping: bool },
     // Passes its input through and writes it to disk on demand (same formats; $F for sequences).
     FileExport { file: String },
     MoonRayRender {
@@ -3559,6 +3685,7 @@ impl NodeKind {
         };
         match self {
             NodeKind::Grid { .. } | NodeKind::Plane { .. } => names(&["size", "resolution"]),
+            NodeKind::FileImport { .. } => names(&["loop"]),
             NodeKind::Cone { .. } => names(&["radius", "height", "rows", "columns", "caps"]),
             NodeKind::Capsule { .. } => names(&["radius", "length", "rows", "columns"]),
             NodeKind::Box { .. } => names(&["size", "divisions"]),
@@ -3588,7 +3715,7 @@ impl NodeKind {
             NodeKind::Extrude(_) => names(&["distance", "inset", "connected", "divisions", "output_front", "output_back", "output_side", "output_groups"]),
             NodeKind::Clip { .. } => names(&["axis", "offset", "invert"]),
             NodeKind::Blast { .. } => names(&["component", "invert"]),
-            NodeKind::Cache { .. } => names(&["", "mode"]),
+            NodeKind::Cache { .. } => names(&["", "mode", "start", "end", "step"]),
             NodeKind::Vdb { .. } => names(&["voxel_size", "padding", "operation", "iterations", "output"]),
             NodeKind::ConvertVdb { .. } => names(&["mode", "iso"]),
             NodeKind::Switch { .. } => names(&["input"]),
@@ -3610,6 +3737,7 @@ impl NodeKind {
             NodeKind::Connectivity(_) => names(&["class"]),
             NodeKind::Resample(_) => names(&["by_length", "length", "segments"]),
             NodeKind::LSystem(_) => names(&["generations", "angle", "step", "step_scale", "thickness", "thickness_scale", "angle_random", "seed"]),
+            NodeKind::TestGeometry(_) => names(&["shape", "size", "on_ground", "colours", "p", "q", "detail", "clip", "look", "looping"]),
             NodeKind::PointDeform(_) => names(&["influences", "fit_neighbours", "follow_rotation"]),
             NodeKind::ForEachEnd(_) => names(&["loop_over", "iterations", "start_value", "increment", "single_pass", "multithread"]),
             NodeKind::ObjectMerge { .. } => names(&["into_this_object"]),
@@ -3712,9 +3840,10 @@ impl NodeKind {
             NodeKind::LopTransform { pattern, .. } | NodeKind::LopMaterial { pattern, .. } | NodeKind::LopPrune { pattern, .. } => {
                 vec![pattern.clone()]
             }
-            NodeKind::LopExport { file } | NodeKind::FileImport { file } | NodeKind::FileExport { file } | NodeKind::UvQuickShade { file } => {
+            NodeKind::LopExport { file } | NodeKind::FileExport { file } | NodeKind::UvQuickShade { file } => {
                 vec![file.clone()]
             }
+            NodeKind::FileImport { file, take, .. } => vec![file.clone(), take.clone()],
             NodeKind::AttributePaint { attribute, .. } => vec![attribute.clone()],
             NodeKind::VolumeWrangle { code } | NodeKind::HeightfieldWrangle { code } => vec![code.clone()],
             NodeKind::LSystem(l) => vec![l.premise.clone(), l.rules.clone()],
@@ -3754,8 +3883,12 @@ impl NodeKind {
                 next(path);
             }
             NodeKind::LopTransform { pattern, .. } | NodeKind::LopMaterial { pattern, .. } | NodeKind::LopPrune { pattern, .. } => next(pattern),
-            NodeKind::LopExport { file } | NodeKind::FileImport { file } | NodeKind::FileExport { file } | NodeKind::UvQuickShade { file } => {
+            NodeKind::LopExport { file } | NodeKind::FileExport { file } | NodeKind::UvQuickShade { file } => {
                 next(file)
+            }
+            NodeKind::FileImport { file, take, .. } => {
+                next(file);
+                next(take);
             }
             NodeKind::AttributePaint { attribute, .. } => next(attribute),
             NodeKind::VolumeWrangle { code } | NodeKind::HeightfieldWrangle { code } => next(code),
@@ -3931,6 +4064,7 @@ impl NodeKind {
                     NodeKind::Torus { major: 1.0, minor: 0.35, rows: 16, cols: 32 },
                     NodeKind::Tube { r_bot: 0.5, r_top: 0.5, height: 2.0, rows: 8, cols: 24, caps: true },
                     NodeKind::LSystem(lsystem::LSystemSettings::defaults()),
+                    NodeKind::TestGeometry(testgeo::TestGeoSettings::defaults()),
                     NodeKind::ParticleSurface {
                         radius: 0.12,
                         join_distance: 0.08,
@@ -4006,7 +4140,7 @@ impl NodeKind {
             (
                 "Import/Export",
                 vec![
-                    NodeKind::FileImport { file: String::new() },
+                    NodeKind::FileImport { file: String::new(), take: String::new(), looping: false },
                     NodeKind::FileExport { file: String::new() },
                     NodeKind::ObjectMerge { sources: vec![None], into_this: true },
                 ],
@@ -4053,7 +4187,7 @@ impl NodeKind {
                     NodeKind::Boolean(boolean::BooleanSettings { operation: 2, mode: 0, resolution: 128 }),
                     NodeKind::Pack(packed::PackSettings::defaults()),
                     NodeKind::Unpack { transfer: true },
-                    NodeKind::Cache { cache_id: 1, mode: 1 },
+                    NodeKind::Cache { cache_id: 1, mode: 1, range: [1.0, 100.0, 1.0] },
                     NodeKind::Reverse,
                     NodeKind::ExtractCentroid(sopkit::CentroidSettings::defaults()),
                     NodeKind::ConvertLine,
@@ -4087,7 +4221,7 @@ impl NodeKind {
                 vec![NodeKind::CrowdSolver(crowd::CrowdSettings::defaults())],
             ),
             (
-                "KineFX",
+                "Rigging",
                 vec![
                     NodeKind::Skeleton(kinefx::SkeletonSettings::defaults()),
                     NodeKind::RigPose(kinefx::RigPose::new()),
@@ -4289,7 +4423,7 @@ impl NodeKind {
             NodeKind::LopMerge => "usd_merge",
             NodeKind::LopExport { .. } => "usd_export",
             NodeKind::RbdSolver(_) => "rbd_solver",
-            NodeKind::VellumSolver(_) => "vellum_solver",
+            NodeKind::VellumSolver(_) => "cloth_solver",
             NodeKind::Normal(_) => "normal",
             NodeKind::Scatter(_) => "scatter",
             NodeKind::Boolean(_) => "boolean",
@@ -4304,6 +4438,7 @@ impl NodeKind {
             NodeKind::VolumeWrangle { .. } => "volume_wrangle",
             NodeKind::HeightfieldWrangle { .. } => "heightfield_wrangle",
             NodeKind::LSystem(_) => "lsystem",
+            NodeKind::TestGeometry(_) => "test_geometry",
             NodeKind::PointDeform(_) => "point_deform",
             NodeKind::TransformPieces => "transform_pieces",
             NodeKind::ForEachBegin => "foreach_begin",
@@ -4414,7 +4549,7 @@ impl NodeKind {
             | NodeKind::AttributeRandomize(_)
             | NodeKind::AttributeDelete { .. } => 1,
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => 1,
-            NodeKind::LSystem(_) => 0,
+            NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
             NodeKind::AttributeVop { .. } => 1,
             NodeKind::Vop(v) => v.def().inputs.len(),
             NodeKind::MoonRayRender { .. } => 0,
@@ -4511,6 +4646,7 @@ impl NodeKind {
             NodeKind::AttributeDelete { attribute } => vec![*attribute as f32],
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => vec![],
             NodeKind::LSystem(l) => l.to_params(),
+            NodeKind::TestGeometry(t) => t.to_params(),
             NodeKind::AttributeVop { domain } => vec![*domain as f32],
             NodeKind::Vop(v) => vec![v.op as f32, v.ty as f32, v.value[0], v.value[1], v.value[2]],
             NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
@@ -4576,12 +4712,13 @@ impl NodeKind {
                 params.extend(indices.iter().map(|index| *index as f32));
                 params
             }
-            NodeKind::Cache { cache_id, mode } => vec![*cache_id as f32, *mode as f32],
+            NodeKind::Cache { cache_id, mode, range } => vec![*cache_id as f32, *mode as f32, range[0], range[1], range[2]],
             NodeKind::Vdb { voxel_size, padding, operation, iterations, output } => {
                 vec![*voxel_size, *padding as f32, *operation as f32, *iterations as f32, *output as f32]
             }
             NodeKind::ConvertVdb { mode, iso } => vec![*mode as f32, *iso],
-            NodeKind::FileImport { .. } | NodeKind::FileExport { .. } | NodeKind::UvQuickShade { .. } => vec![],
+            NodeKind::FileImport { looping, .. } => vec![*looping as u8 as f32],
+            NodeKind::FileExport { .. } | NodeKind::UvQuickShade { .. } => vec![],
             NodeKind::MoonRayRender { .. } => vec![],
             NodeKind::Camera { position, rotation, focal, near, orthographic, pan, zoom } => {
                 [position.to_vec(), rotation.to_vec(), vec![*focal, *near, *orthographic as u8 as f32, pan[0], pan[1], *zoom]].concat()
@@ -4817,6 +4954,7 @@ impl NodeKind {
             "volume_wrangle" => NodeKind::VolumeWrangle { code: String::new() },
             "heightfield_wrangle" => NodeKind::HeightfieldWrangle { code: String::new() },
             "lsystem" => NodeKind::LSystem(lsystem::LSystemSettings::from_params(p)),
+            "test_geometry" => NodeKind::TestGeometry(testgeo::TestGeoSettings::from_params(p)),
             "attribute_vop" => NodeKind::AttributeVop { domain: u(0).min(3) },
             "vop" => NodeKind::Vop(vop::VopNode {
                 op: u(0).min(vop::OPS.len() - 1),
@@ -4884,7 +5022,12 @@ impl NodeKind {
                     invert: g(1) > 0.5,
                 }
             }
-            "cache" => NodeKind::Cache { cache_id: u(0), mode: u(1).min(1) },
+            "cache" => NodeKind::Cache {
+                cache_id: u(0),
+                mode: u(1).min(1),
+                // Scenes from before the range was added: frames 1 to 100.
+                range: [p.get(2).copied().unwrap_or(1.0), p.get(3).copied().unwrap_or(100.0), p.get(4).copied().unwrap_or(1.0).max(0.001)],
+            },
             "vdb" => NodeKind::Vdb {
                 voxel_size: g(0).max(0.01),
                 padding: u(1).min(4),
@@ -4893,7 +5036,7 @@ impl NodeKind {
                 output: u(4).min(1),
             },
             "convert_vdb" => NodeKind::ConvertVdb { mode: u(0).min(1), iso: g(1) },
-            "file" => NodeKind::FileImport { file: String::new() },
+            "file" => NodeKind::FileImport { file: String::new(), take: String::new(), looping: p.first().is_some_and(|l| *l != 0.0) },
             "file_export" => NodeKind::FileExport { file: String::new() },
             "camera" => NodeKind::Camera {
                 position: v3(0),
@@ -5159,7 +5302,8 @@ impl NodeKind {
                 pivot: [g(5), g(6)],
             }),
             "uv_quickshade" => NodeKind::UvQuickShade { file: String::new() },
-            "vellum_solver" => {
+            // "vellum_solver" in scenes saved before 0.11.
+            "cloth_solver" | "vellum_solver" => {
                 let kind = u(0).min(vellum::VELLUM_TYPES.len() - 1);
                 let d = vellum::VellumSettings::defaults(kind);
                 let or = |i: usize, default: f32| p.get(i).copied().unwrap_or(default);
@@ -5387,7 +5531,7 @@ impl Graph {
                     NodeKind::MuscleSolver(_) => Some("Muscle"),
                     NodeKind::Pyro(_) => Some("Pyro"),
                     NodeKind::RbdSolver(_) => Some("RBD"),
-                    NodeKind::VellumSolver(_) => Some("Vellum"),
+                    NodeKind::VellumSolver(_) => Some("Cloth"),
                     NodeKind::SopSolver { .. } => Some("SOP Solver"),
                     NodeKind::Particles { .. } => Some("Particles"),
                     _ => None,
@@ -6233,8 +6377,14 @@ impl Graph {
                 } else {
                     vec![1.0]
                 },
+                cache: None,
             }),
-            Some(NodeKind::FileExport { file }) => Some(tops::FetchTarget { render: false, output: file.clone(), frames: vec![1.0] }),
+            Some(NodeKind::FileExport { file }) => Some(tops::FetchTarget { render: false, output: file.clone(), frames: vec![1.0], cache: None }),
+            Some(NodeKind::Cache { cache_id, range, .. }) => {
+                let (start, end, step) = (range[0], range[1].max(range[0]), range[2].max(0.001));
+                let count = (((end - start) / step).floor() as usize + 1).min(100_000);
+                Some(tops::FetchTarget { render: false, output: String::new(), frames: (0..count).map(|i| start + i as f32 * step).collect(), cache: Some(*cache_id) })
+            }
             _ => None,
         })
     }
@@ -6446,6 +6596,7 @@ impl Graph {
                 | NodeKind::SolverInput { .. }
         ))
             || matches!(&n.kind, NodeKind::Wrangle { code, .. } | NodeKind::VolumeWrangle { code } | NodeKind::HeightfieldWrangle { code } if ["@Time", "@Frame", "@SimTime", "@SimFrame"].iter().any(|t| code.contains(t)))
+            || matches!(&n.kind, NodeKind::TestGeometry(t) if t.shape == testgeo::CHARACTER)
             || (matches!(n.kind, NodeKind::AttributeVop { .. })
                 && self.vop_code(id).is_ok_and(|code| ["@Time", "@Frame", "@SimTime", "@SimFrame"].iter().any(|t| code.contains(t))))
             || matches!(&n.kind, NodeKind::Cop(c) if c.time_dependent())
@@ -6454,10 +6605,11 @@ impl Graph {
                 NodeKind::LopSopImport { geometry: Some(g), .. } => self.time_dependent(*g),
                 NodeKind::LopSopImport { geometry: None, .. } => self.geometry_ids().into_iter().any(|g| self.time_dependent(g)),
                 NodeKind::LopReference { file, .. } => usd::is_animated(file),
-                NodeKind::FileImport { file } => {
+                NodeKind::FileImport { file, .. } => {
                     fileio::has_frame_token(file)
                         || (matches!(fileio::extension(file).as_str(), "usd" | "usda" | "usdc" | "usdz") && usd::is_animated(file))
                         || (fileio::extension(file) == "abc" && abc::is_animated(file.trim()))
+                        || (fileio::extension(file) == "fbx" && fileio::fbx_is_animated(file.trim()))
                 }
                 _ => false,
             }
@@ -6674,6 +6826,7 @@ impl Graph {
                     }
                 }
                 NodeKind::LSystem(settings) => self.report(id, lsystem::generate(settings)),
+                NodeKind::TestGeometry(settings) => self.report(id, testgeo::generate(settings, time)),
                 NodeKind::Merge => {
                     // Every connected input, in order.
                     let mut slots: Vec<usize> = self.links.iter().filter(|l| l.to == id).map(|l| l.slot).collect();
@@ -6799,7 +6952,7 @@ impl Graph {
                 NodeKind::Blast { component, indices, invert } => {
                     node_blast(input(0, cache), *component, indices, *invert)
                 }
-                NodeKind::Cache { cache_id, mode } => {
+                NodeKind::Cache { cache_id, mode, .. } => {
                     let path = cache_file_path(*cache_id, time);
                     if *mode == 0 {
                         load_mesh_cache(&path).unwrap_or_else(|| input(0, cache))
@@ -6823,9 +6976,9 @@ impl Graph {
                     });
                     self.report(id, result)
                 }
-                NodeKind::FileImport { file } => {
+                NodeKind::FileImport { file, take, looping } => {
                     let path = fileio::expand_frame(file.trim(), time, sims::SIM_FPS);
-                    let result = read_geometry_file(&path, time);
+                    let result = if fileio::extension(&path) == "fbx" { fileio::read_fbx_take(&path, take, time, *looping) } else { read_geometry_file(&path, time) };
                     self.report(id, result)
                 }
                 NodeKind::FileExport { .. } => input(0, cache),
@@ -7708,12 +7861,31 @@ fn inverse_xform(x: &ObjectXform, mut mesh: Mesh) -> Mesh {
 
 // Writes the documentation page next to the app's settings and opens it in the browser.
 fn open_documentation() -> Result<String, String> {
+    open_documentation_at(None)
+}
+
+// Writes the documentation page and opens it, at `anchor` when given (e.g. a VEX
+// function's card). Browsers drop a #fragment passed with a file path, so a tiny
+// page that redirects to it is opened instead.
+fn open_documentation_at(anchor: Option<&str>) -> Result<String, String> {
     let dir = app_config_dir().ok_or("no home folder")?.join("docs");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("index.html");
     std::fs::write(&path, docs::html(env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
+    let target = match anchor {
+        Some(anchor) => {
+            let anchor: String = anchor.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+            let jump = dir.join("open.html");
+            let page = format!(
+                "<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0; url=index.html#{anchor}\"><script>location.replace('index.html#{anchor}')</script>"
+            );
+            std::fs::write(&jump, page).map_err(|e| e.to_string())?;
+            jump
+        }
+        None => path.clone(),
+    };
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    Command::new(opener).arg(&path).spawn().map_err(|e| format!("{opener}: {e}"))?;
+    Command::new(opener).arg(&target).spawn().map_err(|e| format!("{opener}: {e}"))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -8412,6 +8584,9 @@ struct ProceduralFxStudioApp {
     // Performance monitor: cook times drawn on nodes, the column it sorts by, and the
     // interface's smoothed frame time (seconds).
     show_cook_times: bool,
+    // The width the toolbar's render controls took last frame (they move to their own
+    // line when the rest of the row leaves less than that).
+    toolbar_render_width: f32,
     perf_sort: usize,
     frame_time: f32,
 
@@ -8519,6 +8694,8 @@ struct ProceduralFxStudioApp {
     cook_generation: u64,
     tab_open: bool,
     tab_query: String,
+    // The highlighted search result in the add-node menus (arrow keys move it).
+    search_pick: usize,
     // The right-click add menu's search text.
     menu_query: String,
     tab_pos: egui::Pos2,
@@ -8530,7 +8707,11 @@ struct ProceduralFxStudioApp {
     isolate_selection: bool,
     selection_box_start: Option<egui::Pos2>,
     selection_box_end: Option<egui::Pos2>,
+    // Node Info: the pinned window's node, the node the middle button is held on (and
+    // where), and the geometry they show (node, time).
     inspect_node: Option<NodeId>,
+    info_hold: Option<(NodeId, egui::Pos2)>,
+    info_mesh: Option<(NodeId, f32, Mesh)>,
 }
 
 impl Default for ProceduralFxStudioApp {
@@ -8643,6 +8824,7 @@ impl Default for ProceduralFxStudioApp {
             viewport_focal_px: 720.0 * 1.2,
             current_network: None,
             show_cook_times: false,
+            toolbar_render_width: 260.0,
             perf_sort: 0,
             frame_time: 1.0 / 60.0,
             current_mesh: Mesh::default(),
@@ -8722,6 +8904,7 @@ impl Default for ProceduralFxStudioApp {
             cook_generation: 0,
             tab_open: false,
             tab_query: String::new(),
+            search_pick: 0,
             menu_query: String::new(),
             tab_pos: egui::Pos2::ZERO,
             context: AppContext::Obj,
@@ -8733,6 +8916,8 @@ impl Default for ProceduralFxStudioApp {
             selection_box_start: None,
             selection_box_end: None,
             inspect_node: None,
+            info_hold: None,
+            info_mesh: None,
         }
     }
 }
@@ -9054,23 +9239,30 @@ impl ProceduralFxStudioApp {
             }
             self.dirty = true;
         }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Network: RMB add node • drag output→input to wire\n\
+        // The shortcut notes sit at the bottom of the pane when there's room, and after
+        // the parameters when there isn't (so they never cover them).
+        let notes = egui::RichText::new(
+            "Network: RMB add node • drag output→input to wire\n\
                      click input to disconnect • dbl-click = display\n\
                      OBJ: Geometry / Light / Camera nodes need no wiring •\n\
                      dbl-click Geometry to enter • U = up • dbl-click Light/Camera = activate\n\
+                     MMB hold on a node = Node Info\n\
                      TAB search/add • H home network • T template\n\
                      B bypass • Ctrl+D duplicate • Del delete\n\
                      Ctrl+Z / Ctrl+Shift+Z undo/redo • Space play\n\
                      Selection: All • None • Invert • Grow • Shrink • Boundary • Non-manifold • Isolated • Connected\n\
                      Viewport: LMB orbit • RMB pan • wheel zoom • F frame",
-                )
-                .small()
-                .weak(),
-            );
-        });
+        )
+        .small()
+        .weak();
+        let galley = egui::WidgetText::from(notes.clone()).into_galley(ui, Some(egui::TextWrapMode::Wrap), ui.available_width(), egui::TextStyle::Small);
+        let spare = ui.available_height() - galley.size().y - ui.spacing().item_spacing.y * 2.0;
+        if spare > 0.0 && spare.is_finite() {
+            ui.add_space(spare);
+        } else {
+            ui.add_space(12.0);
+        }
+        ui.label(notes);
     }
 
     fn timeline_pane(&mut self, ui: &mut egui::Ui) {
@@ -9155,6 +9347,78 @@ impl ProceduralFxStudioApp {
                 ui.checkbox(&mut self.pause_on_edit, "Pause on edit").on_hover_text("Pause playback whenever the scene is edited: parameters, wiring, flags or gizmo drags");
             });
         });
+    }
+
+    // Node Info: the node itself (type, flags, inputs, cook time, errors), then what its
+    // geometry holds.
+    fn node_info_ui(&mut self, ui: &mut egui::Ui, id: NodeId) {
+        let Some(node) = self.graph.nodes.get(&id) else { return };
+        let title = node.title(id);
+        ui.heading(&title);
+        let mut rows: Vec<(String, String)> = vec![("Type".into(), node.type_label())];
+        let path = self.graph.path_in_object(id);
+        if let Some(object) = self.graph.enclosing_geometry(id) {
+            rows.push(("Path".into(), format!("{} / {path}", self.graph.nodes[&object].title(object))));
+        }
+        let mut flags = Vec::new();
+        if self.graph.is_display(id) {
+            flags.push("display");
+        }
+        if node.bypass {
+            flags.push("bypassed");
+        }
+        if self.graph.time_dependent(id) {
+            flags.push("time dependent");
+        }
+        if !flags.is_empty() {
+            rows.push(("Flags".into(), flags.join(", ")));
+        }
+        let inputs = node.kind.num_inputs();
+        if inputs > 0 || node.kind.is_multi_input() {
+            let connected = self.graph.links.iter().filter(|l| l.to == id).count();
+            rows.push(("Inputs".into(), if node.kind.is_multi_input() { format!("{connected} connected (any number)") } else { format!("{connected} of {inputs} connected") }));
+        }
+        if let Some(stat) = perf::get(id) {
+            rows.push(("Cook".into(), format!("{} last, {} on average, {} cooks", perf::ms(stat.last), perf::ms(stat.average()), stat.cooks)));
+        }
+        egui::Grid::new(("node_info_node", id)).num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+            for (label, value) in &rows {
+                ui.weak(label);
+                ui.label(value);
+                ui.end_row();
+            }
+        });
+        if let Some(error) = node_errors(|e| e.get(&id).cloned()) {
+            ui.colored_label(egui::Color32::from_rgb(240, 110, 110), format!("✖ {error}"));
+        }
+        // Geometry nodes: what they make at this frame.
+        let makes_geometry = !matches!(node.context, AppContext::Out | AppContext::Tasks | AppContext::Img | AppContext::Mat) || node.kind.is_object();
+        if !makes_geometry {
+            return;
+        }
+        let fresh = self.info_mesh.as_ref().is_some_and(|(n, t, _)| *n == id && *t == self.time);
+        if !fresh {
+            let mut cache = self.static_cache.clone();
+            let mesh = self.graph.cook(id, self.time, &mut cache);
+            self.info_mesh = Some((id, self.time, mesh));
+        }
+        let Some((_, _, mesh)) = self.info_mesh.as_ref() else { return };
+        for section in nodeinfo::summarize(mesh) {
+            ui.add_space(6.0);
+            ui.strong(section.title);
+            egui::Grid::new(("node_info", id, section.title)).num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                for (label, value) in &section.rows {
+                    ui.weak(label);
+                    ui.add(egui::Label::new(value).wrap());
+                    ui.end_row();
+                }
+            });
+        }
+        let warnings = mesh.validation_warnings();
+        if !warnings.is_empty() {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::YELLOW, format!("⚠ {}", warnings.join(" · ")));
+        }
     }
 
     // The performance monitor: each node's cook times, slowest first.
@@ -9733,304 +9997,391 @@ impl ProceduralFxStudioApp {
     }
 
     // Menu bar for occasional commands, plus one row of the controls used all the time.
+    // The menus, also reachable from one ☰ button when the window is too narrow for them.
+    const MENUS: [&'static str; 7] = ["File", "Edit", "Select", "View", "Render", "Windows", "Help"];
+
+    fn menu_contents(&mut self, ui: &mut egui::Ui, name: &str) {
+        match name {
+            "File" => self.file_menu(ui),
+            "Edit" => self.edit_menu(ui),
+            "Select" => self.select_menu(ui),
+            "View" => self.view_menu(ui),
+            "Render" => self.render_menu(ui),
+            "Windows" => self.windows_menu(ui),
+            _ => self.help_menu(ui),
+        }
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let menu_ctx = ui.ctx().clone();
+        let shortcut = |s: &egui::KeyboardShortcut| menu_ctx.format_shortcut(s);
+        if ui.add(egui::Button::new("Open…").shortcut_text(shortcut(&SHORTCUT_OPEN))).clicked() {
+            self.open_scene_dialog();
+            ui.close();
+        }
+        ui.add_enabled_ui(!self.recent_scenes.is_empty(), |ui| {
+            ui.menu_button("Open Recent", |ui| {
+                let mut chosen = None;
+                for path in &self.recent_scenes {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                    let button = ui
+                        .add_enabled(path.exists(), egui::Button::new(name))
+                        .on_hover_text(path.display().to_string())
+                        .on_disabled_hover_text(format!("{} (not found)", path.display()));
+                    if button.clicked() {
+                        chosen = Some(path.clone());
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear Recent").clicked() {
+                    self.recent_scenes.clear();
+                    save_recent_scenes(&self.recent_scenes);
+                    ui.close();
+                }
+                if let Some(path) = chosen {
+                    self.open_scene(path);
+                    ui.close();
+                }
+            });
+        });
+        ui.separator();
+        let save_hover = match &self.scene_path {
+            Some(path) => format!("Save to {}", path.display()),
+            None => "Choose where to save this scene".to_owned(),
+        };
+        if ui.add(egui::Button::new("Save").shortcut_text(shortcut(&SHORTCUT_SAVE))).on_hover_text(save_hover).clicked() {
+            self.save_scene();
+            ui.close();
+        }
+        if ui.add(egui::Button::new("Save As…").shortcut_text(shortcut(&SHORTCUT_SAVE_AS))).clicked() {
+            self.save_scene_dialog();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Export OBJ").on_hover_text("Writes the displayed mesh to procedural_output.obj").clicked() {
+            self.status = match self.current_mesh.export_obj("procedural_output.obj") {
+                Ok(_) => "Exported procedural_output.obj".into(),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            ui.close();
+        }
+        if ui.button("Export STL").on_hover_text("Writes the displayed mesh to procedural_output.stl").clicked() {
+            self.status = match self.current_mesh.export_stl("procedural_output.stl") {
+                Ok(_) => "Exported procedural_output.stl".into(),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            ui.close();
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+            self.do_undo();
+            ui.close();
+        }
+        if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
+            self.do_redo();
+            ui.close();
+        }
+    }
+
+    fn select_menu(&mut self, ui: &mut egui::Ui) {
+        let actions: [(&str, fn(&mut Self)); 9] = [
+            ("All", Self::select_all_components),
+            ("None", Self::clear_component_selection),
+            ("Invert", Self::invert_component_selection),
+            ("Grow", Self::grow_component_selection),
+            ("Shrink", Self::shrink_component_selection),
+            ("Boundary edges", Self::select_boundary_edges),
+            ("Non-manifold edges", Self::select_non_manifold_edges),
+            ("Isolated points", Self::select_isolated_vertices),
+            ("Connected", Self::select_connected_components),
+        ];
+        for (i, (label, action)) in actions.into_iter().enumerate() {
+            if i == 5 {
+                ui.separator();
+            }
+            if ui.button(label).clicked() {
+                action(self);
+                ui.close();
+            }
+        }
+        ui.separator();
+        ui.checkbox(&mut self.isolate_selection, "Isolate selection");
+        ui.weak("Shift-drag: box select • double-click an edge: loop");
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.show_points, "Points");
+        ui.checkbox(&mut self.show_floor, "Floor grid");
+        ui.checkbox(&mut self.show_gizmos, "Gizmos");
+        ui.checkbox(&mut self.orthographic, "Orthographic");
+        ui.separator();
+        for (label, rot_x, rot_y) in [
+            ("Top", -1.52, 0.0),
+            ("Front", 0.0, 0.0),
+            ("Right", 0.0, std::f32::consts::FRAC_PI_2),
+            ("Perspective", 0.4, -0.6),
+        ] {
+            if ui.button(format!("{label} view")).clicked() {
+                self.set_camera_view(rot_x, rot_y);
+                ui.close();
+            }
+        }
+        if ui.add(egui::Button::new("Frame all").shortcut_text("F")).clicked() {
+            self.frame_all();
+            ui.close();
+        }
+        ui.separator();
+        pfield(ui, pslider(&mut self.viewport_bg, 15..=80).text("Background"));
+        pfield(ui, pslider(&mut self.grid_spacing, 0.1..=2.0).text("Grid spacing"));
+        pfield(ui, pslider(&mut self.grid_extent, 1.0..=20.0).text("Grid extent"));
+        ui.menu_button("Camera & lights", |ui| {
+            pfield(ui, pslider(&mut self.camera_focal, 0.5..=2.5).text("Focal scale"));
+            pfield(ui, pslider(&mut self.camera_near, 0.05..=2.0).text("Near clip"));
+            ui.separator();
+            ui.label("Viewport lighting (used when the scene has no lights)");
+            pfield(ui, pslider(&mut self.ambient_light, 0.0..=1.0).text("Ambient"));
+            vec3_ui(ui, "Key direction", &mut self.key_light_dir, 0.05);
+            pfield(ui, pslider(&mut self.key_light_intensity, 0.0..=2.0).text("Key intensity"));
+            vec3_ui(ui, "Fill direction", &mut self.fill_light_dir, 0.05);
+            pfield(ui, pslider(&mut self.fill_light_intensity, 0.0..=2.0).text("Fill intensity"));
+        });
+    }
+
+    fn render_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Render with MoonRay").clicked() {
+            self.start_moonray_render();
+            ui.close();
+        }
+        if ui.button("✨ AI").on_hover_text("Describe a setup and Claude builds it as nodes").clicked() {
+            self.assistant.open = !self.assistant.open;
+        }
+        if ui.button("Render Settings…").clicked() {
+            self.show_moonray_settings = true;
+            ui.close();
+        }
+        if ui.button("Render Viewer").clicked() {
+            self.viewer.show();
+            ui.close();
+        }
+    }
+
+    fn windows_menu(&mut self, ui: &mut egui::Ui) {
+        for pane in Pane::ALL {
+            let mut open = self.open_panes.contains(&pane);
+            if ui.checkbox(&mut open, pane.title()).changed() {
+                self.pane_requests.push(PaneRequest::Show(pane, open));
+            }
+        }
+        ui.separator();
+        ui.menu_button("Open in New Window", |ui| {
+            for pane in Pane::ALL {
+                if ui.button(pane.title()).clicked() {
+                    self.pane_requests.push(PaneRequest::PopOut(pane));
+                    ui.close();
+                }
+            }
+        });
+        ui.menu_button("Layouts", |ui| {
+            if ui.button("Save Current Layout…").clicked() {
+                self.layout_name_prompt = Some(String::new());
+                ui.close();
+            }
+            let names = saved_layouts();
+            if !names.is_empty() {
+                ui.separator();
+            }
+            for name in names {
+                ui.horizontal(|ui| {
+                    if ui.button(&name).on_hover_text("Switch to this layout").clicked() {
+                        self.pane_requests.push(PaneRequest::Load(name.clone()));
+                        ui.close();
+                    }
+                    if ui.small_button("🗑").on_hover_text("Delete this layout").clicked() {
+                        self.pane_requests.push(PaneRequest::Delete(name.clone()));
+                    }
+                });
+            }
+            ui.separator();
+            if ui.button("Reset Layout").on_hover_text("Back to the default arrangement of panes").clicked() {
+                self.pane_requests.push(PaneRequest::Reset);
+                ui.close();
+            }
+        });
+        ui.weak("Drag tabs to rearrange or split; drag one out to float it.");
+        ui.separator();
+        if ui.button("Render Viewer").clicked() {
+            self.viewer.show();
+            ui.close();
+        }
+        if ui.button("Render Settings").clicked() {
+            self.show_moonray_settings = true;
+            ui.close();
+        }
+    }
+
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("📖 Documentation").on_hover_text("All nodes and VEX, as a web page in your browser").clicked() {
+            self.status = match open_documentation() {
+                Ok(path) => format!("Opened the documentation ({path})"),
+                Err(e) => format!("Couldn't open the documentation: {e}"),
+            };
+            ui.close_menu();
+        }
+        ui.separator();
+        self.updater.menu(ui);
+        ui.separator();
+        ui.weak("Houdini is a trademark of Side Effects Software Inc.\nProceduralFX Studio is not affiliated with or endorsed by SideFX.");
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.strong("ProceduralFX Studio");
-            ui.separator();
-            ui.menu_button("File", |ui| {
-                let menu_ctx = ui.ctx().clone();
-                let shortcut = |s: &egui::KeyboardShortcut| menu_ctx.format_shortcut(s);
-                if ui.add(egui::Button::new("Open…").shortcut_text(shortcut(&SHORTCUT_OPEN))).clicked() {
-                    self.open_scene_dialog();
-                    ui.close();
-                }
-                ui.add_enabled_ui(!self.recent_scenes.is_empty(), |ui| {
-                    ui.menu_button("Open Recent", |ui| {
-                        let mut chosen = None;
-                        for path in &self.recent_scenes {
-                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                            let button = ui
-                                .add_enabled(path.exists(), egui::Button::new(name))
-                                .on_hover_text(path.display().to_string())
-                                .on_disabled_hover_text(format!("{} (not found)", path.display()));
-                            if button.clicked() {
-                                chosen = Some(path.clone());
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("Clear Recent").clicked() {
-                            self.recent_scenes.clear();
-                            save_recent_scenes(&self.recent_scenes);
-                            ui.close();
-                        }
-                        if let Some(path) = chosen {
-                            self.open_scene(path);
-                            ui.close();
-                        }
-                    });
-                });
+            // Narrower windows drop the title, then fold the menus into one ☰ button.
+            let width = ui.available_width();
+            let updater = if self.updater.has_indicator() { 190.0 } else { 0.0 };
+            if width - updater > 640.0 {
+                ui.strong("ProceduralFX Studio");
                 ui.separator();
-                let save_hover = match &self.scene_path {
-                    Some(path) => format!("Save to {}", path.display()),
-                    None => "Choose where to save this scene".to_owned(),
-                };
-                if ui.add(egui::Button::new("Save").shortcut_text(shortcut(&SHORTCUT_SAVE))).on_hover_text(save_hover).clicked() {
-                    self.save_scene();
-                    ui.close();
+            }
+            if width - updater > 470.0 {
+                for name in Self::MENUS {
+                    ui.menu_button(name, |ui| self.menu_contents(ui, name));
                 }
-                if ui.add(egui::Button::new("Save As…").shortcut_text(shortcut(&SHORTCUT_SAVE_AS))).clicked() {
-                    self.save_scene_dialog();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Export OBJ").on_hover_text("Writes the displayed mesh to procedural_output.obj").clicked() {
-                    self.status = match self.current_mesh.export_obj("procedural_output.obj") {
-                        Ok(_) => "Exported procedural_output.obj".into(),
-                        Err(e) => format!("Export failed: {e}"),
-                    };
-                    ui.close();
-                }
-                if ui.button("Export STL").on_hover_text("Writes the displayed mesh to procedural_output.stl").clicked() {
-                    self.status = match self.current_mesh.export_stl("procedural_output.stl") {
-                        Ok(_) => "Exported procedural_output.stl".into(),
-                        Err(e) => format!("Export failed: {e}"),
-                    };
-                    ui.close();
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
-                    self.do_undo();
-                    ui.close();
-                }
-                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
-                    self.do_redo();
-                    ui.close();
-                }
-            });
-            ui.menu_button("Select", |ui| {
-                let actions: [(&str, fn(&mut Self)); 9] = [
-                    ("All", Self::select_all_components),
-                    ("None", Self::clear_component_selection),
-                    ("Invert", Self::invert_component_selection),
-                    ("Grow", Self::grow_component_selection),
-                    ("Shrink", Self::shrink_component_selection),
-                    ("Boundary edges", Self::select_boundary_edges),
-                    ("Non-manifold edges", Self::select_non_manifold_edges),
-                    ("Isolated points", Self::select_isolated_vertices),
-                    ("Connected", Self::select_connected_components),
-                ];
-                for (i, (label, action)) in actions.into_iter().enumerate() {
-                    if i == 5 {
-                        ui.separator();
-                    }
-                    if ui.button(label).clicked() {
-                        action(self);
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.checkbox(&mut self.isolate_selection, "Isolate selection");
-                ui.weak("Shift-drag: box select • double-click an edge: loop");
-            });
-            ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.show_points, "Points");
-                ui.checkbox(&mut self.show_floor, "Floor grid");
-                ui.checkbox(&mut self.show_gizmos, "Gizmos");
-                ui.checkbox(&mut self.orthographic, "Orthographic");
-                ui.separator();
-                for (label, rot_x, rot_y) in [
-                    ("Top", -1.52, 0.0),
-                    ("Front", 0.0, 0.0),
-                    ("Right", 0.0, std::f32::consts::FRAC_PI_2),
-                    ("Perspective", 0.4, -0.6),
-                ] {
-                    if ui.button(format!("{label} view")).clicked() {
-                        self.set_camera_view(rot_x, rot_y);
-                        ui.close();
-                    }
-                }
-                if ui.add(egui::Button::new("Frame all").shortcut_text("F")).clicked() {
-                    self.frame_all();
-                    ui.close();
-                }
-                ui.separator();
-                pfield(ui, pslider(&mut self.viewport_bg, 15..=80).text("Background"));
-                pfield(ui, pslider(&mut self.grid_spacing, 0.1..=2.0).text("Grid spacing"));
-                pfield(ui, pslider(&mut self.grid_extent, 1.0..=20.0).text("Grid extent"));
-                ui.menu_button("Camera & lights", |ui| {
-                    pfield(ui, pslider(&mut self.camera_focal, 0.5..=2.5).text("Focal scale"));
-                    pfield(ui, pslider(&mut self.camera_near, 0.05..=2.0).text("Near clip"));
-                    ui.separator();
-                    ui.label("Viewport lighting (used when the scene has no lights)");
-                    pfield(ui, pslider(&mut self.ambient_light, 0.0..=1.0).text("Ambient"));
-                    vec3_ui(ui, "Key direction", &mut self.key_light_dir, 0.05);
-                    pfield(ui, pslider(&mut self.key_light_intensity, 0.0..=2.0).text("Key intensity"));
-                    vec3_ui(ui, "Fill direction", &mut self.fill_light_dir, 0.05);
-                    pfield(ui, pslider(&mut self.fill_light_intensity, 0.0..=2.0).text("Fill intensity"));
-                });
-            });
-            ui.menu_button("Render", |ui| {
-                if ui.button("Render with MoonRay").clicked() {
-                    self.start_moonray_render();
-                    ui.close();
-                }
-                if ui.button("✨ AI").on_hover_text("Describe a setup and Claude builds it as nodes").clicked() {
-                    self.assistant.open = !self.assistant.open;
-                }
-                if ui.button("Render Settings…").clicked() {
-                    self.show_moonray_settings = true;
-                    ui.close();
-                }
-                if ui.button("Render Viewer").clicked() {
-                    self.viewer.show();
-                    ui.close();
-                }
-            });
-            ui.menu_button("Windows", |ui| {
-                for pane in Pane::ALL {
-                    let mut open = self.open_panes.contains(&pane);
-                    if ui.checkbox(&mut open, pane.title()).changed() {
-                        self.pane_requests.push(PaneRequest::Show(pane, open));
-                    }
-                }
-                ui.separator();
-                ui.menu_button("Open in New Window", |ui| {
-                    for pane in Pane::ALL {
-                        if ui.button(pane.title()).clicked() {
-                            self.pane_requests.push(PaneRequest::PopOut(pane));
-                            ui.close();
-                        }
+            } else {
+                ui.menu_button("☰", |ui| {
+                    for name in Self::MENUS {
+                        ui.menu_button(name, |ui| self.menu_contents(ui, name));
                     }
                 });
-                ui.menu_button("Layouts", |ui| {
-                    if ui.button("Save Current Layout…").clicked() {
-                        self.layout_name_prompt = Some(String::new());
-                        ui.close();
-                    }
-                    let names = saved_layouts();
-                    if !names.is_empty() {
-                        ui.separator();
-                    }
-                    for name in names {
-                        ui.horizontal(|ui| {
-                            if ui.button(&name).on_hover_text("Switch to this layout").clicked() {
-                                self.pane_requests.push(PaneRequest::Load(name.clone()));
-                                ui.close();
-                            }
-                            if ui.small_button("🗑").on_hover_text("Delete this layout").clicked() {
-                                self.pane_requests.push(PaneRequest::Delete(name.clone()));
-                            }
-                        });
-                    }
-                    ui.separator();
-                    if ui.button("Reset Layout").on_hover_text("Back to the default arrangement of panes").clicked() {
-                        self.pane_requests.push(PaneRequest::Reset);
-                        ui.close();
-                    }
-                });
-                ui.weak("Drag tabs to rearrange or split; drag one out to float it.");
-                ui.separator();
-                if ui.button("Render Viewer").clicked() {
-                    self.viewer.show();
-                    ui.close();
-                }
-                if ui.button("Render Settings").clicked() {
-                    self.show_moonray_settings = true;
-                    ui.close();
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("📖 Documentation").on_hover_text("All nodes and VEX, as a web page in your browser").clicked() {
-                    self.status = match open_documentation() {
-                        Ok(path) => format!("Opened the documentation ({path})"),
-                        Err(e) => format!("Couldn't open the documentation: {e}"),
-                    };
-                    ui.close_menu();
-                }
-                ui.separator();
-                self.updater.menu(ui);
-            });
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.updater.indicator(ui));
         });
 
-        ui.horizontal(|ui| {
-            for (context, label, hover) in [
-                (AppContext::Obj, "OBJ", "Objects and their geometry (SOP) networks"),
-                (AppContext::Mat, "MAT", "Materials"),
-                (AppContext::Out, "OUT", "Render nodes"),
-                (AppContext::Stage, "STAGE", "USD stage (LOP) network"),
-                (AppContext::Img, "IMG", "Compositing (COP networks)"),
-                (AppContext::Tasks, "TASKS", "Task graphs: renders, wedges and batch jobs (TOP networks)"),
-            ] {
-                if ui.selectable_label(self.context == context, egui::RichText::new(label).strong()).on_hover_text(hover).clicked()
-                    && self.context != context
-                {
-                    self.context = context;
-                    // An open network belongs to its own context (a Material Builder to MAT).
-                    if self.network().is_some_and(|id| self.graph.nodes.get(&id).is_some_and(|n| n.context != context)) {
-                        self.current_network = None;
+        // The toolbar wraps a group at a time when the window is narrow, so every control
+        // stays visible; the render controls keep to the right edge when they fit there.
+        ui.horizontal_wrapped(|ui| {
+            toolbar_group(ui, "contexts", |ui| {
+                for (context, label, hover) in [
+                    (AppContext::Obj, "OBJ", "Objects and their geometry (SOP) networks"),
+                    (AppContext::Mat, "MAT", "Materials"),
+                    (AppContext::Out, "OUT", "Render nodes"),
+                    (AppContext::Stage, "STAGE", "USD stage (LOP) network"),
+                    (AppContext::Img, "IMG", "Compositing (COP networks)"),
+                    (AppContext::Tasks, "TASKS", "Task graphs: renders, wedges and batch jobs (TOP networks)"),
+                ] {
+                    if ui.selectable_label(self.context == context, egui::RichText::new(label).strong()).on_hover_text(hover).clicked()
+                        && self.context != context
+                    {
+                        self.context = context;
+                        // An open network belongs to its own context (a Material Builder to MAT).
+                        if self.network().is_some_and(|id| self.graph.nodes.get(&id).is_some_and(|n| n.context != context)) {
+                            self.current_network = None;
+                        }
+                        self.selected = None;
+                        self.dirty = true;
                     }
-                    self.selected = None;
-                    self.dirty = true;
                 }
-            }
-            ui.separator();
-            ui.selectable_value(&mut self.render_mode, RenderMode::ShadedWireframe, "Shaded");
-            ui.selectable_value(&mut self.render_mode, RenderMode::FlatShaded, "Flat");
-            ui.selectable_value(&mut self.render_mode, RenderMode::Wireframe, "Wire");
-            ui.selectable_value(&mut self.render_mode, RenderMode::Normals, "Normals");
-            ui.separator();
-            let mode_changed = ui.selectable_value(&mut self.selection_mode, SelectionMode::Vertex, "Points").changed()
-                || ui.selectable_value(&mut self.selection_mode, SelectionMode::Triangle, "Faces").changed()
-                || ui.selectable_value(&mut self.selection_mode, SelectionMode::Edge, "Edges").changed();
-            if mode_changed {
-                self.clear_component_selection();
-            }
-            ui.separator();
-            if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("↶")).on_hover_text("Undo (Ctrl+Z)").clicked() {
-                self.do_undo();
-            }
-            if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("↷")).on_hover_text("Redo (Ctrl+Shift+Z)").clicked() {
-                self.do_redo();
-            }
-            ui.separator();
-            for (mode, label, hover) in [
-                (GizmoMode::Translate, "✥ Move", "Move the selected object (W)"),
-                (GizmoMode::Rotate, "⟳ Rotate", "Rotate the selected object (E)"),
-                (GizmoMode::Scale, "⤢ Scale", "Scale the selected geometry object (R)"),
-            ] {
-                ui.selectable_value(&mut self.gizmo_mode, mode, label).on_hover_text(hover);
-            }
-            ui.separator();
-            if ui.button("◆ Key").on_hover_text("Key the selected node at this frame (K)").clicked() {
-                self.key_selected();
-            }
-            ui.toggle_value(&mut self.auto_key, "Auto Key").on_hover_text("Key every parameter you change, not only animated ones");
-            let mut graph_open = self.open_panes.contains(&Pane::GraphEditor);
-            if ui.toggle_value(&mut graph_open, "📈 Graph").on_hover_text("Graph Editor").changed() {
-                self.pane_requests.push(PaneRequest::Show(Pane::GraphEditor, graph_open));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙").on_hover_text("Render Settings").clicked() {
-                    self.show_moonray_settings = true;
-                }
-                if self.moonray_rx.is_some() || self.sequence.is_some() {
-                    if ui.button("■ Cancel").clicked() {
-                        self.cancel_render();
-                    }
-                    if let Some(started) = self.render_started {
-                        ui.label(format!("{:.0}s", started.elapsed().as_secs_f32()));
-                    }
-                    ui.spinner();
-                } else if ui.button(egui::RichText::new("▶ Render").strong()).on_hover_text("Render with MoonRay").clicked() {
-                    self.start_moonray_render();
-                }
-                let cameras = self.camera_ids();
-                render_camera_combo(ui, &mut self.render_camera, &cameras);
-                ui.weak("Camera");
             });
+            toolbar_group(ui, "shading", |ui| {
+                ui.separator();
+                ui.selectable_value(&mut self.render_mode, RenderMode::ShadedWireframe, "Shaded");
+                ui.selectable_value(&mut self.render_mode, RenderMode::FlatShaded, "Flat");
+                ui.selectable_value(&mut self.render_mode, RenderMode::Wireframe, "Wire");
+                ui.selectable_value(&mut self.render_mode, RenderMode::Normals, "Normals");
+            });
+            toolbar_group(ui, "selection", |ui| {
+                ui.separator();
+                let mode_changed = ui.selectable_value(&mut self.selection_mode, SelectionMode::Vertex, "Points").changed()
+                    || ui.selectable_value(&mut self.selection_mode, SelectionMode::Triangle, "Faces").changed()
+                    || ui.selectable_value(&mut self.selection_mode, SelectionMode::Edge, "Edges").changed();
+                if mode_changed {
+                    self.clear_component_selection();
+                }
+            });
+            toolbar_group(ui, "undo", |ui| {
+                ui.separator();
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("↶")).on_hover_text("Undo (Ctrl+Z)").clicked() {
+                    self.do_undo();
+                }
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("↷")).on_hover_text("Redo (Ctrl+Shift+Z)").clicked() {
+                    self.do_redo();
+                }
+            });
+            toolbar_group(ui, "transform", |ui| {
+                ui.separator();
+                for (mode, label, hover) in [
+                    (GizmoMode::Translate, "✥ Move", "Move the selected object (W)"),
+                    (GizmoMode::Rotate, "⟳ Rotate", "Rotate the selected object (E)"),
+                    (GizmoMode::Scale, "⤢ Scale", "Scale the selected geometry object (R)"),
+                ] {
+                    ui.selectable_value(&mut self.gizmo_mode, mode, label).on_hover_text(hover);
+                }
+            });
+            toolbar_group(ui, "keys", |ui| {
+                ui.separator();
+                if ui.button("◆ Key").on_hover_text("Key the selected node at this frame (K)").clicked() {
+                    self.key_selected();
+                }
+                ui.toggle_value(&mut self.auto_key, "Auto Key").on_hover_text("Key every parameter you change, not only animated ones");
+                let mut graph_open = self.open_panes.contains(&Pane::GraphEditor);
+                if ui.toggle_value(&mut graph_open, "📈 Graph").on_hover_text("Graph Editor").changed() {
+                    self.pane_requests.push(PaneRequest::Show(Pane::GraphEditor, graph_open));
+                }
+            });
+            if ui.available_size_before_wrap().x < self.toolbar_render_width + 8.0 && ui.cursor().min.x > ui.max_rect().left() + 1.0 {
+                ui.end_row();
+            }
+            if ui.max_rect().width() < self.toolbar_render_width + 8.0 {
+                // Narrower than the render controls themselves: left to right, wrapping.
+                self.render_controls(ui, false);
+            } else {
+                let row = egui::vec2(ui.available_size_before_wrap().x, ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let right = ui.max_rect().right();
+                    self.render_controls(ui, true);
+                    self.toolbar_render_width = right - ui.min_rect().left();
+                });
+            }
         });
+    }
+
+    // The toolbar's camera, Render and settings controls; `from_right` lays them out
+    // right to left (⚙ at the edge).
+    fn render_controls(&mut self, ui: &mut egui::Ui, from_right: bool) {
+        let settings = |app: &mut Self, ui: &mut egui::Ui| {
+            if ui.button("⚙").on_hover_text("Render Settings").clicked() {
+                app.show_moonray_settings = true;
+            }
+        };
+        let render = |app: &mut Self, ui: &mut egui::Ui| {
+            if app.moonray_rx.is_some() || app.sequence.is_some() {
+                if ui.button("■ Cancel").clicked() {
+                    app.cancel_render();
+                }
+                if let Some(started) = app.render_started {
+                    ui.label(format!("{:.0}s", started.elapsed().as_secs_f32()));
+                }
+                ui.spinner();
+            } else if ui.button(egui::RichText::new("▶ Render").strong()).on_hover_text("Render with MoonRay").clicked() {
+                app.start_moonray_render();
+            }
+        };
+        let camera = |app: &mut Self, ui: &mut egui::Ui| {
+            let cameras = app.camera_ids();
+            render_camera_combo(ui, &mut app.render_camera, &cameras);
+        };
+        if from_right {
+            settings(self, ui);
+            render(self, ui);
+            camera(self, ui);
+            ui.weak("Camera");
+        } else {
+            ui.weak("Camera");
+            camera(self, ui);
+            render(self, ui);
+            settings(self, ui);
+        }
     }
 
     fn open_scene_dialog(&mut self) {
@@ -11082,6 +11433,22 @@ impl ProceduralFxStudioApp {
                     };
                     self.set_item_state(node, index, state, log);
                 }
+                tops::Job::Cache(target) => {
+                    let result = self.with_wedges(&item, |app| {
+                        let source = app.graph.input_of(target, 0).ok_or("the Cache node has no input")?;
+                        let mesh = app.graph.cook_fresh(Some(source), item.time(sims::SIM_FPS));
+                        save_mesh_cache(std::path::Path::new(&item.output), &mesh).map(|_| item.output.clone()).map_err(|e| format!("couldn't write {}: {e}", item.output))
+                    });
+                    let run = self.top_run.as_mut().unwrap();
+                    if result.is_err() {
+                        run.failed += 1;
+                    }
+                    let (state, log) = match result {
+                        Ok(out) => (tops::State::Done, out),
+                        Err(e) => (tops::State::Failed, e),
+                    };
+                    self.set_item_state(node, index, state, log);
+                }
                 tops::Job::Render(target) => {
                     let Some(NodeKind::MoonRayRender { executable, arguments, width, height, samples, opts, .. }) = self.graph.nodes.get(&target).map(|n| n.kind.clone()) else {
                         self.set_item_state(node, index, tops::State::Failed, "the render node is gone".into());
@@ -12100,6 +12467,9 @@ impl ProceduralFxStudioApp {
             .iter()
             .map(|(id, m)| (*id, (m.vertices.len(), m.indices.len())))
             .collect();
+        // Node Info shows what this cook made (or cooks on its own when it needs to).
+        let shown = [self.inspect_node, self.info_hold.map(|h| h.0)];
+        self.info_mesh = shown.into_iter().flatten().find_map(|id| cache.get(&id).map(|m| (id, self.time, m.clone())));
         for (id, m) in cache {
             if !self.graph.time_dependent(id) {
                 self.static_cache.entry(id).or_insert(m);
@@ -12962,7 +13332,7 @@ impl ProceduralFxStudioApp {
                     .graph
                     .nodes
                     .iter()
-                    .filter(|(_, n)| matches!(n.kind, NodeKind::MoonRayRender { .. } | NodeKind::FileExport { .. }))
+                    .filter(|(_, n)| matches!(n.kind, NodeKind::MoonRayRender { .. } | NodeKind::FileExport { .. } | NodeKind::Cache { .. }))
                     .map(|(nid, n)| (*nid, n.title(*nid)))
                     .collect();
                 fetch.sort_unstable();
@@ -13048,6 +13418,9 @@ impl ProceduralFxStudioApp {
                 field.request_focus();
             }
             c |= field.changed();
+            if ui.button("ℹ").on_hover_text("Node Info: counts, bounds, attributes and groups (or hold the middle button on the node)").clicked() {
+                self.inspect_node = Some(id);
+            }
         });
         ui.horizontal(|ui| {
             if is_object {
@@ -13237,7 +13610,7 @@ impl ProceduralFxStudioApp {
                         }
                     });
                     if fetch_targets.is_empty() {
-                        ui.small("Add a MoonRay render node (OUT) or a File Export node (in a geometry network) to fetch.");
+                        ui.small("Add a MoonRay render node (OUT), or a File Export or Cache node (in a geometry network), to fetch.");
                     }
                 }
                 if op == tops::WEDGE {
@@ -13712,6 +14085,46 @@ impl ProceduralFxStudioApp {
                 c |= examples_menu(ui, code, &HEIGHTFIELD_WRANGLE_EXAMPLES);
                 c |= vex_editor_ui(ui, code, 2, "points", &mut node.channels, "@height += 1;");
             }
+            NodeKind::TestGeometry(set) => {
+                egui::ComboBox::from_label("Shape").selected_text(testgeo::SHAPES[set.shape.min(testgeo::SHAPES.len() - 1)]).show_ui(ui, |ui| {
+                    for (value, label) in testgeo::SHAPES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.shape, value, *label).changed();
+                    }
+                });
+                if set.shape <= 2 {
+                    ui.small("Keenan Crane's public-domain (CC0) models, quads with UVs.");
+                    c |= ui.checkbox(&mut set.colours, "Painted colours (Cd from the model's texture)").changed();
+                }
+                if set.shape == testgeo::CHARACTER {
+                    ui.small("Quaternius's public-domain (CC0) animated human: a skinned mesh with seven takes.");
+                    let clips = testgeo::character_clips();
+                    let shown = clips.get(set.clip).cloned().unwrap_or_default();
+                    egui::ComboBox::from_label("Take").selected_text(shown).show_ui(ui, |ui| {
+                        for (value, label) in clips.iter().enumerate() {
+                            c |= ui.selectable_value(&mut set.clip, value, label).changed();
+                        }
+                    });
+                    c |= ui.checkbox(&mut set.looping, "Loop (else hold the last pose)").changed();
+                    c |= ui.checkbox(&mut set.colours, "Colours").changed();
+                    if set.colours {
+                        egui::ComboBox::from_label("Look").selected_text(testgeo::LOOKS[set.look.min(testgeo::LOOKS.len() - 1)]).show_ui(ui, |ui| {
+                            for (value, label) in testgeo::LOOKS.iter().enumerate() {
+                                c |= ui.selectable_value(&mut set.look, value, *label).changed();
+                            }
+                        });
+                    }
+                    ui.small("The take plays from frame 1, at the file's 24 frames per second.");
+                }
+                c |= pfield(ui, pslider(&mut set.size, 0.01..=100.0).logarithmic(true).text("Size")).on_hover_text("The largest side, in scene units").changed();
+                c |= ui.checkbox(&mut set.on_ground, "Sit on the ground (else centred on the origin)").changed();
+                if set.shape == 7 {
+                    c |= pfield(ui, pslider(&mut set.p, 1..=12).text("Windings (p)")).changed();
+                    c |= pfield(ui, pslider(&mut set.q, 1..=12).text("Twists (q)")).changed();
+                }
+                if set.shape >= 7 {
+                    c |= pfield(ui, pslider(&mut set.detail, 8..=256).text("Detail")).changed();
+                }
+            }
             NodeKind::LSystem(set) => {
                 ui.small("Rewrites the premise by the rules, generation after generation, then draws it as curves.");
                 ui.menu_button("Presets ▾", |ui| {
@@ -13920,7 +14333,7 @@ impl ProceduralFxStudioApp {
                 }
                 ui.small("Select components in the viewport and press Delete to create this node.");
             }
-            NodeKind::Cache { cache_id, mode } => {
+            NodeKind::Cache { cache_id, mode, range } => {
                 ui.label("Persistent frame cache: cache/cache_ID_frame.mcache");
                 c |= pfield(ui, pslider(cache_id, 0..=9999).text("Cache ID")).changed();
                 ui.horizontal(|ui| {
@@ -13929,6 +14342,13 @@ impl ProceduralFxStudioApp {
                     c |= ui.selectable_value(mode, 1, "Write").changed();
                 });
                 ui.small("Write saves each evaluated frame. Read reuses files and falls back to the input on a miss.");
+                ui.label("Frame range (what a Fetch TOP writes when nothing is connected to it)");
+                ui.horizontal(|ui| {
+                    c |= pfield(ui, pdrag(&mut range[0]).speed(1.0).prefix("Start ")).changed();
+                    c |= pfield(ui, pdrag(&mut range[1]).speed(1.0).prefix("End ")).changed();
+                    c |= pfield(ui, pdrag(&mut range[2]).speed(0.1).range(0.001..=1000.0).prefix("Step ")).changed();
+                });
+                ui.small("To write the cache in the background, or across wedges: in TASKS, point a Fetch at this node and cook it. Then set the mode to Read.");
             }
             NodeKind::Vdb { voxel_size, padding, operation, iterations, output } => {
                 ui.heading("VDB from Polygons");
@@ -14749,7 +15169,7 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::Skeleton(set) => {
-                ui.small("A KineFX skeleton: joints as points with `parent` and `transform`. Pose it with Rig Pose, Two Bone IK or Procedural Motion; skin a mesh with Joint Capture and Bone Deform.");
+                ui.small("A skeleton: joints as points with `parent` and `transform`. Pose it with Rig Pose, Two Bone IK or Procedural Motion; skin a mesh with Joint Capture and Bone Deform.");
                 egui::ComboBox::from_label("Preset").selected_text(kinefx::PRESETS[set.preset.min(2)]).show_ui(ui, |ui| {
                     for (value, label) in kinefx::PRESETS.iter().enumerate() {
                         c |= ui.selectable_value(&mut set.preset, value, *label).changed();
@@ -15013,7 +15433,7 @@ impl ProceduralFxStudioApp {
                 });
             }
             NodeKind::VellumSolver(set) => {
-                ui.heading("Vellum Solver");
+                ui.heading("Cloth Solver");
                 ui.small("Input 1: geometry (a mesh for cloth/softbody, curves for hair, points for grains) • Input 2: optional static collider. Pin points with f@pin = 1; hair roots are pinned automatically.");
                 ui.horizontal(|ui| {
                     ui.label("Type");
@@ -15264,7 +15684,7 @@ impl ProceduralFxStudioApp {
                 }
                 ui.small("Input: a VDB from VDB from Polygons, a .vdb file read with the File node, or Pyro smoke.");
             }
-            NodeKind::FileImport { file } => {
+            NodeKind::FileImport { file, take, looping } => {
                 ui.heading("File");
                 ui.horizontal(|ui| {
                     c |= ui.add(egui::TextEdit::singleline(file).hint_text("/path/to/model.$F4.obj").desired_width(220.0)).changed();
@@ -15281,11 +15701,38 @@ impl ProceduralFxStudioApp {
                 if fileio::has_frame_token(file) {
                     ui.weak(format!("Frame now: {}", fileio::expand_frame(file, self.time, sims::SIM_FPS)));
                 }
+                // FBX: which take plays, from the file's own list.
+                if fileio::extension(file.trim()) == "fbx" {
+                    let takes = fileio::fbx_take_names(file.trim());
+                    if takes.is_empty() {
+                        ui.weak("No animation takes in this file.");
+                    } else {
+                        let label = |name: &str, seconds: f64| format!("{name} ({seconds:.2} s)");
+                        let shown = if take.is_empty() {
+                            format!("First: {}", takes[0].0)
+                        } else {
+                            takes.iter().find(|(n, _)| n == take).map_or_else(|| format!("{take} (not in the file)"), |(n, s)| label(n, *s))
+                        };
+                        egui::ComboBox::from_label("Take").selected_text(shown).show_ui(ui, |ui| {
+                            if ui.selectable_label(take.is_empty(), format!("First take ({})", takes[0].0)).clicked() {
+                                take.clear();
+                                c = true;
+                            }
+                            for (name, seconds) in &takes {
+                                if ui.selectable_label(take == name, label(name, *seconds)).clicked() {
+                                    *take = name.clone();
+                                    c = true;
+                                }
+                            }
+                        });
+                        c |= ui.checkbox(looping, "Loop (else hold the last pose)").changed();
+                    }
+                }
                 if ui.button("Reload").on_hover_text("Read the file again after it changed on disk").clicked() {
                     usd::forget_loaded_files();
                     c = true;
                 }
-                ui.small("Reads .obj, .fbx, Alembic (.abc, animated: read at the current time), .stl, USD (.usd .usda .usdc .usdz) and .vdb. $F / $F4 insert the frame number for sequences. Separate objects get a piece attribute.");
+                ui.small("Reads .obj, FBX (.fbx: the chosen take's animation, skinning and blend shapes play from frame 1), Alembic (.abc, animated: read at the current time), .stl, USD (.usd .usda .usdc .usdz) and .vdb. $F / $F4 insert the frame number for sequences. Separate objects get a piece attribute.");
             }
             NodeKind::FileExport { file } => {
                 ui.heading("File Export");
@@ -15517,54 +15964,16 @@ impl ProceduralFxStudioApp {
         let templates = self.templates_for_view();
         let zoom = self.graph_zoom;
         let mut query = std::mem::take(&mut self.menu_query);
+        let mut pick = self.search_pick;
         canvas.clone().context_menu(|ui| {
             let at = egui::pos2((menu_pos.x - origin.x) / zoom, (menu_pos.y - origin.y) / zoom);
-            // Type straight away to search every category.
-            let field = ui.add(egui::TextEdit::singleline(&mut query).hint_text("Search nodes…").desired_width(180.0));
-            field.request_focus();
-            if !query.trim().is_empty() {
-                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let found: Vec<(&str, &NodeKind)> = templates
-                    .iter()
-                    .flat_map(|(cat, kinds)| kinds.iter().map(move |k| (*cat, k)))
-                    .filter(|(cat, k)| node_matches(k, cat, &query))
-                    .collect();
-                if found.is_empty() {
-                    ui.weak("No matching nodes");
-                }
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for (i, (cat, kind)) in found.iter().enumerate() {
-                        let button = ui.button(format!("{}   ({cat})", kind.menu_name()));
-                        let button = match kind.menu_help() {
-                            Some(help) => button.on_hover_text(help),
-                            None => button,
-                        };
-                        if button.clicked() || (enter && i == 0) {
-                            actions.push(Action::Add((*kind).clone(), at));
-                            ui.close_menu();
-                        }
-                    }
-                });
-                return;
-            }
-            ui.separator();
-            for (cat, kinds) in &templates {
-                ui.menu_button(*cat, |ui| {
-                    for kind in kinds {
-                        let button = ui.button(kind.menu_name());
-                        let button = match kind.menu_help() {
-                            Some(help) => button.on_hover_text(help),
-                            None => button,
-                        };
-                        if button.clicked() {
-                            actions.push(Action::Add(kind.clone(), at));
-                            ui.close_menu();
-                        }
-                    }
-                });
+            if let Some(kind) = node_search_ui(ui, &mut query, &mut pick, &templates) {
+                actions.push(Action::Add(kind, at));
+                ui.close_menu();
             }
         });
         self.menu_query = query;
+        self.search_pick = pick;
 
         // Wires (only within current context)
         for l in &self.graph.links {
@@ -15606,9 +16015,9 @@ impl ProceduralFxStudioApp {
             if resp.clicked() || resp.drag_started() {
                 self.selected = Some(id);
             }
-            if resp.middle_clicked() {
-                self.selected = Some(id);
-                self.inspect_node = Some(id);
+            // Holding the middle button on a node shows its info, like Houdini's.
+            if resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle)) {
+                self.info_hold = ui.input(|i| i.pointer.interact_pos()).map(|p| (id, p));
             }
             if resp.double_clicked() {
                 if self.graph.nodes[&id].kind.is_container() {
@@ -15627,6 +16036,10 @@ impl ProceduralFxStudioApp {
                 if ui.button("Rename (F2)").clicked() {
                     self.selected = Some(id);
                     self.focus_rename = true;
+                    ui.close_menu();
+                }
+                if ui.button("Node Info (hold middle button)").clicked() {
+                    self.inspect_node = Some(id);
                     ui.close_menu();
                 }
                 let display_label = if is_object { "Toggle Active / Activate Camera" } else { "Set Display Flag" };
@@ -15906,47 +16319,45 @@ impl ProceduralFxStudioApp {
         if pointer_in && !typing && self.selected.is_some() && ui.input(|i| i.key_pressed(egui::Key::F2)) {
             self.focus_rename = true;
         }
-        // TAB: searchable add-node menu (auto-wires below the selected node)
-        if pointer_in && !typing && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+        // TAB over the network: the searchable add-node menu (auto-wires below the selected
+        // node). It opens even while a field elsewhere has focus, except a VEX editor
+        // (where Tab indents).
+        let in_code_editor = {
+            let focused = ui.ctx().memory(|m| m.focused());
+            focused.is_some() && focused == ui.ctx().data(|d| d.get_temp::<egui::Id>(egui::Id::new(CODE_EDITOR_FOCUS)))
+        };
+        if pointer_in && !self.tab_open && !in_code_editor && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
             self.tab_open = true;
             self.tab_query.clear();
+            self.search_pick = 0;
             self.tab_pos = pointer.unwrap_or(canvas.rect.center());
         }
         if self.tab_open {
-            let q = self.tab_query.clone();
-            let q = q.as_str();
-            let matches: Vec<NodeKind> = self
-                .templates_for_view()
-                .into_iter()
-                .flat_map(|(cat, kinds)| kinds.into_iter().filter(move |k| node_matches(k, cat, q)))
-                .collect();
+            let templates = self.templates_for_view();
             let selected = self.selected.filter(|id| self.graph.nodes.contains_key(id));
             let tab_pos = self.tab_pos;
             let mut close = false;
+            let (mut query, mut pick) = (std::mem::take(&mut self.tab_query), self.search_pick);
             egui::Area::new(egui::Id::new("tab_menu"))
                 .fixed_pos(tab_pos)
                 .order(egui::Order::Foreground)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_width(170.0);
-                        ui.text_edit_singleline(&mut self.tab_query).request_focus();
-                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                            for (i, k) in matches.iter().enumerate() {
-                                if ui.button(k.menu_name()).clicked() || (enter && i == 0) {
-                                    actions.push(match selected {
-                                        Some(from) => Action::AddBelow(k.clone(), from),
-                                        None => Action::Add(k.clone(), tab_pos - origin),
-                                    });
-                                    close = true;
-                                }
-                            }
-                        });
+                        ui.set_width(220.0);
+                        if let Some(kind) = node_search_ui(ui, &mut query, &mut pick, &templates) {
+                            actions.push(match selected {
+                                Some(from) => Action::AddBelow(kind, from),
+                                None => Action::Add(kind, tab_pos - origin),
+                            });
+                            close = true;
+                        }
                         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             close = true;
                         }
                     });
                 });
+            self.tab_query = query;
+            self.search_pick = pick;
             if close {
                 self.tab_open = false;
             }
@@ -17635,69 +18046,29 @@ impl eframe::App for ProceduralFxStudioApp {
         self.viewer.ui(ctx);
 
 
-        if let Some(node_id) = self.inspect_node {
+        // Node Info: a pinned window, and the popup while the middle button is held on a node.
+        if let Some(node_id) = self.inspect_node.filter(|id| self.graph.nodes.contains_key(id)) {
             let mut open = true;
-            let node_name = self
-                .graph
-                .nodes
-                .get(&node_id)
-                .map(|node| node.title(node_id))
-                .unwrap_or_else(|| format!("Node {node_id}"));
-            let mut cache = HashMap::new();
-            let mesh = self.graph.cook(node_id, self.time, &mut cache);
-            egui::Window::new(format!("Geometry Info · {node_name}"))
-                .open(&mut open)
-                .default_size([320.0, 260.0])
-                .show(ctx, |ui| {
-                    ui.heading(node_name);
-                    ui.label(format!("Points: {}", mesh.vertices.len()));
-                    ui.label(format!("Primitives: {}", mesh.indices.len()));
-                    let edges: HashSet<(usize, usize)> = mesh
-                        .indices
-                        .iter()
-                        .flat_map(|tri| [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])])
-                        .map(|(a, b)| (a.min(b), a.max(b)))
-                        .collect();
-                    ui.label(format!("Edges: {}", edges.len()));
-                    if let Some((lo, hi)) = mesh.bounds() {
-                        ui.label(format!(
-                            "Bounds: ({:.3}, {:.3}, {:.3}) to ({:.3}, {:.3}, {:.3})",
-                            lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
-                        ));
-                    }
-                    ui.separator();
-                    ui.label("Point attributes:");
-                    if mesh.point_attributes.is_empty() {
-                        ui.small("None");
-                    } else {
-                        let mut names: Vec<_> = mesh.point_attributes.keys().filter(|k| !poly::is_internal(k)).collect();
-                        names.sort();
-                        for name in names {
-                            let values = &mesh.point_attributes[name];
-                            let components = if mesh.vertices.is_empty() {
-                                0
-                            } else {
-                                values.len() / mesh.vertices.len()
-                            };
-                            ui.label(format!(
-                                "• {name}: {} component{}",
-                                components,
-                                if components == 1 { "" } else { "s" }
-                            ));
-                        }
-                    }
-                    let warnings = mesh.validation_warnings();
-                    if warnings.is_empty() {
-                        ui.colored_label(egui::Color32::LIGHT_GREEN, "Validation: OK");
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            format!("Validation: {}", warnings.join(" · ")),
-                        );
-                    }
-                });
+            let title = self.graph.nodes[&node_id].title(node_id);
+            egui::Window::new(format!("Node Info · {title}")).id(egui::Id::new("node_info_window")).open(&mut open).default_width(360.0).show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| self.node_info_ui(ui, node_id));
+            });
             if !open {
                 self.inspect_node = None;
+            }
+        } else {
+            self.inspect_node = None;
+        }
+        if let Some((node_id, at)) = self.info_hold {
+            if !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle)) || !self.graph.nodes.contains_key(&node_id) {
+                self.info_hold = None;
+            } else {
+                egui::Area::new(egui::Id::new("node_info_hold")).order(egui::Order::Tooltip).fixed_pos(at + egui::vec2(14.0, 14.0)).show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(380.0);
+                        self.node_info_ui(ui, node_id);
+                    });
+                });
             }
         }
 
@@ -18117,7 +18488,7 @@ mod tests {
         for extension in formats {
             let path = dir.join(format!("pfx_file_node.{extension}")).to_string_lossy().into_owned();
             write_geometry_file(&original, &path).unwrap_or_else(|e| panic!("write {extension}: {e}"));
-            let reader = g.add(NodeKind::FileImport { file: path.clone() }, egui::pos2(0.0, 0.0));
+            let reader = g.add(NodeKind::FileImport { file: path.clone(), take: String::new(), looping: false }, egui::pos2(0.0, 0.0));
             let back = g.cook(reader, 0.0, &mut HashMap::new());
             if extension.starts_with("usd") && !usd::NATIVE {
                 continue;
@@ -18130,7 +18501,7 @@ mod tests {
         // $F sequences.
         let pattern = dir.join("pfx_seq.$F4.obj").to_string_lossy().into_owned();
         assert!(fileio::expand_frame(&pattern, 1.0, sims::SIM_FPS).ends_with("pfx_seq.0025.obj"));
-        let reader = g.add(NodeKind::FileImport { file: pattern }, egui::pos2(0.0, 0.0));
+        let reader = g.add(NodeKind::FileImport { file: pattern, take: String::new(), looping: false }, egui::pos2(0.0, 0.0));
         assert!(g.time_dependent(reader));
     }
 
@@ -18522,7 +18893,7 @@ mod scene_file_tests {
     #[test]
     fn background_cook_names_its_solvers() {
         let (g, _, cloth) = cloth_over_box(false);
-        assert_eq!(g.cooking_label(&[cloth]), "Simulating Vellum");
+        assert_eq!(g.cooking_label(&[cloth]), "Simulating Cloth");
         let mut g = Graph::default();
         let grid = g.add(NodeKind::Grid { size: 1.0, res: 4 }, egui::pos2(0.0, 0.0));
         let wave = g.add(NodeKind::Ripple { freq: 1.0, amp: 0.1, speed: 1.0 }, egui::pos2(0.0, 0.0));
@@ -18532,7 +18903,7 @@ mod scene_file_tests {
         g.connect(wave, pyro, 0);
         let vellum = g.add(NodeKind::VellumSolver(vellum::VellumSettings::defaults(0)), egui::pos2(0.0, 0.0));
         g.connect(pyro, vellum, 0);
-        assert_eq!(g.cooking_label(&[vellum]), "Simulating Pyro + Vellum");
+        assert_eq!(g.cooking_label(&[vellum]), "Simulating Pyro + Cloth");
     }
 
     #[test]
@@ -19644,7 +20015,7 @@ mod material_sop_tests {
         assert!(find("noise").iter().any(|n| n == "noise"));
         assert!(find("terrain erode").iter().any(|n| n == "terrain_erode"));
         assert!(find("terrainerode").iter().any(|n| n == "terrain_erode"));
-        assert!(find("kinefx ik").iter().any(|n| n == "two_bone_ik"), "category words match too");
+        assert!(find("rigging ik").iter().any(|n| n == "two_bone_ik"), "category words match too");
         assert!(find("zzzz").is_empty());
     }
 }
@@ -19733,6 +20104,49 @@ mod img_tasks_tests {
         let loaded = Graph::deserialize(&app.graph.serialize());
         assert_eq!(loaded.nodes[&blur].context, AppContext::Img);
         assert_eq!(format!("{:?}", loaded.nodes[&a].kind), format!("{:?}", app.graph.nodes[&a].kind));
+    }
+
+    #[test]
+    fn fetch_writes_a_cache_that_reads_back() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        // A grid that rises with time, cached over frames 1-3 (cache id 9871).
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let grid = inside(&mut app, geo, AppContext::Obj, NodeKind::Grid { size: 2.0, res: 3 });
+        let rise = inside(&mut app, geo, AppContext::Obj, NodeKind::Wrangle { code: "@P.y = @Time;".into(), domain: 2 });
+        let cache = inside(&mut app, geo, AppContext::Obj, NodeKind::Cache { cache_id: 9871, mode: 0, range: [1.0, 3.0, 1.0] });
+        app.graph.connect(grid, rise, 0);
+        app.graph.connect(rise, cache, 0);
+        let net = app.graph.add(NodeKind::TopNetwork, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&net).unwrap().context = AppContext::Tasks;
+        let mut fetch = top(tops::FETCH);
+        fetch.set("node", cache as f32);
+        let fetch = inside(&mut app, net, AppContext::Tasks, NodeKind::Top(fetch));
+        let items = app.graph.top_items(fetch).unwrap();
+        assert_eq!(items.len(), 3, "the cache's own frame range");
+        for item in &items {
+            let _ = std::fs::remove_file(&item.output);
+        }
+        app.start_top_cook(fetch);
+        for _ in 0..500 {
+            if app.top_run.is_none() {
+                break;
+            }
+            app.advance_top_run();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.top_results[&fetch].iter().all(|s| s.0 == tops::State::Done), "{:?}", app.top_results[&fetch]);
+        // Each frame's file has the risen grid, polygons included.
+        let frame3 = load_mesh_cache(std::path::Path::new(&items[2].output)).unwrap();
+        let t3 = 2.0 / sims::SIM_FPS;
+        assert!(frame3.vertices.iter().all(|p| (p.y - t3).abs() < 1e-5));
+        assert!(frame3.point_attributes.contains_key(poly::KEY), "polygons survive the cache");
+        // Read mode plays the cache back.
+        let read = app.graph.cook(cache, t3, &mut HashMap::new());
+        assert!(read.vertices.iter().all(|p| (p.y - t3).abs() < 1e-5));
+        for item in &items {
+            let _ = std::fs::remove_file(&item.output);
+        }
     }
 
     #[test]
@@ -20627,5 +21041,179 @@ mod perf_tests {
         g.cook(smooth, 0.0, &mut cache);
         g.cook(smooth, 0.0, &mut cache);
         assert_eq!(perf::get(smooth).unwrap().cooks, before + 2);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_move_through_search_results() {
+        assert_eq!(search_step(0, 5, true, false), 1);
+        assert_eq!(search_step(4, 5, true, false), 4, "stops at the last result");
+        assert_eq!(search_step(0, 5, false, true), 0, "stops at the first");
+        assert_eq!(search_step(3, 5, false, true), 2);
+        // Fewer results than before: the highlight comes back into range.
+        assert_eq!(search_step(9, 3, false, false), 2);
+        assert_eq!(search_step(0, 0, true, false), 0);
+    }
+}
+
+#[cfg(test)]
+mod toolbar_tests {
+    use super::*;
+
+    // Every text the toolbar draws at a window width: (text, where).
+    fn toolbar_texts(width: f32) -> Vec<(String, egui::Rect)> {
+        fn flatten(shape: egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|s| flatten(s, out)),
+                egui::Shape::Text(t) => {
+                    let text = t.galley.text().to_owned();
+                    if !text.trim().is_empty() {
+                        out.push((text, t.visual_bounding_rect()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut app = ProceduralFxStudioApp::default();
+        let mut texts = Vec::new();
+        // A few passes: the layout uses widths measured on the pass before.
+        for _ in 0..4 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))), ..Default::default() };
+            let output = ctx.run(input, |ctx| {
+                egui::TopBottomPanel::top("toolbar").show(ctx, |ui| app.toolbar(ui));
+            });
+            texts.clear();
+            for clipped in output.shapes {
+                flatten(clipped.shape, &mut texts);
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn every_control_fits_at_any_window_width() {
+        let controls = ["OBJ", "MAT", "OUT", "STAGE", "IMG", "TASKS", "Shaded", "Normals", "Points", "Edges", "↶", "↷", "✥ Move", "⤢ Scale", "◆ Key", "Auto Key", "📈 Graph", "▶ Render", "Camera", "⚙"];
+        for width in [1800.0, 1280.0, 1000.0, 800.0, 640.0, 480.0, 380.0] {
+            let texts = toolbar_texts(width);
+            for control in controls {
+                assert!(texts.iter().any(|(t, _)| t == control), "{width}: '{control}' is missing ({:?})", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+            }
+            // The menus are there, or folded into ☰ when there's no room.
+            assert!(texts.iter().any(|(t, _)| t == "File") || texts.iter().any(|(t, _)| t == "☰"), "{width}: no menus");
+            for (text, rect) in &texts {
+                assert!(rect.min.x >= -0.5 && rect.max.x <= width + 0.5, "{width}: '{text}' is cut off at {rect:?}");
+            }
+            for (i, (a, ra)) in texts.iter().enumerate() {
+                for (b, rb) in &texts[i + 1..] {
+                    let overlap = ra.intersect(*rb);
+                    assert!(overlap.width() <= 1.0 || overlap.height() <= 1.0, "{width}: '{a}' and '{b}' overlap");
+                }
+            }
+        }
+        // Wide: one toolbar row (the menus row and the toolbar row). Narrow: more rows.
+        let rows = |w: f32| {
+            let mut ys: Vec<i32> = toolbar_texts(w).iter().map(|(_, r)| r.center().y.round() as i32 / 8).collect();
+            ys.sort_unstable();
+            ys.dedup();
+            ys.len()
+        };
+        assert!(rows(1800.0) <= 2, "{}", rows(1800.0));
+        assert!(rows(480.0) > rows(1800.0));
+    }
+}
+
+#[cfg(test)]
+mod take_picker_tests {
+    use super::*;
+
+    #[test]
+    fn file_import_plays_the_chosen_take() {
+        let path = std::env::temp_dir().join(format!("pfx_takes_{}.fbx", std::process::id()));
+        std::fs::write(&path, include_bytes!("../assets/testgeo/character.fbx")).unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let names: Vec<String> = fileio::fbx_take_names(&file).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"Walk".to_string()) && names.contains(&"Jump".to_string()), "{names:?}");
+        let mut g = Graph::default();
+        let reader = g.add(NodeKind::FileImport { file: file.clone(), take: "Walk".into(), looping: true }, egui::pos2(0.0, 0.0));
+        assert!(g.time_dependent(reader));
+        let walk = |g: &Graph, t: f32| g.cook(reader, t, &mut HashMap::new());
+        let (a, b) = (walk(&g, 0.2), walk(&g, 0.6));
+        assert!(!a.vertices.is_empty() && a.vertices != b.vertices, "the walk moves");
+        // Looping: a take's length later, the same pose.
+        let length = fileio::fbx_take_names(&file).into_iter().find(|(n, _)| n == "Walk").unwrap().1 as f32;
+        let again = walk(&g, 0.2 + length);
+        assert!(a.vertices.iter().zip(&again.vertices).all(|(p, q)| p.sub(*q).length() < 1e-3));
+        // Another take gives other poses; a misspelt one says what the file has.
+        if let NodeKind::FileImport { take, .. } = &mut g.nodes.get_mut(&reader).unwrap().kind {
+            *take = "Jump".into();
+        }
+        assert_ne!(walk(&g, 0.2).vertices, a.vertices);
+        if let NodeKind::FileImport { take, .. } = &mut g.nodes.get_mut(&reader).unwrap().kind {
+            *take = "Moonwalk".into();
+        }
+        walk(&g, 0.2);
+        let error = node_errors(|e| e.get(&reader).cloned()).unwrap_or_default();
+        assert!(error.contains("Moonwalk") && error.contains("Walk"), "{error}");
+        // The take and loop are saved with the scene.
+        if let NodeKind::FileImport { take, .. } = &mut g.nodes.get_mut(&reader).unwrap().kind {
+            *take = "Run".into();
+        }
+        let loaded = Graph::deserialize(&g.serialize());
+        assert!(matches!(&loaded.nodes[&reader].kind, NodeKind::FileImport { take, looping: true, .. } if take == "Run"));
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod node_info_tests {
+    use super::*;
+
+    #[test]
+    fn scenes_with_the_old_solver_name_still_open() {
+        let old = NodeKind::from_params("vellum_solver", &[]).expect("the old name still loads");
+        assert_eq!(old.name(), "cloth_solver");
+        assert!(NodeKind::templates().iter().flat_map(|(cat, _)| cat.split_whitespace()).all(|w| !w.eq_ignore_ascii_case("kinefx")));
+    }
+
+    #[test]
+    fn node_info_shows_the_node_and_its_geometry() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let make = |app: &mut ProceduralFxStudioApp, kind: NodeKind| {
+            let id = app.graph.add(kind, egui::pos2(0.0, 0.0));
+            app.graph.nodes.get_mut(&id).unwrap().parent = Some(geo);
+            id
+        };
+        let cube = make(&mut app, NodeKind::Box { size: 1.0, div: 1 });
+        let tag = make(&mut app, NodeKind::Wrangle { code: "v@vel = set(0, 1, 0); i@up = @P.y > 0; setpointgroup(0, \"top\", @ptnum, @P.y > 0);".into(), domain: 2 });
+        app.graph.connect(cube, tag, 0);
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let output = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 900.0))), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.node_info_ui(ui, tag));
+            });
+            texts.clear();
+            for clipped in output.shapes {
+                fn flatten(shape: egui::Shape, out: &mut Vec<String>) {
+                    match shape {
+                        egui::Shape::Vec(v) => v.into_iter().for_each(|s| flatten(s, out)),
+                        egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                        _ => {}
+                    }
+                }
+                flatten(clipped.shape, &mut texts);
+            }
+        }
+        let has = |s: &str| texts.iter().any(|t| t.contains(s));
+        for expected in ["Type", "Wrangle", "Inputs", "1 of 1 connected", "Points", "Primitives", "6 (12 triangles)", "Bounds", "Attributes", "vel (3)", "up (1)", "Groups", "top (4)"] {
+            assert!(has(expected), "'{expected}' missing from {texts:?}");
+        }
     }
 }
