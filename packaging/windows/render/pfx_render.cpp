@@ -43,6 +43,10 @@
 // Exit codes the app understands (MoonRay's own codes pass through otherwise).
 static const int EXIT_NOT_READY = 3;    // WSL containers aren't installed
 static const int EXIT_SETUP_FAILED = 4; // the session, image or container failed
+static const int EXIT_NEEDS_ADMIN = 5;  // installing needs an administrator, who declined
+
+// What an administrator can run once instead (it also turns on Virtual Machine Platform).
+static const wchar_t* ADMIN_COMMAND = L"wsl --install --no-distribution";
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -488,7 +492,12 @@ int wmain(int argc, wchar_t* argv[])
         } else {
             Missing(missing);
             HRESULT hr = WslcInstallWithDependencies(missing, WSLC_INSTALL_OPTION_NONE, OnInstall, nullptr);
-            if (FAILED(hr)) {
+            if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) || hr == E_ACCESSDENIED || hr == HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED)) {
+                // The administrator prompt was declined, or this account can't approve it.
+                fwprintf(stderr, L"[pfx-render] error installing needs administrator approval, which wasn't given. An administrator can run this once instead: %s\n", ADMIN_COMMAND);
+                fflush(stderr);
+                result = EXIT_NEEDS_ADMIN;
+            } else if (FAILED(hr)) {
                 Fail(L"couldn't install WSL containers", hr, nullptr);
                 result = EXIT_SETUP_FAILED;
             } else if (missing & WSLC_COMPONENT_FLAG_VIRTUAL_MACHINE_PLATFORM) {

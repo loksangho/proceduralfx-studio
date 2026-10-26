@@ -7881,43 +7881,58 @@ fn inverse_xform(x: &ObjectXform, mut mesh: Mesh) -> Mesh {
 }
 
 // Writes the documentation page next to the app's settings and opens it in the browser.
-// Windows: installs WSL containers if they're missing, then downloads the MoonRay image,
-// sending each line the helper prints.
-fn start_render_setup(helper: PathBuf) -> mpsc::Receiver<String> {
+// What an administrator can run once, when this account can't install WSL itself.
+const WSL_ADMIN_COMMAND: &str = "wsl --install --no-distribution";
+
+// Windows rendering set-up, sending each line the helper prints. It checks first (no
+// administrator needed); if WSL is missing it stops with "[pfx-render] needs-admin"
+// unless `install` is set, in which case it installs (Windows asks an administrator).
+// Then it downloads the MoonRay image.
+fn start_render_setup(helper: PathBuf, install: bool) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(format!("[pfx-render] status running {}", helper.display()));
-        for step in ["--install", "--pull"] {
-            let _ = tx.send(format!("[pfx-render] status step: pfx-render.exe {step}"));
+        // Runs one helper step, passing on what it prints; its exit code.
+        let step = |arg: &str| -> Result<Option<i32>, String> {
             let mut command = Command::new(&helper);
             platform::no_window(&mut command);
-            let child = command.arg(step).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn();
-            let mut child = match child {
-                Ok(child) => child,
-                Err(e) => {
-                    let _ = tx.send(format!("[pfx-render] error couldn't run {}: {e}", helper.display()));
-                    return;
-                }
-            };
+            let mut child = command
+                .arg(arg)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("couldn't run {}: {e}", helper.display()))?;
             if let Some(err) = child.stderr.take() {
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
                     let _ = tx.send(line);
                 }
             }
-            match child.wait() {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    let _ = tx.send(format!("[pfx-render] error set-up stopped: {}", setup_failure(status.code())));
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(format!("[pfx-render] error set-up stopped: {e}"));
-                    return;
-                }
+            child.wait().map(|s| s.code()).map_err(|e| e.to_string())
+        };
+        let fail = |why: String| {
+            let _ = tx.send(format!("[pfx-render] error set-up stopped: {why}"));
+        };
+        let first = if install { "--install" } else { "--check" };
+        let _ = tx.send(format!("[pfx-render] status {}", if install { "installing WSL containers (Windows asks for an administrator)" } else { "checking for WSL containers" }));
+        match step(first) {
+            Ok(Some(0)) => {}
+            // Missing (3), or the administrator prompt was declined (5).
+            Ok(Some(3)) | Ok(Some(5)) => {
+                let _ = tx.send("[pfx-render] needs-admin".into());
+                return;
             }
+            Ok(code) => return fail(setup_failure(code)),
+            Err(e) => return fail(e),
         }
-        let _ = tx.send("[pfx-render] status rendering on Windows is ready".into());
+        let _ = tx.send("[pfx-render] status downloading MoonRay if it isn't here yet".into());
+        match step("--pull") {
+            Ok(Some(0)) => {
+                let _ = tx.send("[pfx-render] status rendering on Windows is ready".into());
+            }
+            Ok(code) => fail(setup_failure(code)),
+            Err(e) => fail(e),
+        }
     });
     rx
 }
@@ -7926,6 +7941,7 @@ fn start_render_setup(helper: PathBuf) -> mpsc::Receiver<String> {
 fn setup_failure(code: Option<i32>) -> String {
     match code {
         Some(3) => "WSL containers aren't installed yet (see above)".into(),
+        Some(5) => format!("installing needs administrator approval; an administrator can run `{WSL_ADMIN_COMMAND}` once"),
         Some(4) => "see the message above".into(),
         // Windows' own codes for a program that couldn't start.
         Some(c) if c as u32 == 0xC000_0135 => "pfx-render.exe couldn't load wslcsdk.dll: keep it in the same folder".into(),
@@ -8743,6 +8759,9 @@ struct ProceduralFxStudioApp {
     // The set-up window: what the helper said, and whether it's showing.
     render_setup_log: Vec<String>,
     render_setup_open: bool,
+    // WSL is missing: the window offers to install it (as an administrator) or to copy
+    // the command for one.
+    render_setup_needs_admin: bool,
     last_render_log: String,
     last_render_summary: String,
     viewer: RenderViewer,
@@ -8968,6 +8987,7 @@ impl Default for ProceduralFxStudioApp {
             render_setup: None,
             render_setup_log: Vec::new(),
             render_setup_open: false,
+            render_setup_needs_admin: false,
             last_render_log: String::new(),
             last_render_summary: String::new(),
             viewer: RenderViewer::default(),
@@ -10255,8 +10275,9 @@ impl ProceduralFxStudioApp {
             ui.separator();
             let busy = self.render_setup.is_some();
             if ui.add_enabled(!busy, egui::Button::new("Set Up Rendering on Windows…")).on_hover_text("Installs WSL containers if needed and downloads MoonRay (a few GB, once)").clicked() {
-                self.render_setup = Some(start_render_setup(helper));
+                self.render_setup = Some(start_render_setup(helper, false));
                 self.render_setup_log.clear();
+                self.render_setup_needs_admin = false;
                 self.render_setup_open = true;
                 ui.close();
             }
@@ -18023,6 +18044,11 @@ impl eframe::App for ProceduralFxStudioApp {
                 self.status = wslrender::progress(line).unwrap_or_else(|| line.trim_start_matches("[pfx-render] ").replacen("error ", "Error: ", 1));
             }
             for line in lines {
+                if line == "[pfx-render] needs-admin" {
+                    self.render_setup_needs_admin = true;
+                    self.status = "Rendering on Windows needs WSL: see Set Up Rendering on Windows".into();
+                    continue;
+                }
                 // Download progress replaces the previous progress line.
                 let progress = line.starts_with("[pfx-render] download ");
                 if progress && self.render_setup_log.last().is_some_and(|l| l.starts_with("[pfx-render] download ")) {
@@ -18057,6 +18083,28 @@ impl eframe::App for ProceduralFxStudioApp {
                         ui.spinner();
                         ui.weak("Working… a Windows permission prompt may appear.");
                     });
+                }
+                let mut next = None;
+                if self.render_setup_needs_admin && !running {
+                    ui.separator();
+                    ui.label(egui::RichText::new("This PC needs WSL (the Windows Subsystem for Linux) to render.").strong());
+                    ui.label("Installing it needs an administrator, once. Turning on Virtual Machine Platform also needs a restart. After that, downloading MoonRay and rendering work without administrator rights.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Install now").on_hover_text("Windows asks for an administrator's approval").clicked() {
+                            next = Some(true);
+                        }
+                        if ui.button("Copy the command for an administrator").on_hover_text(format!("Run in a Terminal opened as administrator: {WSL_ADMIN_COMMAND}")).clicked() {
+                            ui.ctx().copy_text(WSL_ADMIN_COMMAND.to_string());
+                            self.render_setup_log.push(format!("[pfx-render] status copied: {WSL_ADMIN_COMMAND} (an administrator runs it once in a Terminal opened as administrator, then restarts)"));
+                        }
+                        if ui.button("Check again").on_hover_text("After WSL was installed (and Windows restarted)").clicked() {
+                            next = Some(false);
+                        }
+                    });
+                }
+                if let (Some(install), Some(helper)) = (next, wslrender::helper()) {
+                    self.render_setup_needs_admin = false;
+                    self.render_setup = Some(start_render_setup(helper, install));
                 }
             });
             if !open {

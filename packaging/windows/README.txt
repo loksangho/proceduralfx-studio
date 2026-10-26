@@ -11,9 +11,18 @@ Rendering
 ---------
 MoonRay is a Linux program, so on Windows it runs in a small Linux container through
 WSL (the Windows Subsystem for Linux). The first time, choose
-Render > Set Up Rendering on Windows... in the app. It installs WSL containers if
-they're missing (turning on Virtual Machine Platform needs a restart) and downloads
-MoonRay, a few GB, once.
+Render > Set Up Rendering on Windows... in the app. It checks for WSL, then downloads
+MoonRay (about 1.3 GB, once). Downloading and rendering never need administrator
+rights.
+
+If WSL isn't installed yet, installing it needs an administrator once (Windows asks),
+and turning on Virtual Machine Platform needs a restart. On a PC where you can't
+approve that, an administrator can run this once in a Terminal opened as
+administrator, then restart:
+
+  wsl --install --no-distribution
+
+After that, choose Check again in the set-up window and it carries on without them.
 
 Needs Windows 11 with a recent WSL, and virtualization turned on in the BIOS or UEFI
 settings. Rendering uses up to three quarters of your memory and all your CPU cores.
