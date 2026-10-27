@@ -4,6 +4,7 @@
 //   pfx-render.exe --check           exit 0 if WSL containers are ready, else 3
 //   pfx-render.exe --install         install what's missing (may ask to restart)
 //   pfx-render.exe --pull            download the MoonRay image if it isn't here yet
+//   pfx-render.exe --diagnose        try containers step by step (for troubleshooting)
 //   pfx-render.exe moonray <args>    render: the arguments go to moonray as they are,
 //   pfx-render.exe hd_render <args>  with Windows paths mapped into the container
 //
@@ -336,6 +337,119 @@ static DWORD WINAPI WatchInput(LPVOID)
     return 0;
 }
 
+// What a container's first process printed and how it ended (for diagnosing a
+// container that stops straight away).
+struct InitWatch {
+    std::mutex lock;
+    std::string output;
+    INT32 code = -1;
+    bool exited = false;
+};
+
+static void CALLBACK OnInitOutput(WslcProcessIOHandle, const BYTE* data, uint32_t bytes, PVOID context)
+{
+    auto* watch = static_cast<InitWatch*>(context);
+    std::lock_guard<std::mutex> guard(watch->lock);
+    if (watch->output.size() < 4096)
+        watch->output.append(reinterpret_cast<const char*>(data), bytes);
+}
+
+static void CALLBACK OnInitExit(INT32 code, PVOID context)
+{
+    auto* watch = static_cast<InitWatch*>(context);
+    std::lock_guard<std::mutex> guard(watch->lock);
+    watch->code = code;
+    watch->exited = true;
+}
+
+// Explains a container that isn't running: its first process's output and exit code,
+// and the container's state as WSL describes it.
+static void ExplainStopped(WslcContainer container, InitWatch* watch)
+{
+    {
+        std::lock_guard<std::mutex> guard(watch->lock);
+        if (watch->exited)
+            fwprintf(stderr, L"[pfx-render] status the container's first process exited with %d\n", watch->code);
+        if (!watch->output.empty())
+            fwprintf(stderr, L"[pfx-render] status it printed: %hs\n", watch->output.c_str());
+    }
+    PSTR inspect = nullptr;
+    if (container && SUCCEEDED(WslcInspectContainer(container, &inspect)) && inspect) {
+        std::string text(inspect);
+        CoTaskMemFree(inspect);
+        // The part about its state is what matters.
+        size_t at = text.find("\"State\"");
+        text = at != std::string::npos ? text.substr(at, 600) : text.substr(0, 600);
+        fwprintf(stderr, L"[pfx-render] status container: %hs\n", text.c_str());
+    }
+    fflush(stderr);
+}
+
+// Creates and starts a container of `image` whose first process is `initArgv` (it
+// keeps the container running), sharing the local drives when `shareDrives`. Waits a
+// moment and checks it's still running; explains it if not.
+static HRESULT StartContainer(WslcSession session, const char* image, bool shareDrives, bool autoRemove, std::vector<PCSTR> initArgv, WslcContainer* container, InitWatch* watch)
+{
+    PWSTR error = nullptr;
+    WslcProcessSettings init;
+    WslcInitProcessSettings(&init);
+    WslcSetProcessSettingsCmdLine(&init, initArgv.data(), initArgv.size());
+
+    WslcContainerSettings settings;
+    WslcInitContainerSettings(image, &settings);
+    WslcSetContainerSettingsInitProcess(&settings, &init);
+    if (autoRemove)
+        WslcSetContainerSettingsFlags(&settings, WSLC_CONTAINER_FLAG_AUTO_REMOVE);
+    std::vector<DriveMount> drives = shareDrives ? Drives() : std::vector<DriveMount>();
+    std::vector<WslcContainerVolume> volumes;
+    for (auto& drive : drives) {
+        WslcContainerVolume volume = {};
+        volume.windowsPath = drive.windowsPath.c_str();
+        volume.containerPath = drive.containerPath.c_str();
+        volume.readOnly = FALSE;
+        volumes.push_back(volume);
+    }
+    HRESULT hr;
+    if (!volumes.empty()) {
+        hr = WslcSetContainerSettingsVolumes(&settings, volumes.data(), (uint32_t)volumes.size());
+        if (FAILED(hr)) {
+            Fail(L"couldn't share the drives with the container", hr, nullptr);
+            return hr;
+        }
+    }
+    hr = WslcCreateContainer(session, &settings, container, &error);
+    if (FAILED(hr)) {
+        Fail(L"couldn't create the container", hr, error);
+        return hr;
+    }
+    WslcProcessCallbacks callbacks = {};
+    callbacks.onStdOut = OnInitOutput;
+    callbacks.onStdErr = OnInitOutput;
+    callbacks.onExit = OnInitExit;
+    bool attached = SUCCEEDED(WslcSetContainerInitProcessIOCallbacks(*container, &callbacks, watch));
+    hr = WslcStartContainer(*container, attached ? WSLC_CONTAINER_START_FLAG_ATTACH : WSLC_CONTAINER_START_FLAG_NONE, &error);
+    if (FAILED(hr)) {
+        Fail(L"couldn't start the container", hr, error);
+        ExplainStopped(*container, watch);
+        return hr;
+    }
+    // A container that can't keep running stops within moments.
+    Sleep(1500);
+    WslcContainerState state = WSLC_CONTAINER_STATE_INVALID;
+    WslcGetContainerState(*container, &state);
+    bool exited;
+    {
+        std::lock_guard<std::mutex> guard(watch->lock);
+        exited = watch->exited;
+    }
+    if (state != WSLC_CONTAINER_STATE_RUNNING || exited) {
+        fwprintf(stderr, L"[pfx-render] error the container stopped as soon as it started (state %d)\n", (int)state);
+        ExplainStopped(*container, watch);
+        return E_FAIL;
+    }
+    return S_OK;
+}
+
 static int Run(const char* image, const std::vector<std::string>& command)
 {
     WslcSession session = nullptr;
@@ -345,9 +459,8 @@ static int Run(const char* image, const std::vector<std::string>& command)
     int result = EXIT_SETUP_FAILED;
     PWSTR error = nullptr;
     HRESULT hr;
-    std::vector<DriveMount> drives = Drives();
-    std::vector<WslcContainerVolume> volumes;
     std::vector<PCSTR> argv;
+    InitWatch watch;
 
     Status(L"starting the renderer");
     hr = OpenSession(&session);
@@ -356,43 +469,10 @@ static int Run(const char* image, const std::vector<std::string>& command)
     hr = EnsureImage(session, image);
     if (FAILED(hr))
         goto cleanup;
-
-    {
-        // The container's first process only keeps it running while the render runs.
-        WslcProcessSettings init;
-        WslcInitProcessSettings(&init);
-        PCSTR initArgv[] = { "/bin/sleep", "infinity" };
-        WslcSetProcessSettingsCmdLine(&init, initArgv, 2);
-
-        WslcContainerSettings settings;
-        WslcInitContainerSettings(image, &settings);
-        WslcSetContainerSettingsInitProcess(&settings, &init);
-        WslcSetContainerSettingsFlags(&settings, WSLC_CONTAINER_FLAG_AUTO_REMOVE);
-        for (auto& drive : drives) {
-            WslcContainerVolume volume = {};
-            volume.windowsPath = drive.windowsPath.c_str();
-            volume.containerPath = drive.containerPath.c_str();
-            volume.readOnly = FALSE;
-            volumes.push_back(volume);
-        }
-        if (!volumes.empty()) {
-            hr = WslcSetContainerSettingsVolumes(&settings, volumes.data(), (uint32_t)volumes.size());
-            if (FAILED(hr)) {
-                Fail(L"couldn't share the drives with the container", hr, nullptr);
-                goto cleanup;
-            }
-        }
-        hr = WslcCreateContainer(session, &settings, &container, &error);
-        if (FAILED(hr)) {
-            Fail(L"couldn't create the container", hr, error);
-            goto cleanup;
-        }
-        hr = WslcStartContainer(container, WSLC_CONTAINER_START_FLAG_NONE, &error);
-        if (FAILED(hr)) {
-            Fail(L"couldn't start the container", hr, error);
-            goto cleanup;
-        }
-    }
+    // The container's first process only keeps it running while the render runs.
+    hr = StartContainer(session, image, true, true, { "/bin/sleep", "infinity" }, &container, &watch);
+    if (FAILED(hr))
+        goto cleanup;
 
     {
         // The image's entrypoint sets up MoonRay's environment, then runs the command.
@@ -411,6 +491,7 @@ static int Run(const char* image, const std::vector<std::string>& command)
         hr = WslcCreateContainerProcess(container, &settings, &process, &error);
         if (FAILED(hr)) {
             Fail(L"couldn't run the renderer", hr, error);
+            ExplainStopped(container, &watch);
             goto cleanup;
         }
         HANDLE waits[2] = { exit.event, g_cancelled };
@@ -576,6 +657,74 @@ int wmain(int argc, wchar_t* argv[])
                 Status(L"installed");
             }
         }
+    } else if (first == L"--diagnose") {
+        // Tries containers a step at a time, to see which part stops them.
+        WslcSession session = nullptr;
+        result = EXIT_SETUP_FAILED;
+        if (SUCCEEDED(OpenSession(&session)) && SUCCEEDED(EnsureImage(session, image))) {
+            struct Try {
+                const wchar_t* what;
+                bool drives;
+                std::vector<PCSTR> init;
+            };
+            std::vector<Try> tries = {
+                { L"no drives shared, sleep infinity", false, { "/bin/sleep", "infinity" } },
+                { L"no drives shared, sleep 3600", false, { "/bin/sleep", "3600" } },
+                { L"drives shared, sleep infinity", true, { "/bin/sleep", "infinity" } },
+            };
+            int working = -1;
+            for (size_t i = 0; i < tries.size(); i++) {
+                fwprintf(stderr, L"[pfx-render] status try %zu: %s\n", i + 1, tries[i].what);
+                WslcContainer container = nullptr;
+                InitWatch watch;
+                HRESULT hr = StartContainer(session, image, tries[i].drives, false, tries[i].init, &container, &watch);
+                fwprintf(stderr, L"[pfx-render] status try %zu: %s\n", i + 1, SUCCEEDED(hr) ? L"keeps running" : L"stopped");
+                if (SUCCEEDED(hr) && working < 0)
+                    working = (int)i;
+                if (container) {
+                    WslcStopContainer(container, WSLC_SIGNAL_SIGTERM, 5, nullptr);
+                    WslcReleaseContainer(container);
+                }
+            }
+            if (working >= 0) {
+                // MoonRay itself, in the first kind of container that stayed up.
+                fwprintf(stderr, L"[pfx-render] status try 4: moonray -help in \"%s\"\n", tries[working].what);
+                WslcContainer container = nullptr;
+                InitWatch watch;
+                if (SUCCEEDED(StartContainer(session, image, tries[working].drives, false, tries[working].init, &container, &watch))) {
+                    WslcProcessSettings settings;
+                    WslcInitProcessSettings(&settings);
+                    PCSTR argv[] = { "/entrypoint.sh", "moonray", "-help" };
+                    WslcSetProcessSettingsCmdLine(&settings, argv, 3);
+                    Exit exit = { CreateEventW(nullptr, TRUE, FALSE, nullptr), -1 };
+                    WslcProcessCallbacks callbacks = {};
+                    callbacks.onStdOut = OnOutput;
+                    callbacks.onStdErr = OnOutput;
+                    callbacks.onExit = OnExit;
+                    WslcSetProcessSettingsCallbacks(&settings, &callbacks, &exit);
+                    WslcProcess process = nullptr;
+                    PWSTR error = nullptr;
+                    HRESULT hr = WslcCreateContainerProcess(container, &settings, &process, &error);
+                    if (SUCCEEDED(hr)) {
+                        WaitForSingleObject(exit.event, 60000);
+                        fwprintf(stderr, L"[pfx-render] status try 4: moonray exited with %d\n", exit.code);
+                        result = exit.code == 0 ? 0 : EXIT_SETUP_FAILED;
+                        WslcReleaseProcess(process);
+                    } else {
+                        Fail(L"try 4: couldn't run moonray", hr, error);
+                    }
+                    CloseHandle(exit.event);
+                }
+                if (container) {
+                    WslcStopContainer(container, WSLC_SIGNAL_SIGTERM, 5, nullptr);
+                    WslcReleaseContainer(container);
+                }
+            }
+        }
+        if (session) {
+            WslcTerminateSession(session);
+            WslcReleaseSession(session);
+        }
     } else if (first == L"--pull") {
         WslcSession session = nullptr;
         result = EXIT_SETUP_FAILED;
@@ -601,7 +750,7 @@ int wmain(int argc, wchar_t* argv[])
             result = Run(image, command);
         }
     } else {
-        fwprintf(stderr, L"usage: pfx-render.exe --check | --install | --pull | moonray <args> | hd_render <args>\n");
+        fwprintf(stderr, L"usage: pfx-render.exe --check | --install | --pull | --diagnose | moonray <args> | hd_render <args>\n");
         result = 2;
     }
 
