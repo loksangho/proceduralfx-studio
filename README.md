@@ -4,7 +4,7 @@
 
 <a href="https://buymeacoffee.com/sangstari"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=sangstari&button_colour=FFDD00&font_colour=000000&font_family=Inter&outline_colour=000000&coffee_colour=ffffff" height="40" alt="Buy me a coffee"></a>
 
-A node-based procedural 3D tool for macOS and Linux. You build geometry
+A node-based procedural 3D tool for macOS, Windows and Linux. You build geometry
 from networks of nodes, and the app includes:
 
 - modelling nodes and VEX wrangles;
@@ -20,10 +20,10 @@ Downloads are on the [Releases page](https://github.com/loksangho/proceduralfx-s
 |---|---|---|
 | macOS | [ProceduralFxStudio.dmg](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio.dmg) | Apple Silicon Mac, macOS 14 or later |
 | Linux | [ProceduralFxStudio-x86_64.flatpak](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-x86_64.flatpak) | x86_64 CPU with AVX2 (2013 or newer), Flatpak |
-| Windows | Use the Linux build under WSL 2 (see below) | Windows 11, or Windows 10 22H2 with the Store version of WSL |
+| Windows (preview) | [ProceduralFxStudio-windows-x64.zip](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-windows-x64.zip) | Windows 11 (x64) with virtualization turned on |
 
 Once installed, the app checks for new versions at startup and offers to update
-itself (**Help → Check for Updates…**).
+itself (**Help → Check for Updates…**). On Windows it links to the new download.
 
 ## macOS
 
@@ -56,43 +56,20 @@ The Linux build is a Flatpak bundle and runs on most distributions.
 
 To uninstall: `flatpak uninstall --user com.loksangho.proceduralfxstudio`.
 
-## Windows (WSL)
+## Windows
 
-On Windows, the Linux build runs inside WSL 2, and its window appears on your
-desktop.
+1. Download [ProceduralFxStudio-windows-x64.zip](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-windows-x64.zip) and unzip it anywhere.
+2. Run **ProceduralFX Studio.exe**. Keep the files in the folder together.
+3. To render, choose **Render → Set Up Rendering on Windows…** once.
 
-1. In **PowerShell as Administrator**, install Ubuntu, then restart if asked:
-   ```powershell
-   wsl --install -d Ubuntu-24.04
-   wsl --update
-   ```
-2. Open **Ubuntu** from the Start menu, create a user, then install Flatpak and the app:
-   ```sh
-   sudo apt update && sudo apt install -y flatpak
-   flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-   curl -LO https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-x86_64.flatpak
-   flatpak install --user ./ProceduralFxStudio-x86_64.flatpak
-   ```
-3. WSL needs two display settings. Set them once:
-   ```sh
-   flatpak override --user --nosocket=wayland --socket=x11 --env=GALLIUM_DRIVER=llvmpipe com.loksangho.proceduralfxstudio
-   ```
-4. Run it:
-   ```sh
-   flatpak run com.loksangho.proceduralfxstudio
-   ```
+MoonRay is a Linux program, so on Windows it runs in a small Linux container
+through WSL. The set-up window checks for WSL, then downloads MoonRay (about
+1.3 GB, once). If WSL isn't installed, the window installs it: Windows asks an
+administrator to approve that once, and a restart may be needed. Downloading
+and rendering never need administrator rights.
 
-The app can open files in your Linux home folder. To also reach your Windows
-drive (`C:`), run `flatpak override --user --filesystem=/mnt/c com.loksangho.proceduralfxstudio`.
-Files kept on the Linux side are much faster to work with.
-
-### WSL troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `MESA: error: ZINK: failed to choose pdev` | Harmless if the window opens. Otherwise make sure step 3 was run. |
-| `IO error: Broken pipe` at startup | WSLg's Wayland connection dropped. Step 3 switches the app to X11. |
-| Slow viewport | Step 3 uses software OpenGL, because WSL's GPU isn't reachable from Flatpak. MoonRay renders run on the CPU either way, so they're unaffected. |
+The Windows version is a preview. Binary USD (`.usdc`), OpenVDB and Alembic
+files aren't supported on it yet.
 
 ## Support
 

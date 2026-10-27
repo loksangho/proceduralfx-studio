@@ -129,3 +129,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ZIP }}
+          body_path: .github/release-notes/${{ github.ref_name }}.md
