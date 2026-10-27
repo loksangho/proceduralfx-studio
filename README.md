@@ -20,7 +20,7 @@ Downloads are on the [Releases page](https://github.com/loksangho/proceduralfx-s
 |---|---|---|
 | macOS | [ProceduralFxStudio.dmg](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio.dmg) | Apple Silicon Mac, macOS 14 or later |
 | Linux | [ProceduralFxStudio-x86_64.flatpak](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-x86_64.flatpak) | x86_64 CPU with AVX2 (2013 or newer), Flatpak |
-| Windows (preview) | [ProceduralFxStudio-windows-x64.zip](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-windows-x64.zip) | Windows 11 (x64) with virtualization turned on |
+| Windows | [ProceduralFxStudio-windows-x64.zip](https://github.com/loksangho/proceduralfx-studio/releases/latest/download/ProceduralFxStudio-windows-x64.zip) | Windows 11 (x64) with virtualization turned on |
 
 Once installed, the app checks for new versions at startup and offers to update
 itself (**Help → Check for Updates…**). On Windows it links to the new download.
@@ -68,8 +68,8 @@ through WSL. The set-up window checks for WSL, then downloads MoonRay (about
 administrator to approve that once, and a restart may be needed. Downloading
 and rendering never need administrator rights.
 
-The Windows version is a preview. Binary USD (`.usdc`), OpenVDB and Alembic
-files aren't supported on it yet.
+On Windows, binary USD (`.usdc`), OpenVDB and Alembic files aren't supported
+yet.
 
 ## Support
 
