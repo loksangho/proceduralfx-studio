@@ -6,6 +6,10 @@
 // small shell script swaps the bundles once the app has quit, then relaunches.
 // Flatpak: the release's `.flatpak` bundle is installed through the host's
 // flatpak (needs --talk-name=org.freedesktop.Flatpak), then the app relaunches.
+// Windows: the release's `-windows-x64.zip` is unpacked inside the app's folder and
+// its programs' Authenticode signatures are checked against the running app's
+// signer. On restart the running files are renamed aside (Windows allows that, not
+// overwriting them), the new ones moved in, and the leftovers removed next start.
 // Other builds (e.g. `cargo run`) only get a link to the release page.
 
 use eframe::egui;
@@ -44,6 +48,8 @@ pub struct Release {
 enum InstallKind {
     MacApp(PathBuf),
     Flatpak { user: bool },
+    // The folder unzipped from a Windows release (it has pfx-render.exe beside the app).
+    WindowsFolder(PathBuf),
     Unmanaged,
 }
 
@@ -61,6 +67,13 @@ impl InstallKind {
                 return InstallKind::MacApp(app);
             }
         }
+        if cfg!(windows) {
+            if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
+                if dir.join(crate::wslrender::HELPER).is_file() {
+                    return InstallKind::WindowsFolder(dir);
+                }
+            }
+        }
         InstallKind::Unmanaged
     }
 
@@ -71,6 +84,10 @@ impl InstallKind {
                 name.ends_with(".zip") && (name.contains("mac") || name == "proceduralfxstudio.zip")
             }),
             InstallKind::Flatpak { .. } => assets.iter().find(|a| a.name.ends_with(".flatpak") && a.name.contains("x86_64")),
+            InstallKind::WindowsFolder(_) => assets.iter().find(|a| {
+                let name = a.name.to_ascii_lowercase();
+                name.ends_with(".zip") && name.contains("windows")
+            }),
             InstallKind::Unmanaged => None,
         }
     }
@@ -281,6 +298,121 @@ fn flatpak_install(bundle: &Path, user: bool) -> Result<(), String> {
     })
 }
 
+const WINDOWS_APP: &str = "ProceduralFX Studio.exe";
+const WINDOWS_STAGING: &str = ".update";
+const WINDOWS_OLD: &str = ".old";
+
+fn windows_tool(name: &str) -> PathBuf {
+    // The system's own tar.exe and PowerShell, not others found first on PATH.
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    match name {
+        "powershell" => root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        _ => root.join("System32").join(format!("{name}.exe")),
+    }
+}
+
+// An exe's Authenticode status ("Valid", "NotSigned", ...) and signer.
+fn authenticode(exe: &Path) -> Result<(String, String), String> {
+    let mut cmd = Command::new(windows_tool("powershell"));
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$s = Get-AuthenticodeSignature -LiteralPath $env:PFX_SIGNED_FILE; \"$($s.Status)|$($s.SignerCertificate.Subject)\"",
+    ])
+    .env("PFX_SIGNED_FILE", exe);
+    crate::platform::no_window(&mut cmd);
+    let text = run(&mut cmd).map_err(|e| format!("Could not check the update's signature: {e}"))?;
+    let (status, signer) = text.trim().split_once('|').ok_or("Could not check the update's signature.")?;
+    Ok((status.to_owned(), signer.to_owned()))
+}
+
+// Unpacks the downloaded zip into the app folder's staging folder, and checks its
+// programs are signed by the same publisher as this copy (when this copy is
+// signed). Returns the folder holding the new files.
+fn stage_windows_update(zip: &Path, current: &Path) -> Result<PathBuf, String> {
+    let staging = current.join(WINDOWS_STAGING);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("Could not unpack the update in the app's folder: {e}"))?;
+    let mut tar = Command::new(windows_tool("tar"));
+    tar.arg("-xf").arg(zip).arg("-C").arg(&staging);
+    crate::platform::no_window(&mut tar);
+    run(&mut tar).map_err(|e| format!("Could not unpack the update: {e}"))?;
+    // The zip holds one folder ("ProceduralFX Studio"), or the files themselves.
+    let new = std::iter::once(staging.clone())
+        .chain(std::fs::read_dir(&staging).map_err(|e| e.to_string())?.filter_map(Result::ok).map(|e| e.path()))
+        .find(|dir| dir.join(WINDOWS_APP).is_file() && dir.join(crate::wslrender::HELPER).is_file())
+        .ok_or("The update doesn't contain the app.")?;
+    let (status, signer) = authenticode(&current.join(WINDOWS_APP))?;
+    if status == "Valid" {
+        for exe in [WINDOWS_APP, crate::wslrender::HELPER] {
+            match authenticode(&new.join(exe))? {
+                (s, _) if s != "Valid" => return Err(format!("The update's {exe} isn't validly signed ({s}).")),
+                (_, by) if by != signer => return Err("The update isn't signed by the same publisher as this app.".to_owned()),
+                _ => {}
+            }
+        }
+    }
+    Ok(new)
+}
+
+// Moves the staged files over the app's own: each existing one is renamed to
+// "<name>.old" first (a running program can be renamed but not replaced). Undoes
+// what it did if a move fails.
+fn swap_windows_files(current: &Path, new: &Path) -> Result<(), String> {
+    let mut done: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let undo = |done: &[(PathBuf, Option<PathBuf>)]| {
+        for (target, old) in done.iter().rev() {
+            let _ = std::fs::rename(target, new.join(target.file_name().unwrap_or_default()));
+            if let Some(old) = old {
+                let _ = std::fs::rename(old, target);
+            }
+        }
+    };
+    for entry in std::fs::read_dir(new).map_err(|e| e.to_string())?.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let target = current.join(&name);
+        let mut old = None;
+        if target.exists() {
+            let mut aside = name.clone();
+            aside.push(WINDOWS_OLD);
+            let aside = current.join(aside);
+            let _ = std::fs::remove_dir_all(&aside);
+            let _ = std::fs::remove_file(&aside);
+            if let Err(e) = std::fs::rename(&target, &aside) {
+                undo(&done);
+                return Err(format!("Could not replace {}: {e}", name.to_string_lossy()));
+            }
+            old = Some(aside);
+        }
+        if let Err(e) = std::fs::rename(entry.path(), &target) {
+            if let Some(old) = &old {
+                let _ = std::fs::rename(old, &target);
+            }
+            undo(&done);
+            return Err(format!("Could not install {}: {e}", name.to_string_lossy()));
+        }
+        done.push((target, old));
+    }
+    Ok(())
+}
+
+// Removes what a Windows update left behind: the renamed old files (no longer
+// running once the new app starts) and the staging folder.
+fn clean_windows_folder(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if name.ends_with(WINDOWS_OLD) || name == WINDOWS_STAGING {
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 fn writable(dir: &Path) -> bool {
     let probe = dir.join(".pfx-write-test");
     let ok = std::fs::write(&probe, b"").is_ok();
@@ -291,7 +423,8 @@ fn writable(dir: &Path) -> bool {
 enum Msg {
     Checked(Result<Release, String>),
     Progress(u64, u64),
-    // The update is ready: a staged .app (macOS) or nothing more to do (Flatpak).
+    // The update is ready: a staged .app (macOS) or folder (Windows), or nothing
+    // more to do (Flatpak).
     Prepared(Result<Option<PathBuf>, String>),
 }
 
@@ -376,12 +509,16 @@ pub struct Updater {
 
 impl Updater {
     pub fn new() -> Self {
+        let install = InstallKind::detect();
+        if let InstallKind::WindowsFolder(dir) = &install {
+            clean_windows_folder(dir);
+        }
         Self {
             state: State::Idle,
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
             prefs: Prefs::load(),
-            install: InstallKind::detect(),
+            install,
             open: false,
             manual: false,
             started: false,
@@ -422,6 +559,16 @@ impl Updater {
                 return;
             }
         }
+        if let InstallKind::WindowsFolder(dir) = &self.install {
+            if !writable(dir) {
+                self.state = State::Failed(format!(
+                    "This copy of the app is in a folder it can't change ({}). Move the folder somewhere of your own, \
+                     such as Documents, run it from there, and try again.",
+                    dir.display()
+                ));
+                return;
+            }
+        }
         self.cancel.store(false, Ordering::Relaxed);
         let cancel = self.cancel.clone();
         let install = self.install.clone();
@@ -434,6 +581,7 @@ impl Updater {
                 let staged = match &install {
                     InstallKind::MacApp(app) => stage_mac_update(&dest, app).map(Some),
                     InstallKind::Flatpak { user } => flatpak_install(&dest, *user).map(|()| None),
+                    InstallKind::WindowsFolder(dir) => stage_windows_update(&dest, dir).map(Some),
                     InstallKind::Unmanaged => Err("This copy can't update itself.".to_owned()),
                 };
                 let _ = std::fs::remove_file(&dest);
@@ -445,7 +593,7 @@ impl Updater {
         self.rx = Some(rx);
     }
 
-    // Swaps in the staged app (macOS) or relaunches (Flatpak), then quits.
+    // Swaps in the staged app (macOS, Windows) or relaunches (Flatpak), then quits.
     fn restart(&mut self, ctx: &egui::Context) {
         let State::Ready { staged, .. } = &self.state else { return };
         let launched = match (&self.install, staged) {
@@ -468,14 +616,20 @@ impl Updater {
                     .stderr(Stdio::null())
                     .spawn()
                     .map(|_| ())
+                    .map_err(|e| e.to_string())
             }
+            (InstallKind::WindowsFolder(dir), Some(new)) => swap_windows_files(dir, new).and_then(|()| {
+                let _ = std::fs::remove_dir_all(dir.join(WINDOWS_STAGING));
+                Command::new(dir.join(WINDOWS_APP)).current_dir(dir).spawn().map(|_| ()).map_err(|e| e.to_string())
+            }),
             (InstallKind::Flatpak { .. }, _) => Command::new("flatpak-spawn")
                 .args(["--host", "flatpak", "run", FLATPAK_ID])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map(|_| ()),
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
             _ => return,
         };
         match launched {
@@ -747,6 +901,41 @@ mod tests {
         assert_eq!(names, ["ProceduralFxStudio.zip", "ProceduralFxStudio-x86_64.flatpak"]);
         assert_eq!(assets[0].url, format!("https://github.com/{REPO}/releases/download/v0.7.0/ProceduralFxStudio.zip"));
         assert!(assets.iter().all(|a| a.sha256.is_none()));
+    }
+
+    #[test]
+    fn windows_update_swaps_files_and_cleans_up() {
+        let assets = [
+            Asset { name: "ProceduralFxStudio.zip".into(), url: String::new(), size: 0, sha256: None },
+            Asset { name: "ProceduralFxStudio-windows-x64.zip".into(), url: String::new(), size: 0, sha256: None },
+        ];
+        let windows = InstallKind::WindowsFolder(PathBuf::from(r"C:\Apps\ProceduralFX Studio"));
+        assert_eq!(windows.pick_asset(&assets).unwrap().name, "ProceduralFxStudio-windows-x64.zip");
+        let mac = InstallKind::MacApp(PathBuf::from("/Applications/ProceduralFxStudio.app"));
+        assert_eq!(mac.pick_asset(&assets).unwrap().name, "ProceduralFxStudio.zip");
+
+        let dir = std::env::temp_dir().join(format!("pfx-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let new = dir.join(WINDOWS_STAGING).join("ProceduralFX Studio");
+        std::fs::create_dir_all(dir.join("licenses")).unwrap();
+        std::fs::create_dir_all(new.join("licenses")).unwrap();
+        std::fs::write(dir.join(WINDOWS_APP), "old").unwrap();
+        std::fs::write(dir.join("licenses/a.txt"), "old").unwrap();
+        std::fs::write(new.join(WINDOWS_APP), "new").unwrap();
+        std::fs::write(new.join("README.txt"), "new").unwrap();
+        std::fs::write(new.join("licenses/a.txt"), "new").unwrap();
+
+        swap_windows_files(&dir, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(WINDOWS_APP)).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("README.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("licenses/a.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join(format!("{WINDOWS_APP}{WINDOWS_OLD}"))).unwrap(), "old");
+
+        clean_windows_folder(&dir);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [WINDOWS_APP, "README.txt", "licenses"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
