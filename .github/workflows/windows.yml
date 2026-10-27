@@ -73,7 +73,7 @@ jobs:
             exit 1
           fi
           7z x -y -owin-deps pfx-windows-deps.zip > /dev/null
-          echo "PFX_WIN_DEPS=$PWD/win-deps" >> "$GITHUB_ENV"
+          echo "PFX_WIN_DEPS=$(cygpath -w "$PWD/win-deps")" >> "$GITHUB_ENV"
 
       - name: Build the app
         shell: pwsh
