@@ -91,7 +91,9 @@ jobs:
         shell: bash
         run: |
           [ -f build.log ] || exit 0
-          grep -n -E "error|cannot open|unresolved|LNK[0-9]|fatal" build.log | grep -v -E "^[0-9]+:\s*Compiling" | head -120 > errors.txt || true
+          # Everything from the first error on, minus progress lines; compiler errors
+          # inside a build script come through as its "warning:" output.
+          awk '/^error|error C[0-9]|error LNK|fatal error/ { on = 1 } on' build.log | grep -v -E "^\s*(Compiling|Downloaded|Building)" | grep -v -E "C4[0-9]{3}:" | head -150 > errors.txt || true
           split -b 3500 errors.txt chunk-
           for f in $(ls chunk-* 2>/dev/null | head -8); do
             echo "::error title=Build errors ($f)::$(sed 's/%/%25/g' "$f" | sed ':a;N;$!ba;s/\r//g;s/\n/%0A/g')"
