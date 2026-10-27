@@ -82,7 +82,20 @@ jobs:
           $env:USD_ROOT = $env:PFX_WIN_DEPS
           $env:OPENVDB_ROOT = $env:PFX_WIN_DEPS
           $env:ALEMBIC_ROOT = $env:PFX_WIN_DEPS
-          cargo build --release --features native-usd,native-openvdb,native-alembic
+          cargo build --release --features native-usd,native-openvdb,native-alembic 2>&1 | Tee-Object build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Build logs need a GitHub login to read; annotations don't, so copy the errors there.
+      - name: Report build errors
+        if: failure()
+        shell: bash
+        run: |
+          [ -f build.log ] || exit 0
+          grep -n -E "error|cannot open|unresolved|LNK[0-9]|fatal" build.log | grep -v -E "^[0-9]+:\s*Compiling" | head -120 > errors.txt || true
+          split -b 3500 errors.txt chunk-
+          for f in $(ls chunk-* 2>/dev/null | head -8); do
+            echo "::error title=Build errors ($f)::$(sed 's/%/%25/g' "$f" | sed ':a;N;$!ba;s/\r//g;s/\n/%0A/g')"
+          done
 
       # The WSL Containers SDK (MIT, from NuGet): header, import library and wslcsdk.dll.
       - name: Get the WSL Containers SDK
