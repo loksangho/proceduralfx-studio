@@ -1,0 +1,91 @@
+name: Windows libraries
+
+# Builds the C++ libraries the Windows app links (OpenUSD, OpenVDB, Alembic and
+# what they need) once, with vcpkg, from packaging/windows/deps/vcpkg.json. The
+# result is a zip on a pre-release tagged windows-deps-<hash of vcpkg.json>, which
+# the Windows workflow downloads, so app builds and releases never compile them.
+#
+# Runs again only when vcpkg.json changes (or by hand), and does nothing if that
+# version's zip already exists. Finishing starts the Windows workflow on main.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/windows/deps/**'
+      - '.github/workflows/windows-deps.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ZIP: pfx-windows-deps.zip
+  TRIPLET: x64-windows-release
+
+jobs:
+  deps:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Which version
+        id: key
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          key=$(sha256sum packaging/windows/deps/vcpkg.json | cut -c1-12)
+          echo "tag=windows-deps-$key" >> "$GITHUB_OUTPUT"
+          echo "baseline=$(sed -n 's/.*"builtin-baseline": *"\([0-9a-f]*\)".*/\1/p' packaging/windows/deps/vcpkg.json)" >> "$GITHUB_OUTPUT"
+          if gh release view "windows-deps-$key" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ZIP"; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo "windows-deps-$key is already built"
+          fi
+
+      - name: Get vcpkg
+        if: steps.key.outputs.built != 'true'
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          git -C "$RUNNER_TEMP/vcpkg" checkout ${{ steps.key.outputs.baseline }}
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Build the libraries
+        if: steps.key.outputs.built != 'true'
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/vcpkg/vcpkg.exe" install --triplet $env:TRIPLET `
+            --x-manifest-root=packaging/windows/deps --x-install-root="$PWD/vcpkg-installed" --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Show the build logs
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem "$env:RUNNER_TEMP/vcpkg/buildtrees" -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'out|err|config' } | Sort-Object LastWriteTime | Select-Object -Last 6 |
+            ForEach-Object { "==== $($_.FullName)"; Get-Content $_.FullName -Tail 60 }
+
+      - name: Zip
+        if: steps.key.outputs.built != 'true'
+        shell: pwsh
+        run: |
+          $root = "vcpkg-installed/$env:TRIPLET"
+          Get-ChildItem "$root/bin" -Filter *.dll | Measure-Object -Property Length -Sum | ForEach-Object { "$($_.Count) DLLs, $([math]::Round($_.Sum / 1MB)) MB" }
+          Push-Location $root
+          $dirs = @('include', 'lib', 'bin', 'share', 'plugin') | Where-Object { Test-Path $_ }
+          7z a -tzip -mx=7 "$env:GITHUB_WORKSPACE/$env:ZIP" @dirs '-xr!*.pdb' | Select-Object -Last 3
+          Pop-Location
+
+      - name: Publish
+        if: steps.key.outputs.built != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.key.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Windows build libraries (${{ steps.key.outputs.tag }})
+          body: C++ libraries the Windows build links (OpenUSD, OpenVDB, Alembic), built once by the "Windows libraries" workflow. Not an app release.
+          prerelease: true
+          files: ${{ env.ZIP }}

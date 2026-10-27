@@ -280,14 +280,15 @@ int pfx_usd_export(const char *usda, const char *path, char **error) {
             set_error(error, "USD rejected the generated scene description");
             return 0;
         }
-        std::filesystem::path target(path);
+        // u8path: the path is UTF-8 (Windows would read a plain char path in the ANSI code page).
+        std::filesystem::path target = std::filesystem::u8path(path);
         if (target.extension() == ".usdz") {
-            std::filesystem::path crate = std::filesystem::temp_directory_path() / (target.stem().string() + "_pfx.usdc");
-            if (!layer->Export(crate.string())) {
+            std::filesystem::path crate = std::filesystem::temp_directory_path() / (target.stem().u8string() + "_pfx.usdc");
+            if (!layer->Export(crate.u8string())) {
                 set_error(error, "could not write the temporary .usdc for the .usdz package");
                 return 0;
             }
-            bool packaged = UsdUtilsCreateNewUsdzPackage(SdfAssetPath(crate.string()), target.string());
+            bool packaged = UsdUtilsCreateNewUsdzPackage(SdfAssetPath(crate.u8string()), target.u8string());
             std::filesystem::remove(crate);
             if (!packaged) {
                 set_error(error, std::string("could not create ") + path);
@@ -295,7 +296,7 @@ int pfx_usd_export(const char *usda, const char *path, char **error) {
             }
             return 1;
         }
-        if (!layer->Export(target.string())) {
+        if (!layer->Export(target.u8string())) {
             set_error(error, std::string("could not write ") + path);
             return 0;
         }

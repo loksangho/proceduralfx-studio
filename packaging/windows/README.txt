@@ -1,11 +1,12 @@
 ProceduralFX Studio for Windows
 ===============================
 
-Run "ProceduralFX Studio.exe". Keep the three files in this folder together:
+Run "ProceduralFX Studio.exe". Keep everything in this folder together:
 
   ProceduralFX Studio.exe   the app
   pfx-render.exe            runs MoonRay for the app (see Rendering)
   wslcsdk.dll               Microsoft's WSL Containers SDK, which pfx-render.exe uses
+  the other .dll files, usd OpenUSD, OpenVDB and Alembic, for USD, .vdb and .abc files
 
 Rendering
 ---------
@@ -30,13 +31,15 @@ settings. Rendering uses up to three quarters of your memory and all your CPU co
 The WSL Containers SDK is a preview from Microsoft, so a WSL update can occasionally
 break rendering until the app catches up.
 
-Not yet on Windows: binary USD (.usdc), OpenVDB (.vdb) and Alembic (.abc) files.
 Rendering through Hydra is untested on Windows so far.
 
 Licences
 --------
 MoonRay (OpenMoonRay) is Apache-2.0, by DreamWorks Animation. The WSL Containers SDK is
-MIT, by Microsoft (its notices are in licenses\). pfx-render.exe is based on
+MIT, by Microsoft (its notices are in licenses\). OpenUSD (Tomorrow Open Source
+Technology License, by Pixar), OpenVDB (Apache-2.0), Alembic (BSD-3-Clause) and the
+libraries they use are built with vcpkg; their licences are in licenses\libraries\.
+pfx-render.exe is based on
 Microsoft's WSLC MoonRay sample (MIT). The test geometry's sources are in
 licenses\test-geometry.md.
 

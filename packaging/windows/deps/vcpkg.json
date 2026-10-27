@@ -1,0 +1,11 @@
+{
+  "name": "pfx-windows-deps",
+  "version": "1.0.0",
+  "description": "C++ libraries the Windows app links: OpenUSD (no imaging or Python), OpenVDB and Alembic. Built once by .github/workflows/windows-deps.yml.",
+  "builtin-baseline": "5363acb796e576328288fae60c25304e227e9839",
+  "dependencies": [
+    { "name": "usd", "default-features": false },
+    { "name": "openvdb", "default-features": false },
+    { "name": "alembic", "default-features": false }
+  ]
+}

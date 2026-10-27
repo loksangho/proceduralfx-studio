@@ -12,6 +12,9 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_NATIVE_ALEMBIC").is_some() {
         build_alembic_bridge();
     }
+    if msvc() && ["USD", "ALEMBIC", "OPENVDB"].iter().any(|f| std::env::var_os(format!("CARGO_FEATURE_NATIVE_{f}")).is_some()) {
+        link_windows_libraries();
+    }
     if std::env::var_os("CARGO_FEATURE_NATIVE_OPENVDB").is_none() {
         return;
     }
@@ -19,6 +22,12 @@ fn main() {
     let mut build = cc::Build::new();
     build.cpp(true).file("native/openvdb_bridge.cpp");
     build.flag_if_supported("-std=c++17");
+    if msvc() {
+        let root = windows_root("OPENVDB_ROOT", "include/openvdb/openvdb.h");
+        msvc_flags(&mut build).include(root.join("include")).define("OPENVDB_DLL", None);
+        build.compile("proceduralfx_studio_openvdb");
+        return;
+    }
 
     let tbb = pkg_config::Config::new().probe("tbb").unwrap_or_else(|error| {
         panic!(
@@ -80,6 +89,12 @@ fn main() {
 // OpenUSD for the STAGE context. USD_ROOT is an OpenUSD install (include/, lib/);
 // its headers need the Python headers USD was built against (USD_PYTHON_INCLUDE).
 fn build_usd_bridge() {
+    if msvc() {
+        // No Python in the Windows build of USD; its libraries are linked with the rest.
+        let root = windows_root("USD_ROOT", "include/pxr/pxr.h");
+        msvc_flags(cc::Build::new().cpp(true).file("native/usd_bridge.cpp")).include(root.join("include")).compile("proceduralfx_studio_usd");
+        return;
+    }
     let root = std::path::PathBuf::from(
         std::env::var_os("USD_ROOT").unwrap_or_else(|| "/Users/loksangho/openusd-build".into()),
     );
@@ -140,6 +155,16 @@ fn build_usd_bridge() {
 // Alembic for .abc import and export. ALEMBIC_ROOT is an install (include/Alembic,
 // lib/libAlembic) that also has Imath, e.g. the macOS 14 prefix or the Flatpak's /app.
 fn build_alembic_bridge() {
+    if msvc() {
+        let root = windows_root("ALEMBIC_ROOT", "include/Alembic/AbcGeom/All.h");
+        let include = root.join("include");
+        msvc_flags(cc::Build::new().cpp(true).file("native/abc_bridge.cpp"))
+            .include(&include)
+            .include(include.join("Imath"))
+            .define("ALEMBIC_DLL", None)
+            .compile("proceduralfx_studio_abc");
+        return;
+    }
     let root = std::path::PathBuf::from(std::env::var_os("ALEMBIC_ROOT").or_else(|| std::env::var_os("USD_ROOT")).unwrap_or_else(|| "/usr/local".into()));
     let (include, lib) = (root.join("include"), root.join("lib"));
     if !include.join("Alembic/AbcGeom/All.h").exists() {
@@ -157,6 +182,56 @@ fn build_alembic_bridge() {
     println!("cargo:rustc-link-lib=static=Alembic");
     println!("cargo:rustc-link-lib=dylib=Imath");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+}
+
+// Windows (MSVC): USD, OpenVDB and Alembic come from one vcpkg install
+// (packaging/windows/deps, built by the "Windows libraries" workflow), as DLLs.
+fn msvc() -> bool {
+    std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+}
+
+// The vcpkg install a feature's *_ROOT names, checked for one of its headers.
+fn windows_root(variable: &str, header: &str) -> std::path::PathBuf {
+    println!("cargo:rerun-if-env-changed={variable}");
+    let root = std::path::PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| panic!("set {variable} to the Windows libraries' folder (pfx-windows-deps.zip, unpacked)")));
+    if !root.join(header).is_file() {
+        panic!("{variable} has no {header}: {}", root.display());
+    }
+    root
+}
+
+fn msvc_flags(build: &mut cc::Build) -> &mut cc::Build {
+    build
+        .flag("/std:c++17")
+        .flag("/bigobj")
+        .flag("/Zc:__cplusplus")
+        .flag("/utf-8")
+        .flag("/wd4244")
+        .flag("/wd4267")
+        .flag("/wd4996")
+        .define("NOMINMAX", None)
+        .define("_USE_MATH_DEFINES", None)
+        .define("BOOST_ALL_NO_LIB", None)
+        .define("BOOST_ALL_DYN_LINK", None)
+}
+
+// Every import library in the install: the linker only keeps the DLLs the bridges
+// actually use, so this saves listing each one's (versioned) name.
+fn link_windows_libraries() {
+    let root = ["USD_ROOT", "OPENVDB_ROOT", "ALEMBIC_ROOT"].iter().find_map(std::env::var_os).map(std::path::PathBuf::from).expect("set USD_ROOT, OPENVDB_ROOT or ALEMBIC_ROOT");
+    let lib = root.join("lib");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    let mut names: Vec<String> = std::fs::read_dir(&lib)
+        .unwrap_or_else(|e| panic!("no lib folder in {}: {e}", root.display()))
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".lib").map(str::to_owned))
+        // tbbmalloc_proxy would replace malloc if anything pulled it in.
+        .filter(|name| !name.starts_with("tbbmalloc_proxy"))
+        .collect();
+    names.sort();
+    for name in names {
+        println!("cargo:rustc-link-lib=dylib={name}");
+    }
 }
 
 // The Windows app's icon and file details.

@@ -2,6 +2,8 @@ name: Windows
 
 # Builds the Windows version: the app, pfx-render.exe (MoonRay through WSL containers,
 # packaging/windows/render) and the WSL Containers SDK's wslcsdk.dll, in one zip.
+# The app links OpenUSD, OpenVDB and Alembic from the zip the "Windows libraries"
+# workflow built once (windows-deps.yml); their DLLs ship next to the app.
 # Only releases (v* tags) are signed, with SSL.com eSigner (secrets ES_USERNAME,
 # ES_PASSWORD, ES_CREDENTIAL_ID, ES_TOTP_SECRET); test builds are unsigned unless a
 # manual run ticks "Sign".
@@ -21,6 +23,10 @@ on:
       - 'packaging/windows/render/**'
       - 'packaging/windows/README.txt'
       - '.github/workflows/windows.yml'
+  # After the libraries are (re)built.
+  workflow_run:
+    workflows: ['Windows libraries']
+    types: [completed]
   workflow_dispatch:
     inputs:
       sign:
@@ -41,6 +47,7 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
 
@@ -54,10 +61,28 @@ jobs:
             exit 1
           fi
 
+      # OpenUSD, OpenVDB and Alembic, built once by windows-deps.yml for this vcpkg.json.
+      - name: Get the Windows libraries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="windows-deps-$(sha256sum packaging/windows/deps/vcpkg.json | cut -c1-12)"
+          if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" -p pfx-windows-deps.zip; then
+            echo "::error::The Windows libraries for this vcpkg.json ($tag) aren't built yet. Run the \"Windows libraries\" workflow; this one runs again when it finishes."
+            exit 1
+          fi
+          7z x -y -owin-deps pfx-windows-deps.zip > /dev/null
+          echo "PFX_WIN_DEPS=$PWD/win-deps" >> "$GITHUB_ENV"
+
       - name: Build the app
+        shell: pwsh
         run: |
           rustup default stable
-          cargo build --release
+          $env:USD_ROOT = $env:PFX_WIN_DEPS
+          $env:OPENVDB_ROOT = $env:PFX_WIN_DEPS
+          $env:ALEMBIC_ROOT = $env:PFX_WIN_DEPS
+          cargo build --release --features native-usd,native-openvdb,native-alembic
 
       # The WSL Containers SDK (MIT, from NuGet): header, import library and wslcsdk.dll.
       - name: Get the WSL Containers SDK
@@ -86,6 +111,30 @@ jobs:
           Copy-Item wslc-sdk/NOTICE.txt "$out/licenses/WSL-Containers-SDK-NOTICE.txt"
           Copy-Item assets/testgeo/README.md "$out/licenses/test-geometry.md"
           Copy-Item packaging/windows/README.txt "$out/README.txt"
+          # The libraries' DLLs beside the app (Windows looks there first), and USD's
+          # plugin registry (bin/usd/plugInfo.json), which USD finds next to its DLLs.
+          Copy-Item "$env:PFX_WIN_DEPS/bin/*.dll" $out
+          Copy-Item -Recurse "$env:PFX_WIN_DEPS/bin/usd" "$out/usd"
+          if (Test-Path "$env:PFX_WIN_DEPS/plugin/usd") {
+            New-Item -ItemType Directory -Force "$out/plugin" | Out-Null
+            Copy-Item -Recurse "$env:PFX_WIN_DEPS/plugin/usd" "$out/plugin/usd"
+          }
+          # Each library's licence, as vcpkg recorded it.
+          New-Item -ItemType Directory -Force "$out/licenses/libraries" | Out-Null
+          Get-ChildItem "$env:PFX_WIN_DEPS/share" -Directory | ForEach-Object {
+            $copyright = Join-Path $_.FullName copyright
+            if (Test-Path $copyright) { Copy-Item $copyright "$out/licenses/libraries/$($_.Name).txt" }
+          }
+          Get-ChildItem $out -Filter *.dll | Measure-Object -Property Length -Sum | ForEach-Object { "$($_.Count) DLLs, $([math]::Round($_.Sum / 1MB)) MB" }
+
+      # The packaged app loads USD's DLLs and plugins: list a small stage's prims.
+      - name: Check USD works in the packaged app
+        shell: pwsh
+        run: |
+          Set-Content smoke.usda "#usda 1.0`ndef Xform `"World`" {`n  def Sphere `"Ball`" {}`n}"
+          $text = & "dist-windows/ProceduralFX Studio/ProceduralFX Studio.exe" --usd-info smoke.usda 2>&1 | Out-String
+          $text
+          if ($text -notmatch '/World/Ball Sphere') { throw "USD didn't load in the packaged app" }
 
       - name: Sign
         if: env.CAN_SIGN == 'true'

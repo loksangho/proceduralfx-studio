@@ -18328,6 +18328,18 @@ impl eframe::App for ProceduralFxStudioApp {
 }
 
 fn main() -> eframe::Result<()> {
+    // Windows: USD finds its own plugins in usd\ beside its DLLs, but not the plugin
+    // libraries in plugin\usd, which the app ships next to itself.
+    if cfg!(windows) {
+        if let Some(plugins) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("plugin").join("usd"))).filter(|dir| dir.is_dir()) {
+            let mut path = plugins.into_os_string();
+            if let Some(existing) = std::env::var_os("PXR_PLUGINPATH_NAME").filter(|p| !p.is_empty()) {
+                path.push(";");
+                path.push(existing);
+            }
+            std::env::set_var("PXR_PLUGINPATH_NAME", path);
+        }
+    }
     // `--usd-info <file>` lists a USD file's prims and exits (checks USD works in a packaged app).
     let args: Vec<String> = std::env::args().collect();
     if let Some(at) = args.iter().position(|a| a == "--usd-info") {
