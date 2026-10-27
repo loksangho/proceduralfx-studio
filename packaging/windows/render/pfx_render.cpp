@@ -26,6 +26,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <objbase.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <stdio.h>
 
@@ -450,6 +451,67 @@ static void Missing(WslcComponentFlags missing)
         Status(L"missing: an up-to-date WSL");
 }
 
+// Whether this program runs with administrator rights (installing WSL needs them).
+static bool IsElevated()
+{
+    HANDLE token = nullptr;
+    TOKEN_ELEVATION elevation = {};
+    DWORD size = 0;
+    bool elevated = false;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
+        CloseHandle(token);
+    }
+    return elevated;
+}
+
+// Installs as an administrator: runs a second copy of this program through Windows'
+// "run as administrator" request (the usual approval prompt), which writes what it
+// did to a log; that's passed on here. Its exit code is returned.
+static int InstallElevated()
+{
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    std::wstring log = std::wstring(temp) + L"pfx-render-install-" + std::to_wstring(GetCurrentProcessId()) + L".log";
+    std::wstring parameters = L"--install --log \"" + log + L"\"";
+    Status(L"asking Windows for administrator approval");
+
+    SHELLEXECUTEINFOW run = { sizeof(run) };
+    run.fMask = SEE_MASK_NOCLOSEPROCESS;
+    run.lpVerb = L"runas";
+    run.lpFile = exe;
+    run.lpParameters = parameters.c_str();
+    run.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&run)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_CANCELLED) {
+            fwprintf(stderr, L"[pfx-render] error installing needs administrator approval, which wasn't given. An administrator can run this once instead: %s\n", ADMIN_COMMAND);
+            fflush(stderr);
+            return EXIT_NEEDS_ADMIN;
+        }
+        Fail(L"couldn't ask for administrator approval", HRESULT_FROM_WIN32(error), nullptr);
+        return EXIT_SETUP_FAILED;
+    }
+    WaitForSingleObject(run.hProcess, INFINITE);
+    DWORD code = EXIT_SETUP_FAILED;
+    GetExitCodeProcess(run.hProcess, &code);
+    CloseHandle(run.hProcess);
+
+    // What the administrator copy reported.
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, log.c_str(), L"r") == 0 && file) {
+        char line[2048];
+        while (fgets(line, sizeof(line), file))
+            fputs(line, stderr);
+        fclose(file);
+        DeleteFileW(log.c_str());
+    }
+    fflush(stderr);
+    return (int)code;
+}
+
 static void CALLBACK OnInstall(WslcComponentFlags component, uint32_t step, uint32_t steps, PVOID)
 {
     fwprintf(stderr, L"[pfx-render] install %u %u %s\n", step, steps,
@@ -487,8 +549,16 @@ int wmain(int argc, wchar_t* argv[])
             fwprintf(stderr, L"[pfx-render] status ready (WSL containers %u.%u.%u; image %hs)\n", version.major, version.minor, version.revision, image);
         }
     } else if (first == L"--install") {
+        // The administrator copy (see InstallElevated) writes its messages to a log.
+        if (argc > 3 && std::wstring(argv[2]) == L"--log") {
+            FILE* redirected = nullptr;
+            _wfreopen_s(&redirected, argv[3], L"w", stderr);
+        }
         if (SUCCEEDED(ready) && missing == WSLC_COMPONENT_FLAG_NONE) {
             Status(L"already installed");
+        } else if (!IsElevated()) {
+            Missing(missing);
+            result = InstallElevated();
         } else {
             Missing(missing);
             HRESULT hr = WslcInstallWithDependencies(missing, WSLC_INSTALL_OPTION_NONE, OnInstall, nullptr);
