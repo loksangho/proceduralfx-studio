@@ -210,6 +210,8 @@ fn msvc_flags(build: &mut cc::Build) -> &mut cc::Build {
         .flag("/wd4267")
         .flag("/wd4996")
         .define("NOMINMAX", None)
+        // Imath is a DLL: its half-float tables are imported data.
+        .define("IMATH_DLL", None)
         .define("_USE_MATH_DEFINES", None)
         .define("BOOST_ALL_NO_LIB", None)
         .define("BOOST_ALL_DYN_LINK", None)
