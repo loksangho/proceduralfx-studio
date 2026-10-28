@@ -18375,11 +18375,31 @@ fn main() -> eframe::Result<()> {
         })),
         ..Default::default()
     };
-    eframe::run_native(
-        "ProceduralFX Studio",
-        options,
-        Box::new(|_cc| Ok(Box::new(ProceduralFxStudioApp::default()))),
-    )
+    // wgpu (Metal, DirectX 12, Vulkan) unless PFX_RENDERER=opengl. If wgpu can't
+    // start (no usable GPU or driver) before the app opens, run again with OpenGL.
+    let opengl = std::env::var("PFX_RENDERER").is_ok_and(|r| r.eq_ignore_ascii_case("opengl"));
+    let opened = Arc::new(AtomicBool::new(false));
+    let run = |renderer: eframe::Renderer, options: eframe::NativeOptions| {
+        let opened = opened.clone();
+        eframe::run_native(
+            "ProceduralFX Studio",
+            eframe::NativeOptions { renderer, ..options },
+            Box::new(move |_cc| {
+                opened.store(true, Ordering::SeqCst);
+                Ok(Box::new(ProceduralFxStudioApp::default()))
+            }),
+        )
+    };
+    if opengl {
+        return run(eframe::Renderer::Glow, options);
+    }
+    match run(eframe::Renderer::Wgpu, options.clone()) {
+        Err(eframe::Error::Wgpu(error)) if !opened.load(Ordering::SeqCst) => {
+            eprintln!("wgpu couldn't start ({error}); using OpenGL");
+            run(eframe::Renderer::Glow, options)
+        }
+        result => result,
+    }
 }
 
 #[cfg(test)]

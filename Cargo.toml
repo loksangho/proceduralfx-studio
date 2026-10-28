@@ -4,7 +4,8 @@ version = "0.13.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.33" # The egui UI framework
+# The egui UI framework. Draws with wgpu (Bevy's GPU layer), falling back to OpenGL (glow).
+eframe = { version = "0.33", features = ["wgpu"] }
 rfd = "0.9"
 image = "0.25"
 # Tiled, mip-mapped EXR textures for MoonRay (already used by image).
