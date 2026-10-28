@@ -17427,6 +17427,52 @@ impl ProceduralFxStudioApp {
         }
         // Surfaces and wireframe go through a depth buffer (gpu_viewport.rs, else
         // raster.rs), at the screen's pixel density, then onto the viewport as one image.
+        let view_display = self.view_displays().first().copied();
+        // Geometry containers display their inner display node's kind.
+        let view_display_node = view_display.and_then(|id| match self.graph.nodes.get(&id).map(|n| &n.kind) {
+            Some(NodeKind::Geometry { .. }) => self.graph.display_of(id),
+            _ => Some(id),
+        });
+        let particle_display = view_display_node
+            .and_then(|id| self.graph.nodes.get(&id))
+            .is_some_and(|node| matches!(
+                node.kind,
+                NodeKind::Add { .. }
+                    | NodeKind::Particles { .. }
+                        | NodeKind::Flip { .. }
+                    | NodeKind::WhitewaterSolver(_)
+                    | NodeKind::Cache { .. }
+            ));
+        let point_color = view_display_node
+            .and_then(|id| self.graph.nodes.get(&id))
+            .map(|node| match node.kind {
+                NodeKind::Flip { .. } => egui::Color32::from_rgb(70, 180, 255),
+                _ => egui::Color32::from_rgb(255, 170, 45),
+            })
+            .unwrap_or(egui::Color32::from_rgb(255, 220, 80));
+        let point_attribute_color = |index: usize| -> egui::Color32 {
+            cd_color(index).unwrap_or(point_color)
+        };
+        let mut referenced = vec![false; projected.len()];
+        for tri in &mesh.indices {
+            for &vertex in tri {
+                if let Some(is_referenced) = referenced.get_mut(vertex) {
+                    *is_referenced = true;
+                }
+            }
+        }
+        // Hair and other curves (see groom.rs) are drawn as lines, not loose points.
+        let curve_ranges = groom::curves(mesh);
+        for range in &curve_ranges {
+            for i in range.clone() {
+                if let Some(is_referenced) = referenced.get_mut(i) {
+                    *is_referenced = true;
+                }
+            }
+        }
+        let has_unreferenced_points = !kinefx::Skeleton::is_skeleton(mesh) && referenced.iter().any(|&is_referenced| !is_referenced);
+        let point_count = mesh.vertices.len();
+        let splat_alpha = mesh.point_attributes.get("Alpha").filter(|a| a.len() == point_count && point_count > 0);
         if gpu_key.is_some() || !queue.is_empty() {
             // The GPU draws at full pixel density; the CPU is capped to stay interactive.
             let max_pixels: f32 = if self.gpu_viewport.is_some() { 1.6e7 } else { 2.5e6 };
@@ -17437,9 +17483,39 @@ impl ProceduralFxStudioApp {
             }
             let (w, h) = ((size.x * scale).round().max(1.0) as usize, (size.y * scale).round().max(1.0) as usize);
             let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            // The points stay uploaded too, until the mesh or what decides their look changes.
+            let points_key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::hash::DefaultHasher::new();
+                (self.mesh_revision, self.show_points, particle_display, point_color.to_array()).hash(&mut h);
+                h.finish()
+            };
             if let (Some(gpu), Some(key)) = (self.gpu_viewport.as_mut(), gpu_key) {
                 if !gpu_fresh {
                     gpu.set_scene(key, &gpu_faces, &gpu_edges, quickshade.as_ref().map(|(texture, _)| texture.clone()));
+                }
+                if !gpu.has_points(points_key) {
+                    let at = |i: usize| [mesh.vertices[i].x, mesh.vertices[i].y, mesh.vertices[i].z];
+                    let (mut dots, mut splats) = (Vec::new(), Vec::new());
+                    if let Some(alpha) = splat_alpha {
+                        // Soft splats in world units, as opaque at the centre as the CPU's two discs.
+                        let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
+                        let colors = mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3);
+                        let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
+                        let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
+                        splats.extend((0..point_count).filter(|&i| alpha[i] > 0.004).map(|i| {
+                            let a = alpha[i].clamp(0.0, 1.0);
+                            let [r, g, b] = triple(colors, i, 0.8).map(|c| c.clamp(0.0, 1.0));
+                            gpu_viewport::Point::new(at(i), pscale.map_or(0.05, |p| p[i]), [r, g, b, 1.0 - (1.0 - a * 0.5) * (1.0 - a * 0.6)], triple(emission, i, 0.0))
+                        }));
+                    } else if self.show_points || particle_display || has_unreferenced_points {
+                        let radius = if particle_display || has_unreferenced_points { 3.5 } else { 2.0 };
+                        dots.extend((0..point_count).filter(|&i| !(has_unreferenced_points && referenced[i])).map(|i| {
+                            let c = point_attribute_color(i);
+                            gpu_viewport::Point::new(at(i), radius, [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0], [0.0; 3])
+                        }));
+                    }
+                    gpu.set_points(points_key, &dots, &splats);
                 }
                 let camera = gpu_viewport::Camera {
                     target: [target.x, target.y, target.z],
@@ -17486,50 +17562,6 @@ impl ProceduralFxStudioApp {
             }
         }
 
-        let view_display = self.view_displays().first().copied();
-        // Geometry containers display their inner display node's kind.
-        let view_display_node = view_display.and_then(|id| match self.graph.nodes.get(&id).map(|n| &n.kind) {
-            Some(NodeKind::Geometry { .. }) => self.graph.display_of(id),
-            _ => Some(id),
-        });
-        let particle_display = view_display_node
-            .and_then(|id| self.graph.nodes.get(&id))
-            .is_some_and(|node| matches!(
-                node.kind,
-                NodeKind::Add { .. }
-                    | NodeKind::Particles { .. }
-                        | NodeKind::Flip { .. }
-                    | NodeKind::WhitewaterSolver(_)
-                    | NodeKind::Cache { .. }
-            ));
-        let point_color = view_display_node
-            .and_then(|id| self.graph.nodes.get(&id))
-            .map(|node| match node.kind {
-                NodeKind::Flip { .. } => egui::Color32::from_rgb(70, 180, 255),
-                _ => egui::Color32::from_rgb(255, 170, 45),
-            })
-            .unwrap_or(egui::Color32::from_rgb(255, 220, 80));
-        let point_attribute_color = |index: usize| -> egui::Color32 {
-            cd_color(index).unwrap_or(point_color)
-        };
-        let mut referenced = vec![false; projected.len()];
-        for tri in &mesh.indices {
-            for &vertex in tri {
-                if let Some(is_referenced) = referenced.get_mut(vertex) {
-                    *is_referenced = true;
-                }
-            }
-        }
-        // Hair and other curves (see groom.rs) are drawn as lines, not loose points.
-        let curve_ranges = groom::curves(mesh);
-        for range in &curve_ranges {
-            for i in range.clone() {
-                if let Some(is_referenced) = referenced.get_mut(i) {
-                    *is_referenced = true;
-                }
-            }
-        }
-        let has_unreferenced_points = !kinefx::Skeleton::is_skeleton(mesh) && referenced.iter().any(|&is_referenced| !is_referenced);
         if !curve_ranges.is_empty() {
             // Dense grooms are thinned for display; every curve still renders.
             const MAX_DRAWN_CURVES: usize = 8_000;
@@ -17559,10 +17591,9 @@ impl ProceduralFxStudioApp {
             }
         }
         // Volume points (Pyro output) carry Alpha and pscale: draw them as soft,
-        // back-to-front splats sized in world units instead of opaque dots.
-        let point_count = mesh.vertices.len();
-        let splat_alpha = mesh.point_attributes.get("Alpha").filter(|a| a.len() == point_count && point_count > 0);
-        if let Some(alpha) = splat_alpha {
+        // back-to-front splats sized in world units instead of opaque dots. (The GPU
+        // draws these and the points below itself, depth-tested and uncapped.)
+        if let Some(alpha) = splat_alpha.filter(|_| self.gpu_viewport.is_none()) {
             let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
             let colors = mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3);
             // Thin out very dense volumes, growing the remaining splats to compensate.
@@ -17590,6 +17621,7 @@ impl ProceduralFxStudioApp {
             }
         }
         if (self.show_points || particle_display || has_unreferenced_points)
+            && self.gpu_viewport.is_none()
             && projected.len() <= 50_000
             && splat_alpha.is_none()
         {

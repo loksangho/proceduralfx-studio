@@ -45,6 +45,24 @@ impl Vertex {
     }
 }
 
+// A point drawn as a camera-facing sprite. Dots: an opaque disc `radius` points
+// across the screen. Splats (smoke, fire, volumes): a soft disc `radius` world
+// units across, with opacity color[3] at its centre, glowing by `emission`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Point {
+    pub position: [f32; 3],
+    pub radius: f32,
+    pub color: [f32; 4],
+    pub emission: [f32; 4],
+}
+
+impl Point {
+    pub fn new(position: [f32; 3], radius: f32, color: [f32; 4], emission: [f32; 3]) -> Self {
+        Point { position, radius, color, emission: [emission[0], emission[1], emission[2], 0.0] }
+    }
+}
+
 // The viewport camera, as main.rs's viewport sets it up.
 #[derive(Clone, Copy)]
 pub struct Camera {
@@ -89,15 +107,16 @@ impl Camera {
         }
     }
 
-    // The shader's camera; `far` is the orthographic depth range's far end.
-    fn uniform(&self, far: f32) -> [f32; 20] {
+    // The shader's camera; `far` is the orthographic depth range's far end, and
+    // `splat_depth` the camera depths the splats span (for their blending weights).
+    fn uniform(&self, far: f32, splat_depth: [f32; 2]) -> [f32; 20] {
         let (t, r) = (self.target, self.rotation);
         [
             t[0], t[1], t[2], self.zoom,
             r[0], r[1], r[2], r[3],
             self.center.x, self.center.y, self.size.x.max(1.0), self.size.y.max(1.0),
             self.focal, self.ortho_scale, self.near, far.max(self.near + 1e-3),
-            self.orthographic as u8 as f32, 0.0, 0.0, 0.0,
+            self.orthographic as u8 as f32, splat_depth[0], splat_depth[1], 0.0,
         ]
     }
 }
@@ -108,7 +127,7 @@ struct Camera {
     rotate: vec4<f32>, // sin x, cos x, sin y, cos y
     screen: vec4<f32>, // centre, size
     lens: vec4<f32>,   // focal, ortho scale, near, far
-    mode: vec4<f32>,   // orthographic
+    mode: vec4<f32>,   // orthographic, the splats' nearest and farthest camera depth
 };
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
@@ -127,16 +146,24 @@ struct Out {
     @location(2) textured: f32,
 };
 
-// main.rs's to_cam and project_cam, then clip space: depth 1 - near/z under
-// perspective (so it's cut at the near plane, and the same surface wins as on the
-// CPU), linear in z between near and far under orthographic.
-fn to_clip(p: vec3<f32>) -> vec4<f32> {
+// main.rs's to_cam: world to camera space, +z in front.
+fn to_cam(p: vec3<f32>) -> vec3<f32> {
     let v = p - camera.look_at.xyz;
     let r = camera.rotate;
     let rx = v.x * r.w - v.z * r.z;
     let rz = v.x * r.z + v.z * r.w;
     let ry = v.y * r.y - rz * r.x;
-    let c = vec3<f32>(rx, ry, v.y * r.x + rz * r.y + camera.look_at.w);
+    return vec3<f32>(rx, ry, v.y * r.x + rz * r.y + camera.look_at.w);
+}
+
+fn to_clip(p: vec3<f32>) -> vec4<f32> {
+    return cam_to_clip(to_cam(p));
+}
+
+// main.rs's project_cam, then clip space: depth 1 - near/z under perspective (so
+// it's cut at the near plane, and the same surface wins as on the CPU), linear in
+// z between near and far under orthographic.
+fn cam_to_clip(c: vec3<f32>) -> vec4<f32> {
     let size = camera.screen.zw;
     let near = camera.lens.z;
     if (camera.mode.x > 0.5) {
@@ -166,6 +193,87 @@ fn vs_edge(in: In) -> Out {
     return Out(p, in.color, in.uv, in.textured);
 }
 
+// Points: a quad around each, two triangles, corners at (-1..1, -1..1).
+struct PointIn {
+    @location(0) position: vec3<f32>,
+    @location(1) radius: f32,
+    @location(2) color: vec4<f32>,
+    @location(3) emission: vec4<f32>,
+};
+struct PointOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) emission: vec3<f32>,
+    @location(2) corner: vec2<f32>,
+    // Dots: radius in points. Splats: camera depth.
+    @location(3) extra: f32,
+};
+fn corner(i: u32) -> vec2<f32> {
+    var corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
+    return corners[i];
+}
+
+// Dots keep their size on screen, and are pulled toward the camera (more than
+// edges) so a point on a surface shows over it.
+@vertex
+fn vs_dot(@builtin(vertex_index) i: u32, point: PointIn) -> PointOut {
+    let k = corner(i);
+    var p = to_clip(point.position);
+    p.x += k.x * point.radius / camera.screen.z * 2.0 * p.w;
+    p.y += k.y * point.radius / camera.screen.w * 2.0 * p.w;
+    if (p.w > 0.0) {
+        let d = p.z / p.w;
+        p.z = (d - max((1.0 - d) * 2e-3, 1e-5)) * p.w;
+    }
+    return PointOut(p, point.color, vec3<f32>(0.0), k, point.radius);
+}
+
+// Antialiased by coverage: the alpha at the disc's rim thins the samples drawn.
+@fragment
+fn fs_dot(in: PointOut) -> @location(0) vec4<f32> {
+    let edge = clamp((1.0 - length(in.corner)) * in.extra + 0.5, 0.0, 1.0);
+    return vec4<f32>(in.color.rgb, edge);
+}
+
+// Splats are sized in the world, kept between half a point and 120 points across
+// (as on the CPU), facing the camera.
+@vertex
+fn vs_splat(@builtin(vertex_index) i: u32, point: PointIn) -> PointOut {
+    let k = corner(i);
+    let c = to_cam(point.position);
+    let scale = select(camera.lens.x / max(c.z, 1e-6), camera.lens.y, camera.mode.x > 0.5);
+    let shown = point.radius * scale;
+    let radius = point.radius * clamp(shown, 0.5, 120.0) / max(shown, 1e-6);
+    let p = cam_to_clip(c + vec3<f32>(k * radius, 0.0));
+    return PointOut(p, point.color, point.emission.rgb, k, c.z);
+}
+
+// How strongly the emission glows in the viewport: chosen by eye so a flame keeps its
+// orange edge and hot core (the render has its own, physical, strength).
+const GLOW: f32 = 0.12;
+
+// Weighted blended transparency (McGuire and Bavoil 2013): no sorting. Nearer
+// splats weigh more; the glow adds up regardless of order.
+struct Blended {
+    @location(0) accum: vec4<f32>,
+    @location(1) reveal: vec4<f32>,
+    @location(2) glow: vec4<f32>,
+};
+@fragment
+fn fs_splat(in: PointOut) -> Blended {
+    let r2 = dot(in.corner, in.corner);
+    if (r2 > 1.0) {
+        discard;
+    }
+    let falloff = (1.0 - r2) * (1.0 - r2);
+    let a = clamp(in.color.a * falloff, 0.0, 0.99);
+    let span = max(camera.mode.z - camera.mode.y, 1e-6);
+    let t = clamp((in.extra - camera.mode.y) / span, 0.0, 1.0);
+    let w = a * clamp(3e3 * pow(1.0 - 0.95 * t, 3.0), 1e-2, 3e3);
+    // Glow as much as the splat is there (many overlap along each view ray).
+    return Blended(vec4<f32>(in.color.rgb * a, a) * w, vec4<f32>(a), vec4<f32>(in.emission * a * GLOW, 0.0));
+}
+
 // Premultiplied output, as egui's textures are.
 @fragment
 fn fs(in: Out) -> @location(0) vec4<f32> {
@@ -178,10 +286,41 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
+// The splats, blended (above), over the surfaces: premultiplied colour and glow.
+const COMPOSITE: &str = r#"
+@group(0) @binding(0) var accum: texture_2d<f32>;
+@group(0) @binding(1) var reveal: texture_2d<f32>;
+@group(0) @binding(2) var glow: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let at = vec2<i32>(position.xy);
+    let sum = textureLoad(accum, at, 0);
+    let alpha = 1.0 - textureLoad(reveal, at, 0).r;
+    let colour = clamp(sum.rgb / max(sum.a, 1e-5), vec3<f32>(0.0), vec3<f32>(1.0));
+    // Bright glow rolls off toward white instead of clipping.
+    let light = vec3<f32>(1.0) - exp(-textureLoad(glow, at, 0).rgb);
+    return vec4<f32>(colour * alpha + light, alpha);
+}
+"#;
+
 pub struct GpuViewport {
     render_state: egui_wgpu::RenderState,
     surfaces: wgpu::RenderPipeline,
     edges: wgpu::RenderPipeline,
+    dots: wgpu::RenderPipeline,
+    // The splats' passes: the surfaces' depth again (without antialiasing), the
+    // splats, then the composite over the image.
+    depth_only: wgpu::RenderPipeline,
+    splats: wgpu::RenderPipeline,
+    composite: wgpu::RenderPipeline,
+    composite_layout: wgpu::BindGroupLayout,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     camera: wgpu::Buffer,
@@ -191,8 +330,33 @@ pub struct GpuViewport {
     // Untextured draws bind a 1 x 1 white texture.
     blank: wgpu::BindGroup,
     scene: Option<Scene>,
+    points: Option<Points>,
     target: Option<Target>,
+    blended: Option<BlendTargets>,
 }
+
+// The uploaded points: dots and splats, one instance each.
+struct Points {
+    key: u64,
+    dots: Option<(wgpu::Buffer, u32)>,
+    splats: Option<(wgpu::Buffer, u32)>,
+    // The splats' positions' bounding box corners (for their blending weights).
+    corners: Vec<[f32; 3]>,
+}
+
+// The splats' buffers at one size: depth, the weighted colour sum, how much shows
+// through, and the glow, without antialiasing.
+struct BlendTargets {
+    size: [u32; 2],
+    depth: wgpu::TextureView,
+    accum: wgpu::TextureView,
+    reveal: wgpu::TextureView,
+    glow: wgpu::TextureView,
+    group: wgpu::BindGroup,
+}
+
+const ACCUM: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const REVEAL: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
 // The uploaded scene: faces (three vertices each) and edges (two each), the texture
 // the faces use, and the corners of its bounding box (for the orthographic depth range).
@@ -236,7 +400,8 @@ impl GpuViewport {
             label: Some("viewport camera"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // The splats' fragments read it too (their blending weights).
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             }],
@@ -271,6 +436,86 @@ impl GpuViewport {
         // Faces are pushed back by their depth slope (grazing faces change fast), as raster.rs biases its edges.
         let surfaces = pipeline("viewport surfaces", "vs_surface", wgpu::PrimitiveTopology::TriangleList, true, wgpu::DepthBiasState { constant: 0, slope_scale: 1.5, clamp: 0.0 });
         let edges = pipeline("viewport edges", "vs_edge", wgpu::PrimitiveTopology::LineList, false, Default::default());
+        let point_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x4, 3 => Float32x4];
+        let point_buffers = [wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Point>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &point_attributes }];
+        let dots = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport dots"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_dot"), compilation_options: Default::default(), buffers: &point_buffers },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_dot"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: COLOR, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: SAMPLES, alpha_to_coverage_enabled: true, ..Default::default() },
+            multiview: None,
+            cache: None,
+        });
+        let depth_only = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport depth"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_surface"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes }],
+            },
+            fragment: None,
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+        let keep = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add };
+        let splats = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport splats"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_splat"), compilation_options: Default::default(), buffers: &point_buffers },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_splat"),
+                compilation_options: Default::default(),
+                targets: &[
+                    Some(wgpu::ColorTargetState { format: ACCUM, blend: Some(wgpu::BlendState { color: add, alpha: add }), write_mask: wgpu::ColorWrites::ALL }),
+                    Some(wgpu::ColorTargetState { format: REVEAL, blend: Some(wgpu::BlendState { color: keep, alpha: keep }), write_mask: wgpu::ColorWrites::ALL }),
+                    Some(wgpu::ColorTargetState { format: ACCUM, blend: Some(wgpu::BlendState { color: add, alpha: add }), write_mask: wgpu::ColorWrites::ALL }),
+                ],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("viewport composite"), source: wgpu::ShaderSource::Wgsl(COMPOSITE.into()) });
+        let unfiltered = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
+        let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("viewport composite"), entries: &[unfiltered(0), unfiltered(1), unfiltered(2)] });
+        let composite = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport composite"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport composite"), bind_group_layouts: &[&composite_layout], push_constant_ranges: &[] })),
+            vertex: wgpu::VertexState { module: &composite_shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &composite_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: COLOR, blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("viewport texture"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -281,7 +526,7 @@ impl GpuViewport {
         });
         let white = raster::Texture { width: 1, height: 1, pixels: vec![[255; 4]] };
         let blank = texture_bind_group(&render_state, &layout, &sampler, &white);
-        GpuViewport { render_state, surfaces, edges, layout, sampler, camera, camera_group, texture: None, blank, scene: None, target: None }
+        GpuViewport { render_state, surfaces, edges, dots, depth_only, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
     }
 
     // Whether the scene uploaded last has this key (what the mesh, lights and display mode hash to).
@@ -306,6 +551,22 @@ impl GpuViewport {
         self.scene = Some(Scene { key, faces: buffer("viewport faces", faces), edges: buffer("viewport edges", edges), texture, corners });
     }
 
+    // Whether the points uploaded last have this key.
+    pub fn has_points(&self, key: u64) -> bool {
+        self.points.as_ref().is_some_and(|p| p.key == key)
+    }
+
+    // Uploads the dots and splats under `key`.
+    pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point]) {
+        let device = &self.render_state.device;
+        let buffer = |label: &str, points: &[Point]| {
+            (!points.is_empty()).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(points), usage: wgpu::BufferUsages::VERTEX }), points.len() as u32))
+        };
+        let (lo, hi) = splats.iter().fold(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |(lo, hi), p| (std::array::from_fn(|k| lo[k].min(p.position[k])), std::array::from_fn(|k| hi[k].max(p.position[k]))));
+        let corners = if lo[0] <= hi[0] { (0..8).map(|i| std::array::from_fn(|k| if i >> k & 1 == 0 { lo[k] } else { hi[k] })).collect() } else { Vec::new() };
+        self.points = Some(Points { key, dots: buffer("viewport dots", dots), splats: buffer("viewport splats", splats), corners });
+    }
+
     // Draws the uploaded scene through `camera` into an image of `size` pixels and
     // returns the egui texture showing it. Edges are drawn after the faces,
     // depth-tested against them but not each other.
@@ -316,10 +577,16 @@ impl GpuViewport {
             let target = Target::new(state, size, self.target.as_ref().map(|t| t.id));
             self.target = Some(target);
         }
-        // Orthographic depth runs from the near plane to just past the scene's farthest corner.
-        let deepest = self.scene.iter().flat_map(|s| &s.corners).map(|&p| camera.to_cam(p)[2]).fold(camera.near, f32::max);
+        // Orthographic depth runs from the near plane to just past the farthest corner.
+        let corners = self.scene.iter().flat_map(|s| &s.corners).chain(self.points.iter().flat_map(|p| &p.corners));
+        let deepest = corners.map(|&p| camera.to_cam(p)[2]).fold(camera.near, f32::max);
         let far = deepest + (deepest - camera.near).abs().max(1e-3) * 0.01;
-        state.queue.write_buffer(&self.camera, 0, bytemuck::cast_slice(&camera.uniform(far)));
+        let splat_depth = self.points.iter().flat_map(|p| &p.corners).map(|&p| camera.to_cam(p)[2]).fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], z| [lo.min(z), hi.max(z)]);
+        state.queue.write_buffer(&self.camera, 0, bytemuck::cast_slice(&camera.uniform(far, splat_depth)));
+        let splats = self.points.as_ref().and_then(|p| p.splats.as_ref());
+        if splats.is_some() && self.blended.as_ref().is_none_or(|b| b.size != size) {
+            self.blended = Some(BlendTargets::new(state, &self.composite_layout, size));
+        }
         let target = self.target.as_ref().expect("made above");
         let textured = self.scene.as_ref().and_then(|s| s.texture.as_ref());
         let bind_group = textured.and(self.texture.as_ref()).map_or(&self.blank, |(_, b)| b);
@@ -350,6 +617,52 @@ impl GpuViewport {
                     pass.draw(0..*count, 0..1);
                 }
             }
+            if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.dots.as_ref()) {
+                pass.set_pipeline(&self.dots);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..6, 0..*count);
+            }
+        }
+        if let (Some((buffer, count)), Some(blended)) = (splats, &self.blended) {
+            let attachment = |view, clear: f64| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: clear, g: clear, b: clear, a: clear }), store: wgpu::StoreOp::Store } });
+            let depth = |load| Some(wgpu::RenderPassDepthStencilAttachment { view: &blended.depth, depth_ops: Some(wgpu::Operations { load, store: wgpu::StoreOp::Store }), stencil_ops: None });
+            // The surfaces' depth, so splats behind them are hidden.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("viewport depth"), color_attachments: &[], depth_stencil_attachment: depth(wgpu::LoadOp::Clear(1.0)), timestamp_writes: None, occlusion_query_set: None });
+                if let Some((faces, faces_count)) = self.scene.as_ref().and_then(|s| s.faces.as_ref()) {
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.set_bind_group(1, &self.camera_group, &[]);
+                    pass.set_pipeline(&self.depth_only);
+                    pass.set_vertex_buffer(0, faces.slice(..));
+                    pass.draw(0..*faces_count, 0..1);
+                }
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("viewport splats"),
+                    color_attachments: &[attachment(&blended.accum, 0.0), attachment(&blended.reveal, 1.0), attachment(&blended.glow, 0.0)],
+                    depth_stencil_attachment: depth(wgpu::LoadOp::Load),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.set_bind_group(1, &self.camera_group, &[]);
+                pass.set_pipeline(&self.splats);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..6, 0..*count);
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("viewport composite"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.image, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.composite);
+                pass.set_bind_group(0, &blended.group, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
         state.queue.submit([encoder.finish()]);
         target.id
@@ -377,6 +690,22 @@ impl Target {
             None => renderer.register_native_texture(device, &shown, wgpu::FilterMode::Linear),
         };
         Target { size, msaa, depth, image: shown, texture: image, id }
+    }
+}
+
+impl BlendTargets {
+    fn new(state: &egui_wgpu::RenderState, layout: &wgpu::BindGroupLayout, size: [u32; 2]) -> Self {
+        let device = &state.device;
+        let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
+        let view = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: extent, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] }).create_view(&Default::default())
+        };
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let depth = view("viewport splat depth", DEPTH, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let (accum, reveal, glow) = (view("viewport accum", ACCUM, usage), view("viewport reveal", REVEAL, usage), view("viewport glow", ACCUM, usage));
+        let entry = |binding, view| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) };
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("viewport composite"), layout, entries: &[entry(0, &accum), entry(1, &reveal), entry(2, &glow)] });
+        BlendTargets { size, depth, accum, reveal, glow, group }
     }
 }
 
@@ -549,5 +878,79 @@ mod tests {
         let image = read(&gpu);
         assert!(image[31 * 32 + 16][3] > 0, "the floor just in front of the camera shows at the bottom");
         assert_eq!(image[2 * 32 + 16][3], 0, "nothing above the horizon");
+    }
+
+    // The edge test's camera: at z = -5 looking along +z, 20 x 20 points.
+    fn straight_on() -> Camera {
+        Camera { target: [0.0; 3], rotation: Camera::rotation(0.0, 0.0), zoom: 5.0, center: egui::vec2(10.0, 10.0), size: egui::vec2(20.0, 20.0), focal: 20.0, ortho_scale: 4.0, orthographic: false, near: 0.1 }
+    }
+
+    // A white face at depth z filling the view (corners well outside it).
+    fn wall(z: f32) -> Vec<Vertex> {
+        let r = (z + 5.0) * 2.0;
+        [[-r, r, z], [r, r, z], [-r, -r, z], [r, r, z], [r, -r, z], [-r, -r, z]].map(|p| Vertex::new(p, [1.0; 4], None)).to_vec()
+    }
+
+    #[test]
+    fn dots_keep_their_size_and_hide_behind_surfaces() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        gpu.set_scene(1, &wall(0.0), &[], None);
+        // On the surface, 3 points across: shows, and only near the middle.
+        gpu.set_points(1, &[Point::new([0.0; 3], 3.0, red, [0.0; 3])], &[]);
+        gpu.draw([20, 20], &straight_on());
+        let image = read(&gpu);
+        assert_eq!(image[10 * 20 + 10], [255, 0, 0, 255], "a point on the surface shows over it");
+        assert_eq!(image[10 * 20 + 16], [255, 255, 255, 255], "dots are a few points across, not more");
+        // Behind the surface: hidden.
+        gpu.set_points(2, &[Point::new([0.0, 0.0, 2.0], 3.0, red, [0.0; 3])], &[]);
+        gpu.draw([20, 20], &straight_on());
+        assert_eq!(read(&gpu)[10 * 20 + 10], [255, 255, 255, 255], "a point behind the surface is hidden");
+    }
+
+    #[test]
+    fn splats_blend_glow_and_hide_behind_surfaces() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let middle = |gpu: &GpuViewport| read(gpu)[10 * 20 + 10];
+        // A dark wall at z = 1, so blending and glow show.
+        let dark: Vec<Vertex> = wall(1.0).into_iter().map(|v| Vertex { color: [0.2, 0.2, 0.2, 1.0], ..v }).collect();
+        gpu.set_scene(1, &dark, &[], None);
+        let smoke = |z: f32, rgb: [f32; 3], emission: [f32; 3]| Point::new([0.0, 0.0, z], 2.0, [rgb[0], rgb[1], rgb[2], 0.5], emission);
+        // In front: half covers the wall at its centre.
+        gpu.set_points(1, &[], &[smoke(0.0, [1.0; 3], [0.0; 3])]);
+        gpu.draw([20, 20], &straight_on());
+        let over = middle(&gpu);
+        assert!(over[0] > 120 && over[0] < 160, "half-opaque white over dark grey: {over:?}");
+        assert_eq!(over[3], 255, "still opaque where the wall is");
+        // Behind the wall: hidden.
+        gpu.set_points(2, &[], &[smoke(3.0, [1.0; 3], [0.0; 3])]);
+        gpu.draw([20, 20], &straight_on());
+        assert_eq!(middle(&gpu), [51, 51, 51, 255], "a splat behind the wall is hidden");
+        // Glow adds light, in its own colour: dark smoke glowing orange is brighter
+        // than the same smoke not glowing, most in red, least in blue.
+        gpu.set_points(3, &[], &[smoke(0.0, [0.0; 3], [0.0; 3])]);
+        gpu.draw([20, 20], &straight_on());
+        let unlit = middle(&gpu);
+        gpu.set_points(4, &[], &[smoke(0.0, [0.0; 3], [6.0, 3.0, 0.0])]);
+        gpu.draw([20, 20], &straight_on());
+        let glowing = middle(&gpu);
+        let gain: [i32; 3] = std::array::from_fn(|c| glowing[c] as i32 - unlit[c] as i32);
+        assert!(gain[0] > gain[1] && gain[1] > gain[2] && gain[2] == 0 && gain[0] > 30, "fire glows orange: {unlit:?} to {glowing:?}");
+        // Overlapping splats: the same image whichever is drawn first (no sorting needed).
+        let (near, far) = (smoke(-0.5, [1.0, 0.0, 0.0], [0.0; 3]), smoke(0.5, [0.0, 0.0, 1.0], [0.0; 3]));
+        gpu.set_points(5, &[], &[near, far]);
+        gpu.draw([20, 20], &straight_on());
+        let one = middle(&gpu);
+        gpu.set_points(6, &[], &[far, near]);
+        gpu.draw([20, 20], &straight_on());
+        let other = middle(&gpu);
+        assert!((0..4).all(|c| one[c].abs_diff(other[c]) <= 1), "order doesn't matter: {one:?} vs {other:?}");
+        assert!(one[0] > one[2], "the nearer (red) splat weighs more: {one:?}");
     }
 }
