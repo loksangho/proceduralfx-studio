@@ -91,6 +91,26 @@ The full builds include native OpenVDB and USD, plus a bundled MoonRay:
   [.github/workflows/flatpak.yml](.github/workflows/flatpak.yml) builds it on
   GitHub Actions, and publishes a release when a `v*` tag is pushed.
 
+## License
+
+ProceduralFX Studio is **source-available** under the
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
+See [LICENSE](LICENSE).
+
+**Free for noncommercial use.** Learning, personal projects, hobby games,
+research, and use by schools, charities and other noncommercial organizations
+are all free. You can read, build, modify and share the code for those purposes.
+
+**Commercial use needs a commercial license.** If you use ProceduralFX Studio
+to make something you sell or earn money from (for example, effects for a
+commercial game), please get a commercial license: email [support@build3dstudio.com](mailto:support@build3dstudio.com).
+
+**What stays true whatever license you have:**
+
+- Everything you make with the tool belongs to you.
+- Your files use an open, documented format.
+- Your work is never used to train AI models.
+
 ---
 
 Familiar if you've used Houdini. Houdini is a trademark of Side Effects Software Inc.
