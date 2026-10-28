@@ -8685,6 +8685,8 @@ struct ProceduralFxStudioApp {
     frame_time: f32,
 
     current_mesh: Mesh,
+    // Goes up whenever current_mesh is replaced (the GPU viewport re-uploads it then).
+    mesh_revision: u64,
     cook_ms: f32,
     dirty: bool,
     status: String,
@@ -8933,6 +8935,7 @@ impl Default for ProceduralFxStudioApp {
             perf_sort: 0,
             frame_time: 1.0 / 60.0,
             current_mesh: Mesh::default(),
+            mesh_revision: 0,
             cook_ms: 0.0,
             dirty: true,
             status: String::new(),
@@ -12501,6 +12504,30 @@ impl ProceduralFxStudioApp {
         Ok(RenderScene { parts, lights, environment, camera, volumes: Vec::new() })
     }
 
+    // What the viewport's lit surfaces depend on besides the camera: the GPU viewport
+    // keeps them uploaded while this stays the same.
+    fn viewport_scene_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        (self.mesh_revision, self.render_mode as u8, self.ambient_light.to_bits()).hash(&mut h);
+        for (position, direction, color, intensity, kind) in self.scene_lights() {
+            for v in [position.x, position.y, position.z, direction.x, direction.y, direction.z, color[0], color[1], color[2], intensity] {
+                v.to_bits().hash(&mut h);
+            }
+            kind.hash(&mut h);
+        }
+        if let Some((file, scale, rotation, shown)) = self.environment_light() {
+            (file, shown).hash(&mut h);
+            for v in scale.into_iter().chain([rotation]) {
+                v.to_bits().hash(&mut h);
+            }
+        }
+        if self.isolate_selection {
+            (self.selection_mode as u8, &self.selected_vertices, &self.selected_triangles, &self.selected_edges).hash(&mut h);
+        }
+        h.finish()
+    }
+
     fn rebuild_graph(&mut self) {
         // While picking a group the viewport keeps showing the node's input.
         if self.group_pick.is_some() {
@@ -12544,6 +12571,7 @@ impl ProceduralFxStudioApp {
         }
         if let Some(mesh) = self.frame_cache.get(&frame_key) {
             self.current_mesh = mesh.clone();
+            self.mesh_revision += 1;
             self.frame_cache_hits += 1;
             self.status = format!("Frame from cache · {} cached frames", self.frame_cache.len());
         } else if displays.iter().any(|id| self.graph.time_dependent(*id)) {
@@ -12575,6 +12603,7 @@ impl ProceduralFxStudioApp {
                 match rx.try_recv() {
                     Ok(mesh) => {
                         self.current_mesh = mesh.clone();
+                        self.mesh_revision += 1;
                         const MAX_FRAME_CACHE: usize = 120;
                         if self.frame_cache.len() >= MAX_FRAME_CACHE {
                             if let Some(oldest) = self.frame_cache_order.pop_front() {
@@ -12599,6 +12628,7 @@ impl ProceduralFxStudioApp {
             }
         } else {
             self.current_mesh = self.graph.cook_display(&displays, self.time, &mut cache);
+            self.mesh_revision += 1;
             const MAX_FRAME_CACHE: usize = 120;
             if self.frame_cache.len() >= MAX_FRAME_CACHE {
                 if let Some(oldest) = self.frame_cache_order.pop_front() {
@@ -13015,6 +13045,7 @@ impl ProceduralFxStudioApp {
             }
         }
         self.current_mesh = input.clone();
+        self.mesh_revision += 1;
         self.group_pick = Some(GroupPick { node: id, domain, input, previous_mode });
         self.status = "Select in the viewport, then press Enter (or ✓) to set the group; Esc cancels".into();
     }
@@ -17162,10 +17193,15 @@ impl ProceduralFxStudioApp {
                 }
             }
         }
+        // GPU: the lit surfaces stay uploaded until the mesh, lights or display mode change,
+        // so moving the camera skips building them (gpu_viewport.rs).
+        let gpu_key = self.gpu_viewport.is_some().then(|| self.viewport_scene_key());
+        let gpu_fresh = gpu_key.is_some_and(|key| self.gpu_viewport.as_ref().is_some_and(|gpu| gpu.has_scene(key)));
+        let built = if gpu_fresh { &Mesh::default() } else { mesh };
         // Stored normals (Normal node) shade the surface; otherwise they're computed.
-        let corner_normals = sops::corner_normals(mesh);
+        let corner_normals = sops::corner_normals(built);
         // UV Quick Shade: the texture and each triangle corner's UV.
-        let quickshade = sops::quickshade_file(mesh).and_then(|file| sops::corner_uvs(mesh).map(|uvs| (quickshade_texture(&file), uvs)));
+        let quickshade = sops::quickshade_file(built).and_then(|file| sops::corner_uvs(built).map(|uvs| (quickshade_texture(&file), uvs)));
         let textured = quickshade.is_some() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals);
         let ambient = self.ambient_light.clamp(0.0, 1.0);
         let lights = self.scene_lights();
@@ -17264,9 +17300,15 @@ impl ProceduralFxStudioApp {
                 (b.clamp(0.0, 1.0) * 255.0) as u8,
             ))
         };
-        let mut queue: Vec<Poly> = Vec::with_capacity(mesh.indices.len());
-        let outlines = poly::outline_edges(&mesh);
-        for (tri_index, tri) in mesh.indices.iter().enumerate() {
+        let wire: Option<[u8; 4]> = match self.render_mode {
+            RenderMode::Wireframe => Some([80, 220, 120, 255]),
+            RenderMode::ShadedWireframe => Some([0, 0, 0, 110]),
+            _ => None,
+        };
+        let mut queue: Vec<Poly> = Vec::new();
+        let (mut gpu_faces, mut gpu_edges) = (Vec::new(), Vec::new());
+        let outlines = poly::outline_edges(built);
+        for (tri_index, tri) in built.indices.iter().enumerate() {
             if self.isolate_selection {
                 let keep = match self.selection_mode {
                     SelectionMode::Vertex => self.selected_vertices.iter().any(|&i| tri.contains(&i)),
@@ -17336,6 +17378,20 @@ impl ProceduralFxStudioApp {
                 [lit_color(0, v0, corner_n[0]), lit_color(1, v1, corner_n[1]), lit_color(2, v2, corner_n[2])]
             };
             let uv = quickshade.as_ref().filter(|_| textured).map(|(_, uvs)| uvs[tri_index].map(|c| egui::pos2(c[0], 1.0 - c[1])));
+            if gpu_key.is_some() {
+                // World-space corners; the GPU does the camera.
+                let corner = |k: usize| [[v0, v1, v2][k].x, [v0, v1, v2][k].y, [v0, v1, v2][k].z];
+                let rgba = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
+                // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
+                if self.render_mode != RenderMode::Wireframe {
+                    gpu_faces.extend((0..3).map(|k| gpu_viewport::Vertex::new(corner(k), rgba(colors[k]), uv.map(|uv| [uv[k].x, uv[k].y]))));
+                }
+                if let Some(c) = wire {
+                    let colour = c.map(|v| v as f32 / 255.0);
+                    gpu_edges.extend((0..3).filter(|&k| outlines[tri_index][k]).flat_map(|k| [k, (k + 1) % 3]).map(|k| gpu_viewport::Vertex::new(corner(k), colour, None)));
+                }
+                continue;
+            }
             let camera_triangle = [to_cam(v0), to_cam(v1), to_cam(v2)];
             let clipped = clip_triangle(camera_triangle);
             if clipped.len() < 3 {
@@ -17369,14 +17425,9 @@ impl ProceduralFxStudioApp {
                 });
             }
         }
-        // Surfaces and wireframe go through a depth buffer (see raster.rs), at the
-        // screen's pixel density, then onto the viewport as one image.
-        let wire: Option<[u8; 4]> = match self.render_mode {
-            RenderMode::Wireframe => Some([80, 220, 120, 255]),
-            RenderMode::ShadedWireframe => Some([0, 0, 0, 110]),
-            _ => None,
-        };
-        if !queue.is_empty() {
+        // Surfaces and wireframe go through a depth buffer (gpu_viewport.rs, else
+        // raster.rs), at the screen's pixel density, then onto the viewport as one image.
+        if gpu_key.is_some() || !queue.is_empty() {
             // The GPU draws at full pixel density; the CPU is capped to stay interactive.
             let max_pixels: f32 = if self.gpu_viewport.is_some() { 1.6e7 } else { 2.5e6 };
             let size = response.rect.size();
@@ -17386,35 +17437,22 @@ impl ProceduralFxStudioApp {
             }
             let (w, h) = ((size.x * scale).round().max(1.0) as usize, (size.y * scale).round().max(1.0) as usize);
             let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            if let Some(gpu) = self.gpu_viewport.as_mut() {
-                let (near, far) = if self.orthographic {
-                    queue.iter().flat_map(|p| p.depth).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), z| (lo.min(z), hi.max(z)))
-                } else {
-                    (near_plane, f32::INFINITY)
+            if let (Some(gpu), Some(key)) = (self.gpu_viewport.as_mut(), gpu_key) {
+                if !gpu_fresh {
+                    gpu.set_scene(key, &gpu_faces, &gpu_edges, quickshade.as_ref().map(|(texture, _)| texture.clone()));
+                }
+                let camera = gpu_viewport::Camera {
+                    target: [target.x, target.y, target.z],
+                    rotation: [sin_x, cos_x, sin_y, cos_y],
+                    zoom,
+                    center: center - rect_min,
+                    size,
+                    focal,
+                    ortho_scale,
+                    orthographic: self.orthographic,
+                    near: near_plane,
                 };
-                // Orthographic: a margin, so the nearest and farthest faces aren't clipped by the
-                // depth range. (Perspective clips at the near plane already, and has no far one.)
-                let pad = if self.orthographic { (far - near).abs().max(1e-3) * 0.01 } else { 0.0 };
-                let projection = gpu_viewport::Projection { origin: rect_min, size, orthographic: self.orthographic, near: near - pad, far: far + pad };
-                let rgba = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
-                let texture = quickshade.as_ref().map(|(texture, _)| texture);
-                // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
-                let faces: Vec<gpu_viewport::Vertex> = if self.render_mode == RenderMode::Wireframe {
-                    Vec::new()
-                } else {
-                    queue.iter().flat_map(|p| (0..3).map(|k| projection.vertex(p.pts[k], p.depth[k], rgba(p.colors[k]), p.uv.filter(|_| texture.is_some()).map(|uv| [uv[k].x, uv[k].y])))).collect()
-                };
-                let edges: Vec<gpu_viewport::Vertex> = match wire {
-                    Some(c) => {
-                        let colour = c.map(|v| v as f32 / 255.0);
-                        queue
-                            .iter()
-                            .flat_map(|p| [(0, 1), (1, 2), (2, 0)].into_iter().filter(|(a, _)| p.edges[*a]).flat_map(|(a, b)| [a, b]).map(|k| projection.vertex(p.pts[k], p.depth[k], colour, None)))
-                            .collect()
-                    }
-                    None => Vec::new(),
-                };
-                let id = gpu.draw([w as u32, h as u32], &faces, &edges, texture);
+                let id = gpu.draw([w as u32, h as u32], &camera);
                 painter.image(id, response.rect, full, egui::Color32::WHITE);
             } else {
                 let mut raster = raster::Raster::new(w, h, self.orthographic);
