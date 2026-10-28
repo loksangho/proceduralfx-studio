@@ -35,6 +35,7 @@ mod extrude;
 mod fields;
 mod fileio;
 mod flipbook;
+mod gpu_viewport;
 mod flow;
 mod fracture;
 mod groom;
@@ -8650,6 +8651,8 @@ struct ProceduralFxStudioApp {
     viewport_bg: u8,
     // Flipbook: the capture in progress, the viewer, and where the viewport is in the main window.
     flipbook_recording: Option<flipbook::Recording>,
+    // The viewport's surfaces on the GPU, when the app runs on wgpu (else raster.rs).
+    gpu_viewport: Option<gpu_viewport::GpuViewport>,
     // The AI assistant panel (bring your own Anthropic API key).
     assistant: assistant::Panel,
     flipbook_viewer: Option<flipbook::Viewer>,
@@ -8906,6 +8909,7 @@ impl Default for ProceduralFxStudioApp {
             orthographic: false,
             viewport_bg: 45,
             flipbook_recording: None,
+            gpu_viewport: None,
             assistant: assistant::Panel::default(),
             flipbook_viewer: None,
             viewport_rect: None,
@@ -17373,41 +17377,75 @@ impl ProceduralFxStudioApp {
             _ => None,
         };
         if !queue.is_empty() {
-            const MAX_PIXELS: f32 = 2.5e6;
+            // The GPU draws at full pixel density; the CPU is capped to stay interactive.
+            let max_pixels: f32 = if self.gpu_viewport.is_some() { 1.6e7 } else { 2.5e6 };
             let size = response.rect.size();
             let mut scale = ctx.pixels_per_point();
-            if size.x * size.y * scale * scale > MAX_PIXELS {
-                scale = (MAX_PIXELS / (size.x * size.y)).sqrt();
+            if size.x * size.y * scale * scale > max_pixels {
+                scale = (max_pixels / (size.x * size.y)).sqrt();
             }
             let (w, h) = ((size.x * scale).round().max(1.0) as usize, (size.y * scale).round().max(1.0) as usize);
-            let mut raster = raster::Raster::new(w, h, self.orthographic);
-            let to_pixel = |p: egui::Pos2, z: f32| raster::ScreenVertex { x: (p.x - rect_min.x) * scale, y: (p.y - rect_min.y) * scale, z };
-            let rgb = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
-            let texture = quickshade.as_ref().map(|(texture, _)| texture.clone());
-            // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
-            let triangles: Vec<raster::Triangle> = if self.render_mode == RenderMode::Wireframe {
-                Vec::new()
+            let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            if let Some(gpu) = self.gpu_viewport.as_mut() {
+                let (near, far) = if self.orthographic {
+                    queue.iter().flat_map(|p| p.depth).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), z| (lo.min(z), hi.max(z)))
+                } else {
+                    (near_plane, f32::INFINITY)
+                };
+                // Orthographic: a margin, so the nearest and farthest faces aren't clipped by the
+                // depth range. (Perspective clips at the near plane already, and has no far one.)
+                let pad = if self.orthographic { (far - near).abs().max(1e-3) * 0.01 } else { 0.0 };
+                let projection = gpu_viewport::Projection { origin: rect_min, size, orthographic: self.orthographic, near: near - pad, far: far + pad };
+                let rgba = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
+                let texture = quickshade.as_ref().map(|(texture, _)| texture);
+                // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
+                let faces: Vec<gpu_viewport::Vertex> = if self.render_mode == RenderMode::Wireframe {
+                    Vec::new()
+                } else {
+                    queue.iter().flat_map(|p| (0..3).map(|k| projection.vertex(p.pts[k], p.depth[k], rgba(p.colors[k]), p.uv.filter(|_| texture.is_some()).map(|uv| [uv[k].x, uv[k].y])))).collect()
+                };
+                let edges: Vec<gpu_viewport::Vertex> = match wire {
+                    Some(c) => {
+                        let colour = c.map(|v| v as f32 / 255.0);
+                        queue
+                            .iter()
+                            .flat_map(|p| [(0, 1), (1, 2), (2, 0)].into_iter().filter(|(a, _)| p.edges[*a]).flat_map(|(a, b)| [a, b]).map(|k| projection.vertex(p.pts[k], p.depth[k], colour, None)))
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                let id = gpu.draw([w as u32, h as u32], &faces, &edges, texture);
+                painter.image(id, response.rect, full, egui::Color32::WHITE);
             } else {
-                queue
-                    .iter()
-                    .map(|p| raster::Triangle {
-                        v: [0, 1, 2].map(|k| to_pixel(p.pts[k], p.depth[k])),
-                        rgb: p.colors.map(rgb),
-                        uv: p.uv.zip(texture.as_deref()).map(|(uv, t)| (uv.map(|c| [c.x, c.y]), t)),
-                    })
-                    .collect()
-            };
-            let lines: Vec<raster::Line> = match wire {
-                Some(colour) => queue
-                    .iter()
-                    .flat_map(|p| [(0, 1), (1, 2), (2, 0)].into_iter().filter(|(a, _)| p.edges[*a]).map(|(a, b)| raster::Line { a: to_pixel(p.pts[a], p.depth[a]), b: to_pixel(p.pts[b], p.depth[b]), rgba: colour }))
-                    .collect(),
-                None => Vec::new(),
-            };
-            raster.draw(&triangles, &lines);
-            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], raster.color.as_flattened());
-            let texture = viewport_texture(ctx, image);
-            painter.image(texture.id(), response.rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                let mut raster = raster::Raster::new(w, h, self.orthographic);
+                let to_pixel = |p: egui::Pos2, z: f32| raster::ScreenVertex { x: (p.x - rect_min.x) * scale, y: (p.y - rect_min.y) * scale, z };
+                let rgb = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
+                let texture = quickshade.as_ref().map(|(texture, _)| texture.clone());
+                // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
+                let triangles: Vec<raster::Triangle> = if self.render_mode == RenderMode::Wireframe {
+                    Vec::new()
+                } else {
+                    queue
+                        .iter()
+                        .map(|p| raster::Triangle {
+                            v: [0, 1, 2].map(|k| to_pixel(p.pts[k], p.depth[k])),
+                            rgb: p.colors.map(rgb),
+                            uv: p.uv.zip(texture.as_deref()).map(|(uv, t)| (uv.map(|c| [c.x, c.y]), t)),
+                        })
+                        .collect()
+                };
+                let lines: Vec<raster::Line> = match wire {
+                    Some(colour) => queue
+                        .iter()
+                        .flat_map(|p| [(0, 1), (1, 2), (2, 0)].into_iter().filter(|(a, _)| p.edges[*a]).map(|(a, b)| raster::Line { a: to_pixel(p.pts[a], p.depth[a]), b: to_pixel(p.pts[b], p.depth[b]), rgba: colour }))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                raster.draw(&triangles, &lines);
+                let image = egui::ColorImage::from_rgba_unmultiplied([w, h], raster.color.as_flattened());
+                let texture = viewport_texture(ctx, image);
+                painter.image(texture.id(), response.rect, full, egui::Color32::WHITE);
+            }
         }
 
         let view_display = self.view_displays().first().copied();
@@ -18384,9 +18422,13 @@ fn main() -> eframe::Result<()> {
         eframe::run_native(
             "ProceduralFX Studio",
             eframe::NativeOptions { renderer, ..options },
-            Box::new(move |_cc| {
+            Box::new(move |cc| {
                 opened.store(true, Ordering::SeqCst);
-                Ok(Box::new(ProceduralFxStudioApp::default()))
+                let mut app = ProceduralFxStudioApp::default();
+                // PFX_VIEWPORT=cpu keeps the viewport on raster.rs (to compare the two).
+                let cpu = std::env::var("PFX_VIEWPORT").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"));
+                app.gpu_viewport = cc.wgpu_render_state.clone().filter(|_| !cpu).map(gpu_viewport::GpuViewport::new);
+                Ok(Box::new(app))
             }),
         )
     };

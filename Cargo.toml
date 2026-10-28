@@ -20,6 +20,8 @@ regex = "1"
 egui_dock = { version = "0.18", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.10"
+# Vertex data for the GPU viewport (already used by egui).
+bytemuck = { version = "1", features = ["derive"] }
 
 [features]
 default = []
@@ -38,3 +40,7 @@ pkg-config = "0.3"
 # The Windows app's icon and version details (built on Windows only).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+# Runs wgpu's async set-up in the GPU viewport tests (already used by eframe).
+pollster = "0.4"

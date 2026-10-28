@@ -3290,6 +3290,7 @@ dependencies = [
 name = "proceduralfx_studio"
 version = "0.13.0"
 dependencies = [
+ "bytemuck",
  "cc",
  "eframe",
  "egui_dock",
@@ -3297,6 +3298,7 @@ dependencies = [
  "exr",
  "image",
  "pkg-config",
+ "pollster",
  "rapier3d",
  "regex",
  "rfd",
