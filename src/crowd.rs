@@ -10,7 +10,8 @@
 // - turning away from obstacles ahead (their signed distance field).
 // Turns are limited to a maximum rate, so agents curve instead of snapping.
 //
-// Output is points (N heading, up, v, agent, speed, phase) for Copy to Points,
+// Output is points (N heading, up, orient, v, agent, speed, phase, pscale) for Copy to
+// Points: orient turns a character facing +Z to face where its agent walks,
 // or posed agents: simple mannequins whose legs and arms swing with a walk
 // cycle timed to their speed.
 
@@ -382,6 +383,17 @@ fn output(state: &State, set: &CrowdSettings) -> Mesh {
     }).collect::<Vec<f32>>();
     mesh.point_attributes.insert("N".into(), vec_attr(&|a| a.heading));
     mesh.point_attributes.insert("up".into(), vec_attr(&|_| Vec3::new(0.0, 1.0, 0.0)));
+    // A turn about Y from +Z to the heading, as a quaternion (x y z w): Copy to Points turns
+    // copies by it, so a character facing +Z faces where its agent walks.
+    let orient: Vec<f32> = state
+        .agents
+        .iter()
+        .flat_map(|a| {
+            let half = a.heading.x.atan2(a.heading.z) * 0.5;
+            [0.0, half.sin(), 0.0, half.cos()]
+        })
+        .collect();
+    mesh.point_attributes.insert("orient".into(), orient);
     mesh.point_attributes.insert("v".into(), vec_attr(&|a| a.heading.scale(a.speed)));
     mesh.point_attributes.insert("agent".into(), (0..state.agents.len()).map(|i| i as f32).collect());
     mesh.point_attributes.insert("speed".into(), state.agents.iter().map(|a| a.speed).collect());
@@ -458,6 +470,15 @@ mod tests {
         }
         assert!(closest > 0.2, "agents {closest} apart");
         assert_eq!(out.point_attributes["N"].len(), 75);
+        // orient turns +Z onto each agent's heading.
+        let (n, q) = (&out.point_attributes["N"], &out.point_attributes["orient"]);
+        for i in 0..25 {
+            let heading = Vec3::new(n[i * 3], 0.0, n[i * 3 + 2]).normalize();
+            let m = crate::vexmath::q_to_m3(&[q[i * 4], q[i * 4 + 1], q[i * 4 + 2], q[i * 4 + 3]]);
+            let rows = [Vec3::new(m[0], m[1], m[2]), Vec3::new(m[3], m[4], m[5]), Vec3::new(m[6], m[7], m[8])];
+            let forward = crate::kinefx::vm(Vec3::new(0.0, 0.0, 1.0), &rows);
+            assert!(forward.sub(heading).length() < 1e-4, "agent {i}: {forward:?} vs {heading:?}");
+        }
     }
 
     #[test]

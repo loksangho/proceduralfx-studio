@@ -16079,6 +16079,9 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.display, value, *label).changed();
                     }
                 });
+                if set.display == 0 {
+                    ui.small("For your own characters: feed these points to Copy to Points's second input, with a character facing +Z, feet at the origin, into its first. orient turns each one to where its agent walks, and pscale sizes it to the agent height (for a character 1.75 tall).");
+                }
                 c |= pfield(ui, pslider(&mut set.speed, 0.0..=10.0).text("Walk speed")).changed();
                 c |= pfield(ui, pslider(&mut set.speed_variance, 0.0..=1.0).text("Speed variance")).changed();
                 c |= pfield(ui, pslider(&mut set.turn_rate, 1.0..=720.0).text("Turn rate°/s")).changed();

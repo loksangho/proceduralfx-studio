@@ -175,6 +175,7 @@ fn note(node: &str) -> Option<&'static str> {
         "material_fracture" => "glue_strength is how hard the glue between pieces is to break: the default 200 holds through a few-units drop; single digits shatter on impact. Feed all three outputs to rbd_bullet_solver's first three inputs",
         "rbd_bullet_solver" => "inputs: material_fracture's outputs 1, 2, 3 into inputs 1, 2, 3; optional static collision geometry into input 4. glue_strength_scale multiplies every glue strength. ground adds a floor at ground_height",
         "merge" => "connect inputs 1, 2, 3, … as many as needed",
+        "crowd_solver" => "display 1 shows built-in walking mannequins; display 0 gives points with orient (facing the walk direction) and pscale, so copy_to_points puts a character facing +Z on each agent: e.g. test_geometry shape 9 (the animated character) on its Walk clip, size 1.75, into copy_to_points input 1 and the crowd into input 2",
         "time_warp" => "cooks input 1 with time running speed times as fast from anchor (0.5: half speed); follow a slowed simulation with time_blend",
         "time_blend" => "between whole frames, mixes the frames either side of input 1 so slowed or shifted simulations move smoothly; put after time_warp or time_shift",
         "trail" => "input 1 over its last `samples` moments, `step` frames apart: mode 0 copies merged (each point gets trail, 0 newest to 1 oldest; fade multiplies Alpha and pscale by 1 - trail), so glowing sparks get streaks; mode 1 curves through each point's past positions (by id); mode 2 adds v",

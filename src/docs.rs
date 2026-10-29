@@ -104,7 +104,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("unpack", "Turns packed points back into geometry at their transform, optionally carrying the points' attributes over."),
     ("material_fracture", "Breaks a closed mesh into pieces: concrete (Voronoi chunks), glass (cracks from an impact point) or wood (splinters along the grain). Outputs pieces, glue constraints between neighbours and proxy collision shapes for the RBD Bullet Solver; pieces keep the input's materials, colours and UVs; cut faces are in the inside group (give them their own material with a Material node)."),
     // Crowds, KineFX, muscles
-    ("crowd_solver", "Agents that walk, flock, seek a goal, keep their distance, follow a ground mesh and avoid obstacles. Shows walking mannequins or points."),
+    ("crowd_solver", "Agents that walk, flock, seek a goal, keep their distance, follow a ground mesh and avoid obstacles. Shows walking mannequins, or points with orient and pscale to copy your own characters onto with Copy to Points (a character facing +Z, such as Test Geometry's animated one on its Walk take)."),
     ("skeleton", "A skeleton (biped, chain or tail): joints as points with parent and transform."),
     ("rig_pose", "Rotates and moves joints in their own axes; children follow. Keyframe it to animate."),
     ("two_bone_ik", "Bends a root → mid → tip chain so the tip reaches a goal, with a pole for the bend."),
