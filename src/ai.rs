@@ -291,6 +291,10 @@ pub fn describe(graph: &Graph) -> String {
             if !params.is_empty() {
                 let _ = write!(line, " [{}]", params.join(" "));
             }
+            if !n.channels.is_empty() {
+                let channels: Vec<String> = n.channels.iter().map(|(name, v)| if v[1] == 0.0 && v[2] == 0.0 { format!("{name}={}", fmt_value(v[0])) } else { format!("{name}=[{}, {}, {}]", fmt_value(v[0]), fmt_value(v[1]), fmt_value(v[2])) }).collect();
+                let _ = write!(line, " channels: {}", channels.join(" "));
+            }
             if !n.group.is_empty() {
                 let _ = write!(line, " group={:?}", n.group.pattern);
             }
@@ -580,8 +584,17 @@ fn apply_one(graph: &mut Graph, edit: &Edit, ids: &mut BTreeMap<String, NodeId>,
         Edit::SetParams { node, params, group } => {
             let id = Resolver { graph, ids }.node(node)?;
             let n = graph.nodes.get_mut(&id).expect("resolved");
+            // Names of the node's user channels (read in VEX with ch()) set those.
+            let (channels, params): (BTreeMap<String, serde_json::Value>, BTreeMap<String, serde_json::Value>) = params.clone().into_iter().partition(|(name, _)| n.channels.contains_key(name));
             let mut kind = n.kind.clone();
-            notes.extend(set_params(&mut kind, params)?.into_iter().map(|note| format!("{node}: {note}")));
+            notes.extend(set_params(&mut kind, &params)?.into_iter().map(|note| format!("{node}: {note}")));
+            for (name, value) in channels {
+                let v = match &value {
+                    serde_json::Value::Array(a) => std::array::from_fn(|i| a.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32),
+                    other => [other.as_f64().ok_or_else(|| format!("{name} takes a number"))? as f32, 0.0, 0.0],
+                };
+                n.channels.insert(name, v);
+            }
             n.kind = kind;
             if let Some(g) = group_of(group) {
                 n.group = g;

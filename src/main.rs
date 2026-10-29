@@ -50,6 +50,7 @@ mod perf;
 mod platform;
 mod paint;
 mod poly;
+mod presets;
 mod randomize;
 mod raster;
 mod sims;
@@ -940,6 +941,25 @@ fn write_vdb_file(mesh: &Mesh, path: &str) -> Result<(), String> {
 
 fn node_wrangle(mesh: Mesh, code: &str, time: f32, domain: usize, mask: Option<&[bool]>, channels: Option<&vex::Channels>) -> Mesh {
     vex::run_wrangle(mesh, code, time, SOLVER_TIME_INC.with(|inc| inc.get()), domain, mask, channels)
+}
+
+// Renumbers the nodes a node refers to (its material, Object Merge sources and so on), for
+// Graph::merge. These are the only kinds that hold node ids.
+fn remap_node_ids(kind: &mut NodeKind, map: impl Fn(NodeId) -> NodeId) {
+    match kind {
+        NodeKind::Geometry { material: Some(id) }
+        | NodeKind::CompileEnd { begin: Some(id) }
+        | NodeKind::LopSopImport { geometry: Some(id), .. }
+        | NodeKind::LopMaterial { material: Some(id), .. } => *id = map(*id),
+        NodeKind::ObjectMerge { sources, .. } => sources.iter_mut().flatten().for_each(|id| *id = map(*id)),
+        NodeKind::MaterialAssign { slots } => slots.iter_mut().filter_map(|(_, id)| id.as_mut()).for_each(|id| *id = map(*id)),
+        NodeKind::MoonRayRender { opts, .. } => {
+            if let RenderCamera::Node(id) = &mut opts.camera {
+                *id = map(*id);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn encode_text(text: &str) -> String {
@@ -5996,6 +6016,35 @@ impl Graph {
         Some(new)
     }
 
+    // Adds a whole other scene (such as a preset) beside this one, with fresh ids. Its
+    // top-level nodes go to the right of what's here. Returns each of its nodes' new ids.
+    fn merge(&mut self, other: &Graph) -> HashMap<NodeId, NodeId> {
+        let offset = self.next_id;
+        let map = |id: NodeId| id + offset;
+        let top = |g: &Graph| g.nodes.values().filter(|n| n.parent.is_none()).map(|n| n.pos.x).collect::<Vec<f32>>();
+        let (here, there) = (top(self), top(other));
+        let shift = match (here.iter().cloned().reduce(f32::max), there.iter().cloned().reduce(f32::min)) {
+            (Some(right), Some(left)) => egui::vec2(right + 220.0 - left, 0.0),
+            _ => egui::Vec2::ZERO,
+        };
+        let mut ids = HashMap::new();
+        for (&id, node) in &other.nodes {
+            let mut node = node.clone();
+            node.parent = node.parent.map(map);
+            remap_node_ids(&mut node.kind, map);
+            if node.parent.is_none() {
+                node.pos += shift;
+            }
+            self.nodes.insert(map(id), node);
+            ids.insert(id, map(id));
+        }
+        self.links.extend(other.links.iter().map(|l| Link { from: map(l.from), to: map(l.to), slot: l.slot, out: l.out }));
+        self.displays.extend(other.displays.iter().map(|(&c, &d)| (map(c), map(d))));
+        self.channels.extend(other.channels.iter().map(|(c, ch)| (ChannelId { node: map(c.node), target: c.target }, ch.clone())));
+        self.next_id = offset + other.next_id;
+        ids
+    }
+
     fn input_of(&self, to: NodeId, slot: usize) -> Option<NodeId> {
         self.links.iter().find(|l| l.to == to && l.slot == slot).map(|l| l.from)
     }
@@ -10205,6 +10254,16 @@ impl ProceduralFxStudioApp {
                 }
             });
         });
+        ui.menu_button("New from Preset", |ui| {
+            ui.weak("Starter effects for 2D games");
+            for preset in presets::PRESETS {
+                let label = if preset.looping { format!("{} (loop)", preset.name) } else { preset.name.to_owned() };
+                if ui.button(label).on_hover_text(preset.description).clicked() {
+                    self.load_preset(preset);
+                    ui.close();
+                }
+            }
+        });
         ui.separator();
         let save_hover = match &self.scene_path {
             Some(path) => format!("Save to {}", path.display()),
@@ -10601,6 +10660,39 @@ impl ProceduralFxStudioApp {
                 }
             }
         }
+    }
+
+    // Starts a new scene from a starter effect: its nodes, the playback range it's made for,
+    // its camera as the render camera, and sprite-sheet settings to suit (a seamless loop
+    // for looping effects). Undoable, like opening a file; saving asks where.
+    fn load_preset(&mut self, preset: &presets::Preset) {
+        self.undo.push(self.last_state.clone());
+        self.load_state(preset.scene.to_owned());
+        self.scene_path = None;
+        self.selected = None;
+        self.current_network = None;
+        let camera = self.graph.nodes.iter().filter(|(_, n)| matches!(n.kind, NodeKind::Camera { .. })).map(|(id, _)| *id).min();
+        self.use_preset_settings(preset, camera);
+        self.status = format!("New scene from the {} preset. Render → Export Sprite Sheet… exports it for a game.", preset.name);
+    }
+
+    // A preset's playback range, sprite-sheet settings and, given its camera, render camera.
+    fn use_preset_settings(&mut self, preset: &presets::Preset, camera: Option<NodeId>) {
+        self.animate = false;
+        (self.playback_start, self.playback_end) = preset.range;
+        self.time = preset.range.0;
+        if let Some(id) = camera {
+            self.render_camera = RenderCamera::Node(id);
+            // Look through it in the viewport too, so what you see is what exports.
+            if let Some(NodeKind::Camera { position, rotation, zoom, .. }) = self.graph.nodes.get(&id).map(|n| &n.kind) {
+                self.cam_target = Vec3::from_arr(*position);
+                (self.cam_rot_x, self.cam_rot_y) = (rotation[0].to_radians(), rotation[1].to_radians());
+                (self.cam_zoom, self.cam_pan_x, self.cam_pan_y) = (*zoom, 0.0, 0.0);
+            }
+        }
+        let s = &mut self.sprite_sheet;
+        (s.width, s.height, s.seamless) = (preset.frame[0], preset.frame[1], preset.looping);
+        self.dirty = true;
     }
 
     // Saves to the current scene file, or asks where to save if there isn't one yet.
@@ -18661,10 +18753,15 @@ impl eframe::App for ProceduralFxStudioApp {
 
         // The panes: a dock the user can rearrange, split, float and pop out (see Pane).
         self.show_panes(ctx);
-        if let Some(scene) = self.assistant.show(ctx, &self.graph, self.time) {
+        if let Some((scene, preset)) = self.assistant.show(ctx, &self.graph, self.time) {
             self.graph = scene;
             self.dirty = true;
             self.status = "AI changes applied (Ctrl+Z undoes them)".into();
+            // Started from a preset: its range, sheet settings and (newest) camera come too.
+            if let Some(preset) = preset {
+                let camera = self.graph.nodes.iter().filter(|(_, n)| matches!(n.kind, NodeKind::Camera { .. }) && n.name == "sheet_camera").map(|(id, _)| *id).max();
+                self.use_preset_settings(preset, camera);
+            }
         }
         if let Some(viewer) = self.flipbook_viewer.as_mut() {
             viewer.show(ctx);
@@ -19433,6 +19530,46 @@ mod tests {
 #[cfg(test)]
 mod scene_file_tests {
     use super::*;
+
+    #[test]
+    fn presets_load_and_cook_into_glowing_points() {
+        for preset in presets::PRESETS {
+            let g = Graph::deserialize(preset.scene);
+            let cameras = g.nodes.values().filter(|n| matches!(n.kind, NodeKind::Camera { .. }) && n.name == "sheet_camera").count();
+            assert_eq!(cameras, 1, "{}: one sheet camera", preset.name);
+            let geo = g.geometry_ids()[0];
+            let display = g.display_of(geo).unwrap_or_else(|| panic!("{}: a display node", preset.name));
+            // Partway through its range it shows something, as splats (points with Alpha).
+            let (start, end) = preset.range;
+            let mesh = g.cook(display, start + (end - start) * 0.4, &mut HashMap::new());
+            assert!(node_errors(|e| e.get(&display).cloned()).is_none(), "{}: {:?}", preset.name, node_errors(|e| e.get(&display).cloned()));
+            let alpha = mesh.point_attributes.get("Alpha").unwrap_or_else(|| panic!("{}: no Alpha", preset.name));
+            assert!(alpha.iter().filter(|a| **a > 0.05).count() > 20, "{}: too little shows", preset.name);
+            assert!(presets::find(&preset.name.to_uppercase()).is_some());
+        }
+    }
+
+    #[test]
+    fn merging_a_scene_keeps_both_and_renumbers_the_new_one() {
+        // A scene whose object refers to its material by id.
+        let mut g = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj box 1.5 4\nparent 1 0\ndisplay 0 1\nnext 2\n");
+        let mut other = Graph::deserialize(presets::find("slash").unwrap().scene);
+        let material = other.add(NodeKind::Material { kind: 0, color: [1.0; 3], roughness: 0.5, value: 0.5 }, egui::pos2(0.0, 0.0));
+        let geo = other.geometry_ids()[0];
+        if let Some(NodeKind::Geometry { material: m }) = other.nodes.get_mut(&geo).map(|n| &mut n.kind) {
+            *m = Some(material);
+        }
+        let ids = g.merge(&other);
+        assert_eq!(g.nodes.len(), 2 + other.nodes.len());
+        assert!(ids.values().all(|id| *id >= 2 && *id < g.next_id));
+        let new_geo = ids[&geo];
+        assert!(matches!(g.nodes[&new_geo].kind, NodeKind::Geometry { material: Some(m) } if m == ids[&material]));
+        assert!(g.nodes[&new_geo].pos.x > g.nodes[&0].pos.x, "placed beside the old nodes");
+        // The merged copy cooks the same as the original, channels and all.
+        let (a, b) = (other.cook(other.display_of(geo).unwrap(), 0.1, &mut HashMap::new()), g.cook(g.display_of(new_geo).unwrap(), 0.1, &mut HashMap::new()));
+        assert!(a.vertices.len() > 100 && a.vertices.len() == b.vertices.len());
+        assert_eq!(g.display_of(0), Some(1), "the original object is untouched");
+    }
 
     // docs/scene-nodes.md lists every node's saved parameters, generated from the code so it
     // can't go stale. Rewrite it with PFX_WRITE_DOCS=1 cargo test node_reference.
@@ -22030,7 +22167,7 @@ mod realtime_render_tests {
     fn run_recording(app: &mut ProceduralFxStudioApp) {
         let ctx = egui::Context::default();
         let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))), ..Default::default() };
-        for _ in 0..40 {
+        for _ in 0..400 {
             let _ = ctx.run(screen.clone(), |ctx| {
                 app.flipbook_step(ctx);
                 if app.dirty || app.simulation_rx.is_some() {
@@ -22080,6 +22217,30 @@ mod realtime_render_tests {
         assert!(left > 0 && right > left, "frame 1 blends both ends: left {left}, right {right}");
         // The last frame is as rendered: only the right.
         assert!(alpha(3, w / 4) == 0 && alpha(3, w * 3 / 4) == 255);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presets_export_ready_to_use_sheets() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        app.load_preset(presets::find("Magic burst").unwrap());
+        assert!(matches!(app.render_camera, RenderCamera::Node(id) if app.graph.nodes[&id].name == "sheet_camera"));
+        assert_eq!((app.playback_start, app.playback_end, app.sprite_sheet.width, app.sprite_sheet.seamless), (0.0, 0.75, 256, false));
+        let dir = std::env::temp_dir().join(format!("pfx_preset_sheet_{}", std::process::id()));
+        app.start_sprite_sheet(dir.join("burst.png"), false);
+        run_recording(&mut app);
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("burst.pfx.json")).unwrap()).unwrap();
+        assert_eq!(meta["frame_count"], 19, "0 to 0.75 s at 24 fps");
+        let sheet = image::open(dir.join("burst.png")).unwrap().to_rgba8();
+        assert!(sheet.pixels().filter(|p| p.0[3] > 128).count() > 1000, "it glows");
+        // Undo goes back to the scene before.
+        app.do_undo();
+        assert!(app.graph.nodes.is_empty() || !app.graph.nodes.values().any(|n| n.name == "magic_burst"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

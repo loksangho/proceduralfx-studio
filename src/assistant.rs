@@ -205,9 +205,15 @@ pub fn system_prompt() -> String {
          - Inputs and outputs count from 1. Nodes in different objects can't be wired; use object_merge to bring geometry across.\n\
          - Wrangles run VEX (Houdini's language): @P, @N, @Cd, @pscale, @ptnum, @primnum, @Time, @Frame, and functions like rand, noise, fit, sin, point, setpointattrib, removepoint.\n\
          - Edits to a node that's already in the scene keep its other parameters; prefer changing the existing network to rebuilding it when the user asks for a change.\n\n\
+         # Effects for 2D games\n\
+         For a game effect (fire, smoke, sparks, a hit, a spell, a slash and the like), start from the closest preset with load_preset and change it to match the request, rather than building from nothing. \
+         Presets come with a side-on camera and the playback range they're made for; the user exports them with Render → Export Sprite Sheet. \
+         The particle presets are one detail wrangle whose points carry Alpha, Cd, pscale and emission (they render as soft glowing splats); their main settings are the wrangle's user channels (listed under channels, read in VEX with ch(), and set with set_params by name), so adjust those first, then the VEX.\n\
+         Presets: {}\n\n\
          When you are done, reply in one or two sentences saying what you built or changed. If the request is unclear, make a reasonable choice and say what you assumed. \
          Describe only what you checked with inspect_node or view_scene; if you couldn't confirm something (how a simulation ends up, how it looks), say so rather than describing what you expect.\n\n\
          # Geometry node catalog\n{}",
+        presets::PRESETS.iter().map(|p| format!("{} ({}): {}", p.name, if p.looping { "loops" } else { "plays once" }, p.description)).collect::<Vec<_>>().join(" "),
         ai::catalog_text()
     )
 }
@@ -274,6 +280,17 @@ pub fn tools() -> Value {
             }
         },
         {
+            "name": "load_preset",
+            "description": "Add a starter effect for 2D games to the scene: its geometry object, ready to tweak, and a side-on camera that frames it for sprite-sheet export. Returns the new nodes and their settings. Use it as the starting point for game effects.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": presets::PRESETS.iter().map(|p| p.name).collect::<Vec<_>>(), "description": "The preset"}
+                },
+                "required": ["name"]
+            }
+        },
+        {
             "name": "describe_scene",
             "description": "List the scene's objects and their nodes, changed parameters, wiring and display flags, as they are now.",
             "input_schema": {"type": "object", "properties": {}}
@@ -317,7 +334,8 @@ impl Usage {
 
 pub enum Progress {
     Step(String),
-    Done { graph: Box<Graph>, summary: String, usage: Usage, changed: bool },
+    // `preset`: a preset the result started from, whose range and camera come with it.
+    Done { graph: Box<Graph>, summary: String, usage: Usage, changed: bool, preset: Option<&'static presets::Preset> },
     Failed { error: String, usage: Usage },
 }
 
@@ -465,6 +483,15 @@ fn run_text_tool(graph: &mut Graph, ids: &mut std::collections::BTreeMap<String,
             None => ("give the node to inspect".into(), true, false),
         },
         "describe_scene" => (ai::describe(graph), false, false),
+        "load_preset" => match input["name"].as_str().and_then(presets::find) {
+            Some(preset) => {
+                let ids = graph.merge(&Graph::deserialize(preset.scene));
+                let added: Vec<String> = ids.values().filter(|id| graph.nodes.get(id).is_some_and(|n| n.parent.is_none())).map(|id| format!("{} (#{id})", graph.nodes[id].title(*id))).collect();
+                let range = format!("{:.2}–{:.2} s (frames {}–{})", preset.range.0, preset.range.1, (preset.range.0 * sims::SIM_FPS).round() as i32 + 1, (preset.range.1 * sims::SIM_FPS).round() as i32 + 1);
+                (format!("Added the {} preset: {}. It's made to play over {range}{}.\n\n{}", preset.name, added.join(", "), if preset.looping { ", as a loop" } else { "" }, ai::describe(graph)), false, true)
+            }
+            None => (format!("no preset named {}; the presets are {}", input["name"], presets::PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")), true, false),
+        },
         other => (format!("there's no tool named {other}"), true, false),
     }
 }
@@ -479,6 +506,7 @@ fn step_label(name: &str, input: &Value) -> String {
         }
         "inspect_node" => format!("Checking {}", input["node"].as_str().unwrap_or("a node")),
         "describe_scene" => "Reading the scene".into(),
+        "load_preset" => format!("Starting from the {} preset", input["name"].as_str().unwrap_or("")),
         "view_scene" => format!("Looking at {}", input["node"].as_str().unwrap_or("the scene")),
         other => other.to_owned(),
     }
@@ -499,6 +527,7 @@ pub fn run(job: Job, tx: Sender<Progress>, cancel: Arc<AtomicBool>) {
     let agent = agent();
     let mut usage = Usage::default();
     let mut changed = false;
+    let mut preset = None;
     let mut ids = std::collections::BTreeMap::new();
     let mut messages = vec![json!({
         "role": "user",
@@ -544,7 +573,7 @@ pub fn run(job: Job, tx: Sender<Progress>, cancel: Arc<AtomicBool>) {
             }
             "tool_use" => {}
             _ => {
-                let _ = tx.send(Progress::Done { graph: Box::new(graph), summary: text.join("\n").trim().to_owned(), usage, changed });
+                let _ = tx.send(Progress::Done { graph: Box::new(graph), summary: text.join("\n").trim().to_owned(), usage, changed, preset });
                 return;
             }
         }
@@ -560,11 +589,14 @@ pub fn run(job: Job, tx: Sender<Progress>, cancel: Arc<AtomicBool>) {
             let _ = tx.send(Progress::Step(step_label(name, input)));
             let (result, is_error, did_change) = run_tool(&mut graph, &mut ids, name, input, time);
             changed |= did_change;
+            if name == "load_preset" && !is_error {
+                preset = input["name"].as_str().and_then(presets::find);
+            }
             results.push(json!({"type": "tool_result", "tool_use_id": block["id"], "content": result, "is_error": is_error}));
         }
         messages.push(json!({"role": "user", "content": results}));
     }
-    let _ = tx.send(Progress::Done { graph: Box::new(graph), summary: "Stopped after many steps; here is what was built so far.".into(), usage, changed });
+    let _ = tx.send(Progress::Done { graph: Box::new(graph), summary: "Stopped after many steps; here is what was built so far.".into(), usage, changed, preset });
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +702,7 @@ pub struct Panel {
     // What runs the current (or last) request, for its cost.
     running: Option<Backend>,
     // The finished preview: the edited scene, the model's summary, and whether it changed anything.
-    result: Option<(Box<Graph>, String, bool)>,
+    result: Option<(Box<Graph>, String, bool, Option<&'static presets::Preset>)>,
     started_from: u64,
     error: Option<String>,
     usage: Usage,
@@ -999,8 +1031,8 @@ impl Panel {
         while let Ok(progress) = rx.try_recv() {
             match progress {
                 Progress::Step(step) => self.log.push(step),
-                Progress::Done { graph, summary, usage, changed } => {
-                    self.result = Some((graph, if summary.is_empty() { "Done.".into() } else { summary }, changed));
+                Progress::Done { graph, summary, usage, changed, preset } => {
+                    self.result = Some((graph, if summary.is_empty() { "Done.".into() } else { summary }, changed, preset));
                     self.finished(usage);
                     return;
                 }
@@ -1118,7 +1150,7 @@ impl Panel {
     }
 
     // Shows the panel; returns a scene to switch to when the user accepts a result.
-    pub fn show(&mut self, ctx: &egui::Context, graph: &Graph, time: f32) -> Option<Graph> {
+    pub fn show(&mut self, ctx: &egui::Context, graph: &Graph, time: f32) -> Option<(Graph, Option<&'static presets::Preset>)> {
         self.poll();
         if self.busy() || self.listing.is_some() || self.signing_in.is_some() || self.paying_since.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -1196,7 +1228,7 @@ impl Panel {
                 ui.colored_label(egui::Color32::from_rgb(240, 110, 110), error);
             }
             let mut discard = false;
-            if let Some((result, summary, changed)) = &self.result {
+            if let Some((result, summary, changed, preset)) = &self.result {
                 ui.separator();
                 ui.label(summary);
                 if *changed {
@@ -1206,7 +1238,7 @@ impl Panel {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("✔ Accept").on_hover_text("Use this scene (Ctrl+Z undoes it in one step)").clicked() {
-                            accepted = Some((**result).clone());
+                            accepted = Some(((**result).clone(), *preset));
                         }
                         if ui.button("✖ Discard").clicked() {
                             discard = true;
@@ -1260,7 +1292,7 @@ mod tests {
         assert!(prompt.contains("# Geometry node catalog") && prompt.contains("- scatter: "));
         let tools = tools();
         let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["edit_scene", "inspect_node", "view_scene", "describe_scene"]);
+        assert_eq!(names, ["edit_scene", "inspect_node", "view_scene", "load_preset", "describe_scene"]);
         // The ops the tool offers are the ones ai.rs understands.
         let ops = tools[0]["input_schema"]["properties"]["edits"]["items"]["properties"]["op"]["enum"].as_array().unwrap();
         for op in ops {
@@ -1268,6 +1300,29 @@ mod tests {
             let err = ai::parse_edits(&sample).err().unwrap_or_default();
             assert!(!err.contains("unknown variant"), "{op}: {err}");
         }
+    }
+
+    #[test]
+    fn presets_load_beside_the_scene_and_their_channels_can_be_set() {
+        let mut g = Graph::default();
+        let mut ids = std::collections::BTreeMap::new();
+        let (_, is_error, _) = run_tool(&mut g, &mut ids, "edit_scene", &json!({"edits": [{"op": "create_object", "id": "obj"}, {"op": "add_node", "id": "b", "type": "box", "object": "obj"}]}), 0.0);
+        assert!(!is_error);
+        let (text, is_error, changed) = run_tool(&mut g, &mut ids, "load_preset", &json!({"name": "impact"}), 0.0);
+        let text = text.as_str().unwrap().to_owned();
+        assert!(!is_error && changed, "{text}");
+        // The box is still there, the preset's object and camera are added, and its settings show.
+        assert!(text.contains("Added the Impact preset") && text.contains("sheet_camera") && text.contains("play over 0.00–0.50 s"), "{text}");
+        assert!(text.contains("box") && text.contains("channels: count=70 life=0.45 size=0.03 speed=9"), "{text}");
+        // Its channels are set by name, like parameters.
+        let (text, is_error, _) = run_tool(&mut g, &mut ids, "edit_scene", &json!({"edits": [{"op": "set_params", "node": "impact_points", "params": {"count": 20}}]}), 0.0);
+        assert!(!is_error, "{text}");
+        let points = g.nodes.iter().find(|(_, n)| n.name == "impact_points").map(|(id, _)| *id).unwrap();
+        assert_eq!(g.nodes[&points].channels["count"], [20.0, 0.0, 0.0]);
+        let (text, is_error, _) = run_tool(&mut g, &mut ids, "load_preset", &json!({"name": "rain"}), 0.0);
+        assert!(is_error && text.as_str().unwrap().contains("Fire, Smoke, Impact, Magic burst, Slash"), "{text}");
+        assert!(step_label("load_preset", &json!({"name": "Slash"})).contains("Slash"));
+        assert!(system_prompt().contains("Magic burst (plays once)"));
     }
 
     #[test]
@@ -1322,7 +1377,7 @@ mod live {
         for progress in rx.iter() {
             match progress {
                 Progress::Step(s) => println!("step: {s}"),
-                Progress::Done { graph, summary, usage, changed } => {
+                Progress::Done { graph, summary, usage, changed, .. } => {
                     println!("summary: {summary}\n{}", ai::describe(&graph));
                     println!("usage: {usage:?}, about ${:.3}", backend.cost(&usage).unwrap_or(0.0));
                     // PFX_AI_SAVE keeps the result (e.g. to open it in the app).
@@ -1440,7 +1495,7 @@ mod compatible {
         let (tx, rx) = std::sync::mpsc::channel();
         let backend = Backend::Compatible { base_url: url, key: String::new(), model: "local-model".into(), vision: false };
         run(Job { prompt: "a box".into(), graph: Graph::default(), backend: backend.clone(), time: 0.0 }, tx, Arc::new(AtomicBool::new(false)));
-        let Some(Progress::Done { graph, summary, usage, changed }) = rx.iter().find(|p| !matches!(p, Progress::Step(_))) else { panic!("didn't finish") };
+        let Some(Progress::Done { graph, summary, usage, changed, .. }) = rx.iter().find(|p| !matches!(p, Progress::Step(_))) else { panic!("didn't finish") };
         assert!(changed && summary == "Made a box.", "{summary}");
         assert!(ai::describe(&graph).contains("box"));
         assert_eq!((usage.input, usage.output), (1850, 45));

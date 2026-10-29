@@ -71,7 +71,7 @@ Some nodes store several types under one saved name, for example `vop`, `cop`, `
 Two node types use their own layout:
 
 - **`wrangle`** stores one token, `<domain>:<code>`. Here `domain` is what the code runs
-  over: 0 points, 1 vertices, 2 primitives, 3 once (detail). `code` is the VEX in hex.
+  over: 0 once (detail), 1 primitives, 2 points, 3 vertices. `code` is the VEX in hex.
 - **`moonray_render`** stores one token: `mr:` followed by 20 fields separated by `|`:
 
   | # | Field | # | Field |
