@@ -2513,19 +2513,19 @@ fn prim_pattern_ui(ui: &mut egui::Ui, pattern: &mut String, picked: &Option<Stri
     changed
 }
 
-fn render_camera_combo(ui: &mut egui::Ui, choice: &mut RenderCamera, cameras: &[NodeId]) {
+fn render_camera_combo(ui: &mut egui::Ui, choice: &mut RenderCamera, cameras: &[(NodeId, String)]) {
     let label = match *choice {
         RenderCamera::Auto => "Auto (selected camera, else viewport)".to_string(),
         RenderCamera::Viewport => "Viewport".to_string(),
-        RenderCamera::Node(id) => format!("camera{id}"),
+        RenderCamera::Node(id) => cameras.iter().find(|(c, _)| *c == id).map_or_else(|| format!("camera{id} (deleted)"), |(_, name)| name.clone()),
     };
     egui::ComboBox::from_id_salt("render_camera")
         .selected_text(label)
         .show_ui(ui, |ui| {
             ui.selectable_value(choice, RenderCamera::Auto, "Auto (selected camera, else viewport)");
             ui.selectable_value(choice, RenderCamera::Viewport, "Viewport");
-            for id in cameras {
-                ui.selectable_value(choice, RenderCamera::Node(*id), format!("camera{id}"));
+            for (id, name) in cameras {
+                ui.selectable_value(choice, RenderCamera::Node(*id), name);
             }
         });
 }
@@ -9225,16 +9225,17 @@ impl ProceduralFxStudioApp {
         *zoom = self.cam_zoom;
     }
 
-    fn camera_ids(&self) -> Vec<NodeId> {
-        let mut ids: Vec<NodeId> = self
+    // The scene's cameras and their names, as the camera menus list them.
+    fn camera_ids(&self) -> Vec<(NodeId, String)> {
+        let mut cameras: Vec<(NodeId, String)> = self
             .graph
             .nodes
             .iter()
             .filter(|(_, n)| matches!(n.kind, NodeKind::Camera { .. }))
-            .map(|(id, _)| *id)
+            .map(|(id, n)| (*id, n.title(*id)))
             .collect();
-        ids.sort_unstable();
-        ids
+        cameras.sort_unstable();
+        cameras
     }
 
     fn resolve_render_camera(&self) -> (CamRig, String) {
@@ -9249,7 +9250,7 @@ impl ProceduralFxStudioApp {
                     orthographic: *orthographic,
                     pan: *pan,
                 },
-                format!("camera{id}"),
+                self.graph.nodes[&id].title(id),
             )),
             _ => None,
         };
@@ -11140,8 +11141,14 @@ impl ProceduralFxStudioApp {
             } else if let Some(dir) = done.capture.and_then(|c| c.save_to) {
                 self.status = match flipbook::save_pngs(&done.frames, &dir, "render") {
                     Ok(first) => {
-                        self.viewer.add(first, true);
-                        format!("Rendered {} frame{} in real time to {}", done.frames.len(), if done.frames.len() == 1 { "" } else { "s" }, dir.display())
+                        self.viewer.add(first, !(done.frames.len() > 1));
+                        let count = done.frames.len();
+                        // A range plays as an animation in the flipbook viewer, at its own rate.
+                        if count > 1 {
+                            let step = (done.times[1] - done.times[0]).abs().max(1e-3);
+                            self.flipbook_viewer = Some(flipbook::Viewer::new(done.frames, done.times, (1.0 / step).clamp(1.0, 120.0)));
+                        }
+                        format!("Rendered {count} frame{} in real time to {}{}", if count == 1 { "" } else { "s" }, dir.display(), if count > 1 { "; playing them in the flipbook viewer" } else { "" })
                     }
                     Err(e) => format!("Real-time render: couldn't save the frames: {e}"),
                 };
@@ -11418,9 +11425,10 @@ impl ProceduralFxStudioApp {
                         ui.checkbox(&mut opts.sequence, "Render frame range");
                         if opts.sequence {
                             ui.horizontal(|ui| {
-                                pfield(ui, pdrag(&mut opts.range_start).speed(0.05).range(0.0..=100_000.0).prefix("Start "));
-                                pfield(ui, pdrag(&mut opts.range_end).speed(0.05).range(0.0..=100_000.0).prefix("End "));
-                                pfield(ui, pdrag(&mut opts.range_step).speed(0.01).range(0.0001..=1000.0).prefix("Step "));
+                                pfield(ui, pdrag(&mut opts.range_start).speed(0.05).range(0.0..=100_000.0).prefix("Start ").suffix(" s"));
+                                pfield(ui, pdrag(&mut opts.range_end).speed(0.05).range(0.0..=100_000.0).prefix("End ").suffix(" s"));
+                                pfield(ui, pdrag(&mut opts.range_step).speed(0.01).range(0.0001..=1000.0).prefix("Step ").suffix(" s"))
+                                    .on_hover_text(format!("Seconds between rendered frames: {:.4} is every frame", 1.0 / sims::SIM_FPS));
                             });
                             if ui.button("Use timeline range").clicked() {
                                 opts.range_start = self.playback_start.max(0.0);
@@ -12840,6 +12848,28 @@ impl ProceduralFxStudioApp {
                 _ => None,
             }
         })
+    }
+
+    // The scene's lights for shading smoke in the real-time renderer: none when it has no
+    // light nodes or environment light, so smoke keeps the solver's own overhead shading.
+    fn volume_lights(&self) -> Vec<sims::VolumeLight> {
+        let has_lights = self.graph.nodes.values().any(|n| !n.bypass && n.parent.is_none() && matches!(n.kind, NodeKind::Light { .. }));
+        if !has_lights && self.environment_light().is_none() {
+            return Vec::new();
+        }
+        let mut lights: Vec<sims::VolumeLight> = self
+            .scene_lights()
+            .into_iter()
+            .map(|(position, direction, color, intensity, kind)| match kind {
+                1 => sims::VolumeLight::Sphere { position, color, intensity, falloff: POINT_LIGHT_FALLOFF },
+                2 => sims::VolumeLight::Dome { color, intensity },
+                _ => sims::VolumeLight::Distant { to_light: direction.scale(-1.0), color, intensity },
+            })
+            .collect();
+        if self.environment_light().is_some() {
+            lights.push(sims::VolumeLight::Dome { color: [1.0; 3], intensity: 1.0 });
+        }
+        lights
     }
 
     fn scene_lights(&self) -> Vec<(Vec3, Vec3, [f32; 3], f32, usize)> {
@@ -18080,8 +18110,11 @@ impl ProceduralFxStudioApp {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::hash::DefaultHasher::new();
                 (self.mesh_revision, self.show_points, particle_display, point_color.to_array()).hash(&mut h);
+                // Smoke is lit by the scene's lights, so moving one redraws it.
+                format!("{:?}", self.scene_lights()).hash(&mut h);
                 h.finish()
             };
+            let volume_lights = self.volume_lights();
             // A flipbook or real-time render frame waiting to be rendered, once this frame's
             // scene is uploaded: through the render camera at its size, or the viewport's view.
             let capture = self.flipbook_recording.as_ref().filter(|r| r.waiting).and_then(|r| r.capture.as_ref()).map(|c| c.render);
@@ -18105,7 +18138,9 @@ impl ProceduralFxStudioApp {
                     if let Some(alpha) = splat_alpha {
                         // Soft splats in world units, as opaque at the centre as the CPU's two discs.
                         let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
-                        let colors = mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3);
+                        // Smoke lit by the scene's lights, when it has any.
+                        let relit = (!volume_lights.is_empty()).then(|| sims::relight_smoke(mesh, &volume_lights)).flatten();
+                        let colors = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3));
                         let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
                         let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
                         splats.extend((0..point_count).filter(|&i| alpha[i] > 0.004).map(|i| {
@@ -18460,7 +18495,7 @@ impl ProceduralFxStudioApp {
                                 painter.text(
                                     p + egui::vec2(0.0, 26.0),
                                     egui::Align2::CENTER_TOP,
-                                    format!("camera{id}"),
+                                    node.title(id),
                                     egui::FontId::proportional(11.0),
                                     if selected { egui::Color32::WHITE } else { tint },
                                 );
@@ -22561,6 +22596,30 @@ mod realtime_render_tests {
         assert!(lit(0, w / 4) && !lit(0, w * 3 / 4));
         assert!(!lit(3, w / 4) && lit(3, w * 3 / 4));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_time_range_renders_play_in_the_flipbook_viewer() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        app.load_preset(presets::find("Slash").unwrap());
+        (app.moonray_default_width, app.moonray_default_height) = (64, 64);
+        let frame = 1.0 / sims::SIM_FPS;
+        app.moonray_default_opts = RenderOpts { sequence: true, range_start: 0.0, range_end: 4.0 * frame, range_step: frame, ..RenderOpts::default() };
+        app.start_realtime_render();
+        run_recording(&mut app);
+        let viewer = app.flipbook_viewer.as_ref().unwrap_or_else(|| panic!("the frames play: {}", app.status));
+        assert_eq!(viewer.frame_count(), 5);
+        assert!(app.status.starts_with("Rendered 5 frames in real time") && app.status.contains("flipbook viewer"), "{}", app.status);
+        // Cameras are listed by their names.
+        let cameras = app.camera_ids();
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].1, "sheet_camera");
+        assert_eq!(app.resolve_render_camera().1, "sheet_camera");
     }
 
     #[test]

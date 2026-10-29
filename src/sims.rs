@@ -768,6 +768,85 @@ fn fire_color(flame: f32) -> [f32; 3] {
     std::array::from_fn(|c| ramp[i][c] + (ramp[i + 1][c] - ramp[i][c]) * k)
 }
 
+// A light shading smoke in the real-time renderer: shining from a direction, from a position
+// (fading with distance like the viewport's sphere lights), or from all around (a dome).
+pub enum VolumeLight {
+    Distant { to_light: Vec3, color: [f32; 3], intensity: f32 },
+    Sphere { position: Vec3, color: [f32; 3], intensity: f32, falloff: f32 },
+    Dome { color: [f32; 3], intensity: f32 },
+}
+
+// Smoke's display colour (Cd) lit by the scene's lights, for volume points (Pyro, VDB) that
+// carry their density: each point's light is dimmed by the smoke between it and the light,
+// marched through a grid rebuilt from the points. Flame is unchanged: it glows by itself.
+// None when the mesh isn't a volume or is too big to grid. Without lights the solver's own
+// shading (lit from straight overhead) stays, so this is only used when the scene has lights.
+pub fn relight_smoke(mesh: &Mesh, lights: &[VolumeLight]) -> Option<Vec<f32>> {
+    let n = mesh.vertices.len();
+    let attr = |name: &str| mesh.point_attributes.get(name).filter(|v| v.len() == n && n > 0);
+    let density = attr("density")?;
+    let flame = attr("flame");
+    let h = *mesh.point_attributes.get("detail:volume_voxelsize")?.first()?;
+    let opacity = mesh.point_attributes.get("detail:volume_extinction").and_then(|e| e.first()).map_or(1.0, |e| e * h);
+    if h <= 0.0 {
+        return None;
+    }
+    let origin = mesh.point_attributes.get("detail:volume_origin").filter(|o| o.len() == 3).map_or(Vec3::zero(), |o| Vec3::new(o[0], o[1], o[2]));
+    // The voxel each point sits in (points are jittered inside their voxel).
+    let key = |p: Vec3| [((p.x - origin.x) / h).round() as i64, ((p.y - origin.y) / h).round() as i64, ((p.z - origin.z) / h).round() as i64];
+    let keys: Vec<[i64; 3]> = mesh.vertices.iter().map(|p| key(*p)).collect();
+    let lo: [i64; 3] = std::array::from_fn(|a| keys.iter().map(|k| k[a]).min().unwrap_or(0));
+    let dims: [usize; 3] = std::array::from_fn(|a| (keys.iter().map(|k| k[a]).max().unwrap_or(0) - lo[a] + 1) as usize);
+    if dims.iter().product::<usize>() > 8_000_000 {
+        return None;
+    }
+    let at = |k: [i64; 3]| -> Option<usize> {
+        let r: [i64; 3] = std::array::from_fn(|a| k[a] - lo[a]);
+        (0..3).all(|a| r[a] >= 0 && (r[a] as usize) < dims[a]).then(|| (r[2] as usize * dims[1] + r[1] as usize) * dims[0] + r[0] as usize)
+    };
+    let mut grid = vec![0.0f32; dims.iter().product()];
+    for (k, d) in keys.iter().zip(density) {
+        if let Some(i) = at(*k) {
+            grid[i] += d;
+        }
+    }
+    let longest = dims.iter().copied().max().unwrap_or(1) as f32 * 1.8;
+    // How much light gets from the voxel at `p` to it along `dir`, through the smoke.
+    let through = |p: Vec3, dir: Vec3, until: f32| -> f32 {
+        let mut optical_depth = 0.0;
+        let steps = (until / h).min(longest) as usize;
+        for s in 1..=steps {
+            match at(key(p.add(dir.scale(s as f32 * h)))) {
+                Some(i) => optical_depth += grid[i] * h * 6.0 * opacity,
+                None => break,
+            }
+        }
+        (-optical_depth).exp()
+    };
+    let mut out = Vec::with_capacity(n * 3);
+    for (i, p) in mesh.vertices.iter().enumerate() {
+        let mut light = [0.0f32; 3];
+        for l in lights {
+            let (amount, color) = match l {
+                VolumeLight::Distant { to_light, color, intensity } => (intensity * through(*p, *to_light, f32::INFINITY), color),
+                VolumeLight::Sphere { position, color, intensity, falloff } => {
+                    let to = position.sub(*p);
+                    let d = to.length().max(1e-4);
+                    (intensity * (falloff / (d * d)).min(1.5) * through(*p, to.scale(1.0 / d), d), color)
+                }
+                VolumeLight::Dome { color, intensity } => (intensity * 0.5, color),
+            };
+            (0..3).for_each(|c| light[c] += amount * color[c]);
+        }
+        let smoke: [f32; 3] = std::array::from_fn(|c| ((0.22 + 0.7 * light[c]) * if c == 2 { 1.03 } else { 1.0 }).min(1.0));
+        let f = flame.map_or(0.0, |v| v[i]);
+        let fire_weight = (f * 1.2).clamp(0.0, 1.0);
+        let fire = fire_color(f);
+        out.extend((0..3).map(|c| (smoke[c] * (1.0 - fire_weight) + fire[c] * fire_weight * 1.3).min(1.0)));
+    }
+    Some(out)
+}
+
 // Voxels with smoke or flame become points carrying density, temperature, flame,
 // a display colour (Cd), opacity (Alpha) and splat size (pscale).
 fn pyro_output(s: &PyroState, set: &PyroSettings) -> Mesh {
@@ -1173,6 +1252,46 @@ pub fn rbd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smoke_is_lit_by_the_scenes_lights_through_itself() {
+        // A slab of smoke 10 voxels across x, with a burning voxel in the middle.
+        let h = 0.1;
+        let mut m = Mesh::default();
+        let (mut density, mut flame) = (Vec::new(), Vec::new());
+        for x in 0..10 {
+            for y in 0..3 {
+                m.vertices.push(Vec3::new(x as f32 * h, y as f32 * h, 0.0));
+                density.push(1.0);
+                flame.push(if x == 5 && y == 1 { 1.0 } else { 0.0 });
+            }
+        }
+        m.point_attributes.insert("density".into(), density);
+        m.point_attributes.insert("flame".into(), flame);
+        m.point_attributes.insert("detail:volume_voxelsize".into(), vec![h]);
+        m.point_attributes.insert("detail:volume_origin".into(), vec![0.0; 3]);
+        m.point_attributes.insert("detail:volume_extinction".into(), vec![1.0 / h]);
+        let red = |x: usize, cd: &[f32]| cd[(x * 3 + 1) * 3];
+        let from = |dir: Vec3| relight_smoke(&m, &[VolumeLight::Distant { to_light: dir, color: [1.0; 3], intensity: 1.0 }]).unwrap();
+        // Lit from +x: the +x side is bright, the far side in the slab's shadow.
+        let right = from(Vec3::new(1.0, 0.0, 0.0));
+        assert!(red(9, &right) > red(0, &right) + 0.3, "{} {}", red(9, &right), red(0, &right));
+        let left = from(Vec3::new(-1.0, 0.0, 0.0));
+        assert!(red(0, &left) > red(9, &left) + 0.3);
+        // The burning voxel glows the same either way.
+        assert_eq!(&right[(5 * 3 + 1) * 3..(5 * 3 + 1) * 3 + 3], &left[(5 * 3 + 1) * 3..(5 * 3 + 1) * 3 + 3]);
+        // A dome lights every voxel alike, with no shadow.
+        let dome = relight_smoke(&m, &[VolumeLight::Dome { color: [1.0; 3], intensity: 1.0 }]).unwrap();
+        assert_eq!(red(0, &dome), red(9, &dome));
+        // A coloured light tints the smoke.
+        let blue = relight_smoke(&m, &[VolumeLight::Distant { to_light: Vec3::new(1.0, 0.0, 0.0), color: [0.2, 0.3, 1.0], intensity: 1.0 }]).unwrap();
+        let lit = (9 * 3 + 1) * 3;
+        assert!(blue[lit + 2] > blue[lit], "blue more than red on the lit side");
+        // Geometry that isn't a volume is left alone.
+        let mut plain = Mesh::default();
+        plain.vertices.push(Vec3::zero());
+        assert!(relight_smoke(&plain, &[]).is_none());
+    }
 
     fn cube(center: Vec3, half: f32) -> Mesh {
         let mut mesh = Mesh::default();
