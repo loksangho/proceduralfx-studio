@@ -7775,7 +7775,7 @@ const SCENE_FILE: &str = "scene.pfs";
 // A live sprite sheet: after an export with "Keep updating" on, the same files are
 // exported again whenever the scene, camera or sheet settings change, once they've been
 // still for a moment, so a game watching them (bevy_procedural_fx with Bevy's
-// file_watcher) updates as you work.
+// file_watcher, or embedded_watcher for embedded assets) updates as you work.
 struct LiveSheet {
     path: PathBuf,
     // What the files on disk (or the export under way) show.
@@ -10735,7 +10735,7 @@ impl ProceduralFxStudioApp {
                 ui.label("Live");
                 ui.checkbox(&mut s.live, "Keep updating").on_hover_text(
                     "After exporting, export again to the same files whenever the scene, camera or these settings change. \
-                     A Bevy game using bevy_procedural_fx with Bevy's file_watcher feature then updates as you work.",
+                     A Bevy game using bevy_procedural_fx with Bevy's file_watcher feature (embedded_watcher if the game builds its art in) then updates as you work.",
                 );
                 ui.end_row();
             });

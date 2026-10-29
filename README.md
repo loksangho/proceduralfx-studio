@@ -81,6 +81,8 @@ commands.spawn(FxSprite::looping(assets.load("fx/fire.pfx.json")));
 
 Tick **Keep updating** when you export, and the app exports again whenever you change the
 effect. A game running with Bevy's `file_watcher` feature shows each change within a moment.
+If the game builds its effects into the program with `embedded_asset!`, use Bevy's
+`embedded_watcher` feature instead.
 
 https://github.com/user-attachments/assets/2fdcdd85-ec14-45ca-922b-c3bdfacd9b34
 

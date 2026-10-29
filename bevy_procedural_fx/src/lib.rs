@@ -146,7 +146,7 @@ fn play(mut commands: Commands, time: Res<Time>, sheets: Res<Assets<FxSheet>>, m
         }
         let index = sheet.frame_at(fx.elapsed, fx.playback);
         // Set every frame, so a sheet re-exported while the game runs (with Bevy's
-        // file_watcher feature) takes effect straight away.
+        // file_watcher or embedded_watcher feature) takes effect straight away.
         if sprite.image != sheet.image {
             sprite.image = sheet.image.clone();
         }

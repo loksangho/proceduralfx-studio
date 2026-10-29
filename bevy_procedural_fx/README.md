@@ -54,6 +54,18 @@ the effect, so the game follows along as you work.
 bevy = { version = "0.20", features = ["file_watcher"] }
 ```
 
+If your game builds its effects into the program with `embedded_asset!`, for example for
+phones or the web, turn on `embedded_watcher` instead. It watches the files the embedded
+assets were built from, so export into that folder beside your source, such as `src/fx/`,
+and run the game with `cargo run` from its project folder. Embed both files of each effect:
+
+```rust
+embedded_asset!(app, "fx/fire.pfx.json");
+embedded_asset!(app, "fx/fire.png");
+// Then load it from the embedded source:
+commands.spawn(FxSprite::looping(assets.load("embedded://my_game/fx/fire.pfx.json")));
+```
+
 ## Example
 
 ```sh
