@@ -15190,7 +15190,13 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pdrag(&mut pan[1]).speed(1.0).prefix("Pan Y ")).changed();
                 c |= pfield(ui, pslider(zoom, 0.5..=200.0).logarithmic(true).text("Zoom")).changed();
                 if self.active_camera == Some(id) {
-                    ui.label("Active viewport camera");
+                    ui.horizontal(|ui| {
+                        ui.label("Active viewport camera: moving the viewport moves it.");
+                        if ui.button("Stop using as viewport camera").on_hover_text("The viewport keeps its view; this camera stays where it is").clicked() {
+                            self.active_camera = None;
+                            self.status = "The viewport no longer moves this camera".into();
+                        }
+                    });
                 } else if ui.button("Use as viewport camera").clicked() {
                     self.use_camera_requested = true;
                 }
