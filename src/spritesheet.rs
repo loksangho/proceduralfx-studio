@@ -90,6 +90,22 @@ pub fn trim_box(frames: &[egui::ColorImage]) -> [u32; 4] {
     [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
 }
 
+// The frame edges ("top", "bottom", "left", "right") that something visible touches in
+// any frame: the effect runs off them, so the sheet cuts it off.
+pub fn edges_touched(frames: &[egui::ColorImage]) -> Vec<&'static str> {
+    let Some([w, h]) = frames.first().map(|f| f.size) else { return Vec::new() };
+    let mut touched = [false; 4];
+    for frame in frames.iter().filter(|f| f.size == [w, h]) {
+        // Faint wisps that barely show don't count.
+        let shows = |x: usize, y: usize| frame.pixels[y * w + x].a() > 24;
+        touched[0] |= (0..w).any(|x| shows(x, 0));
+        touched[1] |= (0..w).any(|x| shows(x, h - 1));
+        touched[2] |= (0..h).any(|y| shows(0, y));
+        touched[3] |= (0..h).any(|y| shows(w - 1, y));
+    }
+    ["top", "bottom", "left", "right"].into_iter().zip(touched).filter(|(_, t)| *t).map(|(e, _)| e).collect()
+}
+
 #[derive(Debug)]
 pub struct Sheet {
     pub image: image::RgbaImage,
@@ -272,6 +288,15 @@ mod tests {
         assert_eq!(s.extra_frames(24), 0);
         s.seamless = true;
         assert_eq!((s.extra_frames(24), s.extra_frames(5), s.extra_frames(1)), (8, 5, 0));
+    }
+
+    #[test]
+    fn effects_that_run_off_the_frame_are_noticed() {
+        assert!(edges_touched(&[frame(8, 6, 3, 3)]).is_empty());
+        assert_eq!(edges_touched(&[frame(8, 6, 3, 0), frame(8, 6, 7, 2)]), ["top", "right"]);
+        let mut faint = frame(8, 6, 3, 3);
+        faint.pixels[5] = egui::Color32::from_white_alpha(10);
+        assert!(edges_touched(&[faint]).is_empty(), "a faint wisp doesn't count");
     }
 
     #[test]

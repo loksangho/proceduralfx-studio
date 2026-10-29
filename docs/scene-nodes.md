@@ -27,7 +27,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | Node | Saved as | Parameters |
 | --- | --- | --- |
 | geometry | `geometry` | #0=-1 |
-| camera | `camera` | #0=0, #1=0, #2=0, #3=23, #4=-35, #5=0, #6=1.2, #7=0.5, #8=0, #9=0, #10=0, #11=6 |
+| camera | `camera` | position.x=0, position.y=0, position.z=0, rotation.x=23, rotation.y=-35, rotation.z=0, focal=1.2, near=0.5, orthographic=0, pan.x=0, pan.y=0, zoom=6 |
 | light | `light` | #0=3, #1=4, #2=3, #3=-35, #4=35, #5=0, #6=1, #7=0.95, #8=0.85, #9=0.9, #10=0 |
 | environment_light | `environment_light` | 1 text field(s); #0=1, #1=1, #2=1, #3=1, #4=0, #5=1 |
 

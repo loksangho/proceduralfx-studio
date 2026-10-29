@@ -3,7 +3,8 @@
 //
 // Lit from the camera (nothing is black just because it faces away from a
 // fixed light), on a ground grid at y = 0 with the X/Y/Z axes, colours from Cd,
-// particles as dots and curves as lines. Returns a PNG.
+// curves as lines. Points with Alpha (effects, Pyro) are soft glowing splats as in
+// the GPU viewport; other particles are dots. Returns a PNG.
 
 use super::*;
 
@@ -54,12 +55,64 @@ fn corner_colors(mesh: &Mesh) -> Vec<[[f32; 3]; 3]> {
         .collect()
 }
 
-fn png(raster: &raster::Raster, background: [u8; 3]) -> Result<Vec<u8>, String> {
+// Soft splats, blended as the GPU viewport does: an alpha-weighted average colour over
+// what's behind, so order doesn't matter, plus glow that adds up regardless.
+struct Splats {
+    // Premultiplied colour and alpha, summed; what shows through (the product of 1 - alpha); glow.
+    accum: Vec<[f32; 4]>,
+    reveal: Vec<f32>,
+    glow: Vec<[f32; 3]>,
+}
+
+// How strongly emission glows: the GPU viewport's constant, so both look alike.
+const GLOW: f32 = 0.12;
+
+impl Splats {
+    fn new(len: usize) -> Self {
+        Splats { accum: vec![[0.0; 4]; len], reveal: vec![1.0; len], glow: vec![[0.0; 3]; len] }
+    }
+
+    // One splat centred on `s`, `radius` pixels across, hidden where a surface is nearer.
+    fn add(&mut self, r: &raster::Raster, s: raster::ScreenVertex, radius: f32, rgb: [f32; 3], opacity: f32, emission: [f32; 3]) {
+        let radius = radius.clamp(0.75, 400.0);
+        let key = 1.0 / s.z;
+        let (x0, x1) = (((s.x - radius).floor().max(0.0)) as usize, ((s.x + radius).ceil().max(0.0) as usize).min(r.width));
+        let (y0, y1) = (((s.y - radius).floor().max(0.0)) as usize, ((s.y + radius).ceil().max(0.0) as usize).min(r.height));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d2 = ((x as f32 + 0.5 - s.x).powi(2) + (y as f32 + 0.5 - s.y).powi(2)) / (radius * radius);
+                let i = y * r.width + x;
+                if d2 >= 1.0 || r.depth[i] > key {
+                    continue;
+                }
+                let a = opacity * (1.0 - d2) * (1.0 - d2);
+                let acc = &mut self.accum[i];
+                for k in 0..3 {
+                    acc[k] += rgb[k] * a;
+                    self.glow[i][k] += emission[k] * a * GLOW;
+                }
+                acc[3] += a;
+                self.reveal[i] *= 1.0 - a;
+            }
+        }
+    }
+}
+
+fn png(raster: &raster::Raster, background: [u8; 3], splats: Option<&Splats>) -> Result<Vec<u8>, String> {
     let mut image = image::RgbImage::new(raster.width as u32, raster.height as u32);
     for (i, c) in raster.color.iter().enumerate() {
         let a = c[3] as f32 / 255.0;
-        let mix = |k: usize| (c[k] as f32 * a + background[k] as f32 * (1.0 - a)).round() as u8;
-        image.put_pixel((i % raster.width) as u32, (i / raster.width) as u32, image::Rgb([mix(0), mix(1), mix(2)]));
+        let mut rgb: [f32; 3] = std::array::from_fn(|k| (c[k] as f32 * a + background[k] as f32 * (1.0 - a)) / 255.0);
+        if let Some(s) = splats.filter(|s| s.accum[i][3] > 0.0) {
+            let (acc, reveal) = (s.accum[i], s.reveal[i]);
+            for k in 0..3 {
+                rgb[k] = acc[k] / acc[3] * (1.0 - reveal) + rgb[k] * reveal;
+                // Bright glow rolls off toward white instead of clipping.
+                let light = 1.0 - (-s.glow[i][k]).exp();
+                rgb[k] = 1.0 - (1.0 - rgb[k]) * (1.0 - light);
+            }
+        }
+        image.put_pixel((i % raster.width) as u32, (i / raster.width) as u32, image::Rgb(rgb.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)));
     }
     let mut out = std::io::Cursor::new(Vec::new());
     image.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
@@ -148,7 +201,26 @@ pub fn render(mesh: &Mesh, view: &View, width: usize, height: usize) -> Result<V
             r.line(project(mesh.vertices[i]), project(mesh.vertices[i + 1]), [235, 205, 120, 255]);
         }
     }
-    if mesh.indices.is_empty() && curves.is_empty() {
+    let n = mesh.vertices.len();
+    let attr = |name: &str, size: usize| mesh.point_attributes.get(name).filter(|v| n > 0 && v.len() == n * size);
+    let mut splats = None;
+    if let Some(alpha) = attr("Alpha", 1) {
+        let (pscale, cd, emission) = (attr("pscale", 1), attr("Cd", 3), attr("emission", 3));
+        let triple = |v: Option<&Vec<f32>>, i: usize, default: f32| v.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
+        let mut layer = Splats::new(width * height);
+        for (i, p) in mesh.vertices.iter().enumerate().filter(|(i, _)| alpha[*i] > 0.004) {
+            let s = project(*p);
+            if s.z < near {
+                continue;
+            }
+            // As opaque at the centre as the viewport's splats.
+            let a = alpha[i].clamp(0.0, 1.0);
+            let opacity = 1.0 - (1.0 - a * 0.5) * (1.0 - a * 0.6);
+            let radius = pscale.map_or(0.05, |v| v[i]) * focal / s.z;
+            layer.add(&r, s, radius, triple(cd, i, 0.8).map(|c| c.clamp(0.0, 1.0)), opacity, triple(emission, i, 0.0));
+        }
+        splats = Some(layer);
+    } else if mesh.indices.is_empty() && curves.is_empty() {
         let cd = mesh.point_attributes.get("Cd").filter(|c| c.len() == mesh.vertices.len() * 3);
         for (i, p) in mesh.vertices.iter().enumerate() {
             let s = project(*p);
@@ -162,7 +234,7 @@ pub fn render(mesh: &Mesh, view: &View, width: usize, height: usize) -> Result<V
             r.triangle([corner(-d, -d), corner(d, d), corner(-d, d)], [rgb; 3], None);
         }
     }
-    png(&r, [46, 46, 50])
+    png(&r, [46, 46, 50], splats.as_ref())
 }
 
 pub fn base64(bytes: &[u8]) -> String {
@@ -201,5 +273,37 @@ mod tests {
         cloud.vertices = (0..50).map(|i| Vec3::new(i as f32 * 0.1, 0.5, 0.0)).collect();
         assert!(render(&cloud, &View::named("front").unwrap(), 160, 120).is_ok());
         assert!(render(&Mesh::default(), &View::named("front").unwrap(), 160, 120).is_err());
+    }
+
+    #[test]
+    fn points_with_alpha_are_soft_glowing_splats() {
+        // Two blobs of splats side by side, the same grey and above the ground grid; only the
+        // right one glows orange.
+        let mut fx = Mesh::default();
+        let (mut alpha, mut cd, mut emission, mut pscale) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for side in [-1.0f32, 1.0] {
+            for k in 0..20 {
+                fx.vertices.push(Vec3::new(side + (k % 5) as f32 * 0.02, 1.0 + (k / 5) as f32 * 0.02, 0.0));
+                alpha.push(0.6);
+                pscale.push(0.25);
+                cd.extend([0.3, 0.3, 0.3]);
+                emission.extend(if side > 0.0 { [4.0, 1.5, 0.2] } else { [0.0; 3] });
+            }
+        }
+        for (name, v) in [("Alpha", alpha), ("Cd", cd), ("emission", emission), ("pscale", pscale)] {
+            fx.point_attributes.insert(name.into(), v);
+        }
+        let png = render(&fx, &View::named("front").unwrap(), 200, 100).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgb8();
+        let brightest = |x0: u32, x1: u32| (x0..x1).flat_map(|x| (35..65).map(move |y| (x, y))).map(|(x, y)| image.get_pixel(x, y).0).max_by_key(|p| p[0] as u32 + p[1] as u32 + p[2] as u32).unwrap();
+        let (plain, glowing) = (brightest(0, 85), brightest(115, 200));
+        // The plain blob is a soft grey over the background, not a bright dot.
+        assert!(plain.iter().all(|c| (40..=90).contains(c)), "{plain:?}");
+        // The glowing one is brighter, and orange: most red, least blue.
+        assert!(glowing[0] > plain[0] + 60 && glowing[0] > glowing[1] && glowing[1] > glowing[2], "{glowing:?}");
+        // Soft: across the glowing blob, red passes through many levels rather than jumping
+        // from background to bright (a dot would give two or three).
+        let levels: std::collections::BTreeSet<u8> = (115..200).flat_map(|x| (35..65).map(move |y| (x, y))).map(|(x, y)| image.get_pixel(x, y).0[0]).collect();
+        assert!(levels.len() > 20, "soft edges: {} levels", levels.len());
     }
 }

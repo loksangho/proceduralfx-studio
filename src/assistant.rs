@@ -207,6 +207,9 @@ pub fn system_prompt() -> String {
          - Edits to a node that's already in the scene keep its other parameters; prefer changing the existing network to rebuilding it when the user asks for a change.\n\n\
          # Effects for 2D games\n\
          For a game effect (fire, smoke, sparks, a hit, a spell, a slash and the like), start from the closest preset with load_preset and change it to match the request, rather than building from nothing. \
+         If the scene already has the effect, change it instead of loading a preset. \
+         A preset's sheet_camera frames the export: it's orthographic, looking along -Z at its position, and the frame's shorter side spans zoom ÷ focal units (for example zoom 3.6 and focal 1.2 show 3 units). \
+         When you make an effect bigger or move it, check its bounds with inspect_node over its range, and set the camera's position and zoom so it fits with a little room; otherwise the sprite sheet cuts it off. \
          Presets come with a side-on camera and the playback range they're made for; the user exports them with Render → Export Sprite Sheet. \
          The particle presets are one detail wrangle whose points carry Alpha, Cd, pscale and emission (they render as soft glowing splats); their main settings are the wrangle's user channels (listed under channels, read in VEX with ch(), and set with set_params by name), so adjust those first, then the VEX.\n\
          Presets: {}\n\n\
@@ -266,7 +269,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "view_scene",
-            "description": "See the scene: renders it like the viewport and returns the image (lit from the camera, on a grid at y = 0 with the X red, Y green and Z blue axes; colours from Cd; particles as dots, curves as lines). Use it after building something and after big changes, to check what numbers can't show: whether things sit on the ground or float, overlap, look the right shape and size, or a simulation looks right at a later frame. Look from more than one view when it matters.",
+            "description": "See the scene: renders it like the viewport and returns the image (lit from the camera, on a grid at y = 0 with the X red, Y green and Z blue axes; colours from Cd; curves as lines; points with Alpha, such as the effect presets and Pyro, as soft glowing splats sized by pscale and lit by emission, as in sprite-sheet exports; other particles as dots). Use it after building something and after big changes, to check what numbers can't show: whether things sit on the ground or float, overlap, look the right shape and size, or a simulation looks right at a later frame. Look from more than one view when it matters.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1319,6 +1322,12 @@ mod tests {
         assert!(!is_error, "{text}");
         let points = g.nodes.iter().find(|(_, n)| n.name == "impact_points").map(|(id, _)| *id).unwrap();
         assert_eq!(g.nodes[&points].channels["count"], [20.0, 0.0, 0.0]);
+        // The sheet camera is listed, and moved and zoomed out by name.
+        assert!(ai::describe(&g).contains("camera sheet_camera"), "{}", ai::describe(&g));
+        let (text, is_error, _) = run_tool(&mut g, &mut ids, "edit_scene", &json!({"edits": [{"op": "set_params", "node": "sheet_camera", "params": {"position": [0, 1.5, 0], "zoom": 6}}]}), 0.0);
+        assert!(!is_error, "{text}");
+        let camera = g.nodes.iter().find(|(_, n)| n.name == "sheet_camera").map(|(id, _)| *id).unwrap();
+        assert!(matches!(g.nodes[&camera].kind, NodeKind::Camera { position: [0.0, 1.5, 0.0], zoom: 6.0, orthographic: true, .. }), "{:?}", g.nodes[&camera].kind);
         let (text, is_error, _) = run_tool(&mut g, &mut ids, "load_preset", &json!({"name": "rain"}), 0.0);
         assert!(is_error && text.as_str().unwrap().contains("Fire, Smoke, Impact, Magic burst, Slash"), "{text}");
         assert!(step_label("load_preset", &json!({"name": "Slash"})).contains("Slash"));
@@ -1386,8 +1395,9 @@ mod live {
                     }
                     assert!(changed);
                     let object = graph.nodes.iter().find(|(_, n)| matches!(n.kind, NodeKind::Geometry { .. })).map(|(id, _)| *id).expect("an object");
-                    let shown = graph.display_of(object).map(|d| graph.cook(d, 0.0, &mut HashMap::new())).unwrap_or_default();
-                    assert!(!shown.vertices.is_empty(), "the object shows geometry");
+                    // Something shows in the first second (a one-shot effect starts empty).
+                    let shows = |t: f32| graph.display_of(object).is_some_and(|d| !graph.cook(d, t, &mut HashMap::new()).vertices.is_empty());
+                    assert!([0.0, 0.25, 0.5, 1.0].into_iter().any(shows), "the object shows geometry");
                 }
                 Progress::Failed { error, usage } => panic!("{error} ({usage:?})"),
             }

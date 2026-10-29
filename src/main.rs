@@ -3789,6 +3789,7 @@ impl NodeKind {
             NodeKind::Vdb { .. } => names(&["voxel_size", "padding", "operation", "iterations", "output"]),
             NodeKind::ConvertVdb { .. } => names(&["mode", "iso"]),
             NodeKind::Switch { .. } => names(&["input"]),
+            NodeKind::Camera { .. } => names(&["position.x", "position.y", "position.z", "rotation.x", "rotation.y", "rotation.z", "focal", "near", "orthographic", "pan.x", "pan.y", "zoom"]),
             NodeKind::Pyro(_) => names(&["resolution", "center.x", "center.y", "center.z", "size.x", "size.y", "size.z", "substeps", "density", "temperature", "fuel", "buoyancy", "dissipation", "cooling", "vorticity", "turbulence", "burn_rate", "wind.x", "wind.y", "wind.z", "opacity"]),
             NodeKind::RbdSolver(_) => names(&["shape", "density", "friction", "bounce", "gravity", "substeps", "ground", "ground_height", "velocity.x", "velocity.y", "velocity.z", "spin.x", "spin.y", "spin.z"]),
             NodeKind::HairGuides(_) => names(&["count", "length", "length_variance", "segments", "droop", "seed"]),
@@ -11015,12 +11016,18 @@ impl ProceduralFxStudioApp {
             if done.frames.is_empty() {
                 self.status = "Flipbook: nothing was captured".into();
             } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
+                let edges = spritesheet::edges_touched(&done.frames);
+                let cut_off = if edges.is_empty() {
+                    String::new()
+                } else {
+                    format!(". The effect runs off the {} of the frame and is cut off there: zoom the render camera out, or make the frame bigger", edges.join(" and "))
+                };
                 self.status = match spritesheet::save(&done.frames, &output) {
-                    Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}", png.display()),
+                    Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}{cut_off}", png.display()),
                     Ok((png, sheet)) => {
                         self.viewer.add(png.clone(), true);
                         let (w, h) = sheet.image.dimensions();
-                        format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}", done.frames.len().saturating_sub(output.blend), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
+                        format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}{cut_off}", done.frames.len().saturating_sub(output.blend), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
                     }
                     Err(e) => format!("Sprite sheet: {e}"),
                 };
@@ -12987,7 +12994,10 @@ impl ProceduralFxStudioApp {
             self.current_mesh = mesh.clone();
             self.mesh_revision += 1;
             self.frame_cache_hits += 1;
-            self.status = format!("Frame from cache · {} cached frames", self.frame_cache.len());
+            // Routine, so it doesn't replace a message worth reading (a finished export, say).
+            if self.status.is_empty() || self.status.starts_with("Frame from cache") {
+                self.status = format!("Frame from cache · {} cached frames", self.frame_cache.len());
+            }
         } else if displays.iter().any(|id| self.graph.time_dependent(*id)) {
             self.frame_cache_misses += 1;
             if self.simulation_key != frame_key

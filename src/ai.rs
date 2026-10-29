@@ -316,6 +316,11 @@ pub fn describe(graph: &Graph) -> String {
             let _ = writeln!(out, "{line}");
         }
     }
+    // Cameras, such as a preset's sheet_camera, which frames sprite-sheet exports.
+    for camera in sorted_ids(graph, |n| matches!(n.kind, NodeKind::Camera { .. })) {
+        let c = &graph.nodes[&camera];
+        let _ = writeln!(out, "camera {} (#{camera}) [{}]", c.title(camera), changed_params(&c.kind).join(" "));
+    }
     out
 }
 
