@@ -72,7 +72,8 @@ fn text_names(kind: &NodeKind) -> Vec<String> {
         NodeKind::Measure(_) => &["name", "source"],
         NodeKind::Extrude(_) => &["front_group", "side_group", "back_group"],
         NodeKind::GroupCreate(_) => &["name", "expression"],
-        NodeKind::AttributeRandomize(_) => &["name"],
+        NodeKind::AttributeRandomize(_) | NodeKind::AttributeCreate(_) => &["name"],
+        NodeKind::AttributeDelete(_) => &["pattern"],
         NodeKind::Connectivity(_) => &["attribute"],
         _ => &[],
     };
@@ -80,17 +81,18 @@ fn text_names(kind: &NodeKind) -> Vec<String> {
     (0..count).map(|i| names.get(i).map_or_else(|| format!("text{}", i + 1), |n| n.to_string())).collect()
 }
 
-const ATTRIBUTES: [&str; 4] = ["id", "pscale", "Cd", "orient"];
 const CLASS: [&str; 2] = ["Points", "Primitives"];
+const DELETE_CLASSES: [&str; 5] = ["Points", "Primitives", "Detail", "Vertices", "All"];
 
 // Parameters that pick one of several options: their choices, in order (0, 1, 2…).
 // The model sets them by name ("attribute": "Custom") or number.
 fn options(node: &str, param: &str) -> Option<&'static [&'static str]> {
     Some(match (node, param) {
-        ("attribute_randomize", "attribute") => &randomize::PRESETS,
-        ("attribute_randomize", "class") => &randomize::CLASSES,
+        ("attribute_create" | "attribute_randomize", "class") => &attrib::CLASSES,
+        ("attribute_create" | "attribute_randomize", "type") => &attrib::TYPES,
+        ("attribute_randomize", "distribution") => &randomize::DISTRIBUTIONS,
         ("attribute_randomize", "mode") => &randomize::MODES,
-        ("attribute_create" | "attribute_delete", "attribute") => &ATTRIBUTES,
+        ("attribute_delete", "class") => &DELETE_CLASSES,
         ("boolean", "operation") => &boolean::OPERATIONS,
         ("test_geometry", "shape") => &crate::testgeo::SHAPES,
         ("boolean", "method") => &boolean::MODES,
@@ -144,8 +146,13 @@ fn shown_value(node: &str, param: &str, v: f32) -> String {
 // one of them is reported back, so the model notices it did nothing.
 fn ignored(kind: &NodeKind) -> Vec<(&'static str, &'static str)> {
     match kind {
-        NodeKind::AttributeRandomize(r) if r.preset != randomize::CUSTOM => ["class", "size", "min", "max", "mode", "name"].map(|p| (p, "it only applies when attribute is \"Custom\" (the presets use amount)")).to_vec(),
-        NodeKind::AttributeRandomize(_) => vec![("amount", "it only applies to the presets; a Custom attribute uses min and max")],
+        NodeKind::AttributeRandomize(r) if r.preset < randomize::CUSTOM => {
+            ["class", "size", "min", "max", "mode", "name", "type", "distribution"].map(|p| (p, "this node uses an older preset (which uses amount); add a new attribute_randomize instead")).to_vec()
+        }
+        NodeKind::AttributeRandomize(r) if matches!(r.distribution, randomize::HUE | randomize::ROTATION) => {
+            ["min", "max"].map(|p| (p, "the Hue and Rotation distributions use amount, not min and max")).to_vec()
+        }
+        NodeKind::AttributeRandomize(_) => vec![("amount", "it only applies to the Hue and Rotation distributions; the others use min and max")],
         NodeKind::Resample(r) if r.by_length => vec![("segments", "by_length is on, so length decides")],
         NodeKind::Resample(_) => vec![("length", "by_length is off, so segments decides")],
         _ => Vec::new(),
@@ -158,7 +165,9 @@ fn note(node: &str) -> Option<&'static str> {
     Some(match node {
         "copy_to_points" => "copies keep their own up direction (the points' N isn't used): set orient on the points (a quaternion, or degrees about Y) to tilt or turn copies; pscale scales each copy",
         "scatter" => "its points get N (the surface normal) and pscale (half their typical spacing), which Copy to Points then uses as the copy size: set pscale yourself to control it",
-        "attribute_randomize" => "min, max, class, size and name only apply when attribute is \"Custom\"; the presets use amount (pscale adds a random value between -amount and +amount)",
+        "attribute_create" => "name is any attribute (Cd, Alpha, pscale, N, v, orient, id, or your own); class points, primitives, detail or vertices; type float (size 1-4 components), integer, vector, colour or quaternion. value is an array for several components (Cd: [1, 0.5, 0]); a quaternion's value is a rotation in degrees [x, y, z], stored as x y z w",
+        "attribute_randomize" => "name, class and type as attribute_create; min and max are arrays, one per component (a single number sets them all). distribution: Uniform (each component between its min and max; for a quaternion, angles in degrees, so max [0, 360, 0] spins around Y), Between Min and Max (one point on the line, e.g. a colour between two), Direction (unit vectors, length min to max), Hue (random colours; amount shifts hue), Rotation (random orientation; amount 0-1). mode Set, Add or Multiply",
+        "attribute_delete" => "pattern is names separated by spaces, * matches anything and ^ keeps a name (\"Cd N\", \"fx_*\", \"* ^P\"); class points, primitives, detail, vertices or all",
         "volume_wrangle" => "input must be a volume (vdb, pyro, convert_vdb output); code runs per voxel with @density (fog) or @surface (level set) and @P at the voxel centre (positions can't change); volumesample(0, \"density\", pos) reads neighbours",
         "heightfield_wrangle" => "input must be a terrain (terrain node chain); code runs per grid point with @height and @mask; x and z stay fixed; volumesample(0, \"height\", pos) reads neighbouring heights",
         "lsystem" => "premise is the start string and rules one per line like \"A=F[+A][-A]\"; F draws a step, + - turn (yaw), & ^ pitch, \\\\ / roll, [ ] branch, ! thins the width; grows up +Y from the origin as curves (curveu, width); keep generations low (each one multiplies the size)",
@@ -505,7 +514,7 @@ fn set_params(kind: &mut NodeKind, values: &BTreeMap<String, serde_json::Value>)
             continue;
         }
         if let Some(list) = value.as_array() {
-            let suffixes: [&[&str]; 3] = [&[".x", ".y", ".z"], &[".r", ".g", ".b"], &["x", "y", "z"]];
+            let suffixes: [&[&str]; 3] = [&[".x", ".y", ".z", ".w"], &[".r", ".g", ".b"], &["x", "y", "z"]];
             let targets = suffixes
                 .iter()
                 .map(|s| s.iter().take(list.len()).map(|x| index(&format!("{name}{x}"))).collect::<Option<Vec<usize>>>())
@@ -518,6 +527,14 @@ fn set_params(kind: &mut NodeKind, values: &BTreeMap<String, serde_json::Value>)
         }
         if let (Some(choices), Some(text), Some(i)) = (options(kind.name(), name), value.as_str(), index(name)) {
             params[i] = option_index(choices, text).ok_or_else(|| format!("'{name}' is one of: {}", choices.join(", ")))? as f32;
+            continue;
+        }
+        // One number for a vector parameter sets all of its components.
+        if index(name).is_none() && index(&format!("{name}.x")).is_some() {
+            let v = number(name, value)?;
+            for i in [".x", ".y", ".z", ".w"].iter().filter_map(|s| index(&format!("{name}{s}"))) {
+                params[i] = v;
+            }
             continue;
         }
         let Some(i) = index(name) else {
@@ -904,8 +921,8 @@ mod tests {
             }
         }
         let table = [
-            ("attribute_randomize", "attribute"), ("attribute_randomize", "class"), ("attribute_randomize", "mode"), ("attribute_create", "attribute"),
-            ("attribute_delete", "attribute"), ("boolean", "operation"), ("boolean", "method"), ("material_fracture", "material"), ("measure", "measure"),
+            ("attribute_randomize", "class"), ("attribute_randomize", "type"), ("attribute_randomize", "distribution"), ("attribute_randomize", "mode"),
+            ("attribute_create", "class"), ("attribute_create", "type"), ("attribute_delete", "class"), ("boolean", "operation"), ("boolean", "method"), ("material_fracture", "material"), ("measure", "measure"),
             ("measure", "curvature"), ("measure", "summary"), ("extract_centroid", "partition"), ("extract_centroid", "method"), ("match_size", "justify.x"),
             ("group_create", "primitives"), ("group_create", "method"), ("group_create", "combine"), ("pack", "pack"), ("pack", "pivot"),
             ("terrain_noise", "noise"), ("terrain_noise", "blend"), ("terrain_mask", "source"), ("terrain_mask", "combine"), ("normal", "domain"),
@@ -917,24 +934,26 @@ mod tests {
             assert!(kind.param_names().iter().any(|n| n == param), "{node} has no {param}: {:?}", kind.param_names());
         }
         let text = catalog_text();
-        assert!(text.contains("attribute=\"pscale\"{id|pscale|Cd|orient|Custom}"), "{}", text.lines().find(|l| l.contains("attribute_randomize")).unwrap_or(""));
+        assert!(text.contains("distribution=\"Uniform\"{Uniform|Between Min and Max|Direction|Hue|Rotation}"), "{}", text.lines().find(|l| l.contains("attribute_randomize")).unwrap_or(""));
         // Set by name.
         let mut g = Graph::default();
         let report = apply(&mut g, &edits(serde_json::json!([
             {"op": "create_object", "id": "obj"},
-            {"op": "add_node", "id": "r", "type": "attribute_randomize", "object": "obj", "params": {"attribute": "custom", "class": "primitives", "name": "rock_size", "min": 0.15, "max": 0.55}},
+            {"op": "add_node", "id": "r", "type": "attribute_randomize", "object": "obj", "params": {"class": "primitives", "name": "rock_size", "type": "float", "min": 0.15, "max": 0.55}},
+            {"op": "add_node", "id": "c", "type": "attribute_create", "object": "obj", "params": {"name": "orient", "type": "quaternion", "value": [0, 90, 0]}},
             {"op": "add_node", "id": "b", "type": "boolean", "object": "obj", "params": {"operation": "subtract"}},
             {"op": "add_node", "id": "x", "type": "boolean", "object": "obj", "params": {"operation": "melt"}}
         ])));
-        assert!(matches!(&g.nodes[&report.ids["r"]].kind, NodeKind::AttributeRandomize(r) if r.preset == randomize::CUSTOM && r.class == 1 && r.name == "rock_size"));
+        assert!(matches!(&g.nodes[&report.ids["r"]].kind, NodeKind::AttributeRandomize(r) if r.preset == randomize::CUSTOM && r.class == 1 && r.name == "rock_size" && r.kind == 0 && r.min == [0.15; 4] && r.max == [0.55; 4]));
+        assert!(matches!(&g.nodes[&report.ids["c"]].kind, NodeKind::AttributeCreate(c) if c.name == "orient" && c.kind == attrib::QUATERNION && c.value[1] == 90.0));
         assert!(matches!(&g.nodes[&report.ids["b"]].kind, NodeKind::Boolean(b) if b.operation == 2));
         assert!(report.errors.iter().any(|e| e.contains("one of: Union, Intersect")), "{:?}", report.errors);
-        assert!(describe(&g).contains("attribute=\"Custom\""), "{}", describe(&g));
+        assert!(describe(&g).contains("class=\"Primitives\""), "{}", describe(&g));
         // A value that does nothing as the node is set up comes back as a note.
         let pscale = apply(&mut g, &edits(serde_json::json!([
-            {"op": "add_node", "id": "p", "type": "attribute_randomize", "object": "#0", "params": {"min": 0.1, "max": 0.5}}
+            {"op": "add_node", "id": "p", "type": "attribute_randomize", "object": "#0", "params": {"distribution": "hue", "min": 0.1}}
         ])));
-        assert!(pscale.errors.is_empty() && pscale.notes.iter().any(|n| n.contains("ignores min") && n.contains("Custom")), "{:?}", pscale.notes);
+        assert!(pscale.errors.is_empty() && pscale.notes.iter().any(|n| n.contains("ignores min") && n.contains("Hue")), "{:?}", pscale.notes);
         assert!(pscale.to_text(&g).contains("Note: p: attribute_randomize ignores min"));
     }
 

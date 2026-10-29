@@ -23,6 +23,7 @@ mod render_viewer;
 mod abc;
 mod ai;
 mod anim;
+mod attrib;
 mod assistant;
 mod boolean;
 mod bullet;
@@ -635,23 +636,74 @@ fn node_transform(mut mesh: Mesh, t: [f32; 3], r: [f32; 3], s: [f32; 3]) -> Mesh
     mesh
 }
 
-fn node_attribute_create(mut mesh: Mesh, attribute: usize, value: f32) -> Mesh {
-    let name = match attribute.min(3) {
-        1 => "pscale",
-        2 => "Cd",
-        3 => "orient",
-        _ => "id",
-    };
-    if name == "Cd" {
-        let color = attribute_color(value);
-        mesh.point_attributes.insert(
-            name.into(),
-            color.into_iter().cycle().take(mesh.vertices.len() * 3).collect(),
-        );
-    } else {
-        mesh.point_attributes.insert(name.into(), vec![value; mesh.vertices.len()]);
+// The attribute an attribute node works on: a Common menu that fills everything in, the
+// name, the class and the type (with its size for floats). Returns whether anything changed,
+// and the Common entry chosen, (name, type, size, value), for the caller to fill in.
+type CommonAttribute = (&'static str, usize, usize, [f32; 4]);
+fn attribute_target_ui(ui: &mut egui::Ui, id: NodeId, name: &mut String, class: &mut usize, kind: &mut usize, size: &mut usize) -> (bool, Option<CommonAttribute>) {
+    let mut c = false;
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        ui.label("Attribute");
+        c |= ui.add(egui::TextEdit::singleline(name).desired_width(110.0).hint_text("name")).changed();
+        egui::ComboBox::from_id_salt(("attribute_common", id)).selected_text("Common").show_ui(ui, |ui| {
+            for (n, k, s, v) in attrib::COMMON {
+                if ui.selectable_label(name.trim() == n, format!("{n}  ({})", attrib::TYPES[k])).clicked() {
+                    chosen = Some((n, k, s, v));
+                }
+            }
+        });
+    });
+    if !attrib::valid_name(name.trim()) {
+        ui.colored_label(egui::Color32::from_rgb(240, 110, 110), "Use letters, digits and _, not starting with a digit");
     }
-    mesh
+    ui.horizontal(|ui| {
+        ui.label("Class");
+        for (i, n) in attrib::CLASSES.iter().enumerate() {
+            c |= ui.selectable_value(class, i, *n).changed();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Type");
+        for (i, n) in attrib::TYPES.iter().enumerate() {
+            c |= ui.selectable_value(kind, i, *n).changed();
+        }
+    });
+    if *kind == 0 {
+        c |= pfield(ui, pslider(size, 1..=4).text("Components")).changed();
+    }
+    (c || chosen.is_some(), chosen)
+}
+
+// An attribute value as its type wants it: a colour picker, a vector, rotation angles,
+// a whole number, or 1 to 4 floats.
+fn attribute_value_ui(ui: &mut egui::Ui, kind: usize, size: usize, value: &mut [f32; 4]) -> bool {
+    let mut c = false;
+    match kind {
+        attrib::COLOUR => {
+            let mut rgb = [value[0], value[1], value[2]];
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                value[..3].copy_from_slice(&rgb);
+                c = true;
+            }
+            for (k, label) in ["R ", "G ", "B "].iter().enumerate() {
+                c |= pfield(ui, pdrag(&mut value[k]).speed(0.01).prefix(*label)).changed();
+            }
+        }
+        attrib::INTEGER => {
+            c |= pfield(ui, pdrag(&mut value[0]).speed(0.2).fixed_decimals(0)).changed();
+        }
+        _ => {
+            let n = match kind {
+                attrib::VECTOR | attrib::QUATERNION => 3,
+                _ => size.clamp(1, 4),
+            };
+            for (k, label) in ["X ", "Y ", "Z ", "W "].iter().take(n).enumerate() {
+                c |= pfield(ui, pdrag(&mut value[k]).speed(if kind == attrib::QUATERNION { 1.0 } else { 0.01 }).prefix(*label)).changed();
+            }
+        }
+    }
+    c
 }
 
 fn attribute_color(value: f32) -> [f32; 3] {
@@ -665,17 +717,6 @@ fn attribute_color(value: f32) -> [f32; 3] {
         4 => [x, 0.0, 1.0],
         _ => [1.0, 0.0, x],
     }
-}
-
-fn node_attribute_delete(mut mesh: Mesh, attribute: usize) -> Mesh {
-    let name = match attribute.min(3) {
-        1 => "pscale",
-        2 => "Cd",
-        3 => "orient",
-        _ => "id",
-    };
-    mesh.point_attributes.remove(name);
-    mesh
 }
 
 // Advice from a node's last cook that isn't an error (e.g. a setup that can't move), shown in its panel.
@@ -3451,9 +3492,9 @@ enum NodeKind {
     Mirror { axis: usize },
     Copy { count: usize, t: [f32; 3], r: [f32; 3], s: f32 },
     CopyToPoints { scale: f32, rotation: [f32; 3] },
-    AttributeCreate { attribute: usize, value: f32 },
+    AttributeCreate(attrib::CreateSettings),
     AttributeRandomize(randomize::RandomizeSettings),
-    AttributeDelete { attribute: usize },
+    AttributeDelete(attrib::DeleteSettings),
     Wrangle { code: String, domain: usize },
     // VEX over a volume's voxels (@density / @surface) or a terrain's points (@height, @mask).
     VolumeWrangle { code: String },
@@ -3708,7 +3749,7 @@ impl NodeKind {
             | NodeKind::Peak { .. }
             | NodeKind::Ripple { .. }
             | NodeKind::Jitter { .. }
-            | NodeKind::AttributeCreate { .. }
+            | NodeKind::AttributeCreate(_)
             | NodeKind::AttributeRandomize(_)
             | NodeKind::Normal(_)
             | NodeKind::UvTexture(_)
@@ -3784,9 +3825,12 @@ impl NodeKind {
             NodeKind::Mirror { .. } => names(&["axis"]),
             NodeKind::Copy { .. } => names(&["copies", "t.x", "t.y", "t.z", "r.x", "r.y", "r.z", "uniform_scale"]),
             NodeKind::CopyToPoints { .. } => names(&["scale", "r.x", "r.y", "r.z"]),
-            NodeKind::AttributeCreate { .. } => names(&["attribute", "value"]),
-            NodeKind::AttributeRandomize(_) => names(&["attribute", "amount", "seed", "class", "size", "min", "max", "mode"]),
-            NodeKind::AttributeDelete { .. } => names(&["attribute"]),
+            // The first number of each is an old setting (which attribute), kept for older versions.
+            NodeKind::AttributeCreate(_) => names(&["", "value.x", "class", "type", "size", "value.y", "value.z", "value.w"]),
+            NodeKind::AttributeRandomize(_) => names(&[
+                "", "amount", "seed", "class", "size", "min.x", "max.x", "mode", "type", "distribution", "min.y", "min.z", "min.w", "max.y", "max.z", "max.w",
+            ]),
+            NodeKind::AttributeDelete(_) => names(&["", "class"]),
             NodeKind::AttributeVop { .. } => names(&["run_over"]),
             NodeKind::Tube { .. } => names(&["bottom_radius", "top_radius", "height", "rows", "columns", "caps"]),
             NodeKind::Peak { .. } => names(&["distance"]),
@@ -3941,6 +3985,8 @@ impl NodeKind {
             NodeKind::Measure(m) => vec![m.name.clone(), m.source.clone()],
             NodeKind::Connectivity(c) => vec![c.attribute.clone()],
             NodeKind::AttributeRandomize(r) => vec![r.name.clone()],
+            NodeKind::AttributeCreate(s) => vec![s.name.clone()],
+            NodeKind::AttributeDelete(s) => vec![s.pattern.clone()],
             NodeKind::Extrude(e) => vec![e.front_group.clone(), e.side_group.clone(), e.back_group.clone()],
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
@@ -3992,6 +4038,8 @@ impl NodeKind {
                 next(&mut m.source);
             }
             NodeKind::AttributeRandomize(r) => next(&mut r.name),
+            NodeKind::AttributeCreate(s) => next(&mut s.name),
+            NodeKind::AttributeDelete(s) => next(&mut s.pattern),
             NodeKind::Connectivity(c) => next(&mut c.attribute),
             NodeKind::Extrude(e) => {
                 next(&mut e.front_group);
@@ -4359,9 +4407,9 @@ impl NodeKind {
             (
                 "Attributes",
                 vec![
-                    NodeKind::AttributeCreate { attribute: 1, value: 1.0 },
+                    NodeKind::AttributeCreate(attrib::CreateSettings::defaults()),
                     NodeKind::AttributeRandomize(randomize::RandomizeSettings::defaults()),
-                    NodeKind::AttributeDelete { attribute: 1 },
+                    NodeKind::AttributeDelete(attrib::DeleteSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
@@ -4473,9 +4521,9 @@ impl NodeKind {
             NodeKind::Mirror { .. } => "mirror",
             NodeKind::Copy { .. } => "copy",
             NodeKind::CopyToPoints { .. } => "copy_to_points",
-            NodeKind::AttributeCreate { .. } => "attribute_create",
+            NodeKind::AttributeCreate(_) => "attribute_create",
             NodeKind::AttributeRandomize(_) => "attribute_randomize",
-            NodeKind::AttributeDelete { .. } => "attribute_delete",
+            NodeKind::AttributeDelete(_) => "attribute_delete",
             NodeKind::Wrangle { .. } => "wrangle",
             NodeKind::AttributeVop { .. } => "attribute_vop",
             NodeKind::Vop(_) => "vop",
@@ -4646,9 +4694,9 @@ impl NodeKind {
             NodeKind::FileImport { .. } => 0,
             NodeKind::ParticleSurface { .. } => 1,
             NodeKind::Merge | NodeKind::Switch { .. } | NodeKind::CopyToPoints { .. } => 2,
-            NodeKind::AttributeCreate { .. }
+            NodeKind::AttributeCreate(_)
             | NodeKind::AttributeRandomize(_)
-            | NodeKind::AttributeDelete { .. } => 1,
+            | NodeKind::AttributeDelete(_) => 1,
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => 1,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
             NodeKind::AttributeVop { .. } => 1,
@@ -4691,9 +4739,9 @@ impl NodeKind {
                 | NodeKind::Mirror { .. }
                 | NodeKind::Copy { .. }
                 |                 NodeKind::CopyToPoints { .. }
-                    | NodeKind::AttributeCreate { .. }
+                    | NodeKind::AttributeCreate(_)
                     | NodeKind::AttributeRandomize(_)
-                    | NodeKind::AttributeDelete { .. }
+                    | NodeKind::AttributeDelete(_)
                     | NodeKind::Wrangle { .. }
                     | NodeKind::VolumeWrangle { .. }
                     | NodeKind::HeightfieldWrangle { .. } => egui::Color32::from_rgb(200, 140, 60),
@@ -4742,9 +4790,9 @@ impl NodeKind {
             NodeKind::CopyToPoints { scale, rotation } => {
                 vec![*scale, rotation[0], rotation[1], rotation[2]]
             }
-            NodeKind::AttributeCreate { attribute, value } => vec![*attribute as f32, *value],
+            NodeKind::AttributeCreate(s) => s.to_params(),
             NodeKind::AttributeRandomize(r) => r.to_params(),
-            NodeKind::AttributeDelete { attribute } => vec![*attribute as f32],
+            NodeKind::AttributeDelete(s) => s.to_params(),
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => vec![],
             NodeKind::LSystem(l) => l.to_params(),
             NodeKind::TestGeometry(t) => t.to_params(),
@@ -5054,9 +5102,9 @@ impl NodeKind {
                 scale: g(0).max(0.001),
                 rotation: v3(1),
             },
-            "attribute_create" => NodeKind::AttributeCreate { attribute: u(0).min(3), value: g(1) },
+            "attribute_create" => NodeKind::AttributeCreate(attrib::CreateSettings::from_params(p)),
             "attribute_randomize" => NodeKind::AttributeRandomize(randomize::RandomizeSettings::from_params(p)),
-            "attribute_delete" => NodeKind::AttributeDelete { attribute: u(0).min(3) },
+            "attribute_delete" => NodeKind::AttributeDelete(attrib::DeleteSettings::from_params(p)),
             "wrangle" => NodeKind::Wrangle { code: String::new(), domain: u(0).min(3) },
             "volume_wrangle" => NodeKind::VolumeWrangle { code: String::new() },
             "heightfield_wrangle" => NodeKind::HeightfieldWrangle { code: String::new() },
@@ -6925,16 +6973,15 @@ impl Graph {
                 NodeKind::CopyToPoints { scale, rotation } => {
                     node_copy_to_points(input(0, cache), input(1, cache), *scale, *rotation)
                 }
-                NodeKind::AttributeCreate { attribute, value } => {
-                    node_attribute_create(input(0, cache), *attribute, *value)
+                NodeKind::AttributeCreate(settings) => {
+                    let result = attrib::create(input(0, cache), settings);
+                    self.report(id, result)
                 }
                 NodeKind::AttributeRandomize(settings) => {
                     let result = randomize::randomize(input(0, cache), settings);
                     self.report(id, result)
                 }
-                NodeKind::AttributeDelete { attribute } => {
-                    node_attribute_delete(input(0, cache), *attribute)
-                }
+                NodeKind::AttributeDelete(settings) => attrib::delete(input(0, cache), settings),
                 NodeKind::AttributeVop { domain } => match self.vop_code(id) {
                     Ok(code) => {
                         let source = input(0, cache);
@@ -14656,56 +14703,118 @@ impl ProceduralFxStudioApp {
                 c |= vec3_ui(ui, "Rotation°", rotation, 0.5);
                 ui.small("Use Add or a particle output as the point input.");
             }
-            NodeKind::AttributeCreate { attribute, value } => {
-                ui.label("Create or replace a point attribute.");
-                c |= pfield(ui, pslider(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
-                c |= pfield(ui, pdrag(value).speed(0.05).prefix("Value ")).changed();
-            }
-            NodeKind::AttributeRandomize(r) => {
-                ui.label("Deterministic random values for an attribute.");
-                ui.horizontal(|ui| {
-                    ui.label("Attribute");
-                    egui::ComboBox::from_id_salt(("randomize_preset", id)).selected_text(randomize::PRESETS[r.preset]).show_ui(ui, |ui| {
-                        for (i, name) in randomize::PRESETS.iter().enumerate() {
-                            c |= ui.selectable_value(&mut r.preset, i, *name).changed();
-                        }
-                    });
-                    if r.preset == randomize::CUSTOM {
-                        c |= ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(110.0).hint_text("name")).changed();
-                    }
-                });
-                if r.preset == randomize::CUSTOM {
-                    ui.horizontal(|ui| {
-                        ui.label("Class");
-                        for (i, name) in randomize::CLASSES.iter().enumerate() {
-                            c |= ui.selectable_value(&mut r.class, i, *name).changed();
-                        }
-                    });
-                    c |= pfield(ui, pslider(&mut r.size, 1..=4).text("Size (components)")).changed();
-                    ui.horizontal(|ui| {
-                        c |= pfield(ui, pdrag(&mut r.min).speed(0.01).prefix("Min ")).changed();
-                        c |= pfield(ui, pdrag(&mut r.max).speed(0.01).prefix("Max ")).changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Values");
-                        for (i, name) in randomize::MODES.iter().enumerate() {
-                            c |= ui.selectable_value(&mut r.mode, i, *name).changed();
-                        }
-                    });
-                    ui.small("Each point, polygon (or the detail) gets values between Min and Max. Size 3 makes a vector, e.g. a random velocity v.");
-                } else {
-                    c |= pfield(ui, pslider(&mut r.amount, 0.0..=10.0).text("Amount")).changed();
-                    ui.small(match r.preset {
-                        2 => "A random colour per point; Amount shifts the hues.",
-                        3 => "A random rotation per point (a quaternion), blended in from none by Amount (0 to 1).",
-                        _ => "Adds a random value between -Amount and +Amount to each point.",
-                    });
+            NodeKind::AttributeCreate(a) => {
+                ui.label("Creates or replaces an attribute, of any name and type, with one value on every element.");
+                let (changed, chosen) = attribute_target_ui(ui, id, &mut a.name, &mut a.class, &mut a.kind, &mut a.size);
+                c |= changed;
+                if let Some((name, kind, size, value)) = chosen {
+                    (a.name, a.kind, a.size, a.value) = (name.into(), kind, size, value);
                 }
+                ui.horizontal(|ui| {
+                    ui.label(if a.kind == attrib::QUATERNION { "Rotation°" } else { "Value" });
+                    c |= attribute_value_ui(ui, a.kind, a.size, &mut a.value);
+                });
+                if a.kind == attrib::QUATERNION {
+                    ui.small("Stored as a quaternion (x y z w): turns around X, then Y, then Z, like Transform. Copy to Points uses orient to turn copies.");
+                }
+            }
+            NodeKind::AttributeRandomize(r) if r.preset < randomize::CUSTOM => {
+                ui.colored_label(egui::Color32::from_rgb(230, 190, 90), format!("This node uses an older preset: {}.", randomize::PRESETS[r.preset]));
+                if ui.button("Switch to the full settings").on_hover_text("The same values, with any name, type and range").clicked() {
+                    *r = r.converted();
+                    c = true;
+                }
+                c |= pfield(ui, pslider(&mut r.amount, 0.0..=10.0).text("Amount")).changed();
+                ui.small(match r.preset {
+                    2 => "A random colour per point; Amount shifts the hues.",
+                    3 => "A random rotation per point (a quaternion), blended in from none by Amount (0 to 1).",
+                    _ => "Adds a random value between -Amount and +Amount to each point.",
+                });
                 c |= pfield(ui, pdrag(&mut r.seed).prefix("Seed ")).changed();
             }
-            NodeKind::AttributeDelete { attribute } => {
-                ui.label("Remove a point attribute.");
-                c |= pfield(ui, pslider(attribute, 0..=3).text("Attribute (0=id, 1=pscale, 2=Cd, 3=orient)")).changed();
+            NodeKind::AttributeRandomize(r) => {
+                ui.label("Random values for an attribute, the same every time for the same seed.");
+                let (changed, chosen) = attribute_target_ui(ui, id, &mut r.name, &mut r.class, &mut r.kind, &mut r.size);
+                c |= changed;
+                if let Some((name, kind, size, value)) = chosen {
+                    (r.name, r.kind, r.size) = (name.into(), kind, size);
+                    // A useful range to start from.
+                    (r.distribution, r.min, r.max) = match (name, kind) {
+                        (_, attrib::QUATERNION) => (randomize::ROTATION, [0.0; 4], [0.0, 360.0, 0.0, 0.0]),
+                        ("N" | "v" | "up", _) => (randomize::DIRECTION, [1.0; 4], [1.0; 4]),
+                        ("pscale", _) => (0, [value[0] * 0.5; 4], [value[0] * 1.5; 4]),
+                        ("id", _) => (0, [0.0; 4], [9.0; 4]),
+                        _ => (0, [0.0; 4], [1.0; 4]),
+                    };
+                }
+                let choices = randomize::RandomizeSettings::distributions(r.kind);
+                if !choices.contains(&r.distribution) {
+                    r.distribution = 0;
+                    c = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Values");
+                    egui::ComboBox::from_id_salt(("randomize_distribution", id)).selected_text(randomize::DISTRIBUTIONS[r.distribution]).show_ui(ui, |ui| {
+                        for i in choices {
+                            c |= ui.selectable_value(&mut r.distribution, i, randomize::DISTRIBUTIONS[i]).changed();
+                        }
+                    });
+                });
+                match r.distribution {
+                    randomize::HUE => {
+                        c |= pfield(ui, pslider(&mut r.amount, 0.0..=2.0).text("Hue shift")).changed();
+                    }
+                    randomize::ROTATION => {
+                        c |= pfield(ui, pslider(&mut r.amount, 0.0..=1.0).text("Amount (0 none, 1 any rotation)")).changed();
+                    }
+                    randomize::DIRECTION => {
+                        ui.horizontal(|ui| {
+                            c |= pfield(ui, pdrag(&mut r.min[0]).speed(0.01).prefix("Length from ")).changed();
+                            c |= pfield(ui, pdrag(&mut r.max[0]).speed(0.01).prefix("to ")).changed();
+                        });
+                    }
+                    _ => {
+                        let unit = if r.kind == attrib::QUATERNION { "°" } else { "" };
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Min{unit}"));
+                            c |= attribute_value_ui(ui, r.kind, r.size, &mut r.min);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Max{unit}"));
+                            c |= attribute_value_ui(ui, r.kind, r.size, &mut r.max);
+                        });
+                        ui.small(match (r.kind, r.distribution) {
+                            (attrib::QUATERNION, 1) => "A rotation on the way from Min to Max, in degrees around X, then Y, then Z.",
+                            (attrib::QUATERNION, _) => "Each angle between its Min and Max, in degrees around X, then Y, then Z: Max 0 360 0 spins each point around Y.",
+                            (_, 1) => "One random point on the way from Min to Max, all components together: a colour between two colours.",
+                            (attrib::INTEGER, _) => "Whole numbers from Min to Max, both included.",
+                            _ => "Each component on its own, between its Min and Max.",
+                        });
+                    }
+                }
+                ui.horizontal(|ui| {
+                    for (i, name) in randomize::MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut r.mode, i, *name).on_hover_text(match i {
+                            0 => "Replace what's there",
+                            1 => "Add to what's there (for rotations: turn it further)",
+                            _ => "Multiply what's there (for rotations: turn it further)",
+                        }).changed();
+                    }
+                });
+                c |= pfield(ui, pdrag(&mut r.seed).prefix("Seed ")).changed();
+            }
+            NodeKind::AttributeDelete(d) => {
+                ui.label("Removes attributes by name.");
+                ui.horizontal(|ui| {
+                    ui.label("Names");
+                    c |= ui.add(egui::TextEdit::singleline(&mut d.pattern).desired_width(180.0).hint_text("Cd N fx_*")).changed();
+                });
+                ui.horizontal(|ui| {
+                    for (i, name) in attrib::CLASSES.iter().chain(&["All"]).enumerate() {
+                        c |= ui.selectable_value(&mut d.class, i, *name).changed();
+                    }
+                });
+                ui.small("Names separated by spaces; * matches anything, and ^ in front keeps a name: \"* ^P ^N\" removes all but those.");
             }
             NodeKind::AttributeVop { domain } => {
                 ui.heading("Attribute VOP");

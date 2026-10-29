@@ -124,9 +124,9 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("terrain_colorize", "Colours sand, grass, rock and snow by height and slope."),
     ("heightfield_wrangle", "Runs VEX over a terrain's points: @height, @mask and its other attributes (x and z stay fixed). volumesample(0, \"height\", pos) and volumeindex() read neighbouring heights, e.g. to smooth. Works on its group's points."),
     // Attributes, groups, UV
-    ("attribute_create", "Creates an attribute (id, pscale, Cd, orient) with a value."),
-    ("attribute_randomize", "Random values for an attribute: id, pscale, Cd or orient presets, or any custom attribute on points, primitives or the detail, with 1 to 4 components between Min and Max, set or added."),
-    ("attribute_delete", "Deletes an attribute."),
+    ("attribute_create", "Creates or replaces an attribute of any name, on points, primitives, the detail or vertices: a float of 1 to 4 components, an integer, a vector, a colour (with a colour picker) or a quaternion (entered as a rotation in degrees). The Common menu fills in Cd, Alpha, pscale, N, v, up, orient, id and emission."),
+    ("attribute_randomize", "Random values for any attribute, with a Min and Max per component: each component on its own, a point between Min and Max (a colour between two colours), random directions, random hues or random rotations (or angle ranges, such as a spin around Y). Set, add to or multiply what's there; the same values every time for the same seed."),
+    ("attribute_delete", "Removes attributes by name, from points, primitives, the detail, vertices or all of them: names separated by spaces, * matching anything and ^ keeping a name (\"* ^P ^N\")."),
     ("wrangle", "Runs VEX code over points, primitives, vertices or the detail. See the VEX section."),
     ("attribute_vop", "VEX built from nodes: double-click to build a network of VOPs (see below)."),
     ("normal", "Computes normals on points or vertices, with a cusp angle and weighting."),
