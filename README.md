@@ -110,6 +110,32 @@ The full builds include native OpenVDB and USD, plus a bundled MoonRay:
 - **Linux:** [packaging/linux](packaging/linux) contains the Flatpak manifest.
   [.github/workflows/flatpak.yml](.github/workflows/flatpak.yml) builds it on
   GitHub Actions, and publishes a release when a `v*` tag is pushed.
+- **Windows:** you need Rust, Visual Studio 2022 with "Desktop development with C++",
+  and CMake.
+  1. Download `pfx-windows-deps.zip` from the
+     [Windows libraries pre-release](https://github.com/loksangho/proceduralfx-studio/releases/tag/windows-deps-1e95e2a5cf14)
+     and unzip it, for example to `C:\pfx-deps`. It holds OpenUSD, OpenVDB and Alembic,
+     prebuilt with vcpkg. To build them yourself instead, run vcpkg on
+     [packaging/windows/deps/vcpkg.json](packaging/windows/deps/vcpkg.json) with the
+     `x64-windows-release` triplet. That takes a few hours.
+  2. Build the app in PowerShell:
+     ```powershell
+     $env:USD_ROOT = "C:\pfx-deps"
+     $env:OPENVDB_ROOT = "C:\pfx-deps"
+     $env:ALEMBIC_ROOT = "C:\pfx-deps"
+     cargo build --release --features native-usd,native-openvdb,native-alembic
+     ```
+  3. Copy `C:\pfx-deps\bin\*.dll`, and the `C:\pfx-deps\bin\usd` folder, next to
+     `target\release\proceduralfx_studio.exe`, so the app finds the libraries and USD's
+     plugins.
+  4. Rendering with MoonRay goes through `pfx-render.exe`, which runs MoonRay in a WSL
+     container. Build it from [packaging/windows/render](packaging/windows/render) with
+     CMake and the `Microsoft.WSL.Containers` NuGet package, and put it beside the app
+     with the package's `wslcsdk.dll`.
+     Without it, everything except MoonRay rendering still works.
+
+  [.github/workflows/windows.yml](.github/workflows/windows.yml) does all of this on
+  GitHub Actions, and is the full recipe, including how the release zip is laid out.
 
 ## Our promise
 
