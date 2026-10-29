@@ -10346,20 +10346,36 @@ impl ProceduralFxStudioApp {
             ui.close();
         }
         ui.separator();
-        if ui.button("Export OBJ").on_hover_text("Writes the displayed mesh to procedural_output.obj").clicked() {
-            self.status = match self.current_mesh.export_obj("procedural_output.obj") {
-                Ok(_) => "Exported procedural_output.obj".into(),
-                Err(e) => format!("Export failed: {e}"),
-            };
+        if ui.button("Export OBJ…").on_hover_text("Writes the displayed mesh to an OBJ file you choose").clicked() {
             ui.close();
+            self.export_mesh_dialog("OBJ", "obj");
         }
-        if ui.button("Export STL").on_hover_text("Writes the displayed mesh to procedural_output.stl").clicked() {
-            self.status = match self.current_mesh.export_stl("procedural_output.stl") {
-                Ok(_) => "Exported procedural_output.stl".into(),
-                Err(e) => format!("Export failed: {e}"),
-            };
+        if ui.button("Export STL…").on_hover_text("Writes the displayed mesh to an STL file you choose").clicked() {
             ui.close();
+            self.export_mesh_dialog("STL", "stl");
         }
+    }
+
+    // Asks where to write the displayed mesh, named after the scene and beside it by default.
+    fn export_mesh_dialog(&mut self, format: &str, extension: &str) {
+        let stem = self.scene_path.as_ref().and_then(|p| p.file_stem()).map_or_else(|| "procedural_output".to_owned(), |s| s.to_string_lossy().into_owned());
+        let mut dialog = FileDialog::new().set_title(&format!("Export {format}")).set_file_name(&format!("{stem}.{extension}")).add_filter(&format!("{format} mesh"), &[extension]);
+        if let Some(dir) = self.scene_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            self.status = "Export canceled".into();
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension(extension);
+        }
+        let file = path.to_string_lossy().into_owned();
+        let result = if extension == "obj" { self.current_mesh.export_obj(&file) } else { self.current_mesh.export_stl(&file) };
+        self.status = match result {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
     }
 
     fn edit_menu(&mut self, ui: &mut egui::Ui) {
@@ -10428,8 +10444,11 @@ impl ProceduralFxStudioApp {
             pfield(ui, pslider(&mut self.camera_focal, 0.5..=2.5).text("Focal scale"));
             pfield(ui, pslider(&mut self.camera_near, 0.05..=2.0).text("Near clip"));
             ui.separator();
-            ui.label("Viewport lighting (used when the scene has no lights)");
-            pfield(ui, pslider(&mut self.ambient_light, 0.0..=1.0).text("Ambient"));
+            pfield(ui, pslider(&mut self.ambient_light, 0.0..=1.0).text("Ambient")).on_hover_text(
+                "Soft light everywhere, always added, with or without lights in the scene, so the sides facing away from them aren't black. \
+                 MoonRay renders get it too, as a dim environment light. Set it to 0 to light the scene only with its own lights.",
+            );
+            ui.label("Default lights (used when the scene has no lights)");
             vec3_ui(ui, "Key direction", &mut self.key_light_dir, 0.05);
             pfield(ui, pslider(&mut self.key_light_intensity, 0.0..=2.0).text("Key intensity"));
             vec3_ui(ui, "Fill direction", &mut self.fill_light_dir, 0.05);
