@@ -91,13 +91,26 @@ The full builds include native OpenVDB and USD, plus a bundled MoonRay:
   [.github/workflows/flatpak.yml](.github/workflows/flatpak.yml) builds it on
   GitHub Actions, and publishes a release when a `v*` tag is pushed.
 
+## Our promise
+
+These hold for everyone, free or paid, for the version you have, whatever changes later.
+The full text is at [build3dstudio.com/promise](https://www.build3dstudio.com/promise).
+
+1. **Your work is yours.** We claim no rights over anything you make.
+2. **Your files stay open.** Scenes are plain text in a [documented format](docs/scene-format.md).
+3. **Your license keeps working.** If you stop paying for a commercial license, you keep the last version you had, forever.
+4. **The terms you get are the terms you keep.** We never change the license of a version you already have.
+5. **We never train on your work.** Your scenes, prompts and outputs aren't used to train any AI model.
+6. **Prices are always visible.** The AI assistant shows an estimate before you build and the cost after, in real money. Credit never expires.
+7. **If we shut down, the tool lives on.** The code becomes open source under Apache-2.0. This is written into the [LICENSE](LICENSE).
+
 ## License
 
 ProceduralFX Studio is **source-available** under the
 [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
 See [LICENSE](LICENSE).
 
-**Free for noncommercial use.** Learning, personal projects, hobby games,
+**Free for noncommercial use, forever.** Learning, personal projects, hobby games,
 research, and use by schools, charities and other noncommercial organizations
 are all free. You can read, build, modify and share the code for those purposes.
 
@@ -105,11 +118,10 @@ are all free. You can read, build, modify and share the code for those purposes.
 to make something you sell or earn money from (for example, effects for a
 commercial game), please get a commercial license: email [support@build3dstudio.com](mailto:support@build3dstudio.com).
 
-**What stays true whatever license you have:**
-
-- Everything you make with the tool belongs to you.
-- Your files use an open, documented format.
-- Your work is never used to train AI models.
+**If the project ends, it becomes open source.** The code is also licensed under
+Apache-2.0 from the day the project is announced as discontinued, or after 18 months
+in a row with no new version and no commercial licenses for sale. See LICENSE for
+the exact terms.
 
 ---
 

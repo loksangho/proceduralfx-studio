@@ -139,6 +139,7 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     const token = await signIn(t);
     const account = await (await fetch(`${t.base}/v1/account`, { headers: { authorization: `Bearer ${token}` } })).json();
     assert.equal(account.balance, 0.05);
+    assert.equal(account.per_usd, 2);
     assert.equal(account.symbol, "A$");
     assert.deepEqual(account.plans, [{ id: "basic", credit: 8, price: "$8/month", current: false }]);
 
@@ -178,15 +179,20 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     u = (await t.store.userById(user.id))!;
     assert.equal(u.planMicros, 8_000_000 - 120_000);
     assert.equal(u.topupMicros, 10_000_000 - 70_000);
+    // The next month's credit adds to what's left.
+    t.billing.next = { kind: "renewed", id: "in_2", customerId: "cus_1" };
+    await hook("good");
+    u = (await t.store.userById(user.id))!;
+    assert.equal(u.planMicros, 2 * 8_000_000 - 120_000);
     // Subscribed: the plan button now opens the portal.
     assert.equal((await (await t.post("/v1/checkout", { plan: "basic" }, token)).json()).url, "https://stripe.test/portal");
-    // Cancelled: plan credit goes, top-ups stay.
+    // Cancelled: the plan's unused credit is kept, as top-up credit.
     t.billing.next = { kind: "changed", id: "evt_9", customerId: "cus_1", priceId: "price_basic", active: false };
     await hook("good");
     u = (await t.store.userById(user.id))!;
     assert.equal(u.plan, null);
     assert.equal(u.planMicros, 0);
-    assert.equal(u.topupMicros, 10_000_000 - 70_000);
+    assert.equal(u.topupMicros, 10_000_000 - 70_000 + 2 * 8_000_000 - 120_000);
 
     const stats = await (await fetch(`${t.base}/admin/stats`, { headers: { authorization: "Bearer admin" } })).json();
     assert.deepEqual(stats, { currency: "aud", users: 1, requests: 2, anthropic_cost_usd: 0.12, anthropic_cost: 0.19, charged: 0.24, margin: 0.05, topups_paid: 10 });

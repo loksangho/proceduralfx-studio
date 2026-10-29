@@ -1,9 +1,9 @@
 // Accounts, sign-in codes, sessions and balances. Two implementations: MemoryStore
 // (tests, trying things locally) and PgStore (pgstore.ts, production).
 //
-// Each user has two balances: plan credit, refilled to the plan's amount every month
-// (unused credit doesn't roll over), and top-up credit, which never expires.
-// Requests spend plan credit first.
+// Each user has two balances: plan credit, added each month the plan is paid, and
+// top-up credit. Neither expires: unused plan credit rolls over, and when a plan ends
+// its credit moves to top-ups. Requests spend plan credit first.
 
 export interface User {
   id: string;
@@ -72,7 +72,8 @@ export interface Store {
   charge(row: UsageRow): Promise<User>;
   // Credits a paid top-up once per payment id; false if it was already counted.
   addTopup(paymentId: string, userId: string, micros: number): Promise<boolean>;
-  // Sets the plan, and (when micros isn't null) refills plan credit, once per event id.
+  // Sets the plan, and (when micros isn't null) adds that month's plan credit, once per event id.
+  // Ending the plan (null) moves its credit to top-ups.
   setPlan(eventId: string, userId: string, plan: string | null, micros: number | null): Promise<boolean>;
 
   stats(): Promise<Stats>;
@@ -181,8 +182,11 @@ export class MemoryStore implements Store {
     if (!u || this.processed.has(eventId)) return false;
     this.processed.add(eventId);
     u.plan = plan;
-    if (micros !== null) u.planMicros = micros;
-    if (plan === null) u.planMicros = 0;
+    if (micros !== null) u.planMicros += micros;
+    if (plan === null) {
+      u.topupMicros += u.planMicros;
+      u.planMicros = 0;
+    }
     return true;
   }
 

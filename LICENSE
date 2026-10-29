@@ -14,7 +14,29 @@ In summary (the license terms above are what govern):
 - Any commercial use, including making effects for a commercial game or
   other paid product, requires a separate commercial license from the
   copyright holder.
+- If the project ends, the code becomes open source under Apache-2.0 (see
+  "Additional permission if the project ends" below).
 - Anyone you share the software with must receive these terms (or the URL
   above) and the Required Notice line at the top of this file.
 
 For a commercial license, email support@build3dstudio.com.
+
+Additional permission if the project ends
+-----------------------------------------
+
+In addition to the PolyForm Noncommercial License, the copyright holder grants
+everyone a license to this software under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0), starting on the first day that
+either of these is true:
+
+1. The copyright holder has publicly announced that ProceduralFX Studio is
+   discontinued.
+2. For 18 months in a row, no new version of ProceduralFX Studio has been
+   published at https://github.com/loksangho/proceduralfx-studio (or at a new
+   location announced there), and commercial licenses have not been offered
+   for sale.
+
+From that day, every version published up to then is also available under the
+Apache License, Version 2.0, for any purpose, including commercial use. This
+permission is irrevocable for every version published with it, even if a later
+version changes this file.

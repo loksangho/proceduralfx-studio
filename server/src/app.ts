@@ -205,6 +205,8 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
         plan_credit: money(u.planMicros),
         topup_credit: money(u.topupMicros),
         balance: money(balanceMicros(u)),
+        // What one US dollar of list-price usage is charged, so the app can estimate costs.
+        per_usd: config.usdRate * (1 + config.margin),
         plans: await Promise.all(config.plans.map((p) => planInfo(p, u))),
         topups: config.topups,
         models: ALLOWED_MODELS,

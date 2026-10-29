@@ -197,10 +197,10 @@ export class PgStore implements Store {
   setPlan(eventId: string, userId: string, plan: string | null, micros: number | null) {
     const sql =
       plan === null
-        ? "UPDATE users SET plan = NULL, plan_micros = 0 WHERE id = $1"
+        ? "UPDATE users SET plan = NULL, topup_micros = topup_micros + plan_micros, plan_micros = 0 WHERE id = $1"
         : micros === null
           ? "UPDATE users SET plan = $2 WHERE id = $1"
-          : "UPDATE users SET plan = $2, plan_micros = $3 WHERE id = $1";
+          : "UPDATE users SET plan = $2, plan_micros = plan_micros + $3 WHERE id = $1";
     const args = plan === null ? [userId] : micros === null ? [userId, plan] : [userId, plan, micros];
     return this.once(eventId, userId, plan === null ? "plan_end" : "plan", micros ?? 0, (c) => c.query(sql, args));
   }

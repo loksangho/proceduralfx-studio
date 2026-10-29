@@ -19204,6 +19204,76 @@ mod tests {
 mod scene_file_tests {
     use super::*;
 
+    // docs/scene-nodes.md lists every node's saved parameters, generated from the code so it
+    // can't go stale. Rewrite it with PFX_WRITE_DOCS=1 cargo test node_reference.
+    fn node_reference() -> String {
+        let mut out = String::from(
+            "# Scene file node reference\n\n\
+             Generated from the code by `node_reference_is_current` (see [scene-format.md](scene-format.md)). \
+             Each `node` line stores its parameters in the order below, as numbers; the values shown are a new node's defaults. \
+             Nodes with text fields store them first, as `t:` followed by hex-encoded UTF-8 strings joined by `|`.\n",
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (category, kinds) in NodeKind::templates() {
+            let mut rows = String::new();
+            for kind in kinds {
+                if !seen.insert(kind.menu_name()) {
+                    continue;
+                }
+                let (params, names, texts) = (kind.params(), kind.param_names(), kind.texts());
+                // Table-driven nodes share one saved name and store which operation they are first.
+                let table = matches!(kind, NodeKind::Vop(_) | NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::ShaderNode(_));
+                let numbers = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| match names.get(i).filter(|n| !n.is_empty()) {
+                        _ if table && i == 0 => format!("operation={v}"),
+                        Some(n) => format!("{n}={v}"),
+                        None => format!("#{i}={v}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let special = match &kind {
+                    NodeKind::Wrangle { .. } => "the run-over domain (0–3), `:`, then the code in hex".to_owned(),
+                    NodeKind::MoonRayRender { .. } => "`mr:` then 20 fields separated by `\\|` (see scene-format.md)".to_owned(),
+                    _ if texts.is_empty() => numbers,
+                    _ if numbers.is_empty() => format!("{} text field(s)", texts.len()),
+                    _ => format!("{} text field(s); {numbers}", texts.len()),
+                };
+                rows += &format!("| {} | `{}` | {} |\n", kind.menu_name().replace('|', "/"), kind.name(), if special.is_empty() { "none".into() } else { special });
+            }
+            if !rows.is_empty() {
+                out += &format!("\n## {category}\n\n| Node | Saved as | Parameters |\n| --- | --- | --- |\n{rows}");
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_scene_format_example_loads() {
+        let doc = include_str!("../docs/scene-format.md");
+        let example = doc.split("```\n").nth(1).unwrap();
+        let g = Graph::deserialize(example);
+        assert!(matches!(g.nodes[&2].kind, NodeKind::Noise { amp, .. } if amp == 0.2));
+        assert_eq!(g.nodes[&2].parent, Some(0));
+        assert_eq!(g.nodes[&0].name, "rocks");
+        assert_eq!(g.xform_at(0, 0.0).t, [0.0, 1.0, 0.0]);
+        assert_eq!(g.xform_at(0, 0.0).r, [0.0, 45.0, 0.0]);
+        assert!(matches!(g.kind_at(2, 2.0).as_ref(), NodeKind::Noise { amp, .. } if (*amp - 0.8).abs() < 1e-5));
+        assert_eq!(g.next_id, 3);
+        assert_eq!(g.serialize(), example);
+    }
+
+    #[test]
+    fn node_reference_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/scene-nodes.md");
+        let text = node_reference();
+        if std::env::var_os("PFX_WRITE_DOCS").is_some() {
+            std::fs::write(&path, &text).unwrap();
+        }
+        assert!(std::fs::read_to_string(&path).is_ok_and(|saved| saved == text), "docs/scene-nodes.md is out of date: run PFX_WRITE_DOCS=1 cargo test node_reference");
+    }
+
     #[test]
     fn recent_scenes_dedupe_and_cap() {
         let text = "/a.pfs\n\n/b.pfs\n/a.pfs\n".to_owned() + &(0..20).map(|i| format!("/s{i}.pfs\n")).collect::<String>();

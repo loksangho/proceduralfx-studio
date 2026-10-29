@@ -8,7 +8,7 @@ The app keeps the other two options as well: a user's own Claude key, or any Ope
 
 - **Signing in:** the app asks for a code and opens `/device` in the browser. The user enters their email and clicks the emailed link. The confirm page shows the code. The app then receives a session token, and the server stores only its SHA-256 hash.
 - **Credit:** in `CURRENCY`. Each user has two balances.
-  - Plan credit is set to the plan's amount each time the monthly invoice is paid. Unused plan credit doesn't carry over.
+  - Each paid monthly invoice adds the plan's amount to plan credit. Unused plan credit rolls over, and when a plan ends it moves to top-up credit, so no credit expires.
   - Top-up credit never expires.
   - Requests spend plan credit first. A request is refused when the total is zero or less. A request that is already running can take the balance slightly below zero.
 - **The relay:** `POST /v1/messages` takes the app's Messages API request.
@@ -60,6 +60,6 @@ Credit, plans and top-ups use `CURRENCY` (for example `aud`). Anthropic bills yo
 Roughly, with `CURRENCY=aud`, `USD_RATE=1.60` and `MARGIN=0.25`:
 
 - **A$5 top-up:** Stripe's fee is about A$0.40–0.50 (lower for Australian cards). Spending A$5 of credit costs you about A$4 in tokens, so you keep about A$0.50–0.60.
-- **A$12 plan with A$12 of credit:** earns about A$1.50–2.00 a month when fully used. Unused plan credit is extra, because it doesn't carry over.
+- **A$12 plan with A$12 of credit:** earns about A$1.50–2.00 a month when fully used. Unused credit isn't extra income: it rolls over and is spent later.
 
 Raise `MARGIN`, or give plans less credit than their price, to earn more per user. Prices per million tokens are in `src/pricing.ts`; update them when Anthropic's prices change. `/admin/stats` reports Anthropic's cost both in US dollars and converted at the current `USD_RATE`.

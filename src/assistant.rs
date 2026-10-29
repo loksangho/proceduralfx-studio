@@ -308,7 +308,7 @@ impl Usage {
         }
     }
 
-    // Estimated dollars at the model's list prices.
+    // Dollars at the model's list prices.
     pub fn cost(&self, model: &str) -> f64 {
         let p = MODELS.iter().find(|(id, ..)| *id == model).map_or(MODELS[0].2, |m| m.2);
         (self.input as f64 * p[0] + self.output as f64 * p[1] + self.cache_write as f64 * p[2] + self.cache_read as f64 * p[3]) / 1e6
@@ -688,6 +688,8 @@ pub struct Panel {
     signing_in: Option<(String, String)>,
     sign_in_cancel: Arc<AtomicBool>,
     paying_since: Option<std::time::Instant>,
+    // The first request's size in tokens, and when it was last measured.
+    request_tokens: Option<(f64, std::time::Instant)>,
 }
 
 impl Default for Panel {
@@ -719,8 +721,27 @@ impl Default for Panel {
             signing_in: None,
             sign_in_cancel: Arc::new(AtomicBool::new(false)),
             paying_since: None,
+            request_tokens: None,
         }
     }
+}
+
+// A typical build's cost in list-price US dollars, given the first request's size in
+// tokens. The first turn writes the system prompt, tools, scene and request to the cache;
+// each later turn reads them back and adds the last turn's output and tool results.
+// Most builds take 2 to 6 turns of about 1,500 tokens out each.
+pub fn estimate(model: &str, first_tokens: f64) -> (f64, f64) {
+    let p = MODELS.iter().find(|(id, ..)| *id == model).map_or(MODELS[0].2, |m| m.2);
+    let turns = |n: usize| {
+        let (mut cached, mut new, mut cost) = (0.0, first_tokens, 0.0);
+        for _ in 0..n {
+            cost += new * p[2] + cached * p[3] + 1500.0 * p[1];
+            cached += new;
+            new = 2000.0;
+        }
+        cost / 1e6
+    };
+    (turns(2), turns(6))
 }
 
 fn fingerprint(graph: &Graph) -> u64 {
@@ -848,6 +869,22 @@ impl Panel {
         }
     }
 
+    // "About A$0.12–0.45 for a typical build", in what the request would be paid with.
+    fn estimate_text(&mut self, graph: &Graph) -> Option<String> {
+        let (symbol, per_usd) = match self.settings.backend().ok()? {
+            Backend::Credits { .. } => (self.symbol(), self.account.as_ref()?["per_usd"].as_f64()?),
+            Backend::Anthropic { .. } => ("$".to_owned(), 1.0),
+            Backend::Compatible { .. } => return None,
+        };
+        // Describing the scene isn't free, so it's measured at most once a second.
+        if self.request_tokens.is_none_or(|(_, at)| at.elapsed() > std::time::Duration::from_secs(1)) {
+            let chars = system_prompt().len() + tools().to_string().len() + ai::describe(graph).len() + self.prompt.len();
+            self.request_tokens = Some((chars as f64 / 4.0, std::time::Instant::now()));
+        }
+        let (low, high) = estimate(&self.settings.model, self.request_tokens?.0);
+        Some(format!("About {symbol}{:.2}–{:.2} for a typical build", low * per_usd, high * per_usd))
+    }
+
     // The credits currency symbol (e.g. "A$"), as the server reports it.
     fn symbol(&self) -> String {
         self.account.as_ref().and_then(|a| a["symbol"].as_str()).unwrap_or("$").to_owned()
@@ -937,7 +974,7 @@ impl Panel {
                 }
             }
         });
-        ui.weak("Plan credit refills each month and doesn't carry over; top-ups never expire. Payment happens in your browser.");
+        ui.weak("Credit never expires: unused plan credit rolls over to the next month. Payment happens in your browser.");
     }
 
     fn poll(&mut self) {
@@ -1140,6 +1177,12 @@ impl Panel {
                     ui.weak(missing);
                 }
             });
+            if let Some(text) = self.estimate_text(graph) {
+                ui.weak(text).on_hover_text(
+                    "Before you build: what a typical request costs with this model and this scene. \
+                     Most take 2 to 6 steps; a long one can cost more. What each request actually cost is shown when it finishes.",
+                );
+            }
             if !self.log.is_empty() {
                 ui.separator();
                 for line in &self.log {
@@ -1199,6 +1242,17 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimates_rise_with_the_model_and_the_scene() {
+        let graph = Graph::default();
+        let tokens = (system_prompt().len() + tools().to_string().len() + ai::describe(&graph).len()) as f64 / 4.0;
+        let (low, high) = estimate("claude-opus-5-5", tokens);
+        println!("{tokens:.0} tokens: Opus ${low:.3}–{high:.3}, Haiku ${:.4}–{:.4}", estimate("claude-haiku-5-5", tokens).0, estimate("claude-haiku-5-5", tokens).1);
+        assert!(0.0 < low && low < high);
+        assert!(estimate("claude-haiku-5-5", tokens).1 < estimate("claude-sonnet-5-5", tokens).0);
+        assert!(estimate("claude-opus-5-5", tokens * 2.0).0 > low);
+    }
 
     #[test]
     fn the_prompt_and_tools_are_well_formed() {

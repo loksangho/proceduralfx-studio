@@ -8,7 +8,7 @@ import { symbol } from "./pricing.js";
 export type BillingEvent =
   // A paid top-up: credit it once (id is the Checkout session).
   | { kind: "topup"; id: string; userId: string; micros: number }
-  // A plan's first or monthly invoice was paid: refill plan credit (id is the invoice).
+  // A plan's first or monthly invoice was paid: add a month of plan credit (id is the invoice).
   | { kind: "renewed"; id: string; customerId: string }
   // A subscription changed plan or ended (id is the event).
   | { kind: "changed"; id: string; customerId: string; priceId: string | null; active: boolean }
