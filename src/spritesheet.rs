@@ -5,6 +5,9 @@
 //
 // Trimming crops every frame to the same box: the union of what's visible in any frame,
 // plus a 1-pixel transparent border so neighbouring cells don't bleed when filtered.
+//
+// Seamless loops render a few frames past the end of the range and cross-fade them into
+// the first frames, so the last frame leads into the first as smoothly as into the next.
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -26,11 +29,21 @@ pub struct Settings {
     pub trim: bool,
     // Export again to the same files whenever the scene changes.
     pub live: bool,
+    // Cross-fade the end into the start over `blend` frames.
+    pub seamless: bool,
+    pub blend: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8 }
+    }
+}
+
+impl Settings {
+    // How many extra frames a seamless loop of `count` frames renders past the end.
+    pub fn extra_frames(&self, count: usize) -> usize {
+        if self.seamless && count > 1 { (self.blend as usize).clamp(1, count) } else { 0 }
     }
 }
 
@@ -43,6 +56,8 @@ pub struct Output {
     pub fps: f32,
     // A live re-export: quieter (no Render Viewer entry).
     pub live: bool,
+    // The last `blend` frames were rendered past the end, to cross-fade into the start.
+    pub blend: usize,
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -130,8 +145,36 @@ pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, s
     })
 }
 
+// Turns `frames`, whose last `blend` were rendered just past the end of the loop, into a
+// loop that wraps smoothly: frame i of the first `blend` fades from the frame `blend`
+// past the end (which follows the last frame) towards its own, in even steps. Blends in
+// linear premultiplied colour, so transparent edges fade without dark fringes.
+pub fn seamless(frames: &[egui::ColorImage], blend: usize) -> Vec<egui::ColorImage> {
+    let blend = blend.min(frames.len() / 2);
+    let n = frames.len() - blend;
+    let mut out = frames[..n].to_vec();
+    for i in 0..blend {
+        let own = (i + 1) as f32 / (blend + 1) as f32;
+        let (head, tail) = (&frames[i], &frames[n + i]);
+        if head.size != tail.size {
+            continue;
+        }
+        for (px, (a, b)) in out[i].pixels.iter_mut().zip(head.pixels.iter().zip(&tail.pixels)) {
+            *px = (egui::Rgba::from(*a) * own + egui::Rgba::from(*b) * (1.0 - own)).into();
+        }
+    }
+    out
+}
+
 // Writes the sheet PNG and its JSON (same name, .pfx.json); returns the PNG's path.
 pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sheet), String> {
+    let looped;
+    let frames = if output.blend > 0 {
+        looped = seamless(frames, output.blend);
+        &looped[..]
+    } else {
+        frames
+    };
     let sheet = pack(frames, output.columns, output.trim)?;
     let png = output.path.with_extension("png");
     if let Some(dir) = png.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -205,6 +248,33 @@ mod tests {
     }
 
     #[test]
+    fn seamless_loops_fade_the_frames_past_the_end_into_the_start() {
+        // Six loop frames plus two rendered past the end, each one flat grey: 10, 20, … 80.
+        let flat = |v: u8| egui::ColorImage::new([2, 2], vec![egui::Color32::from_gray(v); 4]);
+        let frames: Vec<_> = (1..=8).map(|i| flat(i * 10)).collect();
+        let looped = seamless(&frames, 2);
+        assert_eq!(looped.len(), 6, "the extra frames don't become frames of their own");
+        let linear = |c: egui::Color32| egui::Rgba::from(c).r();
+        let mix = |own: f32, a: u8, b: u8| own * linear(egui::Color32::from_gray(a)) + (1.0 - own) * linear(egui::Color32::from_gray(b));
+        // Frame 0 is mostly frame 6 (the one after the last), frame 1 mostly its own.
+        assert!((linear(looped[0].pixels[0]) - mix(1.0 / 3.0, 10, 70)).abs() < 0.01);
+        assert!((linear(looped[1].pixels[0]) - mix(2.0 / 3.0, 20, 80)).abs() < 0.01);
+        // Past the blend, frames are untouched.
+        assert_eq!(&looped[2..], &frames[2..6]);
+        // Fully transparent frames stay fully transparent.
+        let clear = vec![egui::ColorImage::new([2, 2], vec![egui::Color32::TRANSPARENT; 4]); 4];
+        assert!(seamless(&clear, 2).iter().all(|f| f.pixels.iter().all(|p| *p == egui::Color32::TRANSPARENT)));
+    }
+
+    #[test]
+    fn seamless_loops_need_extra_frames_only_when_asked() {
+        let mut s = Settings::default();
+        assert_eq!(s.extra_frames(24), 0);
+        s.seamless = true;
+        assert_eq!((s.extra_frames(24), s.extra_frames(5), s.extra_frames(1)), (8, 5, 0));
+    }
+
+    #[test]
     fn oversized_sheets_are_refused() {
         let frames: Vec<_> = (0..3).map(|_| frame(10000, 1, 0, 0)).collect();
         assert!(pack(&frames, 3, false).unwrap_err().contains("16384"));
@@ -214,7 +284,7 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0 };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();

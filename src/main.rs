@@ -10732,6 +10732,19 @@ impl ProceduralFxStudioApp {
                 ui.label("Trim");
                 ui.checkbox(&mut s.trim, "Crop empty space").on_hover_text("Crops every frame to the same box: what any frame shows, plus a 1-pixel transparent border. The JSON records where the box was in the full frame.");
                 ui.end_row();
+                ui.label("Loop");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut s.seamless, "Seamless").on_hover_text(
+                        "For fires, auras and other looping effects. Renders a few frames past the end of the playback range and fades them into the first frames, \
+                         so the last frame leads into the first without a jump. The sheet still has one frame per frame of the range.",
+                    );
+                    if s.seamless {
+                        ui.label("blend");
+                        ui.add(egui::DragValue::new(&mut s.blend).range(1..=count.max(1) as u32));
+                        ui.label(if s.blend == 1 { "frame" } else { "frames" });
+                    }
+                });
+                ui.end_row();
                 ui.label("Live");
                 ui.checkbox(&mut s.live, "Keep updating").on_hover_text(
                     "After exporting, export again to the same files whenever the scene, camera or these settings change. \
@@ -10782,7 +10795,13 @@ impl ProceduralFxStudioApp {
             self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
         }
         let s = &self.sprite_sheet;
-        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live };
+        // A seamless loop renders on past the end, to fade into the start.
+        let mut times = times;
+        let blend = s.extra_frames(times.len());
+        let step = s.every.max(1) as f32 / sims::SIM_FPS;
+        let last = times.last().copied().unwrap_or(self.playback_start);
+        times.extend((1..=blend).map(|i| last + i as f32 * step));
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend };
         let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output) };
         self.render_camera_in_use();
         self.animate = false;
@@ -10801,7 +10820,7 @@ impl ProceduralFxStudioApp {
             self.playback_start, self.playback_end, s.width, s.height, s.every, s.columns
         )
         .hash(&mut hasher);
-        s.trim.hash(&mut hasher);
+        (s.trim, s.seamless, s.blend).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -10909,7 +10928,7 @@ impl ProceduralFxStudioApp {
                     Ok((png, sheet)) => {
                         self.viewer.add(png.clone(), true);
                         let (w, h) = sheet.image.dimensions();
-                        format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}", done.frames.len(), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
+                        format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}", done.frames.len().saturating_sub(output.blend), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
                     }
                     Err(e) => format!("Sprite sheet: {e}"),
                 };
@@ -22026,6 +22045,42 @@ mod realtime_render_tests {
             }
         }
         assert!(app.flipbook_recording.is_none(), "the recording finished: {}", app.status);
+    }
+
+    #[test]
+    fn seamless_sprite_sheets_fade_the_end_into_the_start() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        // The ball moves right over 4 frames, then stays at the right.
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nchannel 0 x 0 0,-0.5,1,0,0;0.125,0.5,1,0,0\nnext 2\n");
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+        (app.playback_start, app.playback_end) = (0.0, 3.0 / sims::SIM_FPS);
+        app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, seamless: true, blend: 2, ..Default::default() };
+        app.dirty = true;
+        let dir = std::env::temp_dir().join(format!("pfx_sheet_loop_{}", std::process::id()));
+        app.start_sprite_sheet(dir.join("ball.png"), false);
+        run_recording(&mut app);
+        let sheet = image::open(dir.join("ball.png")).expect("the sheet was saved").to_rgba8();
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.pfx.json")).unwrap()).unwrap();
+        assert_eq!(meta["frame_count"], 4, "one frame per frame of the range, however many were rendered");
+        let [w, h] = [meta["frame_size"][0].as_u64().unwrap() as u32, meta["frame_size"][1].as_u64().unwrap() as u32];
+        let alpha = |frame: u32, x: u32| {
+            let cell = &meta["frames"][frame as usize];
+            sheet.get_pixel(cell[0].as_u64().unwrap() as u32 + x, cell[1].as_u64().unwrap() as u32 + h / 2).0[3]
+        };
+        // Frame 1 fades from the ball at the right (where frame 4 left it) towards its own,
+        // at the left: both show, the right more strongly.
+        let (left, right) = (alpha(0, w / 4), alpha(0, w * 3 / 4));
+        assert!(left > 0 && right > left, "frame 1 blends both ends: left {left}, right {right}");
+        // The last frame is as rendered: only the right.
+        assert!(alpha(3, w / 4) == 0 && alpha(3, w * 3 / 4) == 255);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
