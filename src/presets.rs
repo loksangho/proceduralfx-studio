@@ -19,7 +19,7 @@ pub struct Preset {
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "Fire",
-        description: "A looping campfire flame: a Pyro simulation burning fuel from a small source.",
+        description: "A looping campfire flame: a Pyro simulation burning fuel from a small source, looped by a Make Loop node.",
         scene: include_str!("../assets/presets/fire.pfs"),
         range: (2.0, 3.0 - 1.0 / 24.0),
         frame: [192, 256],

@@ -208,6 +208,7 @@ pub fn system_prompt() -> String {
          # Effects for 2D games\n\
          For a game effect (fire, smoke, sparks, a hit, a spell, a slash and the like), start from the closest preset with load_preset and change it to match the request, rather than building from nothing. \
          If the scene already has the effect, change it instead of loading a preset. \
+         To make a simulation loop, put make_loop after a pyro solver, or loop_particles after a particles solver, with start and length matching the playback range; the Fire preset already does. \
          A preset's sheet_camera frames the export: it's orthographic, looking along -Z at its position, and the frame's shorter side spans zoom ÷ focal units (for example zoom 3.6 and focal 1.2 show 3 units). \
          When you make an effect bigger or move it, check its bounds with inspect_node over its range, and set the camera's position and zoom so it fits with a little room; otherwise the sprite sheet cuts it off. \
          Presets come with a side-on camera and the playback range they're made for; the user exports them with Render → Export Sprite Sheet. \

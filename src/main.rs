@@ -42,6 +42,7 @@ mod groom;
 mod groups;
 mod kinefx;
 mod lsystem;
+mod looping;
 mod measure;
 mod muscle;
 mod nodeinfo;
@@ -3543,6 +3544,18 @@ enum NodeKind {
     Switch { index: usize },
     // Smoke and fire on a voxel grid. Input 1: source geometry, input 2: optional static collider.
     Pyro(sims::PyroSettings),
+    // Seamless loops of a simulation, from `start` for `length` seconds (see looping.rs):
+    // particles exactly, anything else by blending its next loop into the start over `blend`.
+    LoopParticles { start: f32, length: f32 },
+    // Input 1 at another time: `offset` seconds later, or held at `at` seconds.
+    TimeShift { offset: f32, hold: bool, at: f32 },
+    // Input 1 retimed: time runs `speed` times as fast from `anchor` (where it's unchanged).
+    TimeWarp { speed: f32, anchor: f32 },
+    // Input 1 between whole frames: the frames either side mixed, for smooth slow motion.
+    TimeBlend,
+    // Input 1 over its last `samples` moments, `step` frames apart: copies, curves or velocity.
+    Trail { samples: usize, step: f32, mode: usize, fade: bool },
+    MakeLoop { start: f32, length: f32, blend: f32 },
     // Groom. Hair Guides: input 1 is the skin mesh.
     HairGuides(groom::GuideSettings),
     // Shapes guide (or hair) curves from input 1.
@@ -3790,6 +3803,11 @@ impl NodeKind {
             NodeKind::ConvertVdb { .. } => names(&["mode", "iso"]),
             NodeKind::Switch { .. } => names(&["input"]),
             NodeKind::Camera { .. } => names(&["position.x", "position.y", "position.z", "rotation.x", "rotation.y", "rotation.z", "focal", "near", "orthographic", "pan.x", "pan.y", "zoom"]),
+            NodeKind::LoopParticles { .. } => names(&["start", "length"]),
+            NodeKind::TimeShift { .. } => names(&["offset", "hold", "at"]),
+            NodeKind::TimeWarp { .. } => names(&["speed", "anchor"]),
+            NodeKind::Trail { .. } => names(&["samples", "step", "mode", "fade"]),
+            NodeKind::MakeLoop { .. } => names(&["start", "length", "blend"]),
             NodeKind::Pyro(_) => names(&["resolution", "center.x", "center.y", "center.z", "size.x", "size.y", "size.z", "substeps", "density", "temperature", "fuel", "buoyancy", "dissipation", "cooling", "vorticity", "turbulence", "burn_rate", "wind.x", "wind.y", "wind.z", "opacity"]),
             NodeKind::RbdSolver(_) => names(&["shape", "density", "friction", "bounce", "gravity", "substeps", "ground", "ground_height", "velocity.x", "velocity.y", "velocity.z", "spin.x", "spin.y", "spin.z"]),
             NodeKind::HairGuides(_) => names(&["count", "length", "length_variance", "segments", "droop", "seed"]),
@@ -4204,6 +4222,12 @@ impl NodeKind {
                     NodeKind::RbdSolver(sims::RbdSettings::default()),
                     NodeKind::VellumSolver(vellum::VellumSettings::defaults(0)),
                     NodeKind::SopSolver { substeps: 1 },
+                    NodeKind::TimeShift { offset: 0.0, hold: false, at: 0.0 },
+                    NodeKind::TimeWarp { speed: 0.5, anchor: 0.0 },
+                    NodeKind::TimeBlend,
+                    NodeKind::Trail { samples: 5, step: 1.0, mode: 0, fade: true },
+                    NodeKind::LoopParticles { start: 1.0, length: 1.0 },
+                    NodeKind::MakeLoop { start: 2.0, length: 1.0, blend: 0.5 },
                     NodeKind::SolverInput { index: 0 },
                     NodeKind::SolverInput { index: 1 },
                 ],
@@ -4479,6 +4503,12 @@ impl NodeKind {
             NodeKind::EnvironmentLight { .. } => "environment_light",
             NodeKind::Reverse => "reverse",
             NodeKind::Pyro(_) => "pyro",
+            NodeKind::LoopParticles { .. } => "loop_particles",
+            NodeKind::TimeShift { .. } => "time_shift",
+            NodeKind::TimeWarp { .. } => "time_warp",
+            NodeKind::TimeBlend => "time_blend",
+            NodeKind::Trail { .. } => "trail",
+            NodeKind::MakeLoop { .. } => "make_loop",
             NodeKind::HairGuides(_) => "hair_guides",
             NodeKind::GuideProcess(_) => "guide_process",
             NodeKind::HairGenerate(_) => "hair_generate",
@@ -4800,6 +4830,12 @@ impl NodeKind {
             NodeKind::Switch { index } => vec![*index as f32],
             NodeKind::Reverse => vec![],
             NodeKind::Pyro(settings) => settings.to_params(),
+            NodeKind::LoopParticles { start, length } => vec![*start, *length],
+            NodeKind::TimeShift { offset, hold, at } => vec![*offset, *hold as u8 as f32, *at],
+            NodeKind::TimeWarp { speed, anchor } => vec![*speed, *anchor],
+            NodeKind::TimeBlend => vec![],
+            NodeKind::Trail { samples, step, mode, fade } => vec![*samples as f32, *step, *mode as f32, *fade as u8 as f32],
+            NodeKind::MakeLoop { start, length, blend } => vec![*start, *length, *blend],
             NodeKind::HairGuides(s) => {
                 vec![s.count as f32, s.length, s.length_variance, s.segments as f32, s.droop, s.seed as f32]
             }
@@ -5127,6 +5163,21 @@ impl NodeKind {
             },
             "reverse" => NodeKind::Reverse,
             "pyro" => NodeKind::Pyro(sims::PyroSettings::from_params(p)),
+            "time_warp" => NodeKind::TimeWarp { speed: p.first().copied().unwrap_or(1.0), anchor: p.get(1).copied().unwrap_or(0.0) },
+            "time_blend" => NodeKind::TimeBlend,
+            "trail" => NodeKind::Trail {
+                samples: p.first().map_or(5, |v| (*v as usize).clamp(2, 200)),
+                step: p.get(1).copied().unwrap_or(1.0).max(0.01),
+                mode: p.get(2).map_or(0, |v| (*v as usize).min(2)),
+                fade: p.get(3).is_none_or(|v| *v > 0.5),
+            },
+            "time_shift" => NodeKind::TimeShift { offset: p.first().copied().unwrap_or(0.0), hold: p.get(1).is_some_and(|v| *v > 0.5), at: p.get(2).copied().unwrap_or(0.0) },
+            "loop_particles" => NodeKind::LoopParticles { start: p.first().copied().unwrap_or(1.0), length: p.get(1).copied().unwrap_or(1.0).max(1.0 / sims::SIM_FPS) },
+            "make_loop" => NodeKind::MakeLoop {
+                start: p.first().copied().unwrap_or(2.0),
+                length: p.get(1).copied().unwrap_or(1.0).max(1.0 / sims::SIM_FPS),
+                blend: p.get(2).copied().unwrap_or(0.5).max(0.0),
+            },
             "hair_guides" => NodeKind::HairGuides(groom::GuideSettings {
                 count: u(0).clamp(1, 20_000),
                 length: g(1).max(0.0),
@@ -6682,6 +6733,12 @@ impl Graph {
             NodeKind::Noise { .. }
                 | NodeKind::Ripple { .. }
                 | NodeKind::Particles { .. }
+                | NodeKind::LoopParticles { .. }
+                | NodeKind::MakeLoop { .. }
+                | NodeKind::TimeShift { .. }
+                | NodeKind::TimeWarp { .. }
+                | NodeKind::TimeBlend
+                | NodeKind::Trail { .. }
                 | NodeKind::Flip { .. }
                 | NodeKind::WhitewaterSolver(_)
                 | NodeKind::CrowdSolver(_)
@@ -7141,6 +7198,12 @@ impl Graph {
                 | NodeKind::LopPrune { .. }
                 | NodeKind::LopMerge
                 | NodeKind::LopExport { .. } => self.cook_stage(id, time, &mut HashMap::new()).to_mesh(),
+                NodeKind::TimeShift { offset, hold, at } => self.cook_input_fresh(id, 0, if *hold { *at } else { time + offset }),
+                NodeKind::TimeWarp { speed, anchor } => self.cook_input_fresh(id, 0, anchor + (time - anchor) * speed),
+                NodeKind::TimeBlend => looping::time_blend(|t| self.cook_input_fresh(id, 0, t), time),
+                NodeKind::Trail { samples, step, mode, fade } => looping::trail(|t| self.cook_input_fresh(id, 0, t), time, *samples, *step, *mode, *fade),
+                NodeKind::LoopParticles { start, length } => self.report(id, looping::loop_particles(|t| self.cook_input_fresh(id, 0, t), time, *start, *length)),
+                NodeKind::MakeLoop { start, length, blend } => self.report(id, looping::make_loop(|t| self.cook_input_fresh(id, 0, t), time, *start, *length, *blend)),
                 NodeKind::Pyro(settings) => {
                     let (source, collider) = (self.input_of(id, 0), self.input_of(id, 1));
                     let animated = source.is_some_and(|s| self.time_dependent(s));
@@ -8878,6 +8941,8 @@ struct ProceduralFxStudioApp {
     layout_name_prompt: Option<String>,
     // Pyro node whose domain should be fitted around its source this frame.
     pyro_fit_request: Option<NodeId>,
+    // Make Loop's Find best length, run after the panel draws.
+    loop_search_request: Option<NodeId>,
     // USD Export node whose stage should be written this frame.
     usd_export_request: Option<NodeId>,
     // File Export node to write: (node, whole timeline range).
@@ -9104,6 +9169,7 @@ impl Default for ProceduralFxStudioApp {
             saved_layout: String::new(),
             layout_name_prompt: None,
             pyro_fit_request: None,
+            loop_search_request: None,
             usd_export_request: None,
             file_export_request: None,
             stage_selected_prim: None,
@@ -10691,8 +10757,10 @@ impl ProceduralFxStudioApp {
                 (self.cam_zoom, self.cam_pan_x, self.cam_pan_y) = (*zoom, 0.0, 0.0);
             }
         }
+        // Looping presets loop in the scene itself (Make Loop, or by construction), so the
+        // rendered frames need no blending.
         let s = &mut self.sprite_sheet;
-        (s.width, s.height, s.seamless) = (preset.frame[0], preset.frame[1], preset.looping);
+        (s.width, s.height, s.seamless) = (preset.frame[0], preset.frame[1], false);
         self.dirty = true;
     }
 
@@ -10828,8 +10896,9 @@ impl ProceduralFxStudioApp {
                 ui.label("Loop");
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut s.seamless, "Seamless").on_hover_text(
-                        "For fires, auras and other looping effects. Renders a few frames past the end of the playback range and fades them into the first frames, \
-                         so the last frame leads into the first without a jump. The sheet still has one frame per frame of the range.",
+                        "Renders a few frames past the end of the playback range and fades those pictures into the first frames, so the last frame leads into the first. \
+                         The sheet still has one frame per frame of the range. For simulations, a Make Loop node (Pyro) or Loop Particles node in the network loops better: \
+                         it blends the simulation itself rather than two pictures, or for particles loops exactly, and loops in the viewport too.",
                     );
                     if s.seamless {
                         ui.label("blend");
@@ -15206,6 +15275,62 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
                 ui.small("Merge the result with the skin to render both.");
             }
+            NodeKind::TimeShift { offset, hold, at } => {
+                ui.heading("Time Shift");
+                ui.small("Input 1 as it is at another time: later or earlier by Offset, or frozen at one moment. Merge shifted copies to build your own loops, or start an effect later.");
+                c |= ui.checkbox(hold, "Hold at one time").changed();
+                if *hold {
+                    c |= pfield(ui, pslider(at, 0.0..=20.0).text("At (s)")).changed();
+                    ui.weak(format!("frame {}", (*at * sims::SIM_FPS).round() as i32 + 1));
+                } else {
+                    c |= pfield(ui, pslider(offset, -10.0..=10.0).text("Offset (s)")).changed();
+                    ui.weak(format!("{:+} frames", (*offset * sims::SIM_FPS).round() as i32));
+                }
+            }
+            NodeKind::TimeWarp { speed, anchor } => {
+                ui.heading("Time Warp");
+                ui.small("Input 1 retimed: time runs Speed times as fast, counting from Anchor, where it's unchanged. 0.5 is half speed. Put a Time Blend after it to smooth a slowed-down simulation.");
+                c |= pfield(ui, pslider(speed, -4.0..=4.0).text("Speed")).changed();
+                c |= pfield(ui, pslider(anchor, 0.0..=20.0).text("Anchor (s)")).changed();
+            }
+            NodeKind::TimeBlend => {
+                ui.heading("Time Blend");
+                ui.small("Simulations step in whole frames, so slowed or shifted by part of a frame they stutter. Between whole frames this mixes the frame before with the one after: particles matched by id, volumes voxel by voxel, other geometry point by point. Put it after a Time Warp or Time Shift.");
+            }
+            NodeKind::Trail { samples, step, mode, fade } => {
+                ui.heading("Trail");
+                ui.small("Input 1 over its last few moments, for streaks behind sparks and slashes. Copies merges them, each point with a trail attribute (0 newest, 1 oldest); Curves draws a line through each point's past positions, matched by id; Velocity adds v from how far each point moved.");
+                ui.horizontal(|ui| {
+                    for (value, label) in [(0, "Copies"), (1, "Curves"), (2, "Velocity")] {
+                        c |= ui.selectable_value(mode, value, label).changed();
+                    }
+                });
+                if *mode != 2 {
+                    c |= pfield(ui, pslider(samples, 2..=60).text("Samples")).changed();
+                }
+                c |= pfield(ui, pslider(step, 0.1..=10.0).text("Step (frames)")).changed();
+                if *mode == 0 {
+                    c |= ui.checkbox(fade, "Fade Alpha and pscale towards the oldest").changed();
+                }
+            }
+            NodeKind::LoopParticles { start, length } => {
+                ui.heading("Loop Particles");
+                ui.small("Makes a particle simulation (input 1) loop exactly, for looping game effects: no blending, so nothing ghosts. Set the playback range to Start until Start + Length and export it as a sprite sheet. The particles mustn't affect each other, and by Start the emitter should have been running for at least a particle's lifetime.");
+                c |= pfield(ui, pslider(start, 0.0..=20.0).text("Start (s)")).changed();
+                c |= pfield(ui, pslider(length, 1.0 / sims::SIM_FPS..=10.0).text("Length (s)")).changed();
+                ui.weak(format!("{} frames", (*length * sims::SIM_FPS).round()));
+            }
+            NodeKind::MakeLoop { start, length, blend } => {
+                ui.heading("Make Loop");
+                ui.small("Makes a simulation (input 1) loop, such as Pyro: it carries on past the end and blends that into the start, voxel by voxel or point by point, over Blend seconds. Set the playback range to Start until Start + Length. For particles, Loop Particles loops exactly.");
+                c |= pfield(ui, pslider(start, 0.0..=20.0).text("Start (s)")).changed();
+                c |= pfield(ui, pslider(length, 1.0 / sims::SIM_FPS..=10.0).text("Length (s)")).changed();
+                c |= pfield(ui, pslider(blend, 0.0..=*length).text("Blend (s)")).changed();
+                ui.weak(format!("{} frames, blending over the first {}", (*length * sims::SIM_FPS).round(), (*blend * sims::SIM_FPS).round()));
+                if ui.button("Find best length").on_hover_text("Tries lengths from half to twice this one and picks the one where the effect comes back closest to how it started, so the blend has least to hide. Keeps this length if none comes back. Simulates up to twice the length past Start.").clicked() {
+                    self.loop_search_request = Some(id);
+                }
+            }
             NodeKind::Pyro(set) => {
                 ui.heading("Pyro Solver");
                 ui.small("Smoke and fire on a voxel grid. Input 1: source (closed mesh or points, pscale sets point radius) • Input 2: optional collider (closed mesh).");
@@ -18871,6 +18996,18 @@ impl eframe::App for ProceduralFxStudioApp {
                 _ => self.status = "Pyro: connect a source to input 1 first".into(),
             }
         }
+        if let Some(id) = self.loop_search_request.take() {
+            if let Some(&NodeKind::MakeLoop { start, length, .. }) = self.graph.nodes.get(&id).map(|n| &n.kind) {
+                let (best, diff) = looping::best_length(|t| self.graph.cook_input_fresh(id, 0, t), start, length * 0.5, length * 2.0, length);
+                if let Some(NodeKind::MakeLoop { length, blend, .. }) = self.graph.nodes.get_mut(&id).map(|n| &mut n.kind) {
+                    *length = best;
+                    *blend = blend.min(best);
+                }
+                self.playback_end = start + best - 1.0 / sims::SIM_FPS;
+                self.dirty = true;
+                self.status = format!("Make Loop: {} frames ({best:.2} s) loops best, its end {:.0}% different from its start. The playback range now ends there.", (best * sims::SIM_FPS).round(), diff * 100.0);
+            }
+        }
         if self.moonray_render_requested {
             self.moonray_render_requested = false;
             self.start_moonray_render();
@@ -19594,6 +19731,21 @@ mod scene_file_tests {
             assert!(alpha.iter().filter(|a| **a > 0.05).count() > 20, "{}: too little shows", preset.name);
             assert!(presets::find(&preset.name.to_uppercase()).is_some());
         }
+    }
+
+    #[test]
+    fn the_fire_preset_loops_in_the_scene_itself() {
+        let preset = presets::find("Fire").unwrap();
+        let g = Graph::deserialize(preset.scene);
+        let display = g.display_of(g.geometry_ids()[0]).unwrap();
+        assert!(matches!(g.nodes[&display].kind, NodeKind::MakeLoop { .. }));
+        // One loop past the first frame is the first frame again, voxel for voxel.
+        let (start, end) = preset.range;
+        let length = end - start + 1.0 / sims::SIM_FPS;
+        let (a, b) = (g.cook(display, start, &mut HashMap::new()), g.cook(display, start + length, &mut HashMap::new()));
+        assert!(!a.vertices.is_empty());
+        assert_eq!(a.vertices, b.vertices);
+        assert_eq!(a.point_attributes["density"], b.point_attributes["density"]);
     }
 
     #[test]

@@ -69,6 +69,12 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | rbd_solver | `rbd_solver` | shape=0, density=1, friction=0.6, bounce=0.2, gravity=9.81, substeps=2, ground=1, ground_height=0, velocity.x=0, velocity.y=0, velocity.z=0, spin.x=0, spin.y=0, spin.z=0 |
 | cloth_solver | `cloth_solver` | type=0, stretch_stiffness=100000, bend_stiffness=1, shape_stiffness=0.5, mass=1, thickness=0.02, gravity=-9.8, damping=0.1, friction=0.3, substeps=16, iterations=4, ground=1, self_collision=0, pin_to_animation=1 |
 | sop_solver | `sop_solver` | substeps=1 |
+| time_shift | `time_shift` | offset=0, hold=0, at=0 |
+| time_warp | `time_warp` | speed=0.5, anchor=0 |
+| time_blend | `time_blend` | none |
+| trail | `trail` | samples=5, step=1, mode=0, fade=1 |
+| loop_particles | `loop_particles` | start=1, length=1 |
+| make_loop | `make_loop` | start=2, length=1, blend=0.5 |
 | solver_input | `solver_input` | #0=0 |
 
 ## Import/Export

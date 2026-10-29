@@ -16,22 +16,28 @@ def camera(cid, target, zoom):
     tx, ty, tz = target
     return f"node {cid} 40 -80 0 obj camera {tx} {ty} {tz} 0 0 0 1.2 0.5 1 0 0 {zoom}"
 
-def pyro_scene(name, sphere, pyro, cam_target, zoom):
+# A Pyro simulation, looped by a Make Loop node (start, length, blend in seconds) so it
+# repeats seamlessly in the viewport and the sprite sheet.
+def pyro_scene(name, sphere, pyro, loop, cam_target, zoom):
     lines = [
         "pfs 2",
         "node 0 40 20 0 obj geometry -1",
         f"node 1 40 20 0 obj sphere {sphere}",
         f"node 2 40 100 0 obj pyro {pyro}",
-        camera(3, cam_target, zoom),
+        f"node 3 40 180 0 obj make_loop {loop}",
+        camera(4, cam_target, zoom),
         "link 1 2 0",
+        "link 2 3 0",
         "parent 1 0",
         "parent 2 0",
+        "parent 3 0",
         f"name 0 {hx(name)}",
         f"name 1 {hx('source')}",
         f"name 2 {hx(name + '_sim')}",
-        f"name 3 {hx('sheet_camera')}",
-        "display 0 2",
-        "next 4",
+        f"name 3 {hx(name + '_loop')}",
+        f"name 4 {hx('sheet_camera')}",
+        "display 0 3",
+        "next 5",
     ]
     return "\n".join(lines) + "\n"
 
@@ -204,7 +210,7 @@ for (int i = 0; i < n && after > 0; i++) {
 """
 
 files = {
-    "fire.pfs": pyro_scene("fire", "0.3 12 24", FIRE, (0, 1.2, 0), 3.8),
+    "fire.pfs": pyro_scene("fire", "0.3 12 24", FIRE, "2 1 0.5", (0, 1.2, 0), 3.8),
     "smoke.pfs": points_scene("smoke", SMOKE_CODE, [("loop", 1), ("puffs", 24), ("rise", 2.4), ("spread", 0.6), ("size", 0.16)], (0, 1.2, 0), 3.4),
     "impact.pfs": points_scene("impact", IMPACT, [("count", 70), ("speed", 9), ("life", 0.45), ("size", 0.03)], (0, 0.5, 0), 3.2),
     "magic_burst.pfs": points_scene("magic_burst", MAGIC, [("count", 160), ("radius", 1.4), ("duration", 0.7), ("swirl", 1.2)], (0, 0, 0), 4),
