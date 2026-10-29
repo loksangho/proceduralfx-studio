@@ -331,15 +331,18 @@ pub struct GpuViewport {
     blank: wgpu::BindGroup,
     scene: Option<Scene>,
     points: Option<Points>,
-    target: Option<Target>,
+    // The viewport's image, and the egui texture showing it.
+    target: Option<(Target, egui::TextureId)>,
     blended: Option<BlendTargets>,
 }
 
-// The uploaded points: dots and splats, one instance each.
+// The uploaded points: dots and splats, one instance each, and curves (hair), two
+// vertices a segment.
 struct Points {
     key: u64,
     dots: Option<(wgpu::Buffer, u32)>,
     splats: Option<(wgpu::Buffer, u32)>,
+    curves: Option<(wgpu::Buffer, u32)>,
     // The splats' positions' bounding box corners (for their blending weights).
     corners: Vec<[f32; 3]>,
 }
@@ -374,10 +377,8 @@ struct Target {
     msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
     image: wgpu::TextureView,
-    // The resolved image itself (the tests read it back).
-    #[cfg_attr(not(test), allow(dead_code))]
+    // The resolved image itself (off-screen renders read it back).
     texture: wgpu::Texture,
-    id: egui::TextureId,
 }
 
 impl GpuViewport {
@@ -556,15 +557,21 @@ impl GpuViewport {
         self.points.as_ref().is_some_and(|p| p.key == key)
     }
 
-    // Uploads the dots and splats under `key`.
-    pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point]) {
+    // Uploads the dots, splats and curve segments (drawn like edges) under `key`.
+    pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point], curves: &[Vertex]) {
         let device = &self.render_state.device;
-        let buffer = |label: &str, points: &[Point]| {
-            (!points.is_empty()).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(points), usage: wgpu::BufferUsages::VERTEX }), points.len() as u32))
+        let buffer = |label: &str, bytes: &[u8], count: usize| {
+            (count > 0).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage: wgpu::BufferUsages::VERTEX }), count as u32))
         };
         let (lo, hi) = splats.iter().fold(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |(lo, hi), p| (std::array::from_fn(|k| lo[k].min(p.position[k])), std::array::from_fn(|k| hi[k].max(p.position[k]))));
         let corners = if lo[0] <= hi[0] { (0..8).map(|i| std::array::from_fn(|k| if i >> k & 1 == 0 { lo[k] } else { hi[k] })).collect() } else { Vec::new() };
-        self.points = Some(Points { key, dots: buffer("viewport dots", dots), splats: buffer("viewport splats", splats), corners });
+        self.points = Some(Points {
+            key,
+            dots: buffer("viewport dots", bytemuck::cast_slice(dots), dots.len()),
+            splats: buffer("viewport splats", bytemuck::cast_slice(splats), splats.len()),
+            curves: buffer("viewport curves", bytemuck::cast_slice(curves), curves.len()),
+            corners,
+        });
     }
 
     // Draws the uploaded scene through `camera` into an image of `size` pixels and
@@ -572,11 +579,40 @@ impl GpuViewport {
     // depth-tested against them but not each other.
     pub fn draw(&mut self, size: [u32; 2], camera: &Camera) -> egui::TextureId {
         let size = [size[0].max(1), size[1].max(1)];
-        let state = &self.render_state;
-        if self.target.as_ref().is_none_or(|t| t.size != size) {
-            let target = Target::new(state, size, self.target.as_ref().map(|t| t.id));
-            self.target = Some(target);
+        if self.target.as_ref().is_none_or(|(t, _)| t.size != size) {
+            let target = Target::new(&self.render_state, size);
+            let mut renderer = self.render_state.renderer.write();
+            let id = match self.target.as_ref() {
+                Some((_, id)) => {
+                    renderer.update_egui_texture_from_wgpu_texture(&self.render_state.device, &target.image, wgpu::FilterMode::Linear, *id);
+                    *id
+                }
+                None => renderer.register_native_texture(&self.render_state.device, &target.image, wgpu::FilterMode::Linear),
+            };
+            drop(renderer);
+            self.target = Some((target, id));
         }
+        if self.points.as_ref().is_some_and(|p| p.splats.is_some()) && self.blended.as_ref().is_none_or(|b| b.size != size) {
+            self.blended = Some(BlendTargets::new(&self.render_state, &self.composite_layout, size));
+        }
+        let (target, id) = self.target.as_ref().expect("made above");
+        self.encode(camera, target, self.blended.as_ref());
+        *id
+    }
+
+    // The uploaded scene through `camera` as an image of `size` pixels, off screen:
+    // premultiplied RGBA in display encoding, row by row, transparent where empty.
+    pub fn render(&self, size: [u32; 2], camera: &Camera) -> Vec<[u8; 4]> {
+        let size = [size[0].clamp(1, 16384), size[1].clamp(1, 16384)];
+        let target = Target::new(&self.render_state, size);
+        let blended = self.points.as_ref().is_some_and(|p| p.splats.is_some()).then(|| BlendTargets::new(&self.render_state, &self.composite_layout, size));
+        self.encode(camera, &target, blended.as_ref());
+        read_texture(&self.render_state, &target.texture, size)
+    }
+
+    // Draws the scene into `target` (and the splats through `blended`) and submits it.
+    fn encode(&self, camera: &Camera, target: &Target, blended: Option<&BlendTargets>) {
+        let state = &self.render_state;
         // Orthographic depth runs from the near plane to just past the farthest corner.
         let corners = self.scene.iter().flat_map(|s| &s.corners).chain(self.points.iter().flat_map(|p| &p.corners));
         let deepest = corners.map(|&p| camera.to_cam(p)[2]).fold(camera.near, f32::max);
@@ -584,10 +620,6 @@ impl GpuViewport {
         let splat_depth = self.points.iter().flat_map(|p| &p.corners).map(|&p| camera.to_cam(p)[2]).fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], z| [lo.min(z), hi.max(z)]);
         state.queue.write_buffer(&self.camera, 0, bytemuck::cast_slice(&camera.uniform(far, splat_depth)));
         let splats = self.points.as_ref().and_then(|p| p.splats.as_ref());
-        if splats.is_some() && self.blended.as_ref().is_none_or(|b| b.size != size) {
-            self.blended = Some(BlendTargets::new(state, &self.composite_layout, size));
-        }
-        let target = self.target.as_ref().expect("made above");
         let textured = self.scene.as_ref().and_then(|s| s.texture.as_ref());
         let bind_group = textured.and(self.texture.as_ref()).map_or(&self.blank, |(_, b)| b);
         let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
@@ -617,13 +649,18 @@ impl GpuViewport {
                     pass.draw(0..*count, 0..1);
                 }
             }
+            if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.curves.as_ref()) {
+                pass.set_pipeline(&self.edges);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
             if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.dots.as_ref()) {
                 pass.set_pipeline(&self.dots);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..6, 0..*count);
             }
         }
-        if let (Some((buffer, count)), Some(blended)) = (splats, &self.blended) {
+        if let (Some((buffer, count)), Some(blended)) = (splats, blended) {
             let attachment = |view, clear: f64| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: clear, g: clear, b: clear, a: clear }), store: wgpu::StoreOp::Store } });
             let depth = |load| Some(wgpu::RenderPassDepthStencilAttachment { view: &blended.depth, depth_ops: Some(wgpu::Operations { load, store: wgpu::StoreOp::Store }), stencil_ops: None });
             // The surfaces' depth, so splats behind them are hidden.
@@ -665,12 +702,11 @@ impl GpuViewport {
             }
         }
         state.queue.submit([encoder.finish()]);
-        target.id
     }
 }
 
 impl Target {
-    fn new(state: &egui_wgpu::RenderState, size: [u32; 2], id: Option<egui::TextureId>) -> Self {
+    fn new(state: &egui_wgpu::RenderState, size: [u32; 2]) -> Self {
         let device = &state.device;
         let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
         let texture = |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
@@ -680,16 +716,7 @@ impl Target {
         let depth = texture("viewport depth", DEPTH, SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         // Values in display encoding, like egui's own (Rgba8Unorm) textures, which it uses as sampled.
         let image = texture("viewport image", COLOR, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
-        let shown = image.create_view(&Default::default());
-        let mut renderer = state.renderer.write();
-        let id = match id {
-            Some(id) => {
-                renderer.update_egui_texture_from_wgpu_texture(device, &shown, wgpu::FilterMode::Linear, id);
-                id
-            }
-            None => renderer.register_native_texture(device, &shown, wgpu::FilterMode::Linear),
-        };
-        Target { size, msaa, depth, image: shown, texture: image, id }
+        Target { size, msaa, depth, image: image.create_view(&Default::default()), texture: image }
     }
 }
 
@@ -709,6 +736,27 @@ impl BlendTargets {
     }
 }
 
+// An Rgba8 texture's pixels, row by row (waits for the GPU).
+fn read_texture(state: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2]) -> Vec<[u8; 4]> {
+    let [w, h] = size;
+    let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = state.device.create_buffer(&wgpu::BufferDescriptor { label: Some("viewport readback"), size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = state.device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    state.queue.submit([encoder.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    if state.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return vec![[0; 4]; (w * h) as usize];
+    }
+    let data = buffer.slice(..).get_mapped_range();
+    let (row, w) = (row as usize, w as usize);
+    (0..h as usize).flat_map(|y| (0..w).map(move |x| (y, x))).map(|(y, x)| std::array::from_fn(|c| data[y * row + x * 4 + c])).collect()
+}
+
 fn texture_bind_group(state: &egui_wgpu::RenderState, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, source: &raster::Texture) -> wgpu::BindGroup {
     let extent = wgpu::Extent3d { width: source.width.max(1) as u32, height: source.height.max(1) as u32, depth_or_array_layers: 1 };
     // Plain (not sRGB): raster.rs multiplies the texture's encoded values too.
@@ -726,38 +774,25 @@ fn texture_bind_group(state: &egui_wgpu::RenderState, layout: &wgpu::BindGroupLa
     })
 }
 
+// A GPU viewport without a window, for tests; None where there's no GPU (as on some CI machines).
+#[cfg(test)]
+pub fn headless() -> Option<GpuViewport> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;
+    let renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8Unorm, Default::default());
+    let state = egui_wgpu::RenderState { adapter, available_adapters: Vec::new(), device, queue, target_format: wgpu::TextureFormat::Rgba8Unorm, renderer: Arc::new(egui::mutex::RwLock::new(renderer)) };
+    Some(GpuViewport::new(state))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A GPU viewport without a window, or None where there's no GPU (as on some CI machines).
-    fn headless() -> Option<GpuViewport> {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;
-        let renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8Unorm, Default::default());
-        let state = egui_wgpu::RenderState { adapter, available_adapters: Vec::new(), device, queue, target_format: wgpu::TextureFormat::Rgba8Unorm, renderer: Arc::new(egui::mutex::RwLock::new(renderer)) };
-        Some(GpuViewport::new(state))
-    }
-
     // The last image drawn, premultiplied, in display encoding.
     fn read(gpu: &GpuViewport) -> Vec<[u8; 4]> {
-        let target = gpu.target.as_ref().expect("drawn");
-        let [w, h] = target.size;
-        let row = (w * 4).div_ceil(256) * 256;
-        let state = &gpu.render_state;
-        let buffer = state.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let mut encoder = state.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(
-            target.texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        state.queue.submit([encoder.finish()]);
-        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("mapped"));
-        state.device.poll(wgpu::PollType::wait_indefinitely()).expect("finished");
-        let data = buffer.slice(..).get_mapped_range();
-        (0..h as usize).flat_map(|y| (0..w as usize).map(move |x| (y, x))).map(|(y, x)| std::array::from_fn(|c| data[y * row as usize + x * 4 + c])).collect()
+        let (target, _) = gpu.target.as_ref().expect("drawn");
+        read_texture(&gpu.render_state, &target.texture, target.size)
     }
 
     // raster.rs's straight colours, premultiplied as the GPU image is.
@@ -900,13 +935,13 @@ mod tests {
         let red = [1.0, 0.0, 0.0, 1.0];
         gpu.set_scene(1, &wall(0.0), &[], None);
         // On the surface, 3 points across: shows, and only near the middle.
-        gpu.set_points(1, &[Point::new([0.0; 3], 3.0, red, [0.0; 3])], &[]);
+        gpu.set_points(1, &[Point::new([0.0; 3], 3.0, red, [0.0; 3])], &[], &[]);
         gpu.draw([20, 20], &straight_on());
         let image = read(&gpu);
         assert_eq!(image[10 * 20 + 10], [255, 0, 0, 255], "a point on the surface shows over it");
         assert_eq!(image[10 * 20 + 16], [255, 255, 255, 255], "dots are a few points across, not more");
         // Behind the surface: hidden.
-        gpu.set_points(2, &[Point::new([0.0, 0.0, 2.0], 3.0, red, [0.0; 3])], &[]);
+        gpu.set_points(2, &[Point::new([0.0, 0.0, 2.0], 3.0, red, [0.0; 3])], &[], &[]);
         gpu.draw([20, 20], &straight_on());
         assert_eq!(read(&gpu)[10 * 20 + 10], [255, 255, 255, 255], "a point behind the surface is hidden");
     }
@@ -923,34 +958,57 @@ mod tests {
         gpu.set_scene(1, &dark, &[], None);
         let smoke = |z: f32, rgb: [f32; 3], emission: [f32; 3]| Point::new([0.0, 0.0, z], 2.0, [rgb[0], rgb[1], rgb[2], 0.5], emission);
         // In front: half covers the wall at its centre.
-        gpu.set_points(1, &[], &[smoke(0.0, [1.0; 3], [0.0; 3])]);
+        gpu.set_points(1, &[], &[smoke(0.0, [1.0; 3], [0.0; 3])], &[]);
         gpu.draw([20, 20], &straight_on());
         let over = middle(&gpu);
         assert!(over[0] > 120 && over[0] < 160, "half-opaque white over dark grey: {over:?}");
         assert_eq!(over[3], 255, "still opaque where the wall is");
         // Behind the wall: hidden.
-        gpu.set_points(2, &[], &[smoke(3.0, [1.0; 3], [0.0; 3])]);
+        gpu.set_points(2, &[], &[smoke(3.0, [1.0; 3], [0.0; 3])], &[]);
         gpu.draw([20, 20], &straight_on());
         assert_eq!(middle(&gpu), [51, 51, 51, 255], "a splat behind the wall is hidden");
         // Glow adds light, in its own colour: dark smoke glowing orange is brighter
         // than the same smoke not glowing, most in red, least in blue.
-        gpu.set_points(3, &[], &[smoke(0.0, [0.0; 3], [0.0; 3])]);
+        gpu.set_points(3, &[], &[smoke(0.0, [0.0; 3], [0.0; 3])], &[]);
         gpu.draw([20, 20], &straight_on());
         let unlit = middle(&gpu);
-        gpu.set_points(4, &[], &[smoke(0.0, [0.0; 3], [6.0, 3.0, 0.0])]);
+        gpu.set_points(4, &[], &[smoke(0.0, [0.0; 3], [6.0, 3.0, 0.0])], &[]);
         gpu.draw([20, 20], &straight_on());
         let glowing = middle(&gpu);
         let gain: [i32; 3] = std::array::from_fn(|c| glowing[c] as i32 - unlit[c] as i32);
         assert!(gain[0] > gain[1] && gain[1] > gain[2] && gain[2] == 0 && gain[0] > 30, "fire glows orange: {unlit:?} to {glowing:?}");
         // Overlapping splats: the same image whichever is drawn first (no sorting needed).
         let (near, far) = (smoke(-0.5, [1.0, 0.0, 0.0], [0.0; 3]), smoke(0.5, [0.0, 0.0, 1.0], [0.0; 3]));
-        gpu.set_points(5, &[], &[near, far]);
+        gpu.set_points(5, &[], &[near, far], &[]);
         gpu.draw([20, 20], &straight_on());
         let one = middle(&gpu);
-        gpu.set_points(6, &[], &[far, near]);
+        gpu.set_points(6, &[], &[far, near], &[]);
         gpu.draw([20, 20], &straight_on());
         let other = middle(&gpu);
         assert!((0..4).all(|c| one[c].abs_diff(other[c]) <= 1), "order doesn't matter: {one:?} vs {other:?}");
         assert!(one[0] > one[2], "the nearer (red) splat weighs more: {one:?}");
+    }
+
+    #[test]
+    fn off_screen_renders_match_the_viewport_at_any_size() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        // A small red square in the middle of an empty view.
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let square: Vec<Vertex> = [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, -1.0, 0.0]].map(|p| Vertex::new(p, red, None)).to_vec();
+        gpu.set_scene(1, &square, &[], None);
+        let camera = Camera { size: egui::vec2(40.0, 30.0), center: egui::vec2(20.0, 15.0), focal: 30.0, ..straight_on() };
+        gpu.draw([40, 30], &camera);
+        let shown = read(&gpu);
+        let small = gpu.render([40, 30], &camera);
+        assert!(small == shown, "an off-screen render at the viewport's size is the viewport's image");
+        assert_eq!(small[0], [0; 4], "transparent where nothing is drawn");
+        // Twice the size: the same picture, in more pixels.
+        let big = gpu.render([80, 60], &camera);
+        let coverage = |image: &[[u8; 4]]| image.iter().filter(|p| p[3] > 127).count() as f32 / image.len() as f32;
+        assert!((coverage(&small) - coverage(&big)).abs() < 0.02, "same framing: {} vs {}", coverage(&small), coverage(&big));
+        assert_eq!(big[30 * 80 + 40], [255, 0, 0, 255], "the square is still in the middle");
     }
 }

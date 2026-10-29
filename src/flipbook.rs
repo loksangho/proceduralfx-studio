@@ -1,6 +1,10 @@
 // Flipbook, as in Houdini: plays the timeline range, captures the viewport at
 // every frame (once it has cooked), then plays the frames back in a viewer that
 // can save them as PNG frames or, with FFmpeg installed, a movie.
+//
+// On the GPU viewport each frame is rendered off screen (see Capture); otherwise
+// it's cut out of a window screenshot. Real-time renders use the same recording,
+// through the render camera, and save the frames instead of showing them.
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -17,11 +21,22 @@ pub struct Recording {
     pub waiting: bool,
     // The time to go back to when done.
     pub resume_time: f32,
+    // Rendered by the GPU viewport, not screenshotted.
+    pub capture: Option<Capture>,
+}
+
+// How the GPU viewport renders each frame of a recording.
+pub struct Capture {
+    // None: the viewport's own view and size (at most MAX_WIDTH wide), over its
+    // background. Some: the render camera at this size, transparent where empty.
+    pub render: Option<[u32; 2]>,
+    // Real-time renders: where the frames are saved (name.0001.png…).
+    pub save_to: Option<PathBuf>,
 }
 
 impl Recording {
-    pub fn new(times: Vec<f32>, resume_time: f32) -> Self {
-        Recording { times, next: 0, frames: Vec::new(), waiting: false, resume_time }
+    pub fn new(times: Vec<f32>, resume_time: f32, capture: Option<Capture>) -> Self {
+        Recording { times, next: 0, frames: Vec::new(), waiting: false, resume_time, capture }
     }
 }
 
@@ -49,9 +64,10 @@ pub fn crop(shot: &egui::ColorImage, rect: egui::Rect, pixels_per_point: f32) ->
     Some(egui::ColorImage::from_rgba_unmultiplied([image.width() as usize, image.height() as usize], image.as_raw()))
 }
 
+// Straight (not premultiplied) alpha, as PNG files have it.
 fn to_rgba(frame: &egui::ColorImage) -> image::RgbaImage {
     let [w, h] = frame.size;
-    image::RgbaImage::from_raw(w as u32, h as u32, frame.pixels.iter().flat_map(|c| c.to_array()).collect()).expect("sized from the frame")
+    image::RgbaImage::from_raw(w as u32, h as u32, frame.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect()).expect("sized from the frame")
 }
 
 // Writes frames as name.0001.png, name.0002.png… in `dir`; returns the first file.

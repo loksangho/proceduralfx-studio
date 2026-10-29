@@ -2526,6 +2526,33 @@ struct CamRig {
     pan: [f32; 2],
 }
 
+impl CamRig {
+    // The GPU renderer's camera for an image of `size` pixels, framed as MoonRay renders
+    // frame it (see export_scene_rdla): the viewport's pan moves the camera, and the focal
+    // length applies along the image's smaller side.
+    fn realtime_camera(&self, size: [u32; 2], near: f32, viewport_focal_px: f32) -> gpu_viewport::Camera {
+        let (sx, cx) = self.rot_x.sin_cos();
+        let (sy, cy) = self.rot_y.sin_cos();
+        let right = Vec3::new(cy, 0.0, -sy);
+        let up = Vec3::new(-sx * sy, cx, -sx * cy);
+        let pan_scale = self.zoom / viewport_focal_px.max(1.0);
+        let target = self.target.sub(right.scale(self.pan[0] * pan_scale)).add(up.scale(self.pan[1] * pan_scale));
+        let (w, h) = (size[0].max(1) as f32, size[1].max(1) as f32);
+        let focal = w.min(h) * self.focal;
+        gpu_viewport::Camera {
+            target: [target.x, target.y, target.z],
+            rotation: [sx, cx, sy, cy],
+            zoom: self.zoom,
+            center: egui::vec2(w * 0.5, h * 0.5),
+            size: egui::vec2(w, h),
+            focal,
+            ortho_scale: focal / self.zoom.max(0.5),
+            orthographic: self.orthographic,
+            near,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RenderOpts {
     camera: RenderCamera,
@@ -10267,6 +10294,13 @@ impl ProceduralFxStudioApp {
             self.start_moonray_render();
             ui.close();
         }
+        let realtime = ui
+            .add_enabled(self.gpu_viewport.is_some() && self.flipbook_recording.is_none(), egui::Button::new("Render Real-Time"))
+            .on_hover_text("Renders like the viewport, in seconds, through the render camera at the Render Settings size (a sequence if that's ticked there): transparent PNGs, no MoonRay needed");
+        if realtime.clicked() {
+            self.start_realtime_render();
+            ui.close();
+        }
         if ui.button("✨ AI").on_hover_text("Describe a setup and Claude builds it as nodes").clicked() {
             self.assistant.open = !self.assistant.open;
         }
@@ -10582,7 +10616,9 @@ impl ProceduralFxStudioApp {
 
     // Flipbook: renders the playback range in the viewport, frame by frame.
     fn start_flipbook(&mut self) {
-        if self.viewport_rect.is_none() {
+        // The GPU viewport renders the frames itself; screenshots need it in the main window.
+        let capture = self.gpu_viewport.is_some().then_some(flipbook::Capture { render: None, save_to: None });
+        if capture.is_none() && self.viewport_rect.is_none() {
             self.status = "Flipbook: show the Viewport in the main window first".into();
             return;
         }
@@ -10593,7 +10629,52 @@ impl ProceduralFxStudioApp {
         }
         self.animate = false;
         self.flipbook_viewer = None;
-        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time));
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, capture));
+    }
+
+    // Renders the current frame, or Render Settings' sequence, with the GPU renderer:
+    // through the render camera at the render size, to transparent PNGs in the temp
+    // folder, shown in the Render Viewer. No MoonRay needed.
+    fn start_realtime_render(&mut self) {
+        if self.gpu_viewport.is_none() {
+            self.status = "Real-time rendering needs the GPU viewport (it's off with PFX_RENDERER=opengl or PFX_VIEWPORT=cpu)".into();
+            return;
+        }
+        if self.flipbook_recording.is_some() {
+            self.status = "A flipbook or real-time render is already running".into();
+            return;
+        }
+        let opts = &self.moonray_default_opts;
+        let times = if opts.sequence { frame_times(opts.range_start, opts.range_end, opts.range_step) } else { vec![self.time] };
+        if times.len() > 1000 {
+            self.status = format!("Real-time render: {} frames is too many; render at most 1000 at a time", times.len());
+            return;
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let dir = std::env::temp_dir().join(format!("pfx_realtime_{stamp}"));
+        let size = [self.moonray_default_width.clamp(1, 16384) as u32, self.moonray_default_height.clamp(1, 16384) as u32];
+        self.render_camera_in_use();
+        self.animate = false;
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(flipbook::Capture { render: Some(size), save_to: Some(dir) })));
+    }
+
+    // Keeps the render options' camera in step with the toolbar's, as MoonRay renders do.
+    fn render_camera_in_use(&mut self) {
+        self.render_opts = RenderOpts { camera: self.render_camera, ..self.moonray_default_opts.clone() };
+    }
+
+    // Once this frame has cooked (simulations too), asks for it to be captured: a
+    // window screenshot, or the GPU viewport's own render as it draws.
+    fn flipbook_request_capture(&mut self, ctx: &egui::Context) {
+        if let Some(recording) = self.flipbook_recording.as_mut() {
+            if !recording.waiting && self.simulation_rx.is_none() {
+                if recording.capture.is_none() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                }
+                recording.waiting = true;
+            }
+            ctx.request_repaint();
+        }
     }
 
     // Takes each frame's screenshot as it arrives and moves on; Escape cancels.
@@ -10604,6 +10685,10 @@ impl ProceduralFxStudioApp {
             self.flipbook_recording = None;
             self.dirty = true;
             self.status = "Flipbook cancelled".into();
+            return;
+        }
+        // The GPU viewport renders the frame as it draws (see viewport).
+        if recording.waiting && recording.capture.is_some() {
             return;
         }
         if recording.waiting {
@@ -10624,6 +10709,14 @@ impl ProceduralFxStudioApp {
             self.dirty = true;
             if done.frames.is_empty() {
                 self.status = "Flipbook: nothing was captured".into();
+            } else if let Some(dir) = done.capture.and_then(|c| c.save_to) {
+                self.status = match flipbook::save_pngs(&done.frames, &dir, "render") {
+                    Ok(first) => {
+                        self.viewer.add(first, true);
+                        format!("Rendered {} frame{} in real time to {}", done.frames.len(), if done.frames.len() == 1 { "" } else { "s" }, dir.display())
+                    }
+                    Err(e) => format!("Real-time render: couldn't save the frames: {e}"),
+                };
             } else {
                 self.status = format!("Flipbook: {} frames", done.frames.len());
                 self.flipbook_viewer = Some(flipbook::Viewer::new(done.frames, done.times, sims::SIM_FPS));
@@ -10635,7 +10728,8 @@ impl ProceduralFxStudioApp {
             self.time = t;
             self.dirty = true;
         }
-        self.status = format!("Flipbook: frame {} of {} (Esc cancels)", recording.next + 1, recording.times.len());
+        let what = if recording.capture.as_ref().is_some_and(|c| c.save_to.is_some()) { "Real-time render" } else { "Flipbook" };
+        self.status = format!("{what}: frame {} of {} (Esc cancels)", recording.next + 1, recording.times.len());
     }
 
     // The scene now matches what's on disk.
@@ -17490,6 +17584,10 @@ impl ProceduralFxStudioApp {
                 (self.mesh_revision, self.show_points, particle_display, point_color.to_array()).hash(&mut h);
                 h.finish()
             };
+            // A flipbook or real-time render frame waiting to be rendered, once this frame's
+            // scene is uploaded: through the render camera at its size, or the viewport's view.
+            let capture = self.flipbook_recording.as_ref().filter(|r| r.waiting).and_then(|r| r.capture.as_ref()).map(|c| c.render);
+            let render_camera = capture.flatten().map(|size| (self.resolve_render_camera().0.realtime_camera(size, near_plane, focal), size));
             if let (Some(gpu), Some(key)) = (self.gpu_viewport.as_mut(), gpu_key) {
                 if !gpu_fresh {
                     gpu.set_scene(key, &gpu_faces, &gpu_edges, quickshade.as_ref().map(|(texture, _)| texture.clone()));
@@ -17497,6 +17595,15 @@ impl ProceduralFxStudioApp {
                 if !gpu.has_points(points_key) {
                     let at = |i: usize| [mesh.vertices[i].x, mesh.vertices[i].y, mesh.vertices[i].z];
                     let (mut dots, mut splats) = (Vec::new(), Vec::new());
+                    // Hair and other curves, segment by segment, in their Cd or hair colour.
+                    let curves: Vec<gpu_viewport::Vertex> = curve_ranges
+                        .iter()
+                        .flat_map(|range| {
+                            let c = cd_color(range.start).unwrap_or(egui::Color32::from_rgb(200, 165, 115));
+                            let rgba = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
+                            (range.start..range.end.saturating_sub(1)).flat_map(move |i| [i, i + 1]).map(move |i| gpu_viewport::Vertex::new(at(i), rgba, None))
+                        })
+                        .collect();
                     if let Some(alpha) = splat_alpha {
                         // Soft splats in world units, as opaque at the centre as the CPU's two discs.
                         let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
@@ -17515,7 +17622,7 @@ impl ProceduralFxStudioApp {
                             gpu_viewport::Point::new(at(i), radius, [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0], [0.0; 3])
                         }));
                     }
-                    gpu.set_points(points_key, &dots, &splats);
+                    gpu.set_points(points_key, &dots, &splats, &curves);
                 }
                 let camera = gpu_viewport::Camera {
                     target: [target.x, target.y, target.z],
@@ -17530,6 +17637,29 @@ impl ProceduralFxStudioApp {
                 };
                 let id = gpu.draw([w as u32, h as u32], &camera);
                 painter.image(id, response.rect, full, egui::Color32::WHITE);
+                if capture.is_some() {
+                    let frame = match render_camera {
+                        // Transparent where empty (premultiplied, as egui images are).
+                        Some((render, size)) => {
+                            let pixels = gpu.render(size, &render);
+                            egui::ColorImage::new([size[0] as usize, size[1] as usize], pixels.into_iter().map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(r, g, b, a)).collect())
+                        }
+                        // The viewport's view, at most flipbook::MAX_WIDTH wide, over its background.
+                        None => {
+                            let width = (w as u32).min(flipbook::MAX_WIDTH);
+                            let size = [width, ((h as f32 * width as f32 / w as f32).round() as u32).max(1)];
+                            let bg = self.viewport_bg as u32;
+                            let over = |c: u8, a: u8| (c as u32 + bg * (255 - a as u32) / 255).min(255) as u8;
+                            let pixels = gpu.render(size, &camera);
+                            egui::ColorImage::new([size[0] as usize, size[1] as usize], pixels.into_iter().map(|[r, g, b, a]| egui::Color32::from_rgb(over(r, a), over(g, a), over(b, a))).collect())
+                        }
+                    };
+                    if let Some(recording) = self.flipbook_recording.as_mut() {
+                        recording.frames.push(frame);
+                        recording.next += 1;
+                        recording.waiting = false;
+                    }
+                }
             } else {
                 let mut raster = raster::Raster::new(w, h, self.orthographic);
                 let to_pixel = |p: egui::Pos2, z: f32| raster::ScreenVertex { x: (p.x - rect_min.x) * scale, y: (p.y - rect_min.y) * scale, z };
@@ -17562,7 +17692,7 @@ impl ProceduralFxStudioApp {
             }
         }
 
-        if !curve_ranges.is_empty() {
+        if !curve_ranges.is_empty() && self.gpu_viewport.is_none() {
             // Dense grooms are thinned for display; every curve still renders.
             const MAX_DRAWN_CURVES: usize = 8_000;
             let stride = curve_ranges.len().div_ceil(MAX_DRAWN_CURVES).max(1);
@@ -18295,14 +18425,7 @@ impl eframe::App for ProceduralFxStudioApp {
             self.rebuild_graph();
             self.dirty = false;
         }
-        // Flipbook: once this frame has cooked (simulations too), capture the window as drawn.
-        if let Some(recording) = self.flipbook_recording.as_mut() {
-            if !recording.waiting && self.simulation_rx.is_none() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
-                recording.waiting = true;
-            }
-            ctx.request_repaint();
-        }
+        self.flipbook_request_capture(ctx);
         if self.simulation_rx.is_some() || self.moonray_rx.is_some() || self.sequence.is_some() {
             ctx.request_repaint();
         }
@@ -21596,5 +21719,53 @@ mod node_info_tests {
         for expected in ["Type", "Wrangle", "Inputs", "1 of 1 connected", "Points", "Primitives", "6 (12 triangles)", "Bounds", "Attributes", "vel (3)", "up (1)", "Groups", "top (4)"] {
             assert!(has(expected), "'{expected}' missing from {texts:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod realtime_render_tests {
+    use super::*;
+
+    #[test]
+    fn real_time_renders_save_transparent_frames_through_the_render_camera() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 1 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n");
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.3, 0.4, 6.0, 0.0, 0.0);
+        (app.moonray_default_width, app.moonray_default_height) = (64, 48);
+        app.moonray_default_opts.sequence = false;
+        app.dirty = true;
+        app.start_realtime_render();
+        let dir = app.flipbook_recording.as_ref().and_then(|r| r.capture.as_ref()).and_then(|c| c.save_to.clone()).expect("a real-time render started");
+        // The app's own frame steps: the flipbook, cooking, asking for the capture, the viewport.
+        let ctx = egui::Context::default();
+        let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))), ..Default::default() };
+        for _ in 0..10 {
+            let _ = ctx.run(screen.clone(), |ctx| {
+                app.flipbook_step(ctx);
+                if app.dirty || app.simulation_rx.is_some() {
+                    app.rebuild_graph();
+                    app.dirty = false;
+                }
+                app.flipbook_request_capture(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.viewport(ui, ctx));
+            });
+            if app.flipbook_recording.is_none() {
+                break;
+            }
+        }
+        assert!(app.flipbook_recording.is_none(), "the render finished: {}", app.status);
+        let frame = image::open(dir.join("render.0001.png")).expect("the frame was saved").to_rgba8();
+        assert_eq!(frame.dimensions(), (64, 48), "at the Render Settings size, not the viewport's");
+        assert_eq!(frame.get_pixel(0, 0).0[3], 0, "transparent where there's nothing");
+        let middle = frame.get_pixel(32, 24).0;
+        assert!(middle[3] == 255 && middle[0] > 40, "the sphere fills the middle: {middle:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
