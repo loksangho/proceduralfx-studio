@@ -34,6 +34,9 @@ pub struct Capture {
     pub save_to: Option<PathBuf>,
     // Sprite sheets: packed into one image when the recording finishes.
     pub sheet: Option<crate::spritesheet::Output>,
+    // A sprite-sheet preview: the frames as they'll export (the last N faded into the start
+    // for a seamless loop), shown looping in the viewer instead of saved.
+    pub preview: Option<usize>,
 }
 
 impl Recording {
@@ -128,6 +131,11 @@ impl Viewer {
     pub fn new(frames: Vec<egui::ColorImage>, times: Vec<f32>, fps: f32) -> Self {
         let textures = (0..frames.len()).map(|_| None).collect();
         Viewer { frames, times, textures, current: 0, playing: true, looping: true, fps, last_step: None, open: true, status: String::new() }
+    }
+
+    #[cfg(test)]
+    pub fn frames(&self) -> &[egui::ColorImage] {
+        &self.frames
     }
 
     pub fn frame_count(&self) -> usize {

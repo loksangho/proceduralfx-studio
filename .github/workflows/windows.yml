@@ -82,6 +82,9 @@ jobs:
           $env:USD_ROOT = $env:PFX_WIN_DEPS
           $env:OPENVDB_ROOT = $env:PFX_WIN_DEPS
           $env:ALEMBIC_ROOT = $env:PFX_WIN_DEPS
+          # The ProceduralFX credits server, as in the macOS and Linux builds; without it
+          # the assistant has no credits option.
+          $env:PFX_AI_SERVER = "https://ai.build3dstudio.com"
           cargo build --release --features native-usd,native-openvdb,native-alembic 2>&1 | Tee-Object build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

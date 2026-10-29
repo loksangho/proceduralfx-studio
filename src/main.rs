@@ -10739,7 +10739,7 @@ impl ProceduralFxStudioApp {
     // Flipbook: renders the playback range in the viewport, frame by frame.
     fn start_flipbook(&mut self) {
         // The GPU viewport renders the frames itself; screenshots need it in the main window.
-        let capture = self.gpu_viewport.is_some().then_some(flipbook::Capture { render: None, save_to: None, sheet: None });
+        let capture = self.gpu_viewport.is_some().then_some(flipbook::Capture { render: None, save_to: None, sheet: None, preview: None });
         if capture.is_none() && self.viewport_rect.is_none() {
             self.status = "Flipbook: show the Viewport in the main window first".into();
             return;
@@ -10777,7 +10777,7 @@ impl ProceduralFxStudioApp {
         let size = [self.moonray_default_width.clamp(1, 16384) as u32, self.moonray_default_height.clamp(1, 16384) as u32];
         self.render_camera_in_use();
         self.animate = false;
-        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(flipbook::Capture { render: Some(size), save_to: Some(dir), sheet: None })));
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(flipbook::Capture { render: Some(size), save_to: Some(dir), sheet: None, preview: None })));
     }
 
     // The playback range's times for a sprite sheet: every Nth frame.
@@ -10790,7 +10790,7 @@ impl ProceduralFxStudioApp {
             return;
         }
         let mut open = true;
-        let mut export = false;
+        let (mut export, mut preview) = (false, false);
         let count = self.sprite_sheet_times().len();
         egui::Window::new("Export Sprite Sheet").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
             let s = &mut self.sprite_sheet;
@@ -10853,6 +10853,13 @@ impl ProceduralFxStudioApp {
                 if ui.add_enabled(!busy && count > 0, egui::Button::new("Export…")).clicked() {
                     export = true;
                 }
+                if ui
+                    .add_enabled(!busy && count > 0, egui::Button::new("Preview"))
+                    .on_hover_text("Plays the frames as they'll be exported, seamless blend included, looping in the flipbook viewer. Nothing is saved.")
+                    .clicked()
+                {
+                    preview = true;
+                }
                 if let Some(live) = &self.live_sheet {
                     let name = live.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     ui.weak(format!("Keeping {name} up to date"));
@@ -10862,6 +10869,9 @@ impl ProceduralFxStudioApp {
                 }
             });
         });
+        if preview {
+            self.preview_sprite_sheet();
+        }
         if export {
             if let Some(path) = FileDialog::new().set_title("Save the sprite sheet").set_file_name("sprite_sheet.png").add_filter("PNG image", &["png"]).save_file() {
                 self.live_sheet = None;
@@ -10871,31 +10881,48 @@ impl ProceduralFxStudioApp {
         self.sprite_sheet.open = open && !export;
     }
 
-    // Live re-exports keep the files current without adding to the Render Viewer.
-    fn start_sprite_sheet(&mut self, path: PathBuf, live: bool) {
+    // The times a sprite sheet renders, with a seamless loop's extra frames past the end, and
+    // how many of them are extra. None (saying why) when it can't start.
+    fn sprite_sheet_job(&mut self) -> Option<(Vec<f32>, usize)> {
         if self.gpu_viewport.is_none() || self.flipbook_recording.is_some() {
             self.status = "Sprite sheets need the GPU viewport, with no flipbook or render running".into();
-            return;
+            return None;
         }
-        let times = self.sprite_sheet_times();
+        let mut times = self.sprite_sheet_times();
         if times.len() > 1000 {
             self.status = format!("Sprite sheet: {} frames is too many; render at most 1000", times.len());
-            return;
+            return None;
         }
+        // A seamless loop renders on past the end, to fade into the start.
+        let s = &self.sprite_sheet;
+        let blend = s.extra_frames(times.len());
+        let step = s.every.max(1) as f32 / sims::SIM_FPS;
+        let last = times.last().copied().unwrap_or(self.playback_start);
+        times.extend((1..=blend).map(|i| last + i as f32 * step));
+        Some((times, blend))
+    }
+
+    // Plays the sheet's frames, as they'll export, looping in the flipbook viewer.
+    fn preview_sprite_sheet(&mut self) {
+        let Some((times, blend)) = self.sprite_sheet_job() else { return };
+        let s = &self.sprite_sheet;
+        let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: None, preview: Some(blend) };
+        self.render_camera_in_use();
+        self.animate = false;
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(capture)));
+    }
+
+    // Live re-exports keep the files current without adding to the Render Viewer.
+    fn start_sprite_sheet(&mut self, path: PathBuf, live: bool) {
+        let Some((times, blend)) = self.sprite_sheet_job() else { return };
         let s = &self.sprite_sheet;
         if s.live && !live {
             let exported = self.live_sheet_fingerprint();
             self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
         }
         let s = &self.sprite_sheet;
-        // A seamless loop renders on past the end, to fade into the start.
-        let mut times = times;
-        let blend = s.extra_frames(times.len());
-        let step = s.every.max(1) as f32 / sims::SIM_FPS;
-        let last = times.last().copied().unwrap_or(self.playback_start);
-        times.extend((1..=blend).map(|i| last + i as f32 * step));
         let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend };
-        let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output) };
+        let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output), preview: None };
         self.render_camera_in_use();
         self.animate = false;
         self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(capture)));
@@ -11013,15 +11040,25 @@ impl ProceduralFxStudioApp {
             let Some(done) = self.flipbook_recording.take() else { return };
             self.time = done.resume_time;
             self.dirty = true;
-            if done.frames.is_empty() {
-                self.status = "Flipbook: nothing was captured".into();
-            } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
+            let cut_off = || {
                 let edges = spritesheet::edges_touched(&done.frames);
-                let cut_off = if edges.is_empty() {
+                if edges.is_empty() {
                     String::new()
                 } else {
                     format!(". The effect runs off the {} of the frame and is cut off there: zoom the render camera out, or make the frame bigger", edges.join(" and "))
-                };
+                }
+            };
+            if done.frames.is_empty() {
+                self.status = "Flipbook: nothing was captured".into();
+            } else if let Some(blend) = done.capture.as_ref().and_then(|c| c.preview) {
+                let cut_off = cut_off();
+                let frames = if blend > 0 { spritesheet::seamless(&done.frames, blend) } else { done.frames.clone() };
+                let times = done.times[..frames.len().min(done.times.len())].to_vec();
+                let looped = if blend > 0 { ", with the seamless blend" } else { "" };
+                self.status = format!("Previewing the sprite sheet: {} frames as they'll export{looped}{cut_off}", frames.len());
+                self.flipbook_viewer = Some(flipbook::Viewer::new(frames, times, sims::SIM_FPS / self.sprite_sheet.every.max(1) as f32));
+            } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
+                let cut_off = cut_off();
                 self.status = match spritesheet::save(&done.frames, &output) {
                     Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}{cut_off}", png.display()),
                     Ok((png, sheet)) => {
@@ -22192,6 +22229,34 @@ mod realtime_render_tests {
             }
         }
         assert!(app.flipbook_recording.is_none(), "the recording finished: {}", app.status);
+    }
+
+    #[test]
+    fn previews_play_the_sheet_as_it_will_export() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        // The ball moves right over 4 frames, then stays at the right.
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nchannel 0 x 0 0,-0.5,1,0,0;0.125,0.5,1,0,0\nnext 2\n");
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+        (app.playback_start, app.playback_end) = (0.0, 3.0 / sims::SIM_FPS);
+        app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, seamless: true, blend: 2, ..Default::default() };
+        app.dirty = true;
+        app.preview_sprite_sheet();
+        run_recording(&mut app);
+        let viewer = app.flipbook_viewer.as_ref().expect("the preview opens in the viewer");
+        assert_eq!(viewer.frame_count(), 4, "one frame per frame of the range: {}", app.status);
+        assert!(app.status.contains("as they'll export, with the seamless blend"), "{}", app.status);
+        // Frame 1 is blended with the ball at the right, where the range ends; frame 4 isn't.
+        let alpha = |frame: &egui::ColorImage, x: usize| frame.pixels[32 * 64 + x].a();
+        let (first, last) = (&viewer.frames()[0], &viewer.frames()[3]);
+        assert!(alpha(first, 22) > 0 && alpha(first, 42) > alpha(first, 22), "both ends show in the first frame");
+        assert!(alpha(last, 22) == 0 && alpha(last, 42) > 200, "the last frame is as rendered");
     }
 
     #[test]
