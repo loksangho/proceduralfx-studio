@@ -32,6 +32,8 @@ pub struct Capture {
     pub render: Option<[u32; 2]>,
     // Real-time renders: where the frames are saved (name.0001.png…).
     pub save_to: Option<PathBuf>,
+    // Sprite sheets: packed into one image when the recording finishes.
+    pub sheet: Option<crate::spritesheet::Output>,
 }
 
 impl Recording {

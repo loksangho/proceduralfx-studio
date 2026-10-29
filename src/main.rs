@@ -58,6 +58,7 @@ mod snapshot;
 mod shading;
 mod sopkit;
 mod sops;
+mod spritesheet;
 mod terrain;
 mod testgeo;
 mod textures;
@@ -8770,6 +8771,7 @@ struct ProceduralFxStudioApp {
     moonray_default_height: usize,
     moonray_default_samples: usize,
     show_moonray_settings: bool,
+    sprite_sheet: spritesheet::Settings,
     // Render Settings dialog: used by toolbar renders; a selected render node overrides them.
     moonray_default_opts: RenderOpts,
     // Auto-named file in the temp folder instead of moonray_default_output.
@@ -9007,6 +9009,7 @@ impl Default for ProceduralFxStudioApp {
             moonray_default_height: default_mr_h,
             moonray_default_samples: default_mr_s,
             show_moonray_settings: false,
+            sprite_sheet: spritesheet::Settings::default(),
             moonray_default_opts: RenderOpts::default(),
             render_to_temp: true,
             render_temp_ext: "exr",
@@ -10301,6 +10304,14 @@ impl ProceduralFxStudioApp {
             self.start_realtime_render();
             ui.close();
         }
+        if ui
+            .add_enabled(self.gpu_viewport.is_some(), egui::Button::new("Export Sprite Sheet…"))
+            .on_hover_text("Renders the playback range in real time and packs the frames into one PNG, with a JSON file describing the grid, ready for a 2D game")
+            .clicked()
+        {
+            self.sprite_sheet.open = true;
+            ui.close();
+        }
         if ui.button("✨ AI").on_hover_text("Describe a setup and Claude builds it as nodes").clicked() {
             self.assistant.open = !self.assistant.open;
         }
@@ -10617,7 +10628,7 @@ impl ProceduralFxStudioApp {
     // Flipbook: renders the playback range in the viewport, frame by frame.
     fn start_flipbook(&mut self) {
         // The GPU viewport renders the frames itself; screenshots need it in the main window.
-        let capture = self.gpu_viewport.is_some().then_some(flipbook::Capture { render: None, save_to: None });
+        let capture = self.gpu_viewport.is_some().then_some(flipbook::Capture { render: None, save_to: None, sheet: None });
         if capture.is_none() && self.viewport_rect.is_none() {
             self.status = "Flipbook: show the Viewport in the main window first".into();
             return;
@@ -10655,7 +10666,87 @@ impl ProceduralFxStudioApp {
         let size = [self.moonray_default_width.clamp(1, 16384) as u32, self.moonray_default_height.clamp(1, 16384) as u32];
         self.render_camera_in_use();
         self.animate = false;
-        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(flipbook::Capture { render: Some(size), save_to: Some(dir) })));
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(flipbook::Capture { render: Some(size), save_to: Some(dir), sheet: None })));
+    }
+
+    // The playback range's times for a sprite sheet: every Nth frame.
+    fn sprite_sheet_times(&self) -> Vec<f32> {
+        frame_times(self.playback_start, self.playback_end, self.sprite_sheet.every.max(1) as f32 / sims::SIM_FPS)
+    }
+
+    fn sprite_sheet_window(&mut self, ctx: &egui::Context) {
+        if !self.sprite_sheet.open {
+            return;
+        }
+        let mut open = true;
+        let mut export = false;
+        let count = self.sprite_sheet_times().len();
+        egui::Window::new("Export Sprite Sheet").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            let s = &mut self.sprite_sheet;
+            ui.label("Renders the playback range through the render camera with the real-time renderer, then packs the frames into one PNG.");
+            ui.add_space(4.0);
+            egui::Grid::new("sprite_sheet_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("Frame size");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut s.width).range(8..=4096).suffix(" px"));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut s.height).range(8..=4096).suffix(" px"));
+                });
+                ui.end_row();
+                ui.label("Frames");
+                ui.horizontal(|ui| {
+                    ui.label("every");
+                    ui.add(egui::DragValue::new(&mut s.every).range(1..=100));
+                    ui.label(format!("frame{} of the playback range: {count} frame{}, {:.3} fps", if s.every == 1 { "" } else { "s" }, if count == 1 { "" } else { "s" }, sims::SIM_FPS / s.every.max(1) as f32));
+                });
+                ui.end_row();
+                ui.label("Columns");
+                ui.horizontal(|ui| {
+                    let mut auto = s.columns == 0;
+                    if ui.checkbox(&mut auto, "Automatic").on_hover_text("As close to square as the frames allow").changed() {
+                        s.columns = if auto { 0 } else { spritesheet::columns(count, [s.width, s.height], 0) };
+                    }
+                    if !auto {
+                        ui.add(egui::DragValue::new(&mut s.columns).range(1..=1000));
+                    }
+                });
+                ui.end_row();
+                ui.label("Trim");
+                ui.checkbox(&mut s.trim, "Crop empty space").on_hover_text("Crops every frame to the same box: what any frame shows, plus a 1-pixel transparent border. The JSON records where the box was in the full frame.");
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.weak("Uses the camera chosen in the toolbar's render camera menu. The JSON beside the PNG gives the frame size, columns and rows (for Bevy's TextureAtlasLayout::from_grid), frame count and frame rate.");
+            ui.add_space(4.0);
+            let busy = self.flipbook_recording.is_some();
+            if ui.add_enabled(!busy && count > 0, egui::Button::new("Export…")).clicked() {
+                export = true;
+            }
+        });
+        if export {
+            if let Some(path) = FileDialog::new().set_title("Save the sprite sheet").set_file_name("sprite_sheet.png").add_filter("PNG image", &["png"]).save_file() {
+                self.start_sprite_sheet(path);
+            }
+        }
+        self.sprite_sheet.open = open && !export;
+    }
+
+    fn start_sprite_sheet(&mut self, path: PathBuf) {
+        if self.gpu_viewport.is_none() || self.flipbook_recording.is_some() {
+            self.status = "Sprite sheets need the GPU viewport, with no flipbook or render running".into();
+            return;
+        }
+        let times = self.sprite_sheet_times();
+        if times.len() > 1000 {
+            self.status = format!("Sprite sheet: {} frames is too many; render at most 1000", times.len());
+            return;
+        }
+        let s = &self.sprite_sheet;
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32 };
+        let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output) };
+        self.render_camera_in_use();
+        self.animate = false;
+        self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(capture)));
     }
 
     // Keeps the render options' camera in step with the toolbar's, as MoonRay renders do.
@@ -10709,6 +10800,15 @@ impl ProceduralFxStudioApp {
             self.dirty = true;
             if done.frames.is_empty() {
                 self.status = "Flipbook: nothing was captured".into();
+            } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
+                self.status = match spritesheet::save(&done.frames, &output) {
+                    Ok((png, sheet)) => {
+                        self.viewer.add(png.clone(), true);
+                        let (w, h) = sheet.image.dimensions();
+                        format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}", done.frames.len(), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
+                    }
+                    Err(e) => format!("Sprite sheet: {e}"),
+                };
             } else if let Some(dir) = done.capture.and_then(|c| c.save_to) {
                 self.status = match flipbook::save_pngs(&done.frames, &dir, "render") {
                     Ok(first) => {
@@ -10728,7 +10828,11 @@ impl ProceduralFxStudioApp {
             self.time = t;
             self.dirty = true;
         }
-        let what = if recording.capture.as_ref().is_some_and(|c| c.save_to.is_some()) { "Real-time render" } else { "Flipbook" };
+        let what = match recording.capture.as_ref() {
+            Some(c) if c.sheet.is_some() => "Sprite sheet",
+            Some(c) if c.save_to.is_some() => "Real-time render",
+            _ => "Flipbook",
+        };
         self.status = format!("{what}: frame {} of {} (Esc cancels)", recording.next + 1, recording.times.len());
     }
 
@@ -18504,6 +18608,7 @@ impl eframe::App for ProceduralFxStudioApp {
         }
 
         self.render_settings_window(ctx);
+        self.sprite_sheet_window(ctx);
         self.viewer.ui(ctx);
 
 
@@ -21795,6 +21900,63 @@ mod node_info_tests {
 #[cfg(test)]
 mod realtime_render_tests {
     use super::*;
+
+    // Runs the app's own frame steps until the recording finishes.
+    fn run_recording(app: &mut ProceduralFxStudioApp) {
+        let ctx = egui::Context::default();
+        let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))), ..Default::default() };
+        for _ in 0..40 {
+            let _ = ctx.run(screen.clone(), |ctx| {
+                app.flipbook_step(ctx);
+                if app.dirty || app.simulation_rx.is_some() {
+                    app.rebuild_graph();
+                    app.dirty = false;
+                }
+                app.flipbook_request_capture(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.viewport(ui, ctx));
+            });
+            if app.flipbook_recording.is_none() {
+                break;
+            }
+        }
+        assert!(app.flipbook_recording.is_none(), "the recording finished: {}", app.status);
+    }
+
+    #[test]
+    fn sprite_sheets_pack_the_playback_range_with_its_metadata() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        // A sphere moving 1 unit along x over the first 4 frames.
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nchannel 0 x 0 0,-0.5,1,0,0;0.125,0.5,1,0,0\nnext 2\n");
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+        (app.playback_start, app.playback_end) = (0.0, 3.0 / sims::SIM_FPS);
+        app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, ..Default::default() };
+        app.dirty = true;
+        let dir = std::env::temp_dir().join(format!("pfx_sheet_app_{}", std::process::id()));
+        app.start_sprite_sheet(dir.join("ball.png"));
+        run_recording(&mut app);
+        let sheet = image::open(dir.join("ball.png")).expect("the sheet was saved").to_rgba8();
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.json")).unwrap()).unwrap();
+        assert_eq!(meta["frame_count"], 4);
+        assert_eq!(meta["fps"], 24.0);
+        let [w, h] = [meta["frame_size"][0].as_u64().unwrap() as u32, meta["frame_size"][1].as_u64().unwrap() as u32];
+        assert!(w < 64 && h < 64 && w > h, "trimmed to the moving ball: {w}×{h}");
+        assert_eq!(sheet.dimensions(), (w * meta["columns"].as_u64().unwrap() as u32, h * meta["rows"].as_u64().unwrap() as u32));
+        // The ball moves right: frame 1's left half is lit, frame 4's isn't.
+        let lit = |frame: u32, x: u32| {
+            let cell = &meta["frames"][frame as usize];
+            sheet.get_pixel(cell[0].as_u64().unwrap() as u32 + x, cell[1].as_u64().unwrap() as u32 + h / 2).0[3] > 0
+        };
+        assert!(lit(0, w / 4) && !lit(0, w * 3 / 4));
+        assert!(!lit(3, w / 4) && lit(3, w * 3 / 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn real_time_renders_save_transparent_frames_through_the_render_camera() {
