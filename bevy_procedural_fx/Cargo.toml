@@ -1,0 +1,18 @@
+[package]
+name = "bevy_procedural_fx"
+version = "0.1.0"
+edition = "2024"
+description = "Play sprite-sheet effects exported from ProceduralFX Studio in Bevy"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/loksangho/proceduralfx-studio"
+keywords = ["bevy", "vfx", "sprite-sheet", "2d", "gamedev"]
+categories = ["game-development"]
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["bevy_asset", "bevy_image", "bevy_sprite", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+bevy = { version = "0.20.1" }

@@ -69,6 +69,16 @@ through WSL. The set-up window checks for WSL, then downloads MoonRay (about
 administrator to approve that once, and a restart may be needed. Downloading
 and rendering never need administrator rights.
 
+## Effects in Bevy
+
+**Render → Export Sprite Sheet…** renders the playback range with the real-time renderer
+and packs it into one PNG, with a `.pfx.json` file describing the grid. The
+[bevy_procedural_fx](bevy_procedural_fx) crate loads that as a Bevy asset and plays it:
+
+```rust
+commands.spawn(FxSprite::looping(assets.load("fx/fire.pfx.json")));
+```
+
 ## Support
 
 ProceduralFX Studio is free. If it's useful to you, you can support its

@@ -126,7 +126,7 @@ pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, s
     })
 }
 
-// Writes the sheet PNG and its JSON (same name, .json); returns the PNG's path.
+// Writes the sheet PNG and its JSON (same name, .pfx.json); returns the PNG's path.
 pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sheet), String> {
     let sheet = pack(frames, output.columns, output.trim)?;
     let png = output.path.with_extension("png");
@@ -141,8 +141,9 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
     Ok((png, sheet))
 }
 
+// name.pfx.json beside name.png: the extension bevy_procedural_fx loads.
 pub fn json_path(png: &Path) -> PathBuf {
-    png.with_extension("json")
+    png.with_extension("pfx.json")
 }
 
 #[cfg(test)]
@@ -206,7 +207,7 @@ mod tests {
         let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0 };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
-        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.json")).unwrap()).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();
         assert_eq!((meta["image"].as_str(), meta["columns"].as_u64(), meta["fps"].as_f64()), (Some("spark.png"), Some(2), Some(12.0)));
         let _ = std::fs::remove_dir_all(dir);
     }

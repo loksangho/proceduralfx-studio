@@ -10716,7 +10716,7 @@ impl ProceduralFxStudioApp {
                 ui.end_row();
             });
             ui.add_space(4.0);
-            ui.weak("Uses the camera chosen in the toolbar's render camera menu. The JSON beside the PNG gives the frame size, columns and rows (for Bevy's TextureAtlasLayout::from_grid), frame count and frame rate.");
+            ui.weak("Uses the camera chosen in the toolbar's render camera menu. Beside the PNG, name.pfx.json gives the frame size, columns and rows, frame count and frame rate. The bevy_procedural_fx crate plays it in Bevy.");
             ui.add_space(4.0);
             let busy = self.flipbook_recording.is_some();
             if ui.add_enabled(!busy && count > 0, egui::Button::new("Export…")).clicked() {
@@ -21942,7 +21942,7 @@ mod realtime_render_tests {
         app.start_sprite_sheet(dir.join("ball.png"));
         run_recording(&mut app);
         let sheet = image::open(dir.join("ball.png")).expect("the sheet was saved").to_rgba8();
-        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.json")).unwrap()).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.pfx.json")).unwrap()).unwrap();
         assert_eq!(meta["frame_count"], 4);
         assert_eq!(meta["fps"], 24.0);
         let [w, h] = [meta["frame_size"][0].as_u64().unwrap() as u32, meta["frame_size"][1].as_u64().unwrap() as u32];
