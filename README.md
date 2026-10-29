@@ -79,6 +79,9 @@ and packs it into one PNG, with a `.pfx.json` file describing the grid. The
 commands.spawn(FxSprite::looping(assets.load("fx/fire.pfx.json")));
 ```
 
+Tick **Keep updating** when you export, and the app exports again whenever you change the
+effect. A game running with Bevy's `file_watcher` feature shows each change within a moment.
+
 ## Support
 
 ProceduralFX Studio is free. If it's useful to you, you can support its

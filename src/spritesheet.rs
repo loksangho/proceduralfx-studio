@@ -24,11 +24,13 @@ pub struct Settings {
     // Cells across; 0 picks a near-square sheet.
     pub columns: u32,
     pub trim: bool,
+    // Export again to the same files whenever the scene changes.
+    pub live: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false }
     }
 }
 
@@ -39,6 +41,8 @@ pub struct Output {
     pub columns: u32,
     pub trim: bool,
     pub fps: f32,
+    // A live re-export: quieter (no Render Viewer entry).
+    pub live: bool,
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -133,11 +137,17 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
     if let Some(dir) = png.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    sheet.image.save(&png).map_err(|e| e.to_string())?;
+    // Written beside the file and renamed over it, so a game watching the files never
+    // reads half of one. The image goes first: the JSON's reload reloads it too.
+    let partial = png.with_extension("png.partial");
+    sheet.image.save_with_format(&partial, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &png).map_err(|e| e.to_string())?;
     let name = png.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let size = frames.first().map_or([0, 0], |f| [f.size[0] as u32, f.size[1] as u32]);
     let json = serde_json::to_string_pretty(&metadata(&sheet, &name, frames.len(), output.fps, size)).map_err(|e| e.to_string())?;
-    std::fs::write(json_path(&png), json + "\n").map_err(|e| e.to_string())?;
+    let partial = png.with_extension("pfx.json.partial");
+    std::fs::write(&partial, json + "\n").map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, json_path(&png)).map_err(|e| e.to_string())?;
     Ok((png, sheet))
 }
 
@@ -204,11 +214,13 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0 };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();
         assert_eq!((meta["image"].as_str(), meta["columns"].as_u64(), meta["fps"].as_f64()), (Some("spark.png"), Some(2), Some(12.0)));
+        // Only the two files are left: nothing half-written.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -46,7 +46,9 @@ empty space was trimmed.
 ## Changing effects while the game runs
 
 With Bevy's `file_watcher` feature on, exporting the sheet again to the same files
-updates every sprite that uses it, without restarting the game:
+updates every sprite that uses it, without restarting the game. Tick **Keep updating** in
+ProceduralFX Studio's Export Sprite Sheet window and it exports again whenever you change
+the effect, so the game follows along as you work.
 
 ```toml
 bevy = { version = "0.20", features = ["file_watcher"] }

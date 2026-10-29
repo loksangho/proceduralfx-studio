@@ -7772,6 +7772,21 @@ const NODE_H: f32 = 40.0;
 const SCENE_EXTENSION: &str = "pfs";
 const SCENE_FILE: &str = "scene.pfs";
 
+// A live sprite sheet: after an export with "Keep updating" on, the same files are
+// exported again whenever the scene, camera or sheet settings change, once they've been
+// still for a moment, so a game watching them (bevy_procedural_fx with Bevy's
+// file_watcher) updates as you work.
+struct LiveSheet {
+    path: PathBuf,
+    // What the files on disk (or the export under way) show.
+    exported: u64,
+    // A change not exported yet, and when it was first seen.
+    pending: Option<(u64, Instant)>,
+}
+
+// How long the scene has to stay unchanged before a live sheet is exported again.
+const LIVE_SHEET_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 // A scene's content regardless of line order (some parts are written from hash maps).
 fn scene_fingerprint(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -8772,6 +8787,8 @@ struct ProceduralFxStudioApp {
     moonray_default_samples: usize,
     show_moonray_settings: bool,
     sprite_sheet: spritesheet::Settings,
+    // Exporting again as the scene changes (Export Sprite Sheet's "Keep updating").
+    live_sheet: Option<LiveSheet>,
     // Render Settings dialog: used by toolbar renders; a selected render node overrides them.
     moonray_default_opts: RenderOpts,
     // Auto-named file in the temp folder instead of moonray_default_output.
@@ -9010,6 +9027,7 @@ impl Default for ProceduralFxStudioApp {
             moonray_default_samples: default_mr_s,
             show_moonray_settings: false,
             sprite_sheet: spritesheet::Settings::default(),
+            live_sheet: None,
             moonray_default_opts: RenderOpts::default(),
             render_to_temp: true,
             render_temp_ext: "exr",
@@ -10714,24 +10732,41 @@ impl ProceduralFxStudioApp {
                 ui.label("Trim");
                 ui.checkbox(&mut s.trim, "Crop empty space").on_hover_text("Crops every frame to the same box: what any frame shows, plus a 1-pixel transparent border. The JSON records where the box was in the full frame.");
                 ui.end_row();
+                ui.label("Live");
+                ui.checkbox(&mut s.live, "Keep updating").on_hover_text(
+                    "After exporting, export again to the same files whenever the scene, camera or these settings change. \
+                     A Bevy game using bevy_procedural_fx with Bevy's file_watcher feature then updates as you work.",
+                );
+                ui.end_row();
             });
             ui.add_space(4.0);
             ui.weak("Uses the camera chosen in the toolbar's render camera menu. Beside the PNG, name.pfx.json gives the frame size, columns and rows, frame count and frame rate. The bevy_procedural_fx crate plays it in Bevy.");
             ui.add_space(4.0);
             let busy = self.flipbook_recording.is_some();
-            if ui.add_enabled(!busy && count > 0, egui::Button::new("Export…")).clicked() {
-                export = true;
-            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy && count > 0, egui::Button::new("Export…")).clicked() {
+                    export = true;
+                }
+                if let Some(live) = &self.live_sheet {
+                    let name = live.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    ui.weak(format!("Keeping {name} up to date"));
+                    if ui.button("Stop").clicked() {
+                        self.sprite_sheet.live = false;
+                    }
+                }
+            });
         });
         if export {
             if let Some(path) = FileDialog::new().set_title("Save the sprite sheet").set_file_name("sprite_sheet.png").add_filter("PNG image", &["png"]).save_file() {
-                self.start_sprite_sheet(path);
+                self.live_sheet = None;
+                self.start_sprite_sheet(path, false);
             }
         }
         self.sprite_sheet.open = open && !export;
     }
 
-    fn start_sprite_sheet(&mut self, path: PathBuf) {
+    // Live re-exports keep the files current without adding to the Render Viewer.
+    fn start_sprite_sheet(&mut self, path: PathBuf, live: bool) {
         if self.gpu_viewport.is_none() || self.flipbook_recording.is_some() {
             self.status = "Sprite sheets need the GPU viewport, with no flipbook or render running".into();
             return;
@@ -10742,11 +10777,75 @@ impl ProceduralFxStudioApp {
             return;
         }
         let s = &self.sprite_sheet;
-        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32 };
+        if s.live && !live {
+            let exported = self.live_sheet_fingerprint();
+            self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
+        }
+        let s = &self.sprite_sheet;
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live };
         let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output) };
         self.render_camera_in_use();
         self.animate = false;
         self.flipbook_recording = Some(flipbook::Recording::new(times, self.time, Some(capture)));
+    }
+
+    // Everything a sprite sheet depends on: the scene, the camera, the range and the sheet settings.
+    fn live_sheet_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        scene_fingerprint(&self.graph.serialize()).hash(&mut hasher);
+        let s = &self.sprite_sheet;
+        format!(
+            "{:?} {:?} {} {} {} {} {} {} {} {} {} {} {}",
+            self.render_camera, self.cam_target, self.cam_rot_x, self.cam_rot_y, self.cam_zoom, self.cam_pan_x, self.cam_pan_y,
+            self.playback_start, self.playback_end, s.width, s.height, s.every, s.columns
+        )
+        .hash(&mut hasher);
+        s.trim.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // Exports a live sheet again once a change has settled. A change during a live export
+    // stops it, and the next one starts once things are still again. Waits while the
+    // timeline plays or a button is held, so it never fights with what you're doing.
+    fn live_sheet_step(&mut self, ctx: &egui::Context) {
+        if !self.sprite_sheet.live {
+            if self.live_sheet.take().is_some() {
+                self.status = "Live sprite sheet stopped".into();
+            }
+            return;
+        }
+        if self.live_sheet.is_none() {
+            return;
+        }
+        let now = self.live_sheet_fingerprint();
+        let exporting_live = self.flipbook_recording.as_ref().and_then(|r| r.capture.as_ref()).and_then(|c| c.sheet.as_ref()).is_some_and(|o| o.live);
+        let Some(live) = self.live_sheet.as_mut() else { return };
+        if exporting_live && now != live.exported {
+            if let Some(stopped) = self.flipbook_recording.take() {
+                self.time = stopped.resume_time;
+                self.dirty = true;
+            }
+        } else if self.flipbook_recording.is_some() {
+            return;
+        }
+        if now == live.exported {
+            live.pending = None;
+            return;
+        }
+        match live.pending {
+            Some((seen, since)) if seen == now => {
+                let busy = self.animate || ctx.input(|i| i.pointer.any_down());
+                if since.elapsed() >= LIVE_SHEET_SETTLE && !busy {
+                    live.exported = now;
+                    live.pending = None;
+                    let path = live.path.clone();
+                    self.start_sprite_sheet(path, true);
+                }
+            }
+            _ => live.pending = Some((now, Instant::now())),
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
     // Keeps the render options' camera in step with the toolbar's, as MoonRay renders do.
@@ -10772,6 +10871,10 @@ impl ProceduralFxStudioApp {
     fn flipbook_step(&mut self, ctx: &egui::Context) {
         let Some(recording) = self.flipbook_recording.as_mut() else { return };
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // Escape during a live export means stop keeping it up to date.
+            if recording.capture.as_ref().and_then(|c| c.sheet.as_ref()).is_some_and(|o| o.live) {
+                self.sprite_sheet.live = false;
+            }
             self.time = recording.resume_time;
             self.flipbook_recording = None;
             self.dirty = true;
@@ -10802,6 +10905,7 @@ impl ProceduralFxStudioApp {
                 self.status = "Flipbook: nothing was captured".into();
             } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
                 self.status = match spritesheet::save(&done.frames, &output) {
+                    Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}", png.display()),
                     Ok((png, sheet)) => {
                         self.viewer.add(png.clone(), true);
                         let (w, h) = sheet.image.dimensions();
@@ -10829,6 +10933,7 @@ impl ProceduralFxStudioApp {
             self.dirty = true;
         }
         let what = match recording.capture.as_ref() {
+            Some(c) if c.sheet.as_ref().is_some_and(|o| o.live) => "Live sprite sheet",
             Some(c) if c.sheet.is_some() => "Sprite sheet",
             Some(c) if c.save_to.is_some() => "Real-time render",
             _ => "Flipbook",
@@ -18524,6 +18629,7 @@ impl eframe::App for ProceduralFxStudioApp {
             self.status = self.write_cop_output(id, range).unwrap_or_else(|e| format!("File Output failed: {e}"));
         }
 
+        self.live_sheet_step(ctx);
         self.flipbook_step(ctx);
         if self.dirty || self.simulation_rx.is_some() {
             self.rebuild_graph();
@@ -21923,6 +22029,56 @@ mod realtime_render_tests {
     }
 
     #[test]
+    fn live_sprite_sheets_follow_the_scene() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n");
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+        (app.playback_start, app.playback_end) = (0.0, 1.0 / sims::SIM_FPS);
+        app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, live: true, ..Default::default() };
+        app.dirty = true;
+        let dir = std::env::temp_dir().join(format!("pfx_live_sheet_{}", std::process::id()));
+        app.start_sprite_sheet(dir.join("ball.png"), false);
+        run_recording(&mut app);
+        let width = |dir: &std::path::Path| {
+            let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.pfx.json")).unwrap()).unwrap();
+            meta["frame_size"][0].as_u64().unwrap()
+        };
+        let small = width(&dir);
+        // A bigger ball: once the change settles, the same files are exported again.
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 1 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n");
+        app.dirty = true;
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        while width(&dir) == small && started.elapsed() < std::time::Duration::from_secs(10) {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.live_sheet_step(ctx);
+                app.flipbook_step(ctx);
+                if app.dirty || app.simulation_rx.is_some() {
+                    app.rebuild_graph();
+                    app.dirty = false;
+                }
+                app.flipbook_request_capture(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.viewport(ui, ctx));
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(width(&dir) > small, "re-exported with the bigger ball: {}", app.status);
+        assert_eq!(app.live_sheet.as_ref().map(|l| l.exported), Some(app.live_sheet_fingerprint()), "and it knows the files are current");
+        // Turning it off stops it.
+        app.sprite_sheet.live = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.live_sheet_step(ctx));
+        assert!(app.live_sheet.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sprite_sheets_pack_the_playback_range_with_its_metadata() {
         let Some(gpu) = gpu_viewport::headless() else {
             eprintln!("no GPU here; skipping");
@@ -21939,7 +22095,7 @@ mod realtime_render_tests {
         app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, ..Default::default() };
         app.dirty = true;
         let dir = std::env::temp_dir().join(format!("pfx_sheet_app_{}", std::process::id()));
-        app.start_sprite_sheet(dir.join("ball.png"));
+        app.start_sprite_sheet(dir.join("ball.png"), false);
         run_recording(&mut app);
         let sheet = image::open(dir.join("ball.png")).expect("the sheet was saved").to_rgba8();
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.pfx.json")).unwrap()).unwrap();
