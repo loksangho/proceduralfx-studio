@@ -73,7 +73,7 @@ impl FxSheet {
     pub fn anchor(&self) -> Anchor {
         let size = self.frame_size.as_vec2().max(Vec2::ONE);
         let centre = self.source_size.as_vec2() / 2.0 - self.offset.as_vec2();
-        Anchor(Vec2::new(centre.x / size.x - 0.5, 0.5 - centre.y / size.y))
+        Anchor::Custom(Vec2::new(centre.x / size.x - 0.5, 0.5 - centre.y / size.y))
     }
 
     /// The frame shown `elapsed` seconds in.
@@ -136,8 +136,8 @@ impl FxSprite {
     }
 }
 
-fn play(mut commands: Commands, time: Res<Time>, sheets: Res<Assets<FxSheet>>, mut sprites: Query<(Entity, &mut FxSprite, &mut Sprite, &mut Anchor)>) {
-    for (entity, mut fx, mut sprite, mut anchor) in &mut sprites {
+fn play(mut commands: Commands, time: Res<Time>, sheets: Res<Assets<FxSheet>>, mut sprites: Query<(Entity, &mut FxSprite, &mut Sprite)>) {
+    for (entity, mut fx, mut sprite) in &mut sprites {
         // Not loaded yet: nothing to show, and the clock waits.
         let Some(sheet) = sheets.get(&fx.sheet) else { continue };
         if fx.playback == Playback::OnceThenDespawn && fx.elapsed >= sheet.duration() - 1e-4 {
@@ -159,8 +159,8 @@ fn play(mut commands: Commands, time: Res<Time>, sheets: Res<Assets<FxSheet>>, m
             _ => sprite.texture_atlas = Some(TextureAtlas { layout: sheet.layout.clone(), index }),
         }
         let wanted = sheet.anchor();
-        if *anchor != wanted {
-            *anchor = wanted;
+        if sprite.anchor != wanted {
+            sprite.anchor = wanted;
         }
         // Each frame shows for its whole time, the first included.
         if !fx.paused {
@@ -238,10 +238,10 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
     let frame_size = UVec2::from(file.frame_size);
     let mut layout = TextureAtlasLayout::from_grid(frame_size, columns, rows, None, None);
     layout.textures.truncate(file.frame_count.max(1));
-    let image_path = load_context.path().resolve_embed_str(&file.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
+    let image_path = load_context.asset_path().resolve_embed(&file.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
     Ok(FxSheet {
         image: load_context.load(image_path),
-        layout: load_context.add_labeled_asset("layout", layout),
+        layout: load_context.add_labeled_asset("layout".to_string(), layout),
         frame_count: file.frame_count.max(1),
         fps: if file.fps > 0.0 { file.fps } else { 24.0 },
         frame_size,
@@ -280,10 +280,10 @@ mod tests {
     fn the_anchor_keeps_the_full_frames_centre() {
         // Cropped to x 30..70, y 40..60 of a 100×100 frame: the centre (50, 50) is the
         // middle of the cell, so the anchor is (0, 0).
-        assert_eq!(sheet(1, 24.0).anchor(), Anchor(Vec2::new(0.0, 0.0)));
+        assert_eq!(sheet(1, 24.0).anchor(), Anchor::Custom(Vec2::new(0.0, 0.0)));
         let mut s = sheet(1, 24.0);
         s.offset = UVec2::new(50, 50);
         // Now the centre is the cell's top-left corner.
-        assert_eq!(s.anchor(), Anchor(Vec2::new(-0.5, 0.5)));
+        assert_eq!(s.anchor(), Anchor::Custom(Vec2::new(-0.5, 0.5)));
     }
 }

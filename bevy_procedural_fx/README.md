@@ -51,7 +51,7 @@ ProceduralFX Studio's Export Sprite Sheet window and it exports again whenever y
 the effect, so the game follows along as you work.
 
 ```toml
-bevy = { version = "0.20", features = ["file_watcher"] }
+bevy = { version = "0.15", features = ["file_watcher"] }
 ```
 
 ## Example
@@ -81,7 +81,14 @@ one-shot bursts.
 
 | bevy_procedural_fx | Bevy |
 | --- | --- |
-| 0.1 | 0.20 |
+| 0.1 (crates.io), `main` branch | 0.20 |
+| [`bevy-0.15` branch](https://github.com/loksangho/proceduralfx-studio/tree/bevy-0.15/bevy_procedural_fx) | 0.15 |
+
+Both read the same `.pfx.json` files. To use the 0.15 version:
+
+```toml
+bevy_procedural_fx = { git = "https://github.com/loksangho/proceduralfx-studio", branch = "bevy-0.15" }
+```
 
 ## License
 
