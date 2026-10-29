@@ -19,6 +19,7 @@
     <nav>
       <a href="#features">Features</a>
       <a href="#ai">AI assistant</a>
+      <a href="#games">For games</a>
       <a href="#pricing">Pricing</a>
       <a class="keep" href="#download">Download</a>
     </nav>
@@ -119,7 +120,24 @@
   </div>
 </section>
 
-<section id="pricing" class="alt">
+<section id="games" class="alt">
+  <div class="wrap">
+    <p class="eyebrow">For game makers</p>
+    <h2>Effects for your Bevy game, updated live.</h2>
+    <p class="intro">Export any effect as a sprite sheet and play it in <a href="https://bevy.org">Bevy</a> with the free <a href="https://crates.io/crates/bevy_procedural_fx">bevy_procedural_fx</a> plugin. Tick <b>Keep updating</b> and the app exports again whenever you change the effect, so your game follows along while it runs.</p>
+    <figure class="demo">
+      <video src="/img/live-export.mp4" poster="/img/live-export.jpg" autoplay muted loop playsinline preload="metadata" aria-label="Changing a fire effect in ProceduralFX Studio, and the same fire updating in a running Bevy game beside it."></video>
+      <figcaption class="small muted">Left, ProceduralFX Studio. Right, BeaverBoy Online, a game made in Bevy, picking up each change as it's made.</figcaption>
+    </figure>
+    <div class="grid grid-3">
+      <div class="card"><h3>One PNG, one JSON</h3><p>Frames are packed into a grid with empty space cropped away. A small JSON file beside it gives the grid and frame rate, so any engine can read it.</p></div>
+      <div class="card"><h3>Three lines in Bevy</h3><p>Add the plugin and spawn an <code>FxSprite</code>: looping for fires and auras, or one-shot for hits and explosions.</p></div>
+      <div class="card"><h3>The effects are yours</h3><p>We claim no rights over the effects you make. The plugin is MIT or Apache-2.0, like Bevy. Making effects for a game you sell needs a commercial license for the app.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="pricing">
   <div class="wrap">
     <p class="eyebrow">Pricing</p>
     <h2>Free for noncommercial use. Pay only for AI.</h2>
@@ -148,7 +166,7 @@
   </div>
 </section>
 
-<section id="download">
+<section id="download" class="alt">
   <div class="wrap">
     <p class="eyebrow">Download</p>
     <h2>Get ProceduralFX Studio</h2>
