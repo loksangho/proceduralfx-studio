@@ -1004,6 +1004,29 @@ fn remap_node_ids(kind: &mut NodeKind, map: impl Fn(NodeId) -> NodeId) {
     }
 }
 
+// A window of its own beside the app's, free to be as big as you like or on another screen,
+// showing `add`; closing it clears `open`. Where the platform can't open more windows, a
+// panel inside the app's window instead. `id` must be unique and stay the same between frames.
+fn own_window(ctx: &egui::Context, id: &str, title: &str, size: [f32; 2], min: [f32; 2], open: &mut bool, add: impl FnOnce(&mut egui::Ui)) {
+    if !*open {
+        return;
+    }
+    let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size(min);
+    // Drawn once a frame; the window's code may call this more than once, so take it once.
+    let mut add = Some(add);
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(id), builder, |ctx, class| {
+        let Some(add) = add.take() else { return };
+        if class == egui::ViewportClass::Embedded {
+            egui::Window::new(title).id(egui::Id::new(id)).open(open).default_size(size).min_size(min).resizable(true).show(ctx, add);
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, add);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            *open = false;
+        }
+    });
+}
+
 fn encode_text(text: &str) -> String {
     text.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -11333,18 +11356,15 @@ impl ProceduralFxStudioApp {
         let mut open = true;
         let mut start = false;
         let mut cancel = false;
-        egui::Window::new("Render Settings")
-            .open(&mut open)
-            .default_width(440.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+        own_window(ctx, "render_settings", "Render Settings", [480.0, 720.0], [360.0, 320.0], &mut open, |ui| {
                 if node_selected {
                     ui.colored_label(
                         egui::Color32::from_rgb(230, 190, 90),
                         "A MoonRay render node is selected: Render uses that node's settings. Resolution scale still applies.",
                     );
                 }
-                egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+                // As tall as the window leaves room for, above the buttons and the log.
+                egui::ScrollArea::vertical().max_height((ui.available_height() - 200.0).max(240.0)).show(ui, |ui| {
                     egui::CollapsingHeader::new("Renderer").default_open(true).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Executable");

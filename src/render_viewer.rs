@@ -334,18 +334,18 @@ impl RenderViewer {
             self.rebuild_texture(ctx);
         }
         let mut open = self.open;
-        egui::Window::new("Render Viewer")
-            .open(&mut open)
-            .default_size([760.0, 560.0])
-            .min_size([360.0, 260.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                self.toolbar(ui);
-                self.display_controls(ui);
-                ui.separator();
-                self.footer(ui);
-                self.image_area(ui);
-            });
+        let rendering = self.progress.is_some();
+        crate::own_window(ctx, "render_viewer", "Render Viewer", [760.0, 560.0], [360.0, 260.0], &mut open, |ui| {
+            self.toolbar(ui);
+            self.display_controls(ui);
+            ui.separator();
+            self.footer(ui);
+            self.image_area(ui);
+            // Its own window redraws itself while a render comes in.
+            if rendering {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        });
         self.open = open;
     }
 

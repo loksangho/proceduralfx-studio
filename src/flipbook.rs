@@ -172,8 +172,24 @@ impl Viewer {
         let texture = self.textures[current]
             .get_or_insert_with(|| ctx.load_texture(format!("flipbook_{current}"), self.frames[current].clone(), egui::TextureOptions::LINEAR))
             .clone();
+        // A window of its own, as big as you like, beside the app; where the platform can't
+        // open one, a panel inside the app's window instead.
+        let [w, h] = self.frames[0].size;
+        let size = [(w as f32 * 0.8 + 20.0).max(360.0), h as f32 * 0.8 + 100.0];
         let mut open = self.open;
-        egui::Window::new("Flipbook").open(&mut open).default_size([self.frames[0].size[0] as f32 * 0.8 + 20.0, self.frames[0].size[1] as f32 * 0.8 + 90.0]).resizable(true).show(ctx, |ui| {
+        crate::own_window(ctx, "flipbook_viewer", "Flipbook", size, [320.0, 240.0], &mut open, |ui| {
+            self.contents(ui, &texture);
+            // Its own window needs its own redraws to play.
+            if self.playing {
+                ui.ctx().request_repaint();
+            }
+        });
+        self.open = open;
+    }
+
+    // The controls, the frame (fitted to the space, keeping its proportions) and saving.
+    fn contents(&mut self, ui: &mut egui::Ui, texture: &egui::TextureHandle) {
+        {
             ui.horizontal(|ui| {
                 if ui.button(if self.playing { "⏸ Pause" } else { "▶ Play" }).clicked() {
                     self.playing = !self.playing;
@@ -230,8 +246,7 @@ impl Viewer {
                 }
                 ui.weak(&self.status);
             });
-        });
-        self.open = open;
+        }
     }
 }
 
