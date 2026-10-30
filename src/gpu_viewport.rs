@@ -241,11 +241,19 @@ fn vs_dot(@builtin(vertex_index) i: u32, point: PointIn) -> PointOut {
     return PointOut(p, point.color, vec3<f32>(0.0), k, point.radius);
 }
 
+// Partial coverage, written premultiplied like the rest of the image. Alpha to coverage
+// already keeps about `a` of the pixel's samples, and each keeps the alpha written, so
+// writing the square root gives the pixel `a` in all, and its colour times `a`.
+fn covered(rgb: vec3<f32>, a: f32) -> vec4<f32> {
+    let s = sqrt(clamp(a, 0.0, 1.0));
+    return vec4<f32>(rgb * s, s);
+}
+
 // Antialiased by coverage: the alpha at the disc's rim thins the samples drawn.
 @fragment
 fn fs_dot(in: PointOut) -> @location(0) vec4<f32> {
     let edge = clamp((1.0 - length(in.corner)) * in.extra + 0.5, 0.0, 1.0);
-    return vec4<f32>(in.color.rgb, edge);
+    return covered(in.color.rgb, edge);
 }
 
 // Strands: each piece of a curve as a ribbon facing the camera, as wide as the hair at
@@ -309,7 +317,7 @@ fn vs_strand(@builtin(vertex_index) i: u32, s: StrandIn) -> StrandOut {
 @fragment
 fn fs_strand(in: StrandOut) -> @location(0) vec4<f32> {
     let to_edge = (1.0 - abs(in.side)) * (in.shown + 1.0) * 0.5;
-    return vec4<f32>(in.color.rgb, clamp(to_edge, 0.0, 1.0) * in.coverage);
+    return covered(in.color.rgb, clamp(to_edge, 0.0, 1.0) * in.coverage);
 }
 
 // Splats are sized in the world, kept between half a point and 120 points across
@@ -1050,6 +1058,12 @@ mod tests {
         // Finer than a pixel: still drawn, but faint.
         let (_, faint) = column(&mut gpu, strand(0.05, 0.0));
         assert!(faint > 0 && faint <= 128, "a fifth of a pixel shows faintly: {faint}");
+        // And premultiplied like the rest of the image, so saving it (which divides by alpha)
+        // keeps its colour: a faint red strand is red, not brightened past it to white.
+        let image = read(&gpu);
+        for p in image.iter().filter(|p| p[3] > 0) {
+            assert!(p[0] <= p[3].saturating_add(2) && p[1] <= p[3].saturating_add(2), "not premultiplied: {p:?}");
+        }
         // No width: a plain line a pixel wide.
         let (_, line) = column(&mut gpu, strand(-1.0, 0.0));
         assert_eq!(line, 255);
