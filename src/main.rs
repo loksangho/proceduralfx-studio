@@ -6813,6 +6813,61 @@ impl Graph {
     // Identifies a solver's simulation by everything that affects it: its settings,
     // its upstream nodes and, for containers, their networks. Node positions are excluded,
     // so moving nodes keeps cached simulations while any parameter edit restarts them.
+    // A fingerprint of everything a node's cooked output depends on: its own settings, group,
+    // channels, keyframes and bypass, and its inputs' fingerprints. A cooked result stays good
+    // while its fingerprint does, so moving a node, the display flag or the selection keeps it.
+    // Nodes that also read beyond their inputs (containers, Object Merge, files, inner networks,
+    // USD...) take in `scene`, the whole scene's fingerprint, as everything did before.
+    fn cook_fingerprints(&self, scene: u64) -> HashMap<NodeId, u64> {
+        let mut memo = HashMap::new();
+        let ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        for id in ids {
+            self.cook_fingerprint(id, scene, &mut memo, &mut HashSet::new());
+        }
+        memo
+    }
+
+    fn cook_fingerprint(&self, id: NodeId, scene: u64, memo: &mut HashMap<NodeId, u64>, visiting: &mut HashSet<NodeId>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        if let Some(f) = memo.get(&id) {
+            return *f;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut h);
+        let Some(node) = self.nodes.get(&id) else { return h.finish() };
+        // A loop in the wiring can't be cooked; take the whole scene rather than recurse forever.
+        if !visiting.insert(id) {
+            return scene;
+        }
+        format!("{:?}", node.kind).hash(&mut h);
+        format!("{:?}", node.group).hash(&mut h);
+        format!("{:?}", node.channels).hash(&mut h);
+        node.bypass.hash(&mut h);
+        for (channel, keys) in self.node_channels(id) {
+            format!("{:?} {:?}", channel.target, keys).hash(&mut h);
+        }
+        let kind = &node.kind;
+        let reads_beyond_inputs = kind.is_container()
+            || kind.is_lop()
+            || matches!(
+                kind.name(),
+                "geometry" | "cop_network" | "cop" | "top" | "top_network" | "solver_input" | "foreach_begin" | "foreach_end" | "vdb" | "usd_export" | "object_merge"
+                    | "sop_solver" | "compile_begin" | "compile_end" | "attribute_vop" | "vop" | "file" | "cache"
+            );
+        if reads_beyond_inputs {
+            scene.hash(&mut h);
+        }
+        let mut inputs: Vec<(usize, usize, NodeId)> = self.links.iter().filter(|l| l.to == id).map(|l| (l.slot, l.out, l.from)).collect();
+        inputs.sort_unstable();
+        for (slot, out, from) in inputs {
+            (slot, out, self.cook_fingerprint(from, scene, memo, visiting)).hash(&mut h);
+        }
+        visiting.remove(&id);
+        let f = h.finish();
+        memo.insert(id, f);
+        f
+    }
+
     fn sim_key(&self, id: NodeId) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -8979,7 +9034,9 @@ struct ProceduralFxStudioApp {
 
     template: Option<NodeId>,
     template_mesh: Mesh,
-    static_cache: HashMap<NodeId, Mesh>,
+    // Cooked results of nodes that don't change with time, with the fingerprint each was
+    // cooked at (Graph::cook_fingerprint): good while it still matches.
+    static_cache: HashMap<NodeId, (u64, Mesh)>,
     cache_key: String,
     frame_cache: HashMap<String, Mesh>,
     frame_cache_order: VecDeque<String>,
@@ -9803,7 +9860,7 @@ impl ProceduralFxStudioApp {
         }
         let fresh = self.info_mesh.as_ref().is_some_and(|(n, t, _)| *n == id && *t == self.time);
         if !fresh {
-            let mut cache = self.static_cache.clone();
+            let mut cache = self.valid_cache(&self.graph.cook_fingerprints(scene_fingerprint(&self.graph.serialize())));
             let mesh = self.graph.cook(id, self.time, &mut cache);
             self.info_mesh = Some((id, self.time, mesh));
         }
@@ -13097,7 +13154,7 @@ impl ProceduralFxStudioApp {
         if self.render_at.is_none() && active.len() == 1 && self.network().is_none() && self.context != AppContext::Stage {
             return vec![(self.current_mesh.clone(), material_of(active[0]))];
         }
-        let mut cache = self.static_cache.clone();
+        let mut cache = self.valid_cache(&self.graph.cook_fingerprints(scene_fingerprint(&self.graph.serialize())));
         active
             .into_iter()
             .map(|id| {
@@ -13228,6 +13285,11 @@ impl ProceduralFxStudioApp {
         h.finish()
     }
 
+    // The cached results still good for the scene as it is: a cook starts from these.
+    fn valid_cache(&self, fingerprints: &HashMap<NodeId, u64>) -> HashMap<NodeId, Mesh> {
+        self.static_cache.iter().filter(|(id, (f, _))| fingerprints.get(id) == Some(f)).map(|(id, (_, m))| (*id, m.clone())).collect()
+    }
+
     fn rebuild_graph(&mut self) {
         // While picking a group the viewport keeps showing the node's input.
         if self.group_pick.is_some() {
@@ -13246,14 +13308,14 @@ impl ProceduralFxStudioApp {
             self.simulation_cancel = None;
             self.simulation_key.clear();
             self.cancelled_simulation_key.clear();
-            self.static_cache.clear();
             self.frame_cache.clear();
             self.frame_cache_order.clear();
             self.frame_cache_hits = 0;
             self.frame_cache_misses = 0;
             self.cache_key = key;
         }
-        let mut cache = self.static_cache.clone();
+        let fingerprints = self.graph.cook_fingerprints(scene_fingerprint(&self.cache_key));
+        let mut cache = self.valid_cache(&fingerprints);
         let displays = self.view_displays();
         let frame_key = format!(
             "{}|display={:?}|time={:08x}",
@@ -13352,9 +13414,11 @@ impl ProceduralFxStudioApp {
         // Node Info shows what this cook made (or cooks on its own when it needs to).
         let shown = [self.inspect_node, self.info_hold.map(|h| h.0)];
         self.info_mesh = shown.into_iter().flatten().find_map(|id| cache.get(&id).map(|m| (id, self.time, m.clone())));
+        // Keep what's still good (nodes not cooked this time too), forget what isn't.
+        self.static_cache.retain(|id, (f, _)| fingerprints.get(id) == Some(f));
         for (id, m) in cache {
-            if !self.graph.time_dependent(id) {
-                self.static_cache.entry(id).or_insert(m);
+            if let Some(&f) = fingerprints.get(&id).filter(|_| !self.graph.time_dependent(id)) {
+                self.static_cache.entry(id).or_insert((f, m));
             }
         }
         self.cook_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -18891,6 +18955,23 @@ impl ProceduralFxStudioApp {
                 ctx.request_repaint();
             }
         }
+        // While a frame cooks in the background, the viewport still shows the last one: say
+        // so, so a click that's working doesn't look like one that did nothing.
+        if self.simulation_rx.is_some() {
+            let label = self.graph.cooking_label(&self.view_displays());
+            let label = if label.is_empty() { "Cooking".to_owned() } else { label };
+            let at = response.rect.left_top() + egui::vec2(12.0, 12.0);
+            let text = format!("{label}…   Esc to cancel");
+            let font = egui::FontId::proportional(14.0);
+            let galley = painter.layout_no_wrap(text, font, egui::Color32::from_gray(235));
+            let spinner = 16.0;
+            let backing = egui::Rect::from_min_size(at, egui::vec2(galley.size().x + spinner + 26.0, galley.size().y.max(spinner) + 12.0));
+            painter.rect_filled(backing, 6.0, egui::Color32::from_black_alpha(170));
+            let spin = egui::Rect::from_min_size(at + egui::vec2(8.0, (backing.height() - spinner) * 0.5), egui::vec2(spinner, spinner));
+            ui.put(spin, egui::Spinner::new().size(spinner).color(egui::Color32::from_gray(235)));
+            painter.galley(at + egui::vec2(spinner + 16.0, 6.0), galley, egui::Color32::from_gray(235));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
     }
 
     // What the gizmo edits for the selected node: an object's transform, a Transform
@@ -20017,6 +20098,53 @@ mod scene_file_tests {
             g.cook(solver, 0.0, &mut HashMap::new());
             assert!(node_errors(|e| e.get(&solver).cloned()).is_none(), "{:?}", node_errors(|e| e.get(&solver).cloned()));
         }
+    }
+
+    #[test]
+    fn cooked_results_stay_good_until_something_they_depend_on_changes() {
+        // box -> transform -> noise, and a separate sphere; object 3 merges object 0.
+        let text = "pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj box 1.5 4\nnode 2 40 100 0 obj xform 0 1 0 0 0 0 1 1 1\nnode 4 40 180 0 obj sphere 1 8 16\nlink 1 2 0\nparent 1 0\nparent 2 0\nparent 4 0\ndisplay 0 2\nnode 3 200 20 0 obj geometry -1\nnode 5 200 20 0 obj object_merge\nparent 5 3\ndisplay 3 5\nnext 6\n";
+        let mut g = Graph::deserialize(text);
+        let prints = |g: &Graph| g.cook_fingerprints(scene_fingerprint(&g.serialize()));
+        let before = prints(&g);
+        // Moving a node or the display flag changes nothing any SOP depends on.
+        g.nodes.get_mut(&1).unwrap().pos.x += 50.0;
+        g.set_display(4);
+        let after = prints(&g);
+        for id in [1, 2, 4] {
+            assert_eq!(before[&id], after[&id], "node {id}");
+        }
+        // But Object Merge (and the objects) read the whole scene, so they follow it.
+        assert_ne!(before[&5], after[&5]);
+        // Editing the box changes it and what's below, not the sphere beside it.
+        if let Some(NodeKind::Box { size, .. }) = g.nodes.get_mut(&1).map(|n| &mut n.kind) {
+            *size = 3.0;
+        }
+        let edited = prints(&g);
+        assert_ne!(after[&1], edited[&1]);
+        assert_ne!(after[&2], edited[&2]);
+        assert_eq!(after[&4], edited[&4]);
+    }
+
+    #[test]
+    fn the_viewport_shows_edits_and_reuses_what_it_cooked() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj box 1.5 4\nnode 2 40 100 0 obj xform 0 1 0 0 0 0 1 1 1\nlink 1 2 0\nparent 1 0\nparent 2 0\ndisplay 0 2\nnext 3\n".into());
+        app.rebuild_graph();
+        let height = |app: &ProceduralFxStudioApp| { let (lo, hi) = app.current_mesh.bounds().unwrap(); hi.y - lo.y };
+        assert!((height(&app) - 1.5).abs() < 1e-4);
+        // Display the box, then the transform again: both come from what was cooked.
+        app.graph.set_display(1);
+        app.rebuild_graph();
+        assert!(app.static_cache.contains_key(&1) && app.static_cache.contains_key(&2), "kept across the display change");
+        app.graph.set_display(2);
+        app.rebuild_graph();
+        // An edit upstream shows straight away, never the old result.
+        if let Some(NodeKind::Box { size, .. }) = app.graph.nodes.get_mut(&1).map(|n| &mut n.kind) {
+            *size = 4.0;
+        }
+        app.rebuild_graph();
+        assert!((height(&app) - 4.0).abs() < 1e-4, "{}", height(&app));
     }
 
     #[test]
