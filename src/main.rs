@@ -677,8 +677,18 @@ fn attribute_target_ui(ui: &mut egui::Ui, id: NodeId, name: &mut String, class: 
 
 // An attribute value as its type wants it: a colour picker, a vector, rotation angles,
 // a whole number, or 1 to 4 floats.
-fn attribute_value_ui(ui: &mut egui::Ui, kind: usize, size: usize, value: &mut [f32; 4]) -> bool {
-    let mut c = false;
+fn attribute_value_ui(ui: &mut egui::Ui, label: &str, kind: usize, size: usize, value: &mut [f32; 4]) -> bool {
+    let shown = match kind {
+        attrib::COLOUR | attrib::VECTOR | attrib::QUATERNION => 3,
+        attrib::INTEGER => 1,
+        _ => size.clamp(1, 4),
+    };
+    let speed = match kind {
+        attrib::QUATERNION => 1.0,
+        attrib::INTEGER => 0.2,
+        _ => 0.01,
+    };
+    let mut c = group_label(ui, label, speed, &mut value[..shown]);
     match kind {
         attrib::COLOUR => {
             let mut rgb = [value[0], value[1], value[2]];
@@ -3055,7 +3065,11 @@ fn channel_params_ui(ui: &mut egui::Ui, code: &str, channels: &mut vex::Channels
     for (name, kind) in refs {
         let value = channels.entry(name.clone()).or_insert([0.0; 3]);
         ui.horizontal(|ui| {
-            ui.label(&name);
+            if kind == 'v' {
+                changed |= group_label(ui, &name, 0.01, &mut value[..]);
+            } else {
+                ui.label(&name);
+            }
             match kind {
                 'i' => {
                     let mut v = value[0].round() as i32;
@@ -8453,12 +8467,29 @@ fn draw_wire(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, color: egui::Color
 fn vec3_ui(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f64) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(label);
+        changed |= group_label(ui, label, speed, v);
         for x in v.iter_mut() {
             changed |= pfield(ui, pdrag(x).speed(speed)).changed();
         }
     });
     changed
+}
+
+// A row's label that changes all of the row's values at once: drag the word "Scale" to
+// move x, y and z together, each by the same amount (Shift for finer steps).
+fn group_label(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>, speed: f64, values: &mut [f32]) -> bool {
+    let response = ui.add(egui::Label::new(label).sense(egui::Sense::drag())).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let response = if values.len() > 1 { response.on_hover_text("Drag to change them all at once") } else { response };
+    if !response.dragged() {
+        return false;
+    }
+    let fine = if ui.input(|i| i.modifiers.shift) { 0.1 } else { 1.0 };
+    let delta = (response.drag_delta().x as f64 * speed * fine) as f32;
+    if delta == 0.0 {
+        return false;
+    }
+    values.iter_mut().for_each(|v| *v += delta);
+    true
 }
 
 enum Action {
@@ -14727,7 +14758,7 @@ impl ProceduralFxStudioApp {
                 let mut remove = None;
                 for (i, p) in points.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{i}"));
+                        c |= group_label(ui, format!("{i}"), 0.01, &mut p[..]);
                         for k in 0..3 {
                             c |= pfield(ui, pdrag(&mut p[k]).speed(0.01)).changed();
                         }
@@ -14852,8 +14883,7 @@ impl ProceduralFxStudioApp {
                     (a.name, a.kind, a.size, a.value) = (name.into(), kind, size, value);
                 }
                 ui.horizontal(|ui| {
-                    ui.label(if a.kind == attrib::QUATERNION { "Rotation°" } else { "Value" });
-                    c |= attribute_value_ui(ui, a.kind, a.size, &mut a.value);
+                    c |= attribute_value_ui(ui, if a.kind == attrib::QUATERNION { "Rotation°" } else { "Value" }, a.kind, a.size, &mut a.value);
                 });
                 if a.kind == attrib::QUATERNION {
                     ui.small("Stored as a quaternion (x y z w): turns around X, then Y, then Z, like Transform. Copy to Points uses orient to turn copies.");
@@ -14917,12 +14947,10 @@ impl ProceduralFxStudioApp {
                     _ => {
                         let unit = if r.kind == attrib::QUATERNION { "°" } else { "" };
                         ui.horizontal(|ui| {
-                            ui.label(format!("Min{unit}"));
-                            c |= attribute_value_ui(ui, r.kind, r.size, &mut r.min);
+                            c |= attribute_value_ui(ui, &format!("Min{unit}"), r.kind, r.size, &mut r.min);
                         });
                         ui.horizontal(|ui| {
-                            ui.label(format!("Max{unit}"));
-                            c |= attribute_value_ui(ui, r.kind, r.size, &mut r.max);
+                            c |= attribute_value_ui(ui, &format!("Max{unit}"), r.kind, r.size, &mut r.max);
                         });
                         ui.small(match (r.kind, r.distribution) {
                             (attrib::QUATERNION, 1) => "A rotation on the way from Min to Max, in degrees around X, then Y, then Z.",
@@ -15260,7 +15288,12 @@ impl ProceduralFxStudioApp {
                 if !auto {
                     for (label, range) in [("Domain centre", 0..3), ("Domain size", 3..6)] {
                         ui.horizontal(|ui| {
-                            ui.label(label);
+                            if group_label(ui, label, 0.02, &mut domain[range.clone()]) {
+                                c = true;
+                                for k in range.clone() {
+                                    domain[k] = if k >= 3 { domain[k].clamp(0.01, 1000.0) } else { domain[k].clamp(-1000.0, 1000.0) };
+                                }
+                            }
                             for k in range {
                                 c |= pfield(ui, pdrag(&mut domain[k]).speed(0.02).range(if k >= 3 { 0.01..=1000.0 } else { -1000.0..=1000.0 })).changed();
                             }
@@ -15872,13 +15905,16 @@ impl ProceduralFxStudioApp {
                 }
                 if !has_reference {
                     ui.horizontal(|ui| {
-                        ui.label("Target centre");
+                        c |= group_label(ui, "Target centre", 0.01, &mut set.target_center[..]);
                         for v in set.target_center.iter_mut() {
                             c |= pfield(ui, pdrag(v).speed(0.01)).changed();
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Target size");
+                        if group_label(ui, "Target size", 0.01, &mut set.target_size[..]) {
+                            c = true;
+                            set.target_size.iter_mut().for_each(|v| *v = v.max(0.0));
+                        }
                         for v in set.target_size.iter_mut() {
                             c |= pfield(ui, pdrag(v).speed(0.01).range(0.0..=1e6)).changed();
                         }
@@ -16122,7 +16158,7 @@ impl ProceduralFxStudioApp {
                 match set.material {
                     1 => {
                         ui.horizontal(|ui| {
-                            ui.label("Impact point");
+                            c |= group_label(ui, "Impact point", 0.01, &mut set.impact[..]);
                             for k in 0..3 {
                                 c |= pfield(ui, pdrag(&mut set.impact[k]).speed(0.01)).changed();
                             }
@@ -16161,7 +16197,7 @@ impl ProceduralFxStudioApp {
                     c |= pfield(ui, pdrag(&mut set.ground_height).speed(0.01).prefix("Ground height: ")).changed();
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Initial velocity");
+                    c |= group_label(ui, "Initial velocity", 0.05, &mut set.velocity[..]);
                     for k in 0..3 {
                         c |= pfield(ui, pdrag(&mut set.velocity[k]).speed(0.05)).changed();
                     }
@@ -16187,7 +16223,7 @@ impl ProceduralFxStudioApp {
                 ui.horizontal(|ui| {
                     c |= ui.checkbox(&mut set.set_velocity, "").changed();
                     ui.add_enabled_ui(set.set_velocity, |ui| {
-                        ui.label("Velocity");
+                        c |= group_label(ui, "Velocity", 0.05, &mut set.velocity[..]);
                         for k in 0..3 {
                             c |= pfield(ui, pdrag(&mut set.velocity[k]).speed(0.05)).changed();
                         }
@@ -16232,7 +16268,7 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pslider(&mut set.cohesion, 0.0..=5.0).text("Cohesion")).changed();
                 c |= pfield(ui, pslider(&mut set.wander, 0.0..=5.0).text("Wander")).changed();
                 ui.horizontal(|ui| {
-                    ui.label("Goal");
+                    c |= group_label(ui, "Goal", 0.1, &mut set.goal[..]);
                     for k in 0..3 {
                         c |= pfield(ui, pdrag(&mut set.goal[k]).speed(0.1)).changed();
                     }
@@ -16266,7 +16302,7 @@ impl ProceduralFxStudioApp {
                     let v = &mut pose.values[slot];
                     for (label, range) in [("Rotate", 0..3), ("Translate", 3..6)] {
                         ui.horizontal(|ui| {
-                            ui.label(label);
+                            c |= group_label(ui, label, if range.start < 3 { 0.5 } else { 0.01 }, &mut v[range.clone()]);
                             for k in range {
                                 c |= pfield(ui, pdrag(&mut v[k]).speed(if k < 3 { 0.5 } else { 0.01 })).changed();
                             }
@@ -16281,7 +16317,7 @@ impl ProceduralFxStudioApp {
                 c |= joint_menu(ui, ("ik", id, 2), "Tip", &mut set.tip, &joint_names, false);
                 for (label, value) in [("Goal", &mut set.goal), ("Pole", &mut set.pole)] {
                     ui.horizontal(|ui| {
-                        ui.label(label);
+                        c |= group_label(ui, label, 0.01, &mut value[..]);
                         for k in 0..3 {
                             c |= pfield(ui, pdrag(&mut value[k]).speed(0.01)).changed();
                         }
@@ -16330,7 +16366,7 @@ impl ProceduralFxStudioApp {
                 ui.small("A muscle from origin to insertion, or along a curve connected to input 1. Animate Activation to flex it.");
                 for (label, point) in [("Origin", &mut set.origin), ("Insertion", &mut set.insertion)] {
                     ui.horizontal(|ui| {
-                        ui.label(label);
+                        c |= group_label(ui, label, 0.01, &mut point[..]);
                         for k in 0..3 {
                             c |= pfield(ui, pdrag(&mut point[k]).speed(0.01)).changed();
                         }
@@ -16368,7 +16404,10 @@ impl ProceduralFxStudioApp {
             NodeKind::Terrain(set) => {
                 ui.small("A flat heightfield grid. Shape it with Terrain Noise, Erode and Terrace.");
                 ui.horizontal(|ui| {
-                    ui.label("Size");
+                    if group_label(ui, "Size", 0.1, &mut set.size[..]) {
+                        c = true;
+                        set.size.iter_mut().for_each(|v| *v = v.clamp(0.01, 10_000.0));
+                    }
                     c |= pfield(ui, pdrag(&mut set.size[0]).speed(0.1).range(0.01..=10_000.0)).changed();
                     c |= pfield(ui, pdrag(&mut set.size[1]).speed(0.1).range(0.01..=10_000.0)).changed();
                 });
@@ -16390,7 +16429,7 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pslider(&mut set.octaves, 1..=12).text("Octaves")).changed();
                 c |= pfield(ui, pslider(&mut set.roughness, 0.0..=1.0).text("Roughness")).changed();
                 ui.horizontal(|ui| {
-                    ui.label("Offset");
+                    c |= group_label(ui, "Offset", 0.05, &mut set.offset[..]);
                     c |= pfield(ui, pdrag(&mut set.offset[0]).speed(0.05)).changed();
                     c |= pfield(ui, pdrag(&mut set.offset[1]).speed(0.05)).changed();
                 });
@@ -16471,10 +16510,10 @@ impl ProceduralFxStudioApp {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Scale");
+                    c |= group_label(ui, "Scale", 0.01, &mut set.scale[..]);
                     c |= pfield(ui, pdrag(&mut set.scale[0]).speed(0.01)).changed();
                     c |= pfield(ui, pdrag(&mut set.scale[1]).speed(0.01)).changed();
-                    ui.label("Offset");
+                    c |= group_label(ui, "Offset", 0.01, &mut set.offset[..]);
                     c |= pfield(ui, pdrag(&mut set.offset[0]).speed(0.01)).changed();
                     c |= pfield(ui, pdrag(&mut set.offset[1]).speed(0.01)).changed();
                 });
@@ -16483,7 +16522,7 @@ impl ProceduralFxStudioApp {
             NodeKind::UvTransform(set) => {
                 for (label, value) in [("Translate", &mut set.translate), ("Scale", &mut set.scale), ("Pivot", &mut set.pivot)] {
                     ui.horizontal(|ui| {
-                        ui.label(label);
+                        c |= group_label(ui, label, 0.01, &mut value[..]);
                         c |= pfield(ui, pdrag(&mut value[0]).speed(0.01)).changed();
                         c |= pfield(ui, pdrag(&mut value[1]).speed(0.01)).changed();
                     });
@@ -20145,6 +20184,55 @@ mod scene_file_tests {
         }
         app.rebuild_graph();
         assert!((height(&app) - 4.0).abs() < 1e-4, "{}", height(&app));
+    }
+
+    #[test]
+    fn dragging_a_rows_label_changes_all_its_values() {
+        // Draws "Scale" and its three fields; returns the label's rect.
+        let ctx = egui::Context::default();
+        let mut v = [1.0f32, 2.0, 3.0];
+        let mut frame = |ctx: &egui::Context, v: &mut [f32; 3], input: egui::RawInput| {
+            let mut rect = egui::Rect::NOTHING;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let before = ui.cursor().min;
+                        group_label(ui, "Scale", 0.01, v);
+                        rect = egui::Rect::from_min_max(before, ui.min_rect().max);
+                    });
+                });
+            });
+            rect
+        };
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0)));
+        let input = |events: Vec<egui::Event>, shift: bool| egui::RawInput { screen_rect: screen, events, modifiers: egui::Modifiers { shift, ..Default::default() }, ..Default::default() };
+        let rect = frame(&ctx, &mut v, input(vec![], false));
+        let at = egui::pos2(rect.min.x + 8.0, rect.center().y);
+        let press = |pos: egui::Pos2, pressed: bool, shift: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers { shift, ..Default::default() } };
+        // Drag 100 points right: each value goes up by 100 × 0.01.
+        frame(&ctx, &mut v, input(vec![egui::Event::PointerMoved(at)], false));
+        frame(&ctx, &mut v, input(vec![press(at, true, false)], false));
+        for step in 1..=10 {
+            frame(&ctx, &mut v, input(vec![egui::Event::PointerMoved(at + egui::vec2(10.0 * step as f32, 0.0))], false));
+        }
+        frame(&ctx, &mut v, input(vec![press(at + egui::vec2(100.0, 0.0), false, false)], false));
+        for (got, want) in v.iter().zip([2.0, 3.0, 4.0]) {
+            assert!((got - want).abs() < 0.05, "{v:?}");
+        }
+        // With Shift, a tenth as much.
+        let start = v;
+        frame(&ctx, &mut v, input(vec![egui::Event::PointerMoved(at)], true));
+        frame(&ctx, &mut v, input(vec![press(at, true, true)], true));
+        for step in 1..=10 {
+            frame(&ctx, &mut v, input(vec![egui::Event::PointerMoved(at + egui::vec2(10.0 * step as f32, 0.0))], true));
+        }
+        frame(&ctx, &mut v, input(vec![press(at + egui::vec2(100.0, 0.0), false, true)], true));
+        assert!(v.iter().zip(start).all(|(a, b)| (a - b - 0.1).abs() < 0.02), "{start:?} -> {v:?}");
+        // A click without dragging changes nothing.
+        let still = v;
+        frame(&ctx, &mut v, input(vec![press(at, true, false)], false));
+        frame(&ctx, &mut v, input(vec![press(at, false, false)], false));
+        assert_eq!(v, still);
     }
 
     #[test]
