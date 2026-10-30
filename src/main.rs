@@ -1998,6 +1998,17 @@ fn node_flip(
     };
     let max_extent = extent.x.max(extent.y).max(extent.z).max(0.1);
     let cell_size = max_extent / resolution as f32;
+    // Particles per cell at rest: the emitter's volume (a closed mesh's, or
+    // its bounds') shared out among the particles. Cells packed above this
+    // get pushed apart, which keeps FLIP from slowly squashing itself flat.
+    let emitter_volume = {
+        let enclosed = emitter.indices.iter().map(|t| {
+            let [a, b, c] = t.map(|i| emitter.vertices[i]);
+            a.dot(b.cross(c)) / 6.0
+        }).sum::<f32>().abs();
+        if enclosed > 1e-6 { enclosed } else { (seed_extent.x * seed_extent.y * seed_extent.z).max(1e-6) }
+    };
+    let rest_density = (max_particles as f32 * cell_size.powi(3) / emitter_volume).max(0.5);
     let init = || {
     let mut particles = Vec::with_capacity(max_particles);
     let point_inside = |point: Vec3| {
@@ -2067,9 +2078,6 @@ fn node_flip(
     let blend = flip_ratio.clamp(0.0, 1.0);
     let grid_len = resolution * resolution * resolution;
     let grid_index = |x: usize, y: usize, z: usize| (z * resolution + y) * resolution + x;
-    let u_index = |x: usize, y: usize, z: usize| (z * resolution + y) * (resolution + 1) + x;
-    let v_index = |x: usize, y: usize, z: usize| (z * (resolution + 1) + y) * resolution + x;
-    let w_index = |x: usize, y: usize, z: usize| (z * resolution + y) * resolution + x;
     let step = |particles: &mut Vec<FlipParticle>, _at: usize| {
         let (collider, collider_bounds) = collider_mesh.get_or_insert_with(|| {
             let mesh = collider.take().map(|c| c()).unwrap_or_default();
@@ -2077,139 +2085,250 @@ fn node_flip(
             (mesh, bounds)
         });
         let (collider, collider_bounds) = (&*collider, *collider_bounds);
-        let mut u = vec![0.0; (resolution + 1) * resolution * resolution];
-        let mut v = vec![0.0; resolution * (resolution + 1) * resolution];
-        let mut w = vec![0.0; resolution * resolution * (resolution + 1)];
-        let mut uw = vec![0.0; u.len()];
-        let mut vw = vec![0.0; v.len()];
-        let mut ww = vec![0.0; w.len()];
-        let mut fluid = vec![false; grid_len];
-        for particle in particles.iter() {
-            let x = ((particle.position.x - lo.x) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
-            let y = ((particle.position.y - lo.y) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
-            let z = ((particle.position.z - lo.z) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
-            fluid[grid_index(x, y, z)] = true;
-            let ui = u_index(x, y, z);
-            let vi = v_index(x, y, z);
-            let wi = w_index(x, y, z);
-            u[ui] += particle.velocity.x;
-            v[vi] += particle.velocity.y;
-            w[wi] += particle.velocity.z;
-            uw[ui] += 1.0;
-            vw[vi] += 1.0;
-            ww[wi] += 1.0;
-        }
-        for i in 0..u.len() { if uw[i] > 0.0 { u[i] /= uw[i]; } }
-        for i in 0..v.len() { if vw[i] > 0.0 { v[i] /= vw[i]; } }
-        for i in 0..w.len() { if ww[i] > 0.0 { w[i] /= ww[i]; } }
-        let old_u = u.clone();
-        let old_v = v.clone();
-        let old_w = w.clone();
-        for value in &mut v { *value += gravity * step_dt; }
-        let fluid_cell = |index: usize| fluid[index];
-        let mut pressure = vec![0.0f32; grid_len];
-        let mut next_pressure = vec![0.0f32; grid_len];
-        let cell = |x: isize, y: isize, z: isize| -> Option<usize> {
-            (x >= 0
-                && y >= 0
-                && z >= 0
-                && x < resolution as isize
-                && y < resolution as isize
-                && z < resolution as isize)
-                .then(|| grid_index(x as usize, y as usize, z as usize))
+        // Velocities live on the cell faces (a MAC grid): component `c` on the
+        // walls across axis `c`, so its grid is one longer along that axis
+        // (and "component" 3 is the cell centres).
+        let dims = |c: usize| [resolution + (c == 0) as usize, resolution + (c == 1) as usize, resolution + (c == 2) as usize];
+        // The 8 faces around a point for component `c` and their trilinear
+        // weights, so velocity varies smoothly inside a cell instead of every
+        // particle in it moving as one block.
+        let stencil = |position: Vec3, c: usize| -> [(usize, f32); 8] {
+            let d = dims(c);
+            let g = [(position.x - lo.x) / cell_size, (position.y - lo.y) / cell_size, (position.z - lo.z) / cell_size];
+            let mut base = [0usize; 3];
+            let mut t = [0.0f32; 3];
+            for k in 0..3 {
+                let f = (g[k] - if k == c { 0.0 } else { 0.5 }).clamp(0.0, (d[k] - 1) as f32);
+                base[k] = (f.floor() as usize).min(d[k] - 2);
+                t[k] = f - base[k] as f32;
+            }
+            let mut out = [(0, 0.0); 8];
+            for (n, slot) in out.iter_mut().enumerate() {
+                let o = [n & 1, (n >> 1) & 1, (n >> 2) & 1];
+                let weight = (0..3).map(|k| if o[k] == 1 { t[k] } else { 1.0 - t[k] }).product();
+                *slot = (((base[2] + o[2]) * d[1] + base[1] + o[1]) * d[0] + base[0] + o[0], weight);
+            }
+            out
         };
-        for _ in 0..20 {
-            for z in 0..resolution {
-                for y in 0..resolution {
-                    for x in 0..resolution {
-                        let index = grid_index(x, y, z);
-                        if !fluid_cell(index) {
-                            continue;
-                        }
-                        let mut sum = 0.0;
-                        let mut count = 0.0;
-                        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
-                            if let Some(neighbor) = cell(x as isize + dx, y as isize + dy, z as isize + dz) {
-                                if fluid_cell(neighbor) {
-                                    sum += pressure[neighbor];
-                                    count += 1.0;
-                                }
+        let face_count = |c: usize| dims(c).iter().product::<usize>();
+        let mut vel: [Vec<f32>; 3] = [0, 1, 2].map(|c| vec![0.0; face_count(c)]);
+        let mut weights: [Vec<f32>; 3] = [0, 1, 2].map(|c| vec![0.0; face_count(c)]);
+        let mut fluid = vec![false; grid_len];
+        let cell_of = |p: Vec3| {
+            let at = |v: f32, l: f32| ((v - l) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
+            grid_index(at(p.x, lo.x), at(p.y, lo.y), at(p.z, lo.z))
+        };
+        let mut density = vec![0.0f32; grid_len];
+        for particle in particles.iter() {
+            fluid[cell_of(particle.position)] = true;
+            // Component 3 isn't a velocity: it's the cell centres.
+            for (i, weight) in stencil(particle.position, 3) {
+                density[i] += weight;
+            }
+            let components = [particle.velocity.x, particle.velocity.y, particle.velocity.z];
+            for c in 0..3 {
+                for (i, weight) in stencil(particle.position, c) {
+                    vel[c][i] += weight * components[c];
+                    weights[c][i] += weight;
+                }
+            }
+        }
+        // Average, then carry velocities a couple of faces out past the
+        // particles, so surface particles don't read empty (zero) faces.
+        for c in 0..3 {
+            let d = dims(c);
+            let mut valid: Vec<bool> = weights[c].iter().map(|&w| w > 1e-6).collect();
+            for (value, &weight) in vel[c].iter_mut().zip(&weights[c]) {
+                if weight > 1e-6 {
+                    *value /= weight;
+                }
+            }
+            for _ in 0..2 {
+                let (field, known) = (vel[c].clone(), valid.clone());
+                for z in 0..d[2] {
+                    for y in 0..d[1] {
+                        for x in 0..d[0] {
+                            let i = (z * d[1] + y) * d[0] + x;
+                            if known[i] {
+                                continue;
+                            }
+                            let (mut sum, mut count) = (0.0, 0.0);
+                            let mut take = |j: usize| if known[j] { sum += field[j]; count += 1.0; };
+                            if x > 0 { take(i - 1); }
+                            if x + 1 < d[0] { take(i + 1); }
+                            if y > 0 { take(i - d[0]); }
+                            if y + 1 < d[1] { take(i + d[0]); }
+                            if z > 0 { take(i - d[0] * d[1]); }
+                            if z + 1 < d[2] { take(i + d[0] * d[1]); }
+                            if count > 0.0 {
+                                vel[c][i] = sum / count;
+                                valid[i] = true;
                             }
                         }
-                        let divergence = (u[u_index(x + 1, y, z)] - u[u_index(x, y, z)]
-                            + v[v_index(x, y + 1, z)] - v[v_index(x, y, z)]
-                            + w[w_index(x, y, z + 1)] - w[w_index(x, y, z)]) / cell_size;
-                        next_pressure[index] = if count > 0.0 {
-                            let target = divergence * cell_size * cell_size / step_dt.max(1e-4);
-                            (sum - target).clamp(-100.0, 100.0) / count
-                        } else {
-                            0.0
-                        };
                     }
                 }
             }
-            std::mem::swap(&mut pressure, &mut next_pressure);
+        }
+        let old = vel.clone();
+        for value in &mut vel[1] { *value += gravity * step_dt; }
+        // Outside the grid is solid below the floor and, in a domain box, on
+        // every side; otherwise it's open air.
+        let solid_outside = |axis: usize, below: bool| boxed || (axis == 1 && below);
+        // No flow through solid walls.
+        for c in 0..3 {
+            let d = dims(c);
+            for z in 0..d[2] {
+                for y in 0..d[1] {
+                    for x in 0..d[0] {
+                        let along = [x, y, z][c];
+                        if (along == 0 && solid_outside(c, true)) || (along == resolution && solid_outside(c, false)) {
+                            vel[c][(z * d[1] + y) * d[0] + x] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        // Pressure: solve for the pressure that makes the flow divergence-free
+        // (preconditioned conjugate gradient over the fluid cells; air is zero
+        // pressure, solid walls block flow).
+        let fluid_cells: Vec<usize> = (0..grid_len).filter(|&i| fluid[i]).collect();
+        let mut slot = vec![u32::MAX; grid_len];
+        for (k, &i) in fluid_cells.iter().enumerate() {
+            slot[i] = k as u32;
+        }
+        let n = fluid_cells.len();
+        let mut diagonal = vec![0.0f32; n];
+        let mut neighbours = vec![[u32::MAX; 6]; n];
+        let mut rhs = vec![0.0f32; n];
+        let face = |c: usize, x: usize, y: usize, z: usize| {
+            let d = dims(c);
+            (z * d[1] + y) * d[0] + x
+        };
+        for (k, &i) in fluid_cells.iter().enumerate() {
+            let (x, y, z) = (i % resolution, (i / resolution) % resolution, i / (resolution * resolution));
+            let at = [x, y, z];
+            for axis in 0..3 {
+                for (side, below) in [(0, true), (1, false)] {
+                    let inside = if below { at[axis] > 0 } else { at[axis] + 1 < resolution };
+                    if !inside {
+                        if !solid_outside(axis, below) {
+                            diagonal[k] += 1.0;
+                        }
+                        continue;
+                    }
+                    diagonal[k] += 1.0;
+                    let mut other = at;
+                    if below { other[axis] -= 1 } else { other[axis] += 1 }
+                    let j = slot[grid_index(other[0], other[1], other[2])];
+                    if j != u32::MAX {
+                        neighbours[k][axis * 2 + side] = j;
+                    }
+                }
+            }
+            let divergence = vel[0][face(0, x + 1, y, z)] - vel[0][face(0, x, y, z)]
+                + vel[1][face(1, x, y + 1, z)] - vel[1][face(1, x, y, z)]
+                + vel[2][face(2, x, y, z + 1)] - vel[2][face(2, x, y, z)];
+            // Overfull cells ask for a little outflow, spread over a few steps.
+            let excess = (density[i] / rest_density - 1.0).clamp(0.0, 1.0);
+            let spread = 0.3 * excess * cell_size / step_dt.max(1e-4);
+            rhs[k] = -(divergence - spread) * cell_size / step_dt.max(1e-4);
+        }
+        let apply = |p: &[f32], out: &mut [f32]| {
+            for k in 0..n {
+                let mut value = diagonal[k] * p[k];
+                for &j in &neighbours[k] {
+                    if j != u32::MAX {
+                        value -= p[j as usize];
+                    }
+                }
+                out[k] = value;
+            }
+        };
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum::<f64>();
+        let mut solution = vec![0.0f32; n];
+        let mut residual = rhs.clone();
+        let precondition = |r: &[f32]| r.iter().zip(&diagonal).map(|(r, d)| r / d.max(1.0)).collect::<Vec<f32>>();
+        let mut search = precondition(&residual);
+        let mut rz = dot(&residual, &search);
+        let tolerance = rhs.iter().fold(0.0f32, |m, v| m.max(v.abs())) * 1e-4;
+        let mut product = vec![0.0f32; n];
+        for _ in 0..(resolution * 4).max(100) {
+            if residual.iter().fold(0.0f32, |m, v| m.max(v.abs())) <= tolerance {
+                break;
+            }
+            apply(&search, &mut product);
+            let curvature = dot(&search, &product);
+            if curvature.abs() < 1e-20 {
+                break;
+            }
+            let alpha = (rz / curvature) as f32;
+            for k in 0..n {
+                solution[k] += alpha * search[k];
+                residual[k] -= alpha * product[k];
+            }
+            let z = precondition(&residual);
+            let rz_next = dot(&residual, &z);
+            let beta = (rz_next / rz.max(1e-30)) as f32;
+            rz = rz_next;
+            for k in 0..n {
+                search[k] = z[k] + beta * search[k];
+            }
+        }
+        let mut pressure = vec![0.0f32; grid_len];
+        for (k, &i) in fluid_cells.iter().enumerate() {
+            pressure[i] = solution[k];
         }
         let pressure_gradient = step_dt / cell_size.max(1e-4);
-        for z in 0..resolution {
-            for y in 0..resolution {
-                for x in 1..resolution {
-                    let left = grid_index(x - 1, y, z);
-                    let right = grid_index(x, y, z);
-                    if fluid_cell(left) || fluid_cell(right) {
-                        u[u_index(x, y, z)] -=
-                            (pressure[right] - pressure[left]) * pressure_gradient;
+        for c in 0..3 {
+            let d = dims(c);
+            for z in 0..d[2] {
+                for y in 0..d[1] {
+                    for x in 0..d[0] {
+                        let at = [x, y, z];
+                        let along = at[c];
+                        // The cells either side of this face; outside the grid
+                        // is either solid (the face stays put) or air.
+                        let lower = (along > 0).then(|| {
+                            let mut p = at;
+                            p[c] -= 1;
+                            grid_index(p[0], p[1], p[2])
+                        });
+                        let upper = (along < resolution).then(|| grid_index(x, y, z));
+                        if (lower.is_none() && solid_outside(c, true)) || (upper.is_none() && solid_outside(c, false)) {
+                            continue;
+                        }
+                        let is_fluid = |cell: Option<usize>| cell.is_some_and(|i| fluid[i]);
+                        if !is_fluid(lower) && !is_fluid(upper) {
+                            continue;
+                        }
+                        let p = |cell: Option<usize>| cell.map_or(0.0, |i| pressure[i]);
+                        vel[c][(z * d[1] + y) * d[0] + x] -= (p(upper) - p(lower)) * pressure_gradient;
                     }
                 }
             }
         }
-        for z in 0..resolution {
-            for y in 1..resolution {
-                for x in 0..resolution {
-                    let below = grid_index(x, y - 1, z);
-                    let above = grid_index(x, y, z);
-                    if fluid_cell(below) || fluid_cell(above) {
-                        v[v_index(x, y, z)] -=
-                            (pressure[above] - pressure[below]) * pressure_gradient;
-                    }
-                }
+        let sample = |field: &[Vec<f32>; 3], position: Vec3| {
+            let mut out = [0.0f32; 3];
+            for (c, value) in out.iter_mut().enumerate() {
+                *value = stencil(position, c).iter().map(|&(i, weight)| field[c][i] * weight).sum();
             }
-        }
-        for z in 1..resolution {
-            for y in 0..resolution {
-                for x in 0..resolution {
-                    let back = grid_index(x, y, z - 1);
-                    let front = grid_index(x, y, z);
-                    if fluid_cell(back) || fluid_cell(front) {
-                        w[w_index(x, y, z)] -=
-                            (pressure[front] - pressure[back]) * pressure_gradient;
-                    }
-                }
-            }
-        }
+            Vec3::new(out[0], out[1], out[2])
+        };
         for particle in particles.iter_mut() {
             let previous_position = particle.position;
-            let x = ((particle.position.x - lo.x) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
-            let y = ((particle.position.y - lo.y) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
-            let z = ((particle.position.z - lo.z) / cell_size).floor().clamp(0.0, (resolution - 1) as f32) as usize;
-            let grid_velocity_sample = Vec3::new(
-                u[u_index(x, y, z)],
-                v[v_index(x, y, z)],
-                w[w_index(x, y, z)],
-            );
-            let previous_velocity = Vec3::new(
-                old_u[u_index(x, y, z)],
-                old_v[v_index(x, y, z)],
-                old_w[w_index(x, y, z)],
-            );
+            let grid_velocity_sample = sample(&vel, particle.position);
+            let previous_velocity = sample(&old, particle.position);
             let flip_velocity = particle.velocity.add(grid_velocity_sample.sub(previous_velocity));
             particle.velocity = grid_velocity_sample
                 .scale(1.0 - blend)
                 .add(flip_velocity.scale(blend));
-            let max_speed = (1.5 * cell_size / step_dt.max(1e-4)).max(1.0);
-            particle.velocity.x = particle.velocity.x.clamp(-max_speed, max_speed);
-            particle.velocity.y = particle.velocity.y.clamp(-max_speed, max_speed);
-            particle.velocity.z = particle.velocity.z.clamp(-max_speed, max_speed);
+            // A safety limit only: a few cells a step, but never so low that
+            // fine grids hold falling water back.
+            let max_speed = (3.0 * cell_size / step_dt.max(1e-4)).max(15.0);
+            let speed = particle.velocity.length();
+            if speed > max_speed {
+                particle.velocity = particle.velocity.scale(max_speed / speed);
+            }
             particle.velocity = particle.velocity.scale((1.0 - viscosity * step_dt).clamp(0.0, 1.0));
             particle.position = particle.position.add(particle.velocity.scale(step_dt));
             if particle.position.y < lo.y {
@@ -21280,6 +21399,28 @@ mod whitewater_node_tests {
     }
 
     #[test]
+    fn flip_dam_break_keeps_its_volume_and_flows() {
+        // A metre cube of water in the corner of a closed 4 x 2 x 2 tank.
+        let mut emitter = node_box(1.0, 1);
+        for v in &mut emitter.vertices {
+            *v = v.add(Vec3::new(-1.4, 0.5, 0.0));
+        }
+        let res = 48;
+        let h = 4.0 / res as f32;
+        sims::clear_all();
+        let out = node_flip(9401, emitter, Mesh::default, 20000, res, 0.95, 0.1, -9.8, 0.02, 1, 3, [0.0, 1.0, 0.0, 4.0, 2.0, 2.0], 1.0);
+        let cells: HashSet<(i32, i32, i32)> = out.vertices.iter().map(|v| (((v.x + 2.0) / h) as i32, (v.y / h) as i32, ((v.z + 1.0) / h) as i32)).collect();
+        let volume = cells.len() as f32 * h.powi(3);
+        // Neither squashed flat nor blown apart.
+        assert!((0.7..1.6).contains(&volume), "volume {volume}");
+        // The water has run across the floor to the far half of the tank...
+        assert!(out.vertices.iter().filter(|v| v.x > 0.5).count() > 1000);
+        // ...and the particles still sit in a layer, not spread through the air.
+        let high = out.vertices.iter().filter(|v| v.y > 0.6).count();
+        assert!(high < out.vertices.len() / 20, "{high} particles high up");
+    }
+
+    #[test]
     fn flip_steps_from_its_cache_and_feeds_whitewater() {
         let mut g = Graph::default();
         g.next_id += 9300;
@@ -23111,3 +23252,4 @@ mod realtime_render_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
