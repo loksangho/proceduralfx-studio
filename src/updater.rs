@@ -728,13 +728,7 @@ impl Updater {
         let mut next: Option<State> = None;
         let mut download: Option<Release> = None;
         let mut restart = false;
-        egui::Window::new("Software Update")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| match &self.state {
+        crate::own_window(ctx, "software_update", "Software Update", [460.0, 300.0], [380.0, 200.0], &mut open, true, |ui| match &self.state {
                 State::Idle => {
                     close = true;
                 }

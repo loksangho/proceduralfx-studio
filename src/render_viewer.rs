@@ -335,7 +335,7 @@ impl RenderViewer {
         }
         let mut open = self.open;
         let rendering = self.progress.is_some();
-        crate::own_window(ctx, "render_viewer", "Render Viewer", [760.0, 560.0], [360.0, 260.0], &mut open, |ui| {
+        crate::own_window(ctx, "render_viewer", "Render Viewer", [760.0, 560.0], [360.0, 260.0], &mut open, false, |ui| {
             self.toolbar(ui);
             self.display_controls(ui);
             ui.separator();

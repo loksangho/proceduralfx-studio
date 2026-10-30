@@ -186,10 +186,12 @@ jobs:
           Get-AuthenticodeSignature "dist-windows/ProceduralFX Studio/*.exe", "dist-windows/ProceduralFX Studio/*.dll" | Format-Table Status, Path -AutoSize
           Compress-Archive -Path "dist-windows/ProceduralFX Studio" -DestinationPath $env:ZIP
 
+      # GitHub zips artifacts itself, so the artifact is the folder (one zip to download,
+      # holding the folder as the release zip does), not the zip made above for the release.
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP }}
-          path: ${{ env.ZIP }}
+          name: ProceduralFxStudio-windows-x64
+          path: dist-windows/
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')

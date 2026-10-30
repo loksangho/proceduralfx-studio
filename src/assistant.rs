@@ -1164,7 +1164,7 @@ impl Panel {
         }
         let mut accepted = None;
         let mut open = self.open;
-        egui::Window::new("✨ AI Assistant").open(&mut open).default_width(420.0).resizable(true).show(ctx, |ui| {
+        crate::own_window(ctx, "ai_assistant", "✨ AI Assistant", [460.0, 640.0], [360.0, 300.0], &mut open, false, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Model");
                 match self.settings.provider {

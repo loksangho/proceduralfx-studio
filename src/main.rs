@@ -1007,23 +1007,75 @@ fn remap_node_ids(kind: &mut NodeKind, map: impl Fn(NodeId) -> NodeId) {
 // A window of its own beside the app's, free to be as big as you like or on another screen,
 // showing `add`; closing it clears `open`. Where the platform can't open more windows, a
 // panel inside the app's window instead. `id` must be unique and stay the same between frames.
-fn own_window(ctx: &egui::Context, id: &str, title: &str, size: [f32; 2], min: [f32; 2], open: &mut bool, add: impl FnOnce(&mut egui::Ui)) {
+// A `modal` window (a dialog) locks the app's window until it's closed; others (tools such as
+// the flipbook) leave it free.
+#[allow(clippy::too_many_arguments)]
+fn own_window(ctx: &egui::Context, id: &str, title: &str, size: [f32; 2], min: [f32; 2], open: &mut bool, modal: bool, add: impl FnOnce(&mut egui::Ui)) {
     if !*open {
         return;
     }
+    let viewport = egui::ViewportId::from_hash_of(id);
     let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size(min);
     // Drawn once a frame; the window's code may call this more than once, so take it once.
     let mut add = Some(add);
-    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(id), builder, |ctx, class| {
+    ctx.show_viewport_immediate(viewport, builder, |ctx, class| {
         let Some(add) = add.take() else { return };
         if class == egui::ViewportClass::Embedded {
-            egui::Window::new(title).id(egui::Id::new(id)).open(open).default_size(size).min_size(min).resizable(true).show(ctx, add);
+            if modal {
+                // Inside the app's window: egui's own modal, which blocks the rest of it.
+                egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(title);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✖").on_hover_text("Close").clicked() {
+                                *open = false;
+                            }
+                        });
+                    });
+                    add(ui);
+                });
+            } else {
+                egui::Window::new(title).id(egui::Id::new(id)).open(open).default_size(size).min_size(min).resizable(true).show(ctx, add);
+            }
             return;
+        }
+        if modal {
+            ctx.data_mut(|d| d.insert_temp(modal_key(), (viewport, title.to_owned())));
         }
         egui::CentralPanel::default().show(ctx, add);
         if ctx.input(|i| i.viewport().close_requested()) {
             *open = false;
         }
+    });
+}
+
+// Where an open modal window (see own_window) notes itself each frame: its viewport and title.
+fn modal_key() -> egui::Id {
+    egui::Id::new("pfx_modal_window")
+}
+
+// While a modal window is open in its own window, the app's window ignores the keyboard (so
+// shortcuts can't act behind the dialog); a click on it brings the dialog to the front.
+// Called at the start of the app's frame, with what the last frame's windows noted.
+fn lock_for_modal(ctx: &egui::Context) -> Option<(egui::ViewportId, String)> {
+    let modal = ctx.data_mut(|d| d.remove_temp::<(egui::ViewportId, String)>(modal_key()))?;
+    ctx.input_mut(|i| {
+        i.events.retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut));
+    });
+    if ctx.input(|i| i.pointer.any_pressed()) {
+        ctx.send_viewport_cmd_to(modal.0, egui::ViewportCommand::Focus);
+    }
+    Some(modal)
+}
+
+// Covers the app's window while a modal window is open, taking every click, and says why.
+fn modal_cover(ctx: &egui::Context, title: &str) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("pfx_modal_cover")).order(egui::Order::Foreground).fixed_pos(screen.min).interactable(true).show(ctx, |ui| {
+        let response = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+        ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
+        ui.painter().text(screen.center(), egui::Align2::CENTER_CENTER, format!("Finish or close {title} first"), egui::FontId::proportional(18.0), egui::Color32::from_gray(230));
+        response.on_hover_cursor(egui::CursorIcon::NotAllowed);
     });
 }
 
@@ -7141,7 +7193,9 @@ impl Graph {
                     if fluid.is_none() {
                         self.report(id, Err("connect a FLIP fluid to input 1".to_owned()))
                     } else {
-                        whitewater::whitewater(self.sim_key(id), settings, time, |t| self.cook_fresh(fluid, t), || self.cook_fresh(collider, 0.0))
+                        // Reported, so the "connect" error from before it was wired goes away.
+                        let mesh = whitewater::whitewater(self.sim_key(id), settings, time, |t| self.cook_fresh(fluid, t), || self.cook_fresh(collider, 0.0));
+                        self.report(id, Ok(mesh))
                     }
                 }
                 NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
@@ -7422,14 +7476,16 @@ impl Graph {
                     if start.is_none() {
                         self.report(id, Err("connect start points to input 1 (for example Scatter on a grid)".to_owned()))
                     } else {
-                        crowd::crowd(
+                        // Reported, so the "connect" error from before it was wired goes away.
+                        let mesh = crowd::crowd(
                             self.sim_key(id),
                             settings,
                             time,
                             || self.cook_fresh(start, 0.0),
                             || self.cook_fresh(ground, 0.0),
                             || self.cook_fresh(obstacles, 0.0),
-                        )
+                        );
+                        self.report(id, Ok(mesh))
                     }
                 }
                 NodeKind::Muscle(settings) => self.report(id, muscle::muscle(&input(0, cache), settings)),
@@ -9500,8 +9556,8 @@ impl ProceduralFxStudioApp {
 
     fn show_panes(&mut self, ctx: &egui::Context) {
         if let Some(mut name) = self.layout_name_prompt.take() {
-            let mut keep = true;
-            egui::Window::new("Save Layout").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
+            let (mut keep, mut open) = (true, true);
+            own_window(ctx, "save_layout", "Save Layout", [340.0, 130.0], [300.0, 110.0], &mut open, true, |ui| {
                 ui.label("Layout name");
                 let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text("e.g. Modelling, Rendering"));
                 field.request_focus();
@@ -9519,7 +9575,8 @@ impl ProceduralFxStudioApp {
                     ui.weak("Saving replaces the layout with this name.");
                 }
             });
-            if keep {
+            // Closing its window cancels it too.
+            if keep && open {
                 self.layout_name_prompt = Some(name);
             }
         }
@@ -10950,7 +11007,7 @@ impl ProceduralFxStudioApp {
         let mut open = true;
         let (mut export, mut preview) = (false, false);
         let count = self.sprite_sheet_times().len();
-        egui::Window::new("Export Sprite Sheet").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+        own_window(ctx, "export_sprite_sheet", "Export Sprite Sheet", [500.0, 460.0], [400.0, 320.0], &mut open, true, |ui| {
             let s = &mut self.sprite_sheet;
             ui.label("Renders the playback range through the render camera with the real-time renderer, then packs the frames into one PNG.");
             ui.add_space(4.0);
@@ -11356,7 +11413,7 @@ impl ProceduralFxStudioApp {
         let mut open = true;
         let mut start = false;
         let mut cancel = false;
-        own_window(ctx, "render_settings", "Render Settings", [480.0, 720.0], [360.0, 320.0], &mut open, |ui| {
+        own_window(ctx, "render_settings", "Render Settings", [480.0, 720.0], [360.0, 320.0], &mut open, true, |ui| {
                 if node_selected {
                     ui.colored_label(
                         egui::Color32::from_rgb(230, 190, 90),
@@ -18948,6 +19005,8 @@ impl ProceduralFxStudioApp {
 
 impl eframe::App for ProceduralFxStudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A dialog in its own window locks this one.
+        lock_for_modal(ctx);
         // Windows rendering set-up: show what the helper is doing.
         if let Some(rx) = &self.render_setup {
             let mut lines = Vec::new();
@@ -18987,7 +19046,7 @@ impl eframe::App for ProceduralFxStudioApp {
         if self.render_setup_open {
             let mut open = true;
             let running = self.render_setup.is_some();
-            egui::Window::new("Set Up Rendering on Windows").open(&mut open).default_width(460.0).show(ctx, |ui| {
+            own_window(ctx, "render_setup", "Set Up Rendering on Windows", [500.0, 420.0], [400.0, 300.0], &mut open, true, |ui| {
                 ui.label("Installs WSL containers if they're missing, then downloads MoonRay (about 1.3 GB, once).");
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).show(ui, |ui| {
@@ -19214,8 +19273,8 @@ impl eframe::App for ProceduralFxStudioApp {
         if let Some(node_id) = self.inspect_node.filter(|id| self.graph.nodes.contains_key(id)) {
             let mut open = true;
             let title = self.graph.nodes[&node_id].title(node_id);
-            egui::Window::new(format!("Node Info · {title}")).id(egui::Id::new("node_info_window")).open(&mut open).default_width(360.0).show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| self.node_info_ui(ui, node_id));
+            own_window(ctx, "node_info_window", &format!("Node Info · {title}"), [380.0, 560.0], [280.0, 200.0], &mut open, false, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| self.node_info_ui(ui, node_id));
             });
             if !open {
                 self.inspect_node = None;
@@ -19257,6 +19316,10 @@ impl eframe::App for ProceduralFxStudioApp {
                     self.undo.remove(0);
                 }
             }
+        }
+        // A dialog opened in its own window this frame: cover this one until it closes.
+        if let Some((_, title)) = ctx.data(|d| d.get_temp::<(egui::ViewportId, String)>(modal_key())) {
+            modal_cover(ctx, &title);
         }
     }
 }
@@ -19938,6 +20001,19 @@ mod scene_file_tests {
         assert!(!a.vertices.is_empty());
         assert_eq!(a.vertices, b.vertices);
         assert_eq!(a.point_attributes["density"], b.point_attributes["density"]);
+    }
+
+    #[test]
+    fn connecting_a_solver_clears_its_connect_error() {
+        // Whitewater and Crowd say what to connect, and stop saying it once it is.
+        let mut g = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 4\nnode 2 40 100 0 obj whitewater_solver\nnode 3 40 100 0 obj crowd_solver\nparent 1 0\nparent 2 0\nparent 3 0\ndisplay 0 2\nnext 4\n");
+        for solver in [2, 3] {
+            g.cook(solver, 0.0, &mut HashMap::new());
+            assert!(node_errors(|e| e.get(&solver).cloned()).is_some_and(|e| e.contains("connect")));
+            g.connect(1, solver, 0);
+            g.cook(solver, 0.0, &mut HashMap::new());
+            assert!(node_errors(|e| e.get(&solver).cloned()).is_none(), "{:?}", node_errors(|e| e.get(&solver).cloned()));
+        }
     }
 
     #[test]

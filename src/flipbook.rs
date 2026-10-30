@@ -177,7 +177,7 @@ impl Viewer {
         let [w, h] = self.frames[0].size;
         let size = [(w as f32 * 0.8 + 20.0).max(360.0), h as f32 * 0.8 + 100.0];
         let mut open = self.open;
-        crate::own_window(ctx, "flipbook_viewer", "Flipbook", size, [320.0, 240.0], &mut open, |ui| {
+        crate::own_window(ctx, "flipbook_viewer", "Flipbook", size, [320.0, 240.0], &mut open, false, |ui| {
             self.contents(ui, &texture);
             // Its own window needs its own redraws to play.
             if self.playing {
