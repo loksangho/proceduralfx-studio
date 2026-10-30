@@ -131,6 +131,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("attribute_vop", "VEX built from nodes: double-click to build a network of VOPs (see below)."),
     ("normal", "Computes normals on points or vertices, with a cusp angle and weighting."),
     ("measure", "Area, perimeter, point area, curvature (mean or Gaussian), the gradient of an attribute, volume or curve length, as attributes."),
+    ("color", "Sets the colour (Cd) of points or primitives: one colour, bright random colours (each element its own, or one per value of an attribute such as piece), or a ramp between two colours along an axis."),
     ("group_create", "Makes a named group by bounding box, random percentage, normal direction or expression."),
     ("uv_texture", "UV projection: planar, cylindrical, spherical or box."),
     ("uv_transform", "Moves, rotates and scales UVs."),

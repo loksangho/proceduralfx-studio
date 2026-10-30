@@ -27,6 +27,7 @@ mod attrib;
 mod assistant;
 mod boolean;
 mod bullet;
+mod color;
 mod cops;
 mod crowd;
 mod deform;
@@ -2424,6 +2425,45 @@ fn node_flip(
     sims::run(key, sims::step_count(time, per_frame), per_frame * 12, init, Clone::clone, Clone::clone, step, output)
 }
 
+// The viewport pick for `target`: a Select button, or while it runs, how many are
+// picked, the points/primitives switch (unless `prims_only`), Accept and Cancel.
+#[allow(clippy::too_many_arguments)]
+fn group_pick_ui(
+    ui: &mut egui::Ui,
+    pick: Option<&GroupPick>,
+    picked: (usize, usize),
+    id: NodeId,
+    target: PickTarget,
+    prims_only: bool,
+    request: &mut Option<(NodeId, PickTarget)>,
+    switch_domain: &mut Option<groups::GroupDomain>,
+    finish: &mut Option<bool>,
+) {
+    let Some(pick) = pick.filter(|p| p.node == id && p.target == target) else {
+        if ui.button("⬚ Select").on_hover_text("Pick the group's points or primitives in the viewport").clicked() {
+            *request = Some((id, target));
+        }
+        return;
+    };
+    ui.horizontal(|ui| {
+        let count = if pick.domain == groups::GroupDomain::Points { picked.0 } else { picked.1 };
+        ui.colored_label(egui::Color32::from_rgb(255, 210, 90), format!("Selecting: {count}"));
+        if !prims_only {
+            for (d, label) in [(groups::GroupDomain::Points, "Points"), (groups::GroupDomain::Prims, "Primitives")] {
+                if ui.selectable_label(pick.domain == d, label).clicked() && pick.domain != d {
+                    *switch_domain = Some(d);
+                }
+            }
+        }
+        if ui.button("✓ Accept").clicked() {
+            *finish = Some(true);
+        }
+        if ui.button("Cancel").clicked() {
+            *finish = Some(false);
+        }
+    });
+}
+
 fn node_clip(mesh: Mesh, axis: usize, offset: f32, invert: bool) -> Mesh {
     let keep = |v: Vec3| {
         let val = axis_of(v, axis);
@@ -3887,6 +3927,8 @@ enum NodeKind {
     EnvironmentLight { file: String, color: [f32; 3], intensity: f32, rotation: f32, visible: bool },
     // Makes a named point or primitive group.
     GroupCreate(groups::GroupCreateSettings),
+    // Sets Cd on points or primitives: one colour, random colours or a ramp.
+    Color(color::ColorSettings),
     // Node-based VEX: a container of VOP nodes compiled to VEX and run over `domain` (like Wrangle).
     AttributeVop { domain: usize },
     // One operation inside an Attribute VOP network.
@@ -3962,6 +4004,7 @@ impl NodeKind {
             | NodeKind::Normal(_)
             | NodeKind::UvTexture(_)
             | NodeKind::UvTransform(_)
+            | NodeKind::Color(_)
             | NodeKind::AttributePaint { .. }
             | NodeKind::GuideProcess(_)
             | NodeKind::HairDeform(_) => GroupSupport::Restrict,
@@ -4096,6 +4139,7 @@ impl NodeKind {
             NodeKind::TerrainMask(_) => names(&["source", "min", "max", "falloff", "blur", "invert", "combine", "visualize"]),
             NodeKind::TerrainColorize(_) => names(&["sand.r", "sand.g", "sand.b", "grass.r", "grass.g", "grass.b", "rock.r", "rock.g", "rock.b", "snow.r", "snow.g", "snow.b", "sand_level", "snow_level", "rock_slope", "blend"]),
             NodeKind::UvTexture(_) => names(&["projection", "axis", "scale.u", "scale.v", "offset.u", "offset.v"]),
+            NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis"]),
             NodeKind::UvTransform(_) => names(&["translate.u", "translate.v", "rotate", "scale.u", "scale.v", "pivot.u", "pivot.v"]),
             NodeKind::VellumSolver(_) => names(&["type", "stretch_stiffness", "bend_stiffness", "shape_stiffness", "mass", "thickness", "gravity", "damping", "friction", "substeps", "iterations", "ground", "self_collision", "pin_to_animation"]),
             NodeKind::SopSolver { .. } => names(&["substeps"]),
@@ -4198,6 +4242,7 @@ impl NodeKind {
             NodeKind::Extrude(e) => vec![e.front_group.clone(), e.side_group.clone(), e.back_group.clone()],
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
+            NodeKind::Color(s) => vec![s.random_by.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
             NodeKind::ShaderNode(n) => n.texts.clone(),
@@ -4259,6 +4304,7 @@ impl NodeKind {
                 next(&mut g.name);
                 next(&mut g.expression);
             }
+            NodeKind::Color(s) => next(&mut s.random_by),
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
             NodeKind::ShaderNode(n) => n.texts.iter_mut().for_each(|t| next(t)),
@@ -4618,6 +4664,7 @@ impl NodeKind {
                     NodeKind::AttributeCreate(attrib::CreateSettings::defaults()),
                     NodeKind::AttributeRandomize(randomize::RandomizeSettings::defaults()),
                     NodeKind::AttributeDelete(attrib::DeleteSettings::defaults()),
+                    NodeKind::Color(color::ColorSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
@@ -4827,6 +4874,7 @@ impl NodeKind {
             NodeKind::TerrainColorize(_) => "terrain_colorize",
             NodeKind::UvTexture(_) => "uv_texture",
             NodeKind::UvTransform(_) => "uv_transform",
+            NodeKind::Color(_) => "color",
             NodeKind::UvQuickShade { .. } => "uv_quickshade",
             NodeKind::AttributePaint { .. } => "attribute_paint",
             NodeKind::GroupCreate(_) => "group_create",
@@ -4904,7 +4952,8 @@ impl NodeKind {
             NodeKind::Merge | NodeKind::Switch { .. } | NodeKind::CopyToPoints { .. } => 2,
             NodeKind::AttributeCreate(_)
             | NodeKind::AttributeRandomize(_)
-            | NodeKind::AttributeDelete(_) => 1,
+            | NodeKind::AttributeDelete(_)
+            | NodeKind::Color(_) => 1,
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => 1,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
             NodeKind::AttributeVop { .. } => 1,
@@ -5226,6 +5275,7 @@ impl NodeKind {
             ]
             .concat(),
             NodeKind::UvTexture(s) => vec![s.projection as f32, s.axis as f32, s.scale[0], s.scale[1], s.offset[0], s.offset[1]],
+            NodeKind::Color(s) => s.params(),
             NodeKind::UvTransform(s) => vec![s.translate[0], s.translate[1], s.rotate, s.scale[0], s.scale[1], s.pivot[0], s.pivot[1]],
             NodeKind::VellumSolver(s) => vec![
                 s.kind as f32,
@@ -5673,6 +5723,7 @@ impl NodeKind {
                 scale: [g(2), g(3)],
                 offset: [g(4), g(5)],
             }),
+            "color" => NodeKind::Color(color::ColorSettings::from_params(p, String::new())),
             "uv_transform" => NodeKind::UvTransform(sops::UvTransformSettings {
                 translate: [g(0), g(1)],
                 rotate: g(2),
@@ -7701,6 +7752,7 @@ impl Graph {
                 NodeKind::TerrainColorize(settings) => self.report(id, terrain::terrain_colorize(&input(0, cache), settings)),
                 NodeKind::UvTexture(settings) => sops::uv_texture(&input(0, cache), settings),
                 NodeKind::UvTransform(settings) => self.report(id, sops::uv_transform(&input(0, cache), settings)),
+                NodeKind::Color(settings) => self.report(id, color::color(&input(0, cache), settings)),
                 NodeKind::UvQuickShade { file } => self.report(id, sops::uv_quickshade(&input(0, cache), file)),
                 NodeKind::VellumSolver(settings) => {
                     let (geometry, collider) = (self.input_of(id, 0), self.input_of(id, 1));
@@ -9071,8 +9123,18 @@ impl egui_dock::TabViewer for PaneViewer<'_> {
     }
 }
 
+// What a viewport pick sets: the node's Group field, Group Create's expression, or a
+// Material node slot's group.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PickTarget {
+    NodeGroup,
+    GroupCreate,
+    MaterialSlot(usize),
+}
+
 struct GroupPick {
     node: NodeId,
+    target: PickTarget,
     domain: groups::GroupDomain,
     // The node's input, whose element numbers the group refers to.
     input: Mesh,
@@ -9219,7 +9281,7 @@ struct ProceduralFxStudioApp {
     group_choices_request: Option<NodeId>,
     // Picking a node's group in the viewport: the viewport shows the node's input meanwhile.
     group_pick: Option<GroupPick>,
-    group_pick_request: Option<NodeId>,
+    group_pick_request: Option<(NodeId, PickTarget)>,
     // Some(true) accepts the pick, Some(false) cancels it.
     group_pick_finish: Option<bool>,
     group_pick_domain: Option<groups::GroupDomain>,
@@ -13930,21 +13992,45 @@ impl ProceduralFxStudioApp {
     }
 
     // Shows the node's input and selects its current group, ready for picking.
-    fn start_group_pick(&mut self, id: NodeId) {
+    fn start_group_pick(&mut self, id: NodeId, target: PickTarget) {
         let Some(node) = self.graph.nodes.get(&id) else { return };
         let (group, support) = (node.group.clone(), node.kind.group_support());
         let mut input = self.graph.input_of(id, 0).map(|i| self.graph.cook(i, self.time, &mut HashMap::new())).unwrap_or_default();
-        let domain = match group.kind {
-            1 => groups::GroupDomain::Points,
-            2 => groups::GroupDomain::Prims,
-            // Nodes that work on primitives (scatter, groom roots, blast) start with primitives.
-            _ if group.is_empty() && support == GroupSupport::Native && !matches!(node.kind, NodeKind::Wrangle { .. }) => groups::GroupDomain::Prims,
-            _ => groups::guess_domain(&input, &group.pattern),
-        };
-        let current: Vec<usize> = if group.is_empty() {
-            Vec::new()
-        } else {
-            groups::evaluate(&input, &group.pattern, domain).map(|m| m.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect()).unwrap_or_default()
+        let members = |mask: Result<Vec<bool>, String>| -> Vec<usize> { mask.map(|m| m.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect()).unwrap_or_default() };
+        let (domain, current) = match (target, &node.kind) {
+            // Starts from the group the node makes now (before Combine and Invert), so
+            // a bounding box or random group can be touched up by hand.
+            (PickTarget::GroupCreate, NodeKind::GroupCreate(set)) => {
+                let raw = groups::GroupCreateSettings { name: "pick".into(), combine: 0, invert: false, ..set.clone() };
+                let current = match groups::group_create(&input, &raw) {
+                    Ok(made) => made.point_attributes.get(&groups::key("pick", set.domain)).map(|v| v.iter().enumerate().filter(|(_, b)| **b > 0.5).map(|(i, _)| i).collect()).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+                (set.domain, current)
+            }
+            // Materials go on primitives.
+            (PickTarget::MaterialSlot(slot), NodeKind::MaterialAssign { slots }) => {
+                let pattern = slots.get(slot).map_or("", |(g, _)| g.as_str()).trim();
+                let current = if pattern.is_empty() {
+                    Vec::new()
+                } else {
+                    let mask = groups::prim_mask(&input, &groups::NodeGroup { pattern: pattern.to_owned(), kind: 2 })
+                        .or_else(|_| groups::prim_mask(&input, &groups::NodeGroup { pattern: pattern.to_owned(), kind: 0 }));
+                    members(mask.map(|m| m.unwrap_or_default()))
+                };
+                (groups::GroupDomain::Prims, current)
+            }
+            _ => {
+                let domain = match group.kind {
+                    1 => groups::GroupDomain::Points,
+                    2 => groups::GroupDomain::Prims,
+                    // Nodes that work on primitives (scatter, groom roots, blast) start with primitives.
+                    _ if group.is_empty() && support == GroupSupport::Native && !matches!(node.kind, NodeKind::Wrangle { .. }) => groups::GroupDomain::Prims,
+                    _ => groups::guess_domain(&input, &group.pattern),
+                };
+                let current = if group.is_empty() { Vec::new() } else { members(groups::evaluate(&input, &group.pattern, domain)) };
+                (domain, current)
+            }
         };
         if let Some(object) = self.graph.enclosing_geometry(id) {
             input = self.graph.xform_at(object, self.time).apply(input);
@@ -13963,13 +14049,13 @@ impl ProceduralFxStudioApp {
         }
         self.current_mesh = input.clone();
         self.mesh_revision += 1;
-        self.group_pick = Some(GroupPick { node: id, domain, input, previous_mode });
+        self.group_pick = Some(GroupPick { node: id, target, domain, input, previous_mode });
         self.status = "Select in the viewport, then press Enter (or ✓) to set the group; Esc cancels".into();
     }
 
     // Switches a running pick between points and primitives.
     fn set_group_pick_domain(&mut self, domain: groups::GroupDomain) {
-        if let Some(pick) = &mut self.group_pick {
+        if let Some(pick) = self.group_pick.as_mut().filter(|p| !matches!(p.target, PickTarget::MaterialSlot(_))) {
             pick.domain = domain;
             self.selection_mode = if domain == groups::GroupDomain::Points { SelectionMode::Vertex } else { SelectionMode::Triangle };
             self.clear_component_selection();
@@ -13985,9 +14071,25 @@ impl ProceduralFxStudioApp {
             };
             let pattern = groups::describe(&pick.input, &selected, pick.domain);
             if let Some(node) = self.graph.nodes.get_mut(&pick.node) {
-                node.group.kind = if pick.domain == groups::GroupDomain::Points { 1 } else { 2 };
-                self.status = if pattern.is_empty() { "Group cleared (nothing selected): the node applies to everything".into() } else { format!("Group set to {pattern}") };
-                node.group.pattern = pattern;
+                match (pick.target, &mut node.kind) {
+                    (PickTarget::GroupCreate, NodeKind::GroupCreate(set)) => {
+                        set.domain = pick.domain;
+                        set.method = 3;
+                        self.status = if pattern.is_empty() { "Nothing selected: the group is empty".into() } else { format!("Group expression set to {pattern}") };
+                        set.expression = pattern;
+                    }
+                    (PickTarget::MaterialSlot(slot), NodeKind::MaterialAssign { slots }) => {
+                        if let Some((group, _)) = slots.get_mut(slot) {
+                            self.status = if pattern.is_empty() { format!("Group {} cleared (nothing selected): its material goes on everything", slot + 1) } else { format!("Group {} set to {pattern}", slot + 1) };
+                            *group = pattern;
+                        }
+                    }
+                    _ => {
+                        node.group.kind = if pick.domain == groups::GroupDomain::Points { 1 } else { 2 };
+                        self.status = if pattern.is_empty() { "Group cleared (nothing selected): the node applies to everything".into() } else { format!("Group set to {pattern}") };
+                        node.group.pattern = pattern;
+                    }
+                }
             }
         } else {
             self.status = "Group selection cancelled".into();
@@ -14567,9 +14669,9 @@ impl ProceduralFxStudioApp {
                 if menu.inner.is_some() {
                     self.group_choices_request = Some(id);
                 }
-                let picking = self.group_pick.as_ref().is_some_and(|p| p.node == id);
+                let picking = self.group_pick.as_ref().is_some_and(|p| p.node == id && p.target == PickTarget::NodeGroup);
                 if !picking && ui.button("⬚ Select").on_hover_text("Pick the group's points or primitives in the viewport").clicked() {
-                    self.group_pick_request = Some(id);
+                    self.group_pick_request = Some((id, PickTarget::NodeGroup));
                 }
                 egui::ComboBox::from_id_salt("group_type").selected_text(groups::GROUP_TYPES[node.group.kind.min(2) as usize]).width(110.0).show_ui(ui, |ui| {
                     for (value, label) in groups::GROUP_TYPES.iter().enumerate() {
@@ -14577,7 +14679,7 @@ impl ProceduralFxStudioApp {
                     }
                 });
             });
-            if let Some(pick) = self.group_pick.as_ref().filter(|p| p.node == id) {
+            if let Some(pick) = self.group_pick.as_ref().filter(|p| p.node == id && p.target == PickTarget::NodeGroup) {
                 let picked = match pick.domain {
                     groups::GroupDomain::Points => self.selected_vertices.len(),
                     groups::GroupDomain::Prims => self.selected_triangles.len(),
@@ -15862,6 +15964,10 @@ impl ProceduralFxStudioApp {
                         c |= ui.add(egui::TextEdit::singleline(&mut set.expression).hint_text("@P.y>0  0-10  other ^skip").desired_width(220.0)).changed();
                     }
                 }
+                ui.horizontal(|ui| {
+                    group_pick_ui(ui, self.group_pick.as_ref(), (self.selected_vertices.len(), self.selected_triangles.len()), id, PickTarget::GroupCreate, false, &mut self.group_pick_request, &mut self.group_pick_domain, &mut self.group_pick_finish);
+                    ui.small("Picking sets the method to Expression, with the picked numbers.");
+                });
                 egui::ComboBox::from_label("Combine").selected_text(groups::COMBINE_MODES[set.combine.min(2)]).show_ui(ui, |ui| {
                     for (value, label) in groups::COMBINE_MODES.iter().enumerate() {
                         c |= ui.selectable_value(&mut set.combine, value, *label).changed();
@@ -15869,6 +15975,49 @@ impl ProceduralFxStudioApp {
                 });
                 c |= ui.checkbox(&mut set.invert, "Invert").changed();
                 ui.small("Stored as a 0/1 attribute (group:name / prim:group:name); use the name in any node's Group field.");
+            }
+            NodeKind::Color(set) => {
+                ui.horizontal(|ui| {
+                    ui.label("Class");
+                    for (value, label) in color::CLASSES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.class, value, *label).changed();
+                    }
+                });
+                egui::ComboBox::from_label("Color type").selected_text(color::MODES[set.mode.min(2)]).show_ui(ui, |ui| {
+                    for (value, label) in color::MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.mode, value, *label).changed();
+                    }
+                });
+                match set.mode {
+                    1 => {
+                        c |= pfield(ui, pslider(&mut set.seed, 0..=9999).text("Seed")).changed();
+                        ui.horizontal(|ui| {
+                            ui.label("One colour per");
+                            c |= ui.add(egui::TextEdit::singleline(&mut set.random_by).hint_text("element, or e.g. piece").desired_width(130.0)).changed();
+                        });
+                    }
+                    2 => {
+                        ui.horizontal(|ui| {
+                            ui.label("From");
+                            c |= ui.color_edit_button_rgb(&mut set.color).changed();
+                            ui.label("to");
+                            c |= ui.color_edit_button_rgb(&mut set.color2).changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Along");
+                            for (value, label) in color::AXES.iter().enumerate() {
+                                c |= ui.selectable_value(&mut set.axis, value, *label).changed();
+                            }
+                        });
+                    }
+                    _ => {
+                        ui.horizontal(|ui| {
+                            ui.label("Color");
+                            c |= ui.color_edit_button_rgb(&mut set.color).changed();
+                        });
+                    }
+                }
+                ui.small("Sets Cd (prim:Cd for primitives). Use the Group field above to colour only part of the geometry.");
             }
             NodeKind::EnvironmentLight { file, color, intensity, rotation, visible } => {
                 ui.heading("Environment Light");
@@ -16246,6 +16395,7 @@ impl ProceduralFxStudioApp {
                             remove = Some(i);
                         }
                     });
+                    group_pick_ui(ui, self.group_pick.as_ref(), (self.selected_vertices.len(), self.selected_triangles.len()), id, PickTarget::MaterialSlot(i), true, &mut self.group_pick_request, &mut self.group_pick_domain, &mut self.group_pick_finish);
                     let shown = material.and_then(|m| material_ids.iter().find(|(mid, _)| *mid == m)).map_or("(object's material)".to_owned(), |(_, name)| name.clone());
                     ui.horizontal(|ui| {
                         ui.label("Material");
@@ -19355,8 +19505,8 @@ impl eframe::App for ProceduralFxStudioApp {
         self.begin_animation_frame(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         self.updater.poll(ctx);
-        if let Some(id) = self.group_pick_request.take() {
-            self.start_group_pick(id);
+        if let Some((id, target)) = self.group_pick_request.take() {
+            self.start_group_pick(id, target);
         }
         if let Some(domain) = self.group_pick_domain.take() {
             self.set_group_pick_domain(domain);
@@ -20486,6 +20636,7 @@ mod scene_file_tests {
             NodeKind::UvTexture(sops::UvTextureSettings { projection: 1, axis: 2, scale: [2.0, 3.0], offset: [0.1, 0.2] }),
             NodeKind::UvTransform(sops::UvTransformSettings { translate: [1.0, 2.0], rotate: 30.0, scale: [0.5, 0.5], pivot: [0.5, 0.5] }),
             NodeKind::UvQuickShade { file: "/textures/grid.png".into() },
+            NodeKind::Color(color::ColorSettings { class: 1, mode: 1, seed: 7, random_by: "piece".into(), ..color::ColorSettings::defaults() }),
             NodeKind::Boolean(boolean::BooleanSettings { operation: 1, mode: 1, resolution: 90 }),
             NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 33, splinter: 7.0, ..fracture::FractureSettings::defaults(2) }),
             NodeKind::CrowdSolver(crowd::CrowdSettings { goal: [1.0, 2.0, 3.0], display: 0, ..crowd::CrowdSettings::defaults() }),
@@ -20920,7 +21071,7 @@ mod group_node_tests {
         let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, "right");
         app.graph = g;
         app.selected = Some(transform);
-        app.start_group_pick(transform);
+        app.start_group_pick(transform, PickTarget::NodeGroup);
         let input = app.graph.cook(make, 0.0, &mut HashMap::new());
         // The viewport shows the node's input, with its current group selected.
         assert_eq!(app.current_mesh.vertices, input.vertices);
@@ -20941,19 +21092,66 @@ mod group_node_tests {
             assert_eq!(p.y, if i <= 3 { 1.0 } else { 0.0 });
         }
         // Primitives, then cancel: the group is left as it was.
-        app.start_group_pick(transform);
+        app.start_group_pick(transform, PickTarget::NodeGroup);
         app.set_group_pick_domain(groups::GroupDomain::Prims);
         assert!(app.selection_mode == SelectionMode::Triangle);
         app.selected_triangles = vec![0, 1];
         app.finish_group_pick(false);
         assert_eq!(app.graph.nodes[&transform].group.pattern, "0-3");
         // Accepting primitives writes a primitive group.
-        app.start_group_pick(transform);
+        app.start_group_pick(transform, PickTarget::NodeGroup);
         app.set_group_pick_domain(groups::GroupDomain::Prims);
         app.selected_triangles = vec![4, 5];
         app.finish_group_pick(true);
         // Triangles 4 and 5 are the grid's third quad.
         assert_eq!(app.graph.nodes[&transform].group, groups::NodeGroup { pattern: "2".into(), kind: 2 });
+    }
+
+    #[test]
+    fn picking_group_create_and_material_groups() {
+        let mut app = ProceduralFxStudioApp::default();
+        let bbox = groups::GroupCreateSettings {
+            name: "picked".into(),
+            domain: groups::GroupDomain::Points,
+            method: 0,
+            bbox_min: [0.01, -1.0, -1.0],
+            bbox_max: [9.0, 1.0, 1.0],
+            percent: 50.0,
+            seed: 1,
+            direction: [0.0, 1.0, 0.0],
+            spread: 30.0,
+            expression: String::new(),
+            combine: 0,
+            invert: true,
+        };
+        let (g, make, create) = chain(NodeKind::GroupCreate(bbox), "");
+        app.graph = g;
+        app.selected = Some(create);
+        let input = app.graph.cook(make, 0.0, &mut HashMap::new());
+        // It starts from the bounding box's points (before Invert).
+        app.start_group_pick(create, PickTarget::GroupCreate);
+        let right: Vec<usize> = (0..input.vertices.len()).filter(|&i| input.vertices[i].x > 0.01).collect();
+        assert_eq!(app.selected_vertices, right);
+        // Picking primitives turns it into an expression group of primitives.
+        app.set_group_pick_domain(groups::GroupDomain::Prims);
+        app.selected_triangles = vec![4, 5];
+        app.finish_group_pick(true);
+        let NodeKind::GroupCreate(set) = &app.graph.nodes[&create].kind else { panic!() };
+        assert_eq!((set.method, set.domain, set.expression.as_str(), set.invert), (3, groups::GroupDomain::Prims, "2", true));
+        assert!(app.graph.nodes[&create].group.is_empty(), "the node's own Group field is untouched");
+
+        // A Material slot: primitives only.
+        let (g, _, assign) = chain(NodeKind::MaterialAssign { slots: vec![(String::new(), None), ("0".into(), None)] }, "");
+        app.graph = g;
+        app.selected = Some(assign);
+        app.start_group_pick(assign, PickTarget::MaterialSlot(1));
+        assert_eq!(app.selected_triangles, vec![0, 1], "slot 2's group (polygon 0) is selected");
+        app.set_group_pick_domain(groups::GroupDomain::Points);
+        assert!(app.selection_mode == SelectionMode::Triangle);
+        app.selected_triangles = vec![2, 3, 4, 5];
+        app.finish_group_pick(true);
+        let NodeKind::MaterialAssign { slots } = &app.graph.nodes[&assign].kind else { panic!() };
+        assert_eq!((slots[0].0.as_str(), slots[1].0.as_str()), ("", "1-2"));
     }
 
     #[test]
