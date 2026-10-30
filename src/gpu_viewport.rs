@@ -57,6 +57,19 @@ pub struct Point {
     pub emission: [f32; 4],
 }
 
+// One piece of a hair or other curve, from `a` to `b`, `width` across at each end in
+// world units (Hair Generate's width attribute). A negative width draws a plain line a
+// pixel wide, for curves that don't say how thick they are.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Strand {
+    pub a: [f32; 3],
+    pub width_a: f32,
+    pub b: [f32; 3],
+    pub width_b: f32,
+    pub color: [f32; 4],
+}
+
 impl Point {
     pub fn new(position: [f32; 3], radius: f32, color: [f32; 4], emission: [f32; 3]) -> Self {
         Point { position, radius, color, emission: [emission[0], emission[1], emission[2], 0.0] }
@@ -235,6 +248,70 @@ fn fs_dot(in: PointOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color.rgb, edge);
 }
 
+// Strands: each piece of a curve as a ribbon facing the camera, as wide as the hair at
+// each end, so it has thickness however it's turned. Hair finer than a pixel stays a pixel
+// wide but shows only as much as it covers, so fine, dense hair looks soft, not wiry.
+struct StrandIn {
+    @location(0) a: vec3<f32>,
+    @location(1) width_a: f32,
+    @location(2) b: vec3<f32>,
+    @location(3) width_b: f32,
+    @location(4) color: vec4<f32>,
+};
+struct StrandOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    // Across the ribbon, -1 to 1; its width in pixels; how much of a pixel it covers.
+    @location(1) side: f32,
+    @location(2) shown: f32,
+    @location(3) coverage: f32,
+};
+@vertex
+fn vs_strand(@builtin(vertex_index) i: u32, s: StrandIn) -> StrandOut {
+    var ends = array<vec2<f32>, 6>(vec2<f32>(0.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0));
+    let k = ends[i];
+    let ca = to_cam(s.a);
+    let cb = to_cam(s.b);
+    let near = camera.lens.z;
+    // Behind the camera: nothing.
+    if (ca.z < near && cb.z < near) {
+        return StrandOut(vec4<f32>(0.0, 0.0, 2.0, 1.0), s.color, 0.0, 1.0, 0.0);
+    }
+    let size = camera.screen.zw;
+    let pa = cam_to_clip(ca);
+    let pb = cam_to_clip(cb);
+    var along = (pb.xy / pb.w - pa.xy / pa.w) * size;
+    if (length(along) < 1e-6) {
+        along = vec2<f32>(1.0, 0.0);
+    }
+    let dir = normalize(along);
+    let normal = vec2<f32>(-dir.y, dir.x);
+    let c = select(ca, cb, k.x > 0.5);
+    var p = select(pa, pb, k.x > 0.5);
+    let width = select(s.width_a, s.width_b, k.x > 0.5);
+    let scale = select(camera.lens.x / max(c.z, 1e-6), camera.lens.y, camera.mode.x > 0.5);
+    let pixels = select(width * scale, 1.0, width < 0.0);
+    let shown = max(pixels, 1.0);
+    // Half a pixel more on each side, to fade the edge over (see fs_strand).
+    p.x += normal.x * k.y * (shown + 1.0) / size.x * p.w;
+    p.y += normal.y * k.y * (shown + 1.0) / size.y * p.w;
+    // Pulled toward the camera a little, as edges are, so roots don't sink into the skin.
+    if (p.w > 0.0) {
+        let d = p.z / p.w;
+        p.z = (d - max((1.0 - d) * 2e-4, 1e-6)) * p.w;
+    }
+    return StrandOut(p, s.color, k.y, shown, min(pixels, 1.0));
+}
+
+// Solid inside, fading over the last pixel at each edge (the ribbon is drawn a pixel wider
+// than the hair for that), so it covers its width in pixels; and faded by how much of a
+// pixel fine hair covers.
+@fragment
+fn fs_strand(in: StrandOut) -> @location(0) vec4<f32> {
+    let to_edge = (1.0 - abs(in.side)) * (in.shown + 1.0) * 0.5;
+    return vec4<f32>(in.color.rgb, clamp(to_edge, 0.0, 1.0) * in.coverage);
+}
+
 // Splats are sized in the world, kept between half a point and 120 points across
 // (as on the CPU), facing the camera.
 @vertex
@@ -315,6 +392,7 @@ pub struct GpuViewport {
     surfaces: wgpu::RenderPipeline,
     edges: wgpu::RenderPipeline,
     dots: wgpu::RenderPipeline,
+    strands: wgpu::RenderPipeline,
     // The splats' passes: the surfaces' depth again (without antialiasing), the
     // splats, then the composite over the image.
     depth_only: wgpu::RenderPipeline,
@@ -336,8 +414,8 @@ pub struct GpuViewport {
     blended: Option<BlendTargets>,
 }
 
-// The uploaded points: dots and splats, one instance each, and curves (hair), two
-// vertices a segment.
+// The uploaded points: dots and splats, one instance each, and curves (hair), one
+// instance per strand piece.
 struct Points {
     key: u64,
     dots: Option<(wgpu::Buffer, u32)>,
@@ -455,6 +533,28 @@ impl GpuViewport {
             multiview: None,
             cache: None,
         });
+        let strand_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x4];
+        let strands = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport strands"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_strand"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Strand>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &strand_attributes }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_strand"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: COLOR, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: SAMPLES, alpha_to_coverage_enabled: true, ..Default::default() },
+            multiview: None,
+            cache: None,
+        });
         let depth_only = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("viewport depth"),
             layout: Some(&pipeline_layout),
@@ -527,7 +627,7 @@ impl GpuViewport {
         });
         let white = raster::Texture { width: 1, height: 1, pixels: vec![[255; 4]] };
         let blank = texture_bind_group(&render_state, &layout, &sampler, &white);
-        GpuViewport { render_state, surfaces, edges, dots, depth_only, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
+        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
     }
 
     // Whether the scene uploaded last has this key (what the mesh, lights and display mode hash to).
@@ -557,8 +657,8 @@ impl GpuViewport {
         self.points.as_ref().is_some_and(|p| p.key == key)
     }
 
-    // Uploads the dots, splats and curve segments (drawn like edges) under `key`.
-    pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point], curves: &[Vertex]) {
+    // Uploads the dots, splats and curve pieces (drawn as strands) under `key`.
+    pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point], curves: &[Strand]) {
         let device = &self.render_state.device;
         let buffer = |label: &str, bytes: &[u8], count: usize| {
             (count > 0).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage: wgpu::BufferUsages::VERTEX }), count as u32))
@@ -650,9 +750,9 @@ impl GpuViewport {
                 }
             }
             if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.curves.as_ref()) {
-                pass.set_pipeline(&self.edges);
+                pass.set_pipeline(&self.strands);
                 pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(0..*count, 0..1);
+                pass.draw(0..6, 0..*count);
             }
             if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.dots.as_ref()) {
                 pass.set_pipeline(&self.dots);
@@ -924,6 +1024,40 @@ mod tests {
     fn wall(z: f32) -> Vec<Vertex> {
         let r = (z + 5.0) * 2.0;
         [[-r, r, z], [r, r, z], [-r, -r, z], [r, r, z], [r, -r, z], [-r, -r, z]].map(|p| Vertex::new(p, [1.0; 4], None)).to_vec()
+    }
+
+    #[test]
+    fn strands_are_as_thick_as_their_width_and_fine_ones_fade() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        // straight_on: 4 pixels per unit at the origin. A red strand across the view, through
+        // the middle of a row of pixels (a quarter of a unit is a pixel).
+        let strand = |width: f32, z: f32| Strand { a: [-2.0, -0.125, z], width_a: width, b: [2.0, -0.125, z], width_b: width, color: [1.0, 0.0, 0.0, 1.0] };
+        // The middle column: how many pixels it covers, and the most it covers one.
+        let column = |gpu: &mut GpuViewport, s: Strand| {
+            gpu.set_scene(1, &[], &[], None);
+            gpu.set_points(1, &[], &[], &[s]);
+            gpu.draw([20, 20], &straight_on());
+            let image = read(gpu);
+            let alphas: Vec<u8> = (0..20).map(|y| image[y * 20 + 10][3]).collect();
+            (alphas.iter().filter(|a| **a > 128).count(), *alphas.iter().max().unwrap())
+        };
+        let (one, _) = column(&mut gpu, strand(1.0, 0.0));
+        let (two, _) = column(&mut gpu, strand(2.0, 0.0));
+        assert!((3..=5).contains(&one) && (7..=9).contains(&two), "1 unit is 4 pixels, 2 units 8: {one}, {two}");
+        // Finer than a pixel: still drawn, but faint.
+        let (_, faint) = column(&mut gpu, strand(0.05, 0.0));
+        assert!(faint > 0 && faint <= 128, "a fifth of a pixel shows faintly: {faint}");
+        // No width: a plain line a pixel wide.
+        let (_, line) = column(&mut gpu, strand(-1.0, 0.0));
+        assert_eq!(line, 255);
+        // Behind a surface: hidden.
+        gpu.set_scene(2, &wall(0.0), &[], None);
+        gpu.set_points(2, &[], &[], &[strand(1.0, 2.0)]);
+        gpu.draw([20, 20], &straight_on());
+        assert_eq!(read(&gpu)[10 * 20 + 10], [255, 255, 255, 255], "a strand behind the surface is hidden");
     }
 
     #[test]

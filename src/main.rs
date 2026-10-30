@@ -18334,13 +18334,16 @@ impl ProceduralFxStudioApp {
                 if !gpu.has_points(points_key) {
                     let at = |i: usize| [mesh.vertices[i].x, mesh.vertices[i].y, mesh.vertices[i].z];
                     let (mut dots, mut splats) = (Vec::new(), Vec::new());
-                    // Hair and other curves, segment by segment, in their Cd or hair colour.
-                    let curves: Vec<gpu_viewport::Vertex> = curve_ranges
+                    // Hair and other curves, piece by piece, as thick as their width attribute
+                    // (a plain line where they have none), in their Cd or hair colour.
+                    let widths = mesh.point_attributes.get("width").filter(|w| w.len() == point_count);
+                    let width = |i: usize| widths.map_or(-1.0, |w| w[i].max(0.0));
+                    let curves: Vec<gpu_viewport::Strand> = curve_ranges
                         .iter()
                         .flat_map(|range| {
                             let c = cd_color(range.start).unwrap_or(egui::Color32::from_rgb(200, 165, 115));
-                            let rgba = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
-                            (range.start..range.end.saturating_sub(1)).flat_map(move |i| [i, i + 1]).map(move |i| gpu_viewport::Vertex::new(at(i), rgba, None))
+                            let color = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
+                            (range.start..range.end.saturating_sub(1)).map(move |i| gpu_viewport::Strand { a: at(i), width_a: width(i), b: at(i + 1), width_b: width(i + 1), color })
                         })
                         .collect();
                     if let Some(alpha) = splat_alpha {
