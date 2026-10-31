@@ -1002,6 +1002,7 @@ fn remap_node_ids(kind: &mut NodeKind, map: impl Fn(NodeId) -> NodeId) {
     match kind {
         NodeKind::Geometry { material: Some(id) }
         | NodeKind::CompileEnd { begin: Some(id) }
+        | NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(id), .. })
         | NodeKind::LopSopImport { geometry: Some(id), .. }
         | NodeKind::LopMaterial { material: Some(id), .. } => *id = map(*id),
         NodeKind::ObjectMerge { sources, .. } => sources.iter_mut().flatten().for_each(|id| *id = map(*id)),
@@ -6375,6 +6376,49 @@ impl Graph {
         Some(new)
     }
 
+    // Duplicates several nodes at once: wires between them are copied between the copies,
+    // and wires coming in from outside feed the copies too, as with one node. Returns
+    // each original's copy.
+    fn duplicate_many(&mut self, ids: &[NodeId]) -> HashMap<NodeId, NodeId> {
+        let ids: Vec<NodeId> = ids.iter().copied().filter(|id| self.nodes.contains_key(id)).collect();
+        let mut map = HashMap::new();
+        for &id in &ids {
+            let n = &self.nodes[&id];
+            let new = self.add(n.kind.clone(), n.pos + egui::vec2(30.0, 60.0));
+            map.insert(id, new);
+        }
+        for &id in &ids {
+            let src = self.nodes[&id].clone();
+            let new = map[&id];
+            if let Some(node) = self.nodes.get_mut(&new) {
+                node.bypass = src.bypass;
+                node.context = src.context;
+                node.parent = src.parent;
+                node.xform = src.xform;
+                node.group = src.group.clone();
+                // References to other copied nodes (a loop's Begin, say) follow them.
+                remap_node_ids(&mut node.kind, |other| map.get(&other).copied().unwrap_or(other));
+            }
+            let copied: Vec<(ChannelTarget, anim::Channel)> = self.node_channels(id).map(|(c, ch)| (c.target, ch.clone())).collect();
+            for (target, channel) in copied {
+                self.channels.insert(ChannelId { node: new, target }, channel);
+            }
+            if src.kind.is_container() {
+                self.copy_children(id, new);
+            }
+        }
+        let incoming: Vec<Link> = self.links.iter().filter(|l| map.contains_key(&l.to)).cloned().collect();
+        for l in incoming {
+            let outside = !map.contains_key(&l.from);
+            // An object container copied on its own isn't fed by what fed the original.
+            if outside && matches!(self.nodes[&l.to].kind, NodeKind::Geometry { .. }) {
+                continue;
+            }
+            self.links.push(Link { from: map.get(&l.from).copied().unwrap_or(l.from), to: map[&l.to], slot: l.slot, out: l.out });
+        }
+        map
+    }
+
     // Adds a whole other scene (such as a preset) beside this one, with fresh ids. Its
     // top-level nodes go to the right of what's here. Returns each of its nodes' new ids.
     fn merge(&mut self, other: &Graph) -> HashMap<NodeId, NodeId> {
@@ -8670,6 +8714,7 @@ enum Action {
     Enter(NodeId),
     Bypass(NodeId),
     Duplicate(NodeId),
+    DuplicateMany(Vec<NodeId>),
     Delete(NodeId),
 }
 
@@ -9144,6 +9189,11 @@ struct GroupPick {
 struct ProceduralFxStudioApp {
     graph: Graph,
     selected: Option<NodeId>,
+    // Nodes selected together with `selected` (Shift-click or Shift-drag a box); only
+    // counts while it includes `selected`.
+    node_selection: Vec<NodeId>,
+    // Where a Shift-drag box selection in the network started (screen position).
+    node_box: Option<egui::Pos2>,
     // The output being wired: (node, output).
     dragging_link: Option<(NodeId, usize)>,
     graph_pan: egui::Vec2,
@@ -9175,7 +9225,9 @@ struct ProceduralFxStudioApp {
     // The IMG viewer's texture, keyed by the image buffer it was made from.
     cop_texture: Option<((usize, usize, usize, usize), egui::TextureHandle)>,
     animate: bool,
-    anim_speed: f32,
+    // Playback rate in frames per second of real time, and the part-frame owed so far.
+    playback_fps: f32,
+    playback_due: f32,
     time: f32,
     playback_start: f32,
     playback_end: f32,
@@ -9214,6 +9266,12 @@ struct ProceduralFxStudioApp {
     fill_light_dir: [f32; 3],
     fill_light_intensity: f32,
     active_camera: Option<NodeId>,
+    // Looking through `active_camera` without moving it: the camera drives the view, and
+    // moving the view leaves the camera. Otherwise the view drives the camera.
+    looking_through: bool,
+    // The view the camera last set, to notice when something else moves the view.
+    camera_view: Option<[f32; 11]>,
+    look_through_request: Option<Option<NodeId>>,
     use_camera_requested: bool,
     render_camera: RenderCamera,
     // Options of the render being started; set by start_moonray_render.
@@ -9425,6 +9483,8 @@ impl Default for ProceduralFxStudioApp {
         Self {
             graph: g,
             selected,
+            node_selection: Vec::new(),
+            node_box: None,
             dragging_link: None,
             graph_pan: egui::Vec2::ZERO,
             graph_zoom: 1.0,
@@ -9447,7 +9507,8 @@ impl Default for ProceduralFxStudioApp {
             cop_write_request: None,
             cop_texture: None,
             animate: true,
-            anim_speed: 0.02,
+            playback_fps: sims::SIM_FPS,
+            playback_due: 0.0,
             time: 0.0,
             playback_start: 0.0,
             playback_end: 20.0,
@@ -9479,6 +9540,9 @@ impl Default for ProceduralFxStudioApp {
             fill_light_dir: [-0.6, 0.2, 0.5],
             fill_light_intensity: 0.25,
             active_camera: None,
+            looking_through: false,
+            camera_view: None,
+            look_through_request: None,
             use_camera_requested: false,
             render_camera: RenderCamera::Auto,
             render_opts: RenderOpts::default(),
@@ -9595,7 +9659,69 @@ impl Default for ProceduralFxStudioApp {
 }
 
 impl ProceduralFxStudioApp {
+    // The viewport's view settings, to compare with what a camera last set.
+    fn view_state(&self) -> [f32; 11] {
+        [self.cam_target.x, self.cam_target.y, self.cam_target.z, self.cam_rot_x, self.cam_rot_y, self.camera_focal, self.camera_near, self.orthographic as u8 as f32, self.cam_pan_x, self.cam_pan_y, self.cam_zoom]
+    }
+
+    // Puts the view where camera `id` is. False if it isn't a camera.
+    fn view_from_camera(&mut self, id: NodeId) -> bool {
+        let Some(NodeKind::Camera { position, rotation, focal, near, orthographic, pan, zoom }) = self.graph.nodes.get(&id).map(|n| n.kind.clone()) else {
+            return false;
+        };
+        self.cam_target = Vec3::from_arr(position);
+        self.cam_rot_x = rotation[0].to_radians();
+        self.cam_rot_y = rotation[1].to_radians();
+        self.camera_focal = focal;
+        self.camera_near = near;
+        self.orthographic = orthographic;
+        (self.cam_pan_x, self.cam_pan_y) = (pan[0], pan[1]);
+        self.cam_zoom = zoom;
+        true
+    }
+
+    // "Use as viewport camera": the selected camera takes the view, and moving the view
+    // moves it.
+    fn use_requested_camera(&mut self) {
+        if !std::mem::take(&mut self.use_camera_requested) {
+            return;
+        }
+        if let Some(id) = self.selected.filter(|id| matches!(self.graph.nodes.get(id).map(|node| &node.kind), Some(NodeKind::Camera { .. }))) {
+            if self.view_from_camera(id) {
+                self.active_camera = Some(id);
+                self.looking_through = false;
+                self.camera_view = None;
+                self.status = format!("Viewport camera {id} activated");
+            }
+        }
+    }
+
+    // Looks through camera `id` without changing it (None: back to the free view, which
+    // stays where it is).
+    fn look_through(&mut self, id: Option<NodeId>) {
+        match id {
+            Some(id) if self.view_from_camera(id) => {
+                self.active_camera = Some(id);
+                self.looking_through = true;
+                self.camera_view = Some(self.view_state());
+                let name = self.graph.nodes.get(&id).map_or(String::new(), |n| n.title(id));
+                self.status = format!("Looking through {name}; moving the view leaves it unchanged");
+            }
+            _ => {
+                if self.looking_through {
+                    self.active_camera = None;
+                }
+                self.looking_through = false;
+                self.camera_view = None;
+            }
+        }
+        self.dirty = true;
+    }
+
     fn sync_active_camera_from_viewport(&mut self) {
+        if self.looking_through {
+            return;
+        }
         let Some(id) = self.active_camera else {
             return;
         };
@@ -9961,7 +10087,8 @@ impl ProceduralFxStudioApp {
                     self.start_flipbook();
                 }
                 ui.label(format!("Time: {:.2}", self.time));
-                pfield(ui, pslider(&mut self.anim_speed, 0.001..=0.1).text("Speed")).on_hover_text("Playback step per update");
+                pfield(ui, pdrag(&mut self.playback_fps).range(1.0..=120.0).speed(0.5).fixed_decimals(0).suffix(" fps"))
+                    .on_hover_text(format!("Playback rate. Scenes are {} frames a second, so {} plays in real time; frames that take longer to cook are waited for, never skipped", sims::SIM_FPS, sims::SIM_FPS));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.status.is_empty() {
                         ui.label(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_GREEN));
@@ -10430,17 +10557,25 @@ impl ProceduralFxStudioApp {
     // Applies the animation at the current time; an animated camera being looked through drives the view.
     fn begin_animation_frame(&mut self, ctx: &egui::Context) {
         self.graph.apply_animation(self.time);
-        if let Some(camera) = self.active_camera.filter(|c| self.graph.is_animated(*c)) {
-            if let Some(NodeKind::Camera { position, rotation, focal, near, orthographic, pan, zoom }) = self.graph.nodes.get(&camera).map(|n| n.kind.clone()) {
-                self.cam_target = Vec3::from_arr(position);
-                self.cam_rot_x = rotation[0].to_radians();
-                self.cam_rot_y = rotation[1].to_radians();
-                self.camera_focal = focal;
-                self.camera_near = near;
-                self.orthographic = orthographic;
-                (self.cam_pan_x, self.cam_pan_y) = (pan[0], pan[1]);
-                self.cam_zoom = zoom;
+        if let Some(request) = self.look_through_request.take() {
+            self.look_through(request);
+        }
+        if self.looking_through {
+            // Anything that moved the view since the camera set it (orbit, pan, zoom,
+            // framing) leaves the camera; otherwise the camera, edits and animation
+            // included, keeps driving the view.
+            let moved = self.camera_view.is_some_and(|set| set.iter().zip(self.view_state()).any(|(a, b)| (a - b).abs() > 1e-5));
+            let camera = self.active_camera;
+            if moved || !camera.is_some_and(|c| self.view_from_camera(c)) {
+                self.look_through(None);
+                if moved {
+                    self.status = "Left the camera's view (the camera is unchanged)".into();
+                }
+            } else {
+                self.camera_view = Some(self.view_state());
             }
+        } else if let Some(camera) = self.active_camera.filter(|c| self.graph.is_animated(*c)) {
+            self.view_from_camera(camera);
         }
         self.anim_snapshot = self
             .selected
@@ -11019,6 +11154,22 @@ impl ProceduralFxStudioApp {
                 ui.selectable_value(&mut self.render_mode, RenderMode::Wireframe, "Wire");
                 ui.selectable_value(&mut self.render_mode, RenderMode::Normals, "Normals");
             });
+            toolbar_group(ui, "camera", |ui| {
+                ui.separator();
+                let cameras = self.camera_ids();
+                let looking = self.active_camera.filter(|_| self.looking_through);
+                let shown = looking.and_then(|id| cameras.iter().find(|(c, _)| *c == id)).map_or("Free view".to_owned(), |(_, name)| name.clone());
+                egui::ComboBox::from_id_salt("look_through").selected_text(format!("👁 {shown}")).show_ui(ui, |ui| {
+                    if ui.selectable_label(looking.is_none(), "Free view").clicked() && looking.is_some() {
+                        self.look_through_request = Some(None);
+                    }
+                    for (id, name) in &cameras {
+                        if ui.selectable_label(looking == Some(*id), name).clicked() {
+                            self.look_through_request = Some(Some(*id));
+                        }
+                    }
+                }).response.on_hover_text("Look through a camera without changing it");
+            });
             toolbar_group(ui, "selection", |ui| {
                 ui.separator();
                 let mode_changed = ui.selectable_value(&mut self.selection_mode, SelectionMode::Vertex, "Points").changed()
@@ -11167,11 +11318,7 @@ impl ProceduralFxStudioApp {
         if let Some(id) = camera {
             self.render_camera = RenderCamera::Node(id);
             // Look through it in the viewport too, so what you see is what exports.
-            if let Some(NodeKind::Camera { position, rotation, zoom, .. }) = self.graph.nodes.get(&id).map(|n| &n.kind) {
-                self.cam_target = Vec3::from_arr(*position);
-                (self.cam_rot_x, self.cam_rot_y) = (rotation[0].to_radians(), rotation[1].to_radians());
-                (self.cam_zoom, self.cam_pan_x, self.cam_pan_y) = (*zoom, 0.0, 0.0);
-            }
+            self.look_through(Some(id));
         }
         // Looping presets loop in the scene itself (Make Loop, or by construction), so the
         // rendered frames need no blending.
@@ -13791,6 +13938,17 @@ impl ProceduralFxStudioApp {
         self.status = "SOP Solver created: double-click it to edit its network (Prev_Frame is last step's result)".into();
     }
 
+    // Every selected node: the multi-selection when it includes the current node,
+    // otherwise just the current node.
+    fn selected_nodes(&self) -> Vec<NodeId> {
+        let Some(current) = self.selected else { return Vec::new() };
+        if self.node_selection.contains(&current) {
+            self.node_selection.iter().copied().filter(|id| self.graph.nodes.contains_key(id)).collect()
+        } else {
+            vec![current]
+        }
+    }
+
     fn apply(&mut self, a: Action) {
         match a {
             Action::Add(kind, pos) => {
@@ -13884,6 +14042,12 @@ impl ProceduralFxStudioApp {
                     self.selected = Some(new);
                 }
             }
+            Action::DuplicateMany(ids) => {
+                let map = self.graph.duplicate_many(&ids);
+                // The copies become the selection, so they can be dragged away together.
+                self.node_selection = ids.iter().filter_map(|id| map.get(id).copied()).collect();
+                self.selected = self.selected.and_then(|s| map.get(&s).copied()).or(self.node_selection.first().copied());
+            }
             Action::Delete(id) => {
                 self.graph.remove(id);
                 if self.template == Some(id) {
@@ -13968,19 +14132,27 @@ impl ProceduralFxStudioApp {
                 self.dirty = true;
             }
         }
-        if let Some(sel) = self.selected {
-            if dup {
-                self.apply(Action::Duplicate(sel));
+        let chosen = self.selected_nodes();
+        if dup {
+            match chosen.as_slice() {
+                [] => {}
+                [one] => self.apply(Action::Duplicate(*one)),
+                many => self.apply(Action::DuplicateMany(many.to_vec())),
             }
-            if byp {
-                self.apply(Action::Bypass(sel));
+        }
+        if byp {
+            for &id in &chosen {
+                self.apply(Action::Bypass(id));
             }
-            if del && self.selected_vertices.is_empty()
-                && self.selected_triangles.is_empty()
-                && self.selected_edges.is_empty()
-            {
-                self.apply(Action::Delete(sel));
+        }
+        if del && self.selected_vertices.is_empty()
+            && self.selected_triangles.is_empty()
+            && self.selected_edges.is_empty()
+        {
+            for &id in &chosen {
+                self.apply(Action::Delete(id));
             }
+            self.node_selection.clear();
         }
         if del
             && (!self.selected_vertices.is_empty()
@@ -15742,7 +15914,14 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pdrag(&mut pan[0]).speed(1.0).prefix("Pan X ")).changed();
                 c |= pfield(ui, pdrag(&mut pan[1]).speed(1.0).prefix("Pan Y ")).changed();
                 c |= pfield(ui, pslider(zoom, 0.5..=200.0).logarithmic(true).text("Zoom")).changed();
-                if self.active_camera == Some(id) {
+                if self.active_camera == Some(id) && self.looking_through {
+                    ui.horizontal(|ui| {
+                        ui.label("Looking through this camera: moving the view leaves it.");
+                        if ui.button("Stop looking through").clicked() {
+                            self.look_through_request = Some(None);
+                        }
+                    });
+                } else if self.active_camera == Some(id) {
                     ui.horizontal(|ui| {
                         ui.label("Active viewport camera: moving the viewport moves it.");
                         if ui.button("Stop using as viewport camera").on_hover_text("The viewport keeps its view; this camera stays where it is").clicked() {
@@ -15750,8 +15929,15 @@ impl ProceduralFxStudioApp {
                             self.status = "The viewport no longer moves this camera".into();
                         }
                     });
-                } else if ui.button("Use as viewport camera").clicked() {
-                    self.use_camera_requested = true;
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("👁 Look through").on_hover_text("See through this camera without changing it; moving the view goes back to the free view").clicked() {
+                            self.look_through_request = Some(Some(id));
+                        }
+                        if ui.button("Use as viewport camera").on_hover_text("Moving the view moves this camera").clicked() {
+                            self.use_camera_requested = true;
+                        }
+                    });
                 }
                 ui.small("Target is the orbit center used by the procedural viewport.");
             }
@@ -17328,14 +17514,42 @@ impl ProceduralFxStudioApp {
             y += step;
         }
 
+        // Shift-drag on empty space draws a box that selects the nodes it touches.
+        let shift = ui.input(|i| i.modifiers.shift);
+        if canvas.drag_started_by(egui::PointerButton::Primary) && shift {
+            self.node_box = canvas.interact_pointer_pos();
+        }
         if canvas.dragged_by(egui::PointerButton::Middle)
-            || (canvas.dragged_by(egui::PointerButton::Primary) && self.dragging_link.is_none())
+            || (canvas.dragged_by(egui::PointerButton::Primary) && self.dragging_link.is_none() && self.node_box.is_none())
         {
             self.graph_pan += canvas.drag_delta();
         }
-        if canvas.clicked() {
-            self.selected = None;
+        if let (Some(start), Some(now)) = (self.node_box, ui.input(|i| i.pointer.interact_pos())) {
+            let area = egui::Rect::from_two_pos(start, now);
+            painter.rect(area, 0.0, egui::Color32::from_rgba_unmultiplied(255, 200, 60, 20), egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 200, 60)), egui::StrokeKind::Inside);
+            if canvas.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                self.node_box = None;
+                let mut inside: Vec<NodeId> = self.graph.nodes.iter()
+                    .filter(|(_, n)| n.context == self.context && n.parent == view_parent && node_rect(n.pos, origin, self.graph_zoom).intersects(area))
+                    .map(|(id, _)| *id)
+                    .collect();
+                inside.sort_unstable();
+                // The box adds to what's already selected.
+                let mut chosen = self.selected_nodes();
+                for id in inside {
+                    if !chosen.contains(&id) {
+                        chosen.push(id);
+                    }
+                }
+                self.selected = chosen.last().copied();
+                self.node_selection = chosen;
+            }
         }
+        if canvas.clicked() && !shift {
+            self.selected = None;
+            self.node_selection.clear();
+        }
+        let chosen: HashSet<NodeId> = self.selected_nodes().into_iter().collect();
         if canvas.secondary_clicked() {
             if let Some(p) = canvas.interact_pointer_pos() {
                 self.menu_pos = p;
@@ -17390,11 +17604,30 @@ impl ProceduralFxStudioApp {
                 None => resp.on_hover_text("Not cooked (not upstream of display/template)"),
             };
             if resp.dragged_by(egui::PointerButton::Primary) {
-                if let Some(n) = self.graph.nodes.get_mut(&id) {
-                    n.pos += resp.drag_delta() / self.graph_zoom;
+                // Dragging one of several selected nodes moves them all.
+                let moved: Vec<NodeId> = if chosen.len() > 1 && chosen.contains(&id) { chosen.iter().copied().collect() } else { vec![id] };
+                for m in moved {
+                    if let Some(n) = self.graph.nodes.get_mut(&m) {
+                        n.pos += resp.drag_delta() / self.graph_zoom;
+                    }
                 }
             }
-            if resp.clicked() || resp.drag_started() {
+            if resp.clicked() && ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+                // Shift- or Ctrl-click adds a node to the selection, or takes it out.
+                let mut picked = self.selected_nodes();
+                if let Some(at) = picked.iter().position(|&p| p == id) {
+                    picked.remove(at);
+                    self.selected = picked.last().copied();
+                } else {
+                    picked.push(id);
+                    self.selected = Some(id);
+                }
+                self.node_selection = picked;
+            } else if resp.clicked() || (resp.drag_started() && !chosen.contains(&id)) {
+                self.selected = Some(id);
+                self.node_selection = vec![id];
+            } else if resp.drag_started() {
+                // Picking up one of the selected nodes keeps the rest selected.
                 self.selected = Some(id);
             }
             // Holding the middle button on a node shows its info, like Houdini's.
@@ -17433,8 +17666,9 @@ impl ProceduralFxStudioApp {
                     actions.push(Action::Bypass(id));
                     ui.close_menu();
                 }
-                if ui.button("Duplicate (Ctrl+D)").clicked() {
-                    actions.push(Action::Duplicate(id));
+                let together = chosen.len() > 1 && chosen.contains(&id);
+                if ui.button(if together { "Duplicate selected (Ctrl+D)" } else { "Duplicate (Ctrl+D)" }).clicked() {
+                    actions.push(if together { Action::DuplicateMany(chosen.iter().copied().collect()) } else { Action::Duplicate(id) });
                     ui.close_menu();
                 }
                 if ui.button("Delete").clicked() {
@@ -17507,7 +17741,7 @@ impl ProceduralFxStudioApp {
             }
 
             // Draw
-            let sel = self.selected == Some(id);
+            let sel = chosen.contains(&id);
             let disp = if node.kind.is_object() {
                 match node.kind {
                     NodeKind::Camera { .. } => self.active_camera == Some(id),
@@ -19494,11 +19728,20 @@ impl eframe::App for ProceduralFxStudioApp {
         // FLIP cook completes. Otherwise playback changes the cache key every
         // frame and cancels the job before it can produce a result.
         if self.animate && self.simulation_rx.is_none() {
-            self.time += self.anim_speed;
-            if self.time > self.playback_end {
-                self.time = self.playback_start;
+            // Whole frames at the playback rate. A slow cook holds playback back
+            // rather than making it skip frames, so at most one frame is owed.
+            if dt.is_finite() && dt > 0.0 {
+                self.playback_due = (self.playback_due + dt.min(0.25) * self.playback_fps.clamp(1.0, 120.0)).min(1.0);
             }
-            self.dirty = true;
+            if self.playback_due >= 1.0 {
+                self.playback_due -= 1.0;
+                let frame = (self.time * sims::SIM_FPS).round() + 1.0;
+                self.time = frame / sims::SIM_FPS;
+                if self.time > self.playback_end + 1e-4 {
+                    self.time = self.playback_start;
+                }
+                self.dirty = true;
+            }
             ctx.request_repaint();
         }
 
@@ -19588,31 +19831,7 @@ impl eframe::App for ProceduralFxStudioApp {
             ctx.request_repaint();
         }
 
-        if self.use_camera_requested {
-            self.use_camera_requested = false;
-            if let Some(id) = self.selected.filter(|id| {
-                matches!(
-                    self.graph.nodes.get(id).map(|node| &node.kind),
-                    Some(NodeKind::Camera { .. })
-                )
-            }) {
-                if let Some(NodeKind::Camera { position, rotation, focal, near, orthographic, pan, zoom }) =
-                    self.graph.nodes.get(&id).map(|node| &node.kind)
-                {
-                    self.active_camera = Some(id);
-                    self.cam_target = Vec3::from_arr(*position);
-                    self.cam_rot_x = rotation[0].to_radians();
-                    self.cam_rot_y = rotation[1].to_radians();
-                    self.camera_focal = *focal;
-                    self.camera_near = *near;
-                    self.orthographic = *orthographic;
-                    self.cam_pan_x = pan[0];
-                    self.cam_pan_y = pan[1];
-                    self.cam_zoom = *zoom;
-                    self.status = format!("Viewport camera {id} activated");
-                }
-            }
-        }
+        self.use_requested_camera();
         if let Some((id, range)) = self.file_export_request.take() {
             self.status = self.write_file_export(id, range).unwrap_or_else(|e| format!("File Export failed: {e}"));
         }
@@ -21105,6 +21324,34 @@ mod group_node_tests {
         app.finish_group_pick(true);
         // Triangles 4 and 5 are the grid's third quad.
         assert_eq!(app.graph.nodes[&transform].group, groups::NodeGroup { pattern: "2".into(), kind: 2 });
+    }
+
+    #[test]
+    fn duplicating_several_nodes_keeps_their_wiring() {
+        let mut g = Graph::default();
+        g.next_id += 9500;
+        let source = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let a = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 80.0));
+        let b = g.add(NodeKind::Noise { freq: 1.0, amp: 0.2 }, egui::pos2(0.0, 160.0));
+        let begin = g.add(NodeKind::ForEachBegin, egui::pos2(0.0, 240.0));
+        let end = g.add(NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(begin), ..flow::ForEachSettings::new(0) }), egui::pos2(0.0, 320.0));
+        g.connect(source, a, 0);
+        g.connect(a, b, 0);
+        g.connect(b, begin, 0);
+        g.connect(begin, end, 0);
+        let before = g.nodes.len();
+        let map = g.duplicate_many(&[a, b, begin, end]);
+        assert_eq!(g.nodes.len(), before + 4);
+        let fed = |g: &Graph, to: NodeId| g.links.iter().filter(|l| l.to == to).map(|l| l.from).collect::<Vec<_>>();
+        // The outside input still feeds the copy; inside wires join the copies.
+        assert_eq!(fed(&g, map[&a]), vec![source]);
+        assert_eq!(fed(&g, map[&b]), vec![map[&a]]);
+        assert_eq!(fed(&g, map[&begin]), vec![map[&b]]);
+        // The copied loop's End points at the copied Begin.
+        assert!(matches!(&g.nodes[&map[&end]].kind, NodeKind::ForEachEnd(f) if f.begin == Some(map[&begin])));
+        // The originals are untouched.
+        assert_eq!(fed(&g, b), vec![a]);
+        assert_eq!(g.nodes[&map[&b]].pos, egui::pos2(30.0, 220.0));
     }
 
     #[test]
@@ -23381,6 +23628,36 @@ mod realtime_render_tests {
         assert!(lit(0, w / 4) && !lit(0, w * 3 / 4));
         assert!(!lit(3, w / 4) && lit(3, w * 3 / 4));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn looking_through_a_camera_leaves_it_unchanged() {
+        let mut app = ProceduralFxStudioApp::default();
+        let camera = app.graph.add(NodeKind::Camera { position: [1.0, 2.0, 3.0], rotation: [-10.0, 30.0, 0.0], focal: 1.0, near: 0.1, orthographic: true, pan: [0.0, 0.0], zoom: 6.0 }, egui::pos2(0.0, 0.0));
+        let ctx = egui::Context::default();
+        app.look_through(Some(camera));
+        assert_eq!((app.cam_target.x, app.cam_zoom, app.orthographic), (1.0, 6.0, true));
+        // Edits to the camera show in the view.
+        if let NodeKind::Camera { zoom, .. } = &mut app.graph.nodes.get_mut(&camera).unwrap().kind {
+            *zoom = 9.0;
+        }
+        app.begin_animation_frame(&ctx);
+        assert_eq!(app.cam_zoom, 9.0);
+        assert!(app.looking_through);
+        // Orbiting leaves the camera where it is and goes back to the free view.
+        app.cam_rot_y += 0.5;
+        app.sync_active_camera_from_viewport();
+        app.begin_animation_frame(&ctx);
+        assert!(!app.looking_through && app.active_camera.is_none());
+        assert!(matches!(app.graph.nodes[&camera].kind, NodeKind::Camera { rotation: [-10.0, 30.0, 0.0], zoom: 9.0, .. }));
+        assert!((app.cam_rot_y - (30.0f32.to_radians() + 0.5)).abs() < 1e-5, "the view stays where it was moved to");
+        // Using it as the viewport camera still moves it with the view.
+        app.selected = Some(camera);
+        app.use_camera_requested = true;
+        app.use_requested_camera();
+        app.cam_zoom = 4.0;
+        app.sync_active_camera_from_viewport();
+        assert!(matches!(app.graph.nodes[&camera].kind, NodeKind::Camera { zoom: 4.0, .. }));
     }
 
     #[test]
