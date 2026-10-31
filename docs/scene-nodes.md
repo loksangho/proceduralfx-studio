@@ -212,6 +212,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | attribute_randomize | `attribute_randomize` | 1 text field(s); #0=4, amount=1, seed=1, class=0, size=3, min.x=0, max.x=1, mode=0, type=3, distribution=0, min.y=0, min.z=0, min.w=0, max.y=1, max.z=1, max.w=1 |
 | attribute_delete | `attribute_delete` | 1 text field(s); #0=4, class=0 |
 | color | `color` | 1 text field(s); class=0, mode=0, color.r=1, color.g=0.45, color.b=0.1, color2.r=0.1, color2.g=0.3, color2.b=1, seed=1, axis=1 |
+| attribute_transfer | `attribute_transfer` | 1 text field(s); class=0, samples=4, distance=1, blend_width=0 |
 | wrangle | `wrangle` | the run-over domain (0–3), `:`, then the code in hex |
 | attribute_vop | `attribute_vop` | run_over=2 |
 | normal | `normal` | domain=1, cusp_angle=60, weighting=0, reverse=0 |

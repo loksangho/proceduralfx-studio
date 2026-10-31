@@ -33,14 +33,14 @@ impl PointDeformSettings {
 }
 
 // Points on a grid, for nearest-neighbour queries.
-struct Grid<'a> {
+pub(crate) struct Grid<'a> {
     points: &'a [Vec3],
     cell: f32,
     cells: HashMap<[i32; 3], Vec<usize>>,
 }
 
 impl<'a> Grid<'a> {
-    fn new(points: &'a [Vec3]) -> Grid<'a> {
+    pub(crate) fn new(points: &'a [Vec3]) -> Grid<'a> {
         let (mut lo, mut hi) = (Vec3::new(f32::MAX, f32::MAX, f32::MAX), Vec3::new(f32::MIN, f32::MIN, f32::MIN));
         for p in points {
             lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
@@ -61,7 +61,7 @@ impl<'a> Grid<'a> {
     }
 
     // The `k` nearest points to `p` (fewer if there aren't that many), nearest first.
-    fn nearest(&self, p: Vec3, k: usize) -> Vec<(f32, usize)> {
+    pub(crate) fn nearest(&self, p: Vec3, k: usize) -> Vec<(f32, usize)> {
         let k = k.min(self.points.len());
         let c = Self::key(p, self.cell);
         let mut found: Vec<(f32, usize)> = Vec::new();
@@ -90,6 +90,11 @@ impl<'a> Grid<'a> {
             if found.len() == self.points.len() {
                 break;
             }
+        }
+        // Sparse points far apart (64 rings of small cells didn't reach enough): check
+        // them all.
+        if found.len() < k {
+            found = self.points.iter().enumerate().map(|(i, q)| (q.sub(p).length(), i)).collect();
         }
         found.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         found.truncate(k);

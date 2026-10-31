@@ -67,6 +67,7 @@ mod terrain;
 mod testgeo;
 mod textures;
 mod tops;
+mod transfer;
 mod updater;
 mod vellum;
 mod usd;
@@ -2854,7 +2855,7 @@ impl CamRig {
             center: egui::vec2(w * 0.5, h * 0.5),
             size: egui::vec2(w, h),
             focal,
-            ortho_scale: focal / self.zoom.max(0.5),
+            ortho_scale: focal / self.zoom.max(MIN_ZOOM),
             orthographic: self.orthographic,
             near,
         }
@@ -3440,6 +3441,9 @@ fn pdrag<'a, N: egui::emath::Numeric>(value: &'a mut N) -> egui::DragValue<'a> {
     egui::DragValue::new(value).custom_parser(typed_parser(current, N::INTEGRAL))
 }
 
+// The closest the view gets to what it looks at, so tiny things (a 0.001 sphere) can fill it.
+const MIN_ZOOM: f32 = 0.001;
+
 fn pslider<'a, N: egui::emath::Numeric>(value: &'a mut N, range: std::ops::RangeInclusive<N>) -> egui::Slider<'a> {
     let current = value.to_f64();
     FIELD_VALUE.with(|v| v.set(current));
@@ -3930,6 +3934,8 @@ enum NodeKind {
     GroupCreate(groups::GroupCreateSettings),
     // Sets Cd on points or primitives: one colour, random colours or a ramp.
     Color(color::ColorSettings),
+    // Copies attributes from the nearest points or primitives of its second input.
+    AttributeTransfer(transfer::TransferSettings),
     // Node-based VEX: a container of VOP nodes compiled to VEX and run over `domain` (like Wrangle).
     AttributeVop { domain: usize },
     // One operation inside an Attribute VOP network.
@@ -4006,6 +4012,7 @@ impl NodeKind {
             | NodeKind::UvTexture(_)
             | NodeKind::UvTransform(_)
             | NodeKind::Color(_)
+            | NodeKind::AttributeTransfer(_)
             | NodeKind::AttributePaint { .. }
             | NodeKind::GuideProcess(_)
             | NodeKind::HairDeform(_) => GroupSupport::Restrict,
@@ -4140,6 +4147,7 @@ impl NodeKind {
             NodeKind::TerrainMask(_) => names(&["source", "min", "max", "falloff", "blur", "invert", "combine", "visualize"]),
             NodeKind::TerrainColorize(_) => names(&["sand.r", "sand.g", "sand.b", "grass.r", "grass.g", "grass.b", "rock.r", "rock.g", "rock.b", "snow.r", "snow.g", "snow.b", "sand_level", "snow_level", "rock_slope", "blend"]),
             NodeKind::UvTexture(_) => names(&["projection", "axis", "scale.u", "scale.v", "offset.u", "offset.v"]),
+            NodeKind::AttributeTransfer(_) => names(&["class", "samples", "distance", "blend_width"]),
             NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis"]),
             NodeKind::UvTransform(_) => names(&["translate.u", "translate.v", "rotate", "scale.u", "scale.v", "pivot.u", "pivot.v"]),
             NodeKind::VellumSolver(_) => names(&["type", "stretch_stiffness", "bend_stiffness", "shape_stiffness", "mass", "thickness", "gravity", "damping", "friction", "substeps", "iterations", "ground", "self_collision", "pin_to_animation"]),
@@ -4244,6 +4252,7 @@ impl NodeKind {
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
             NodeKind::Color(s) => vec![s.random_by.clone()],
+            NodeKind::AttributeTransfer(s) => vec![s.pattern.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
             NodeKind::ShaderNode(n) => n.texts.clone(),
@@ -4306,6 +4315,7 @@ impl NodeKind {
                 next(&mut g.expression);
             }
             NodeKind::Color(s) => next(&mut s.random_by),
+            NodeKind::AttributeTransfer(s) => next(&mut s.pattern),
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
             NodeKind::ShaderNode(n) => n.texts.iter_mut().for_each(|t| next(t)),
@@ -4666,6 +4676,7 @@ impl NodeKind {
                     NodeKind::AttributeRandomize(randomize::RandomizeSettings::defaults()),
                     NodeKind::AttributeDelete(attrib::DeleteSettings::defaults()),
                     NodeKind::Color(color::ColorSettings::defaults()),
+                    NodeKind::AttributeTransfer(transfer::TransferSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
@@ -4876,6 +4887,7 @@ impl NodeKind {
             NodeKind::UvTexture(_) => "uv_texture",
             NodeKind::UvTransform(_) => "uv_transform",
             NodeKind::Color(_) => "color",
+            NodeKind::AttributeTransfer(_) => "attribute_transfer",
             NodeKind::UvQuickShade { .. } => "uv_quickshade",
             NodeKind::AttributePaint { .. } => "attribute_paint",
             NodeKind::GroupCreate(_) => "group_create",
@@ -4912,6 +4924,7 @@ impl NodeKind {
         match self {
             NodeKind::MaterialFracture(_) | NodeKind::RbdConfigure(_) => (&["Geometry", "Constraints", "Proxy"], &["Geometry", "Constraints", "Proxy"]),
             NodeKind::RbdBullet(_) => (&["Geometry", "Constraints", "Proxy", "Collision"], &["Geometry", "Constraints", "Proxy"]),
+            NodeKind::AttributeTransfer(_) => (&["Geometry to change", "Source of the attributes"], &[]),
             _ => (&[], &[]),
         }
     }
@@ -4930,6 +4943,7 @@ impl NodeKind {
             NodeKind::Terrain(_) => 0,
             NodeKind::Boolean(_) => 2,
             NodeKind::MatchSize(_) => 2,
+            NodeKind::AttributeTransfer(_) => 2,
             NodeKind::ObjectMerge { .. } => 0,
             NodeKind::MaterialFracture(_) => 3,
             NodeKind::RbdBullet(_) => 4,
@@ -5277,6 +5291,7 @@ impl NodeKind {
             .concat(),
             NodeKind::UvTexture(s) => vec![s.projection as f32, s.axis as f32, s.scale[0], s.scale[1], s.offset[0], s.offset[1]],
             NodeKind::Color(s) => s.params(),
+            NodeKind::AttributeTransfer(s) => s.params(),
             NodeKind::UvTransform(s) => vec![s.translate[0], s.translate[1], s.rotate, s.scale[0], s.scale[1], s.pivot[0], s.pivot[1]],
             NodeKind::VellumSolver(s) => vec![
                 s.kind as f32,
@@ -5459,7 +5474,7 @@ impl NodeKind {
                 near: g(7).clamp(0.05, 10.0),
                 orthographic: g(8) > 0.5,
                 pan: [g(9), g(10)],
-                zoom: g(11).clamp(0.5, 200.0),
+                zoom: g(11).clamp(MIN_ZOOM, 200.0),
             },
             "light" => NodeKind::Light {
                 position: v3(0),
@@ -5725,6 +5740,7 @@ impl NodeKind {
                 offset: [g(4), g(5)],
             }),
             "color" => NodeKind::Color(color::ColorSettings::from_params(p, String::new())),
+            "attribute_transfer" => NodeKind::AttributeTransfer(transfer::TransferSettings::from_params(p, "*".into())),
             "uv_transform" => NodeKind::UvTransform(sops::UvTransformSettings {
                 translate: [g(0), g(1)],
                 rotate: g(2),
@@ -7797,6 +7813,7 @@ impl Graph {
                 NodeKind::UvTexture(settings) => sops::uv_texture(&input(0, cache), settings),
                 NodeKind::UvTransform(settings) => self.report(id, sops::uv_transform(&input(0, cache), settings)),
                 NodeKind::Color(settings) => self.report(id, color::color(&input(0, cache), settings)),
+                NodeKind::AttributeTransfer(settings) => self.report(id, transfer::transfer(&input(0, cache), &input(1, cache), settings)),
                 NodeKind::UvQuickShade { file } => self.report(id, sops::uv_quickshade(&input(0, cache), file)),
                 NodeKind::VellumSolver(settings) => {
                     let (geometry, collider) = (self.input_of(id, 0), self.input_of(id, 1));
@@ -8971,11 +8988,6 @@ fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn> {
             for (c, label) in component_labels("P", 3).into_iter().enumerate() {
                 columns.push(column(label, "P: point position (3 floats)", SheetSource::Position(c)));
             }
-            if !attributes.iter().any(|a| a.name == "N") {
-                for (c, label) in component_labels("N", 3).into_iter().enumerate() {
-                    columns.push(column(label, "N: computed point normal (no N attribute is stored)", SheetSource::ComputedNormal(c)));
-                }
-            }
         }
         SheetDomain::Vertices => {
             columns.push(column("Prim:Vtx".into(), "Primitive number and the vertex's position in it", SheetSource::VertexPrim));
@@ -9003,6 +9015,13 @@ fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn> {
                     integral: attribute.integral,
                 },
             ));
+        }
+    }
+    // Normals worked out from the surface, when nothing stores N: after the stored
+    // attributes, and only where there's a surface (loose points and particles have none).
+    if domain == SheetDomain::Points && !mesh.indices.is_empty() && !mesh.point_attributes.contains_key("N") {
+        for (c, label) in component_labels("N", 3).into_iter().enumerate() {
+            columns.push(column(label, "N: computed point normal (no N attribute is stored)", SheetSource::ComputedNormal(c)));
         }
     }
     columns
@@ -13786,7 +13805,7 @@ impl ProceduralFxStudioApp {
     fn frame_all(&mut self) {
         if let Some((lo, hi)) = self.current_mesh.bounds() {
             self.cam_target = lo.add(hi).scale(0.5);
-            self.cam_zoom = (hi.sub(lo).length() * 1.4).clamp(0.5, 200.0);
+            self.cam_zoom = (hi.sub(lo).length() * 1.4).clamp(MIN_ZOOM, 200.0);
             self.cam_pan_x = 0.0;
             self.cam_pan_y = 0.0;
         }
@@ -15183,38 +15202,38 @@ impl ProceduralFxStudioApp {
                 }
             }
             NodeKind::Grid { size, res } => {
-                c |= pfield(ui, pslider(size, 0.5..=20.0).text("Size")).changed();
+                c |= pfield(ui, pslider(size, 0.001..=100.0).logarithmic(true).text("Size")).changed();
                 c |= pfield(ui, pslider(res, 2..=120).text("Resolution")).changed();
             }
             NodeKind::Plane { size, res } => {
-                c |= pfield(ui, pslider(size, 0.5..=20.0).text("Size")).changed();
+                c |= pfield(ui, pslider(size, 0.001..=100.0).logarithmic(true).text("Size")).changed();
                 c |= pfield(ui, pslider(res, 2..=120).text("Resolution")).changed();
             }
             NodeKind::Cone { radius, height, rows, cols, caps } => {
-                c |= pfield(ui, pslider(radius, 0.1..=10.0).text("Radius")).changed();
-                c |= pfield(ui, pslider(height, 0.1..=20.0).text("Height")).changed();
+                c |= pfield(ui, pslider(radius, 0.001..=100.0).logarithmic(true).text("Radius")).changed();
+                c |= pfield(ui, pslider(height, 0.001..=100.0).logarithmic(true).text("Height")).changed();
                 c |= pfield(ui, pslider(rows, 1..=32).text("Rows")).changed();
                 c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
                 c |= ui.checkbox(caps, "End Caps").changed();
             }
             NodeKind::Capsule { radius, length, rows, cols } => {
-                c |= pfield(ui, pslider(radius, 0.1..=10.0).text("Radius")).changed();
+                c |= pfield(ui, pslider(radius, 0.001..=100.0).logarithmic(true).text("Radius")).changed();
                 c |= pfield(ui, pslider(length, 0.0..=20.0).text("Length")).changed();
                 c |= pfield(ui, pslider(rows, 4..=96).text("Rows")).changed();
                 c |= pfield(ui, pslider(cols, 8..=128).text("Columns")).changed();
             }
             NodeKind::Box { size, div } => {
-                c |= pfield(ui, pslider(size, 0.1..=10.0).text("Size")).changed();
+                c |= pfield(ui, pslider(size, 0.001..=100.0).logarithmic(true).text("Size")).changed();
                 c |= pfield(ui, pslider(div, 1..=30).text("Divisions")).changed();
             }
             NodeKind::Sphere { radius, rows, cols } => {
-                c |= pfield(ui, pslider(radius, 0.1..=10.0).text("Radius")).changed();
+                c |= pfield(ui, pslider(radius, 0.001..=100.0).logarithmic(true).text("Radius")).changed();
                 c |= pfield(ui, pslider(rows, 2..=96).text("Rows")).changed();
                 c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
             }
             NodeKind::Torus { major, minor, rows, cols } => {
-                c |= pfield(ui, pslider(major, 0.1..=10.0).text("Major Radius")).changed();
-                c |= pfield(ui, pslider(minor, 0.01..=5.0).text("Minor Radius")).changed();
+                c |= pfield(ui, pslider(major, 0.001..=100.0).logarithmic(true).text("Major Radius")).changed();
+                c |= pfield(ui, pslider(minor, 0.0005..=50.0).logarithmic(true).text("Minor Radius")).changed();
                 c |= pfield(ui, pslider(rows, 3..=96).text("Rows")).changed();
                 c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
             }
@@ -15913,7 +15932,7 @@ impl ProceduralFxStudioApp {
                 c |= ui.checkbox(orthographic, "Orthographic").changed();
                 c |= pfield(ui, pdrag(&mut pan[0]).speed(1.0).prefix("Pan X ")).changed();
                 c |= pfield(ui, pdrag(&mut pan[1]).speed(1.0).prefix("Pan Y ")).changed();
-                c |= pfield(ui, pslider(zoom, 0.5..=200.0).logarithmic(true).text("Zoom")).changed();
+                c |= pfield(ui, pslider(zoom, MIN_ZOOM..=200.0).logarithmic(true).text("Zoom")).changed();
                 if self.active_camera == Some(id) && self.looking_through {
                     ui.horizontal(|ui| {
                         ui.label("Looking through this camera: moving the view leaves it.");
@@ -16204,6 +16223,25 @@ impl ProceduralFxStudioApp {
                     }
                 }
                 ui.small("Sets Cd (prim:Cd for primitives). Use the Group field above to colour only part of the geometry.");
+            }
+            NodeKind::AttributeTransfer(set) => {
+                ui.small("Copies attributes from the second input onto the nearest points or primitives of the first.");
+                ui.horizontal(|ui| {
+                    ui.label("Class");
+                    for (value, label) in transfer::CLASSES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.class, value, *label).changed();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Attributes");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.pattern).hint_text("* or Cd temperature ^id").desired_width(160.0)).changed();
+                });
+                c |= pfield(ui, pslider(&mut set.distance, 0.0..=100.0).logarithmic(true).smallest_positive(0.001).text("Distance threshold"))
+                    .on_hover_text("Elements farther than this from every source keep what they had").changed();
+                c |= pfield(ui, pslider(&mut set.blend_width, 0.0..=100.0).logarithmic(true).smallest_positive(0.001).text("Blend width"))
+                    .on_hover_text("Past the threshold, the transfer fades out over this distance instead of stopping at a hard edge").changed();
+                c |= pfield(ui, pslider(&mut set.samples, 1..=32).text("Max samples"))
+                    .on_hover_text("How many nearby sources are blended, weighted by distance (1: the nearest only)").changed();
             }
             NodeKind::EnvironmentLight { file, color, intensity, rotation, visible } => {
                 ui.heading("Environment Light");
@@ -18051,7 +18089,7 @@ impl ProceduralFxStudioApp {
         if response.hovered() {
             let scroll = ctx.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
-                self.cam_zoom = (self.cam_zoom * (1.0 - scroll * 0.002)).clamp(0.5, 200.0);
+                self.cam_zoom = (self.cam_zoom * (1.0 - scroll * 0.002)).clamp(MIN_ZOOM, 200.0);
             }
         }
         self.sync_active_camera_from_viewport();
@@ -18062,10 +18100,11 @@ impl ProceduralFxStudioApp {
         let focal = response.rect.height().min(response.rect.width()) * self.camera_focal;
         self.viewport_focal_px = focal;
         let zoom = self.cam_zoom;
-        let ortho_scale = focal / zoom.max(0.5);
+        let ortho_scale = focal / zoom.max(MIN_ZOOM);
         let target = self.cam_target;
 
-        let near_plane = self.camera_near;
+        // Close in, the near clip comes closer too, or it would cut away what's in view.
+        let near_plane = self.camera_near.min(self.cam_zoom * 0.1);
         let half_w = response.rect.width() * 0.5;
         let half_h = response.rect.height() * 0.5;
         let hw_focal = half_w / focal;
@@ -20855,6 +20894,7 @@ mod scene_file_tests {
             NodeKind::UvTexture(sops::UvTextureSettings { projection: 1, axis: 2, scale: [2.0, 3.0], offset: [0.1, 0.2] }),
             NodeKind::UvTransform(sops::UvTransformSettings { translate: [1.0, 2.0], rotate: 30.0, scale: [0.5, 0.5], pivot: [0.5, 0.5] }),
             NodeKind::UvQuickShade { file: "/textures/grid.png".into() },
+            NodeKind::AttributeTransfer(transfer::TransferSettings { class: 1, pattern: "Cd ^id".into(), samples: 3, distance: 0.25, blend_width: 0.5 }),
             NodeKind::Color(color::ColorSettings { class: 1, mode: 1, seed: 7, random_by: "piece".into(), ..color::ColorSettings::defaults() }),
             NodeKind::Boolean(boolean::BooleanSettings { operation: 1, mode: 1, resolution: 90 }),
             NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 33, splinter: 7.0, ..fracture::FractureSettings::defaults(2) }),
@@ -23733,6 +23773,35 @@ mod realtime_render_tests {
 mod viewport_point_tests {
     use super::*;
 
+    // A sphere of radius 0.001, framed (F), fills the view in either projection.
+    #[test]
+    fn tiny_things_can_be_framed() {
+        for orthographic in [false, true] {
+            let Some(gpu) = gpu_viewport::headless() else {
+                eprintln!("no GPU here; skipping");
+                return;
+            };
+            let mut app = ProceduralFxStudioApp::default();
+            app.gpu_viewport = Some(gpu);
+            app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.001 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n");
+            app.selected = None;
+            app.render_camera = RenderCamera::Viewport;
+            app.orthographic = orthographic;
+            app.rebuild_graph();
+            app.frame_all();
+            assert!(app.cam_zoom < 0.01, "zoom {}", app.cam_zoom);
+            let ctx = egui::Context::default();
+            let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))), ..Default::default() };
+            let _ = ctx.run(screen, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.viewport(ui, ctx));
+            });
+            let camera = app.resolve_render_camera().0.realtime_camera([100, 100], app.camera_near.min(app.cam_zoom * 0.1), 1.0);
+            let pixels = app.gpu_viewport.as_ref().unwrap().render([100, 100], &camera);
+            let covered = pixels.iter().filter(|p| p[3] > 0).count();
+            assert!(covered > 1000, "orthographic {orthographic}: the sphere covers {covered} of 10000 pixels");
+        }
+    }
+
     // Scattered points (no faces at all) show in perspective and orthographic views.
     #[test]
     fn points_alone_show_in_any_view() {
@@ -23775,5 +23844,29 @@ mod viewport_point_tests {
             let points = pixels.iter().filter(|p| p[3] > 0 && p[0] > 150 && p[2] < 100).count();
             assert!(points > 2000, "orthographic {orthographic}: {points} point pixels");
         }
+    }
+}
+
+#[cfg(test)]
+mod sheet_column_tests {
+    use super::*;
+
+    // Stored attributes come straight after P; normals worked out from the surface
+    // come last, and only when there is a surface.
+    #[test]
+    fn particle_attributes_come_first_in_the_spreadsheet() {
+        let headers = |mesh: &Mesh| sheet_columns(mesh, SheetDomain::Points).into_iter().map(|c| c.header).collect::<Vec<_>>();
+        // What the Particles solver outputs: points with v, age, life and id, no faces.
+        let mut particles = Mesh { vertices: vec![Vec3::zero(), Vec3::new(1.0, 0.0, 0.0)], ..Mesh::default() };
+        for (name, values) in [("v", vec![0.0; 6]), ("age", vec![0.5, 1.0]), ("life", vec![4.0; 2]), ("id", vec![0.0, 1.0])] {
+            particles.point_attributes.insert(name.into(), values);
+        }
+        assert_eq!(&headers(&particles)[..6], ["#", "P.x", "P.y", "P.z", "age", "id"]);
+        assert!(!headers(&particles).iter().any(|h| h.starts_with("N.")), "particles have no surface to take normals from");
+        let mut sphere = node_sphere(1.0, 4, 6);
+        sphere.point_attributes.insert("age".into(), vec![0.0; sphere.vertices.len()]);
+        let columns = headers(&sphere);
+        assert_eq!(&columns[4..5], ["age"]);
+        assert_eq!(&columns[columns.len() - 3..], ["N.x", "N.y", "N.z"]);
     }
 }
