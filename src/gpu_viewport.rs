@@ -431,6 +431,15 @@ struct Points {
     curves: Option<(wgpu::Buffer, u32)>,
     // The splats' positions' bounding box corners (for their blending weights).
     corners: Vec<[f32; 3]>,
+    // Every dot's, splat's and strand's bounding box corners, so the depth range
+    // reaches them (an orthographic view's far plane is fitted to what's drawn).
+    extent: Vec<[f32; 3]>,
+}
+
+// The 8 corners of the box around `positions` (none when there are none).
+fn box_corners(positions: impl Iterator<Item = [f32; 3]>) -> Vec<[f32; 3]> {
+    let (lo, hi) = positions.fold(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |(lo, hi), p| (std::array::from_fn(|k| lo[k].min(p[k])), std::array::from_fn(|k| hi[k].max(p[k]))));
+    if lo[0] <= hi[0] { (0..8).map(|i| std::array::from_fn(|k| if i >> k & 1 == 0 { lo[k] } else { hi[k] })).collect() } else { Vec::new() }
 }
 
 // The splats' buffers at one size: depth, the weighted colour sum, how much shows
@@ -671,14 +680,15 @@ impl GpuViewport {
         let buffer = |label: &str, bytes: &[u8], count: usize| {
             (count > 0).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage: wgpu::BufferUsages::VERTEX }), count as u32))
         };
-        let (lo, hi) = splats.iter().fold(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |(lo, hi), p| (std::array::from_fn(|k| lo[k].min(p.position[k])), std::array::from_fn(|k| hi[k].max(p.position[k]))));
-        let corners = if lo[0] <= hi[0] { (0..8).map(|i| std::array::from_fn(|k| if i >> k & 1 == 0 { lo[k] } else { hi[k] })).collect() } else { Vec::new() };
+        let corners = box_corners(splats.iter().map(|p| p.position));
+        let extent = box_corners(dots.iter().chain(splats).map(|p| p.position).chain(curves.iter().flat_map(|c| [c.a, c.b])));
         self.points = Some(Points {
             key,
             dots: buffer("viewport dots", bytemuck::cast_slice(dots), dots.len()),
             splats: buffer("viewport splats", bytemuck::cast_slice(splats), splats.len()),
             curves: buffer("viewport curves", bytemuck::cast_slice(curves), curves.len()),
             corners,
+            extent,
         });
     }
 
@@ -722,7 +732,7 @@ impl GpuViewport {
     fn encode(&self, camera: &Camera, target: &Target, blended: Option<&BlendTargets>) {
         let state = &self.render_state;
         // Orthographic depth runs from the near plane to just past the farthest corner.
-        let corners = self.scene.iter().flat_map(|s| &s.corners).chain(self.points.iter().flat_map(|p| &p.corners));
+        let corners = self.scene.iter().flat_map(|s| &s.corners).chain(self.points.iter().flat_map(|p| &p.extent));
         let deepest = corners.map(|&p| camera.to_cam(p)[2]).fold(camera.near, f32::max);
         let far = deepest + (deepest - camera.near).abs().max(1e-3) * 0.01;
         let splat_depth = self.points.iter().flat_map(|p| &p.corners).map(|&p| camera.to_cam(p)[2]).fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], z| [lo.min(z), hi.max(z)]);
