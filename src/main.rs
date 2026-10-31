@@ -5947,6 +5947,9 @@ struct Graph {
     channels: std::collections::BTreeMap<ChannelId, anim::Channel>,
     // Values written by the last apply_animation, to tell user edits from playback.
     applied: HashMap<ChannelId, f32>,
+    // Edits to animated parameters not keyed yet (Auto Key off), as in Houdini: the value
+    // holds at the frame it was made on, until it's keyed (K) or the frame changes.
+    pending: HashMap<ChannelId, (f32, f32)>,
 }
 
 impl Graph {
@@ -6067,7 +6070,7 @@ impl Graph {
         let mut any = false;
         for (channel_id, channel) in self.node_channels(id) {
             if let ChannelTarget::Param(i) = channel_id.target {
-                if let Some(v) = channel.value(time).filter(|_| i < params.len()) {
+                if let Some(v) = self.pending_at(*channel_id, time).or_else(|| channel.value(time)).filter(|_| i < params.len()) {
                     params[i] = v;
                     any = true;
                 }
@@ -6091,13 +6094,18 @@ impl Graph {
         for (channel_id, channel) in self.node_channels(id) {
             if let (ChannelTarget::Xform(i), false) = (channel_id.target, channel.is_empty()) {
                 if i < 9 {
-                    if let Some(v) = channel.value(time) {
+                    if let Some(v) = self.pending_at(*channel_id, time).or_else(|| channel.value(time)) {
                         set_xform_component(&mut x, i, v);
                     }
                 }
             }
         }
         x
+    }
+
+    // An unkeyed edit to this channel, if it was made at `time`.
+    fn pending_at(&self, id: ChannelId, time: f32) -> Option<f32> {
+        self.pending.get(&id).filter(|(at, _)| (at - time).abs() < 1e-6).map(|(_, v)| *v)
     }
 
     fn channel_value(&self, id: ChannelId) -> Option<f32> {
@@ -6112,6 +6120,8 @@ impl Graph {
     // gizmos show the animated values.
     fn apply_animation(&mut self, time: f32) {
         self.applied.clear();
+        // Moving to another frame drops unkeyed edits, as in Houdini.
+        self.pending.retain(|_, (at, _)| (*at - time).abs() < 1e-6);
         let animated: std::collections::BTreeSet<NodeId> = self.channels.keys().map(|c| c.node).collect();
         for id in animated {
             if !self.nodes.contains_key(&id) {
@@ -6131,9 +6141,10 @@ impl Graph {
         }
     }
 
-    // Keys every animated parameter that was changed since apply_animation (panel edits,
-    // gizmo drags) at `time`. Returns whether any key changed.
-    fn commit_animation_edits(&mut self, time: f32) -> bool {
+    // Every animated parameter changed since apply_animation (panel edits, gizmo drags):
+    // keyed at `time` with Auto Key, otherwise held as a pending edit. Returns whether
+    // anything changed.
+    fn commit_animation_edits(&mut self, time: f32, auto_key: bool) -> bool {
         let mut changed = false;
         let applied: Vec<(ChannelId, f32)> = self.applied.iter().map(|(c, v)| (*c, *v)).collect();
         for (channel_id, before) in applied {
@@ -6143,8 +6154,13 @@ impl Graph {
             }
             let Some(now) = self.channel_value(channel_id) else { continue };
             if (now - before).abs() > 1e-4 * before.abs().max(1.0) {
-                if let Some(channel) = self.channels.get_mut(&channel_id) {
+                if !auto_key {
+                    self.pending.insert(channel_id, (time, now));
+                    self.applied.insert(channel_id, now);
+                    changed = true;
+                } else if let Some(channel) = self.channels.get_mut(&channel_id) {
                     channel.set_key(time, now);
+                    self.pending.remove(&channel_id);
                     self.applied.insert(channel_id, now);
                     changed = true;
                 }
@@ -6158,6 +6174,7 @@ impl Graph {
         if let Some(value) = self.channel_value(id) {
             self.channels.entry(id).or_default().set_key(time, value);
             self.applied.insert(id, value);
+            self.pending.remove(&id);
         }
     }
 
@@ -10606,7 +10623,10 @@ impl ProceduralFxStudioApp {
 
     // Keys this frame's edits: animated parameters always, anything else with Auto Key.
     fn end_animation_frame(&mut self) {
-        let mut changed = self.graph.commit_animation_edits(self.time);
+        let mut changed = self.graph.commit_animation_edits(self.time, self.auto_key);
+        if changed && !self.auto_key && !self.graph.pending.is_empty() {
+            self.status = "Changed without a key (Auto Key is off): press K to key it, or it goes back to the animation on another frame".into();
+        }
         if self.auto_key {
             if let Some((id, params, xform)) = self.anim_snapshot.take() {
                 let targets = self.graph.nodes.get(&id).map(|n| n.kind.animatable()).unwrap_or_default();
@@ -11221,6 +11241,10 @@ impl ProceduralFxStudioApp {
                 ui.separator();
                 if ui.button("◆ Key").on_hover_text("Key the selected node at this frame (K)").clicked() {
                     self.key_selected();
+                }
+                if !self.graph.pending.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(255, 170, 60), format!("● {} unkeyed", self.graph.pending.len()))
+                        .on_hover_text("Changes to animated parameters, not keyed (Auto Key is off). Press K to key them; on another frame they go back to the animation");
                 }
                 ui.toggle_value(&mut self.auto_key, "Auto Key").on_hover_text("Key every parameter you change, not only animated ones");
                 let mut graph_open = self.open_panes.contains(&Pane::GraphEditor);
@@ -20579,12 +20603,31 @@ mod tests {
         assert_eq!(g.content_signature(None), signature, "evaluating animation is not an edit");
         assert_eq!(g.serialize(), saved, "the saved scene does not depend on the current time");
         assert!((g.nodes[&geo].xform.t[1] - 3.0).abs() < 1e-5, "panels and gizmos see the animated value");
-        // A gizmo or panel edit of an animated parameter keys the current frame.
+        let height = ChannelId { node: geo, target: ChannelTarget::Xform(1) };
+        // With Auto Key off, an edit of an animated parameter is pending: no key, but it
+        // holds on this frame (playback re-applying the animation doesn't undo it)...
+        g.nodes.get_mut(&geo).unwrap().xform.t[1] = 7.0;
+        assert!(g.commit_animation_edits(0.75, false));
+        assert!(!g.channels[&height].has_key_at(0.75));
+        g.apply_animation(0.75);
+        assert_eq!(g.nodes[&geo].xform.t[1], 7.0);
+        assert_eq!(g.xform_at(geo, 0.75).t[1], 7.0, "what's cooked on this frame uses it");
+        assert!(!g.commit_animation_edits(0.75, false), "nothing new");
+        // ...until another frame, which goes back to the animation.
+        g.apply_animation(0.5);
+        g.apply_animation(0.75);
+        assert!((g.nodes[&geo].xform.t[1] - 3.0).abs() < 1e-5, "the pending edit is dropped");
+        // Keying (K) a pending edit makes it a key.
+        g.nodes.get_mut(&geo).unwrap().xform.t[1] = 8.0;
+        g.commit_animation_edits(0.75, false);
+        g.set_key(height, 0.75);
+        assert!(g.pending.is_empty() && (g.channels[&height].eval(0.75) - 8.0).abs() < 1e-5);
+        // With Auto Key, an edit of an animated parameter keys the current frame.
         g.nodes.get_mut(&geo).unwrap().xform.t[1] = 10.0;
-        assert!(g.commit_animation_edits(0.75));
-        let channel = &g.channels[&ChannelId { node: geo, target: ChannelTarget::Xform(1) }];
+        assert!(g.commit_animation_edits(0.75, true));
+        let channel = &g.channels[&height];
         assert!(channel.has_key_at(0.75) && (channel.eval(0.75) - 10.0).abs() < 1e-5);
-        assert!(!g.commit_animation_edits(0.75), "nothing more to key");
+        assert!(!g.commit_animation_edits(0.75, true), "nothing more to key");
         // Channels survive saving, loading and duplication.
         let loaded = Graph::deserialize(&g.serialize());
         assert_eq!(loaded.channels, g.channels);
@@ -23104,7 +23147,7 @@ mod expression_tests {
         if let NodeKind::Scatter(s) = &mut g.nodes.get_mut(&scatter).unwrap().kind {
             s.seed = 99;
         }
-        assert!(!g.commit_animation_edits(0.0));
+        assert!(!g.commit_animation_edits(0.0, true));
         assert!(g.channels[&channel].keys.is_empty());
     }
 }
