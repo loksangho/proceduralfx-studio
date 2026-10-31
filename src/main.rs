@@ -69,6 +69,7 @@ mod textures;
 mod tops;
 mod transfer;
 mod enumerate;
+mod blur;
 mod fluidsurface;
 mod updater;
 mod vellum;
@@ -3878,6 +3879,8 @@ enum NodeKind {
     Color(color::ColorSettings),
     // Numbers points or primitives (or pieces) in an attribute.
     Enumerate(enumerate::EnumerateSettings),
+    // Evens out point attributes (or P) toward their neighbours' average.
+    AttributeBlur(blur::BlurSettings),
     // Copies attributes from the nearest points or primitives of its second input.
     AttributeTransfer(transfer::TransferSettings),
     // Node-based VEX: a container of VOP nodes compiled to VEX and run over `domain` (like Wrangle).
@@ -3968,6 +3971,7 @@ impl NodeKind {
             | NodeKind::HairGenerate(_)
             | NodeKind::RbdConfigure(_)
             | NodeKind::Extrude(_)
+            | NodeKind::AttributeBlur(_)
             | NodeKind::HeightfieldWrangle { .. } => GroupSupport::Native,
             NodeKind::VellumSolver(_) => GroupSupport::Pin,
             _ => GroupSupport::None,
@@ -4094,6 +4098,7 @@ impl NodeKind {
             NodeKind::AttributeTransfer(_) => names(&["class", "samples", "distance", "blend_width"]),
             NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis"]),
             NodeKind::Enumerate(_) => names(&["class", "start", "increment"]),
+            NodeKind::AttributeBlur(_) => names(&["mode", "weighting", "iterations", "step", "radius", "max_points", "pin_border"]),
             NodeKind::UvTransform(_) => names(&["translate.u", "translate.v", "rotate", "scale.u", "scale.v", "pivot.u", "pivot.v"]),
             NodeKind::VellumSolver(_) => names(&["type", "stretch_stiffness", "bend_stiffness", "shape_stiffness", "mass", "thickness", "gravity", "damping", "friction", "substeps", "iterations", "ground", "self_collision", "pin_to_animation"]),
             NodeKind::SopSolver { .. } => names(&["substeps"]),
@@ -4199,6 +4204,7 @@ impl NodeKind {
             NodeKind::Color(s) => vec![s.random_by.clone()],
             NodeKind::CopyToPoints { piece_attribute, .. } => vec![piece_attribute.clone()],
             NodeKind::Enumerate(s) => vec![s.attribute.clone(), s.piece_attribute.clone()],
+            NodeKind::AttributeBlur(s) => vec![s.pattern.clone()],
             NodeKind::AttributeTransfer(s) => vec![s.pattern.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
@@ -4267,6 +4273,7 @@ impl NodeKind {
                 next(&mut s.attribute);
                 next(&mut s.piece_attribute);
             }
+            NodeKind::AttributeBlur(s) => next(&mut s.pattern),
             NodeKind::AttributeTransfer(s) => next(&mut s.pattern),
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
@@ -4630,6 +4637,7 @@ impl NodeKind {
                     NodeKind::Color(color::ColorSettings::defaults()),
                     NodeKind::AttributeTransfer(transfer::TransferSettings::defaults()),
                     NodeKind::Enumerate(enumerate::EnumerateSettings::defaults()),
+                    NodeKind::AttributeBlur(blur::BlurSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
@@ -4841,6 +4849,7 @@ impl NodeKind {
             NodeKind::UvTransform(_) => "uv_transform",
             NodeKind::Color(_) => "color",
             NodeKind::Enumerate(_) => "enumerate",
+            NodeKind::AttributeBlur(_) => "attribute_blur",
             NodeKind::AttributeTransfer(_) => "attribute_transfer",
             NodeKind::UvQuickShade { .. } => "uv_quickshade",
             NodeKind::AttributePaint { .. } => "attribute_paint",
@@ -4927,7 +4936,8 @@ impl NodeKind {
             | NodeKind::AttributeRandomize(_)
             | NodeKind::AttributeDelete(_)
             | NodeKind::Color(_)
-            | NodeKind::Enumerate(_) => 1,
+            | NodeKind::Enumerate(_)
+            | NodeKind::AttributeBlur(_) => 1,
             // Input 0 is the geometry they change; 1-3 are read by point(1, ...), @opinput1_P and the like.
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => vex::INPUTS,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
@@ -5251,6 +5261,7 @@ impl NodeKind {
             NodeKind::UvTexture(s) => vec![s.projection as f32, s.axis as f32, s.scale[0], s.scale[1], s.offset[0], s.offset[1]],
             NodeKind::Color(s) => s.params(),
             NodeKind::Enumerate(s) => s.params(),
+            NodeKind::AttributeBlur(s) => s.params(),
             NodeKind::AttributeTransfer(s) => s.params(),
             NodeKind::UvTransform(s) => vec![s.translate[0], s.translate[1], s.rotate, s.scale[0], s.scale[1], s.pivot[0], s.pivot[1]],
             NodeKind::VellumSolver(s) => vec![
@@ -5703,6 +5714,7 @@ impl NodeKind {
             }),
             "color" => NodeKind::Color(color::ColorSettings::from_params(p, String::new())),
             "enumerate" => NodeKind::Enumerate(enumerate::EnumerateSettings::from_params(p)),
+            "attribute_blur" => NodeKind::AttributeBlur(blur::BlurSettings::from_params(p, "Cd".into())),
             "attribute_transfer" => NodeKind::AttributeTransfer(transfer::TransferSettings::from_params(p, "*".into())),
             "uv_transform" => NodeKind::UvTransform(sops::UvTransformSettings {
                 translate: [g(0), g(1)],
@@ -6252,10 +6264,14 @@ impl Graph {
                 });
                 let mut textures: Vec<Option<String>> = Vec::new();
                 let mut toon = vec![0.0f32; n];
+                let mut opacity: Option<Vec<f32>> = None;
                 for (t, m) in ids.iter().enumerate() {
                     let material = if *m >= 0.5 { Some((*m - 1.0).round() as usize) } else { object_material };
                     if let Some(id) = material.filter(|id| self.is_toon(*id)) {
                         toon[t] = id as f32 + 1.0;
+                    }
+                    if let Some(o) = material.and_then(|id| self.surface_opacity(id)) {
+                        opacity.get_or_insert_with(|| [1.0, 0.0].repeat(n))[t * 2..t * 2 + 2].copy_from_slice(&o);
                     }
                     let preview = material.and_then(|m| self.material_preview(m));
                     if let Some((colour, texture, uses_cd)) = preview {
@@ -6272,6 +6288,9 @@ impl Graph {
                 if toon.iter().any(|t| *t > 0.0) {
                     mesh.point_attributes.insert(TOON_ATTR.into(), toon);
                 }
+                if let Some(opacity) = opacity {
+                    mesh.point_attributes.insert(OPACITY_ATTR.into(), opacity);
+                }
                 // One texture for the whole mesh shows (the viewport has one per object).
                 textures.dedup();
                 if let [Some(texture)] = textures.as_slice() {
@@ -6287,6 +6306,9 @@ impl Graph {
                 }
                 if let Some(id) = object_material.filter(|id| self.is_toon(*id) && !mesh.indices.is_empty()) {
                     mesh.point_attributes.insert(TOON_ATTR.into(), vec![id as f32 + 1.0; mesh.indices.len()]);
+                }
+                if let Some(o) = object_material.and_then(|id| self.surface_opacity(id)).filter(|_| !mesh.indices.is_empty()) {
+                    mesh.point_attributes.insert(OPACITY_ATTR.into(), o.repeat(mesh.indices.len()));
                 }
                 // Image textures show in the viewport like UV Quick Shade.
                 if let Some(texture) = texture {
@@ -6930,6 +6952,17 @@ impl Graph {
     }
 
     // What the viewport shows for a MAT node: (colour, image texture, whether point Cd is used).
+    // A Principled Shader that isn't fully opaque: [opacity, 1 if it uses point Alpha].
+    fn surface_opacity(&self, material: NodeId) -> Option<[f32; 2]> {
+        match &self.nodes.get(&material)?.kind {
+            NodeKind::Shader(v) if v.table == shading::Table::Principled => {
+                let (opacity, alpha) = (v.float("opacity").clamp(0.0, 1.0), v.flag("use_point_alpha"));
+                (opacity < 1.0 || alpha).then_some([opacity, alpha as u8 as f32])
+            }
+            _ => None,
+        }
+    }
+
     fn is_toon(&self, material: NodeId) -> bool {
         matches!(self.nodes.get(&material).map(|n| &n.kind), Some(NodeKind::Shader(v)) if v.table == shading::Table::Toon)
     }
@@ -7814,6 +7847,12 @@ impl Graph {
                 NodeKind::UvTransform(settings) => self.report(id, sops::uv_transform(&input(0, cache), settings)),
                 NodeKind::Color(settings) => self.report(id, color::color(&input(0, cache), settings)),
                 NodeKind::Enumerate(settings) => self.report(id, enumerate::enumerate(&input(0, cache), settings)),
+                NodeKind::AttributeBlur(settings) => {
+                    // The group's points change; the rest are read but kept.
+                    let source = input(0, cache);
+                    let blurred = groups::point_mask(&source, &node.group).and_then(|mask| blur::blur(&source, settings, mask.as_deref()));
+                    self.report(id, blurred)
+                }
                 NodeKind::AttributeTransfer(settings) => self.report(id, transfer::transfer(&input(0, cache), &input(1, cache), settings)),
                 NodeKind::UvQuickShade { file } => self.report(id, sops::uv_quickshade(&input(0, cache), file)),
                 NodeKind::VellumSolver(settings) => {
@@ -8575,6 +8614,9 @@ const PRIM_MATERIAL: &str = "prim:material";
 // On displayed geometry only: each primitive's Toon Shader (node id + 1; 0: none), so the
 // real-time renderer cel-shades and outlines it.
 pub(crate) const TOON_ATTR: &str = "prim:__toon";
+// Also on displayed geometry only: each primitive's material opacity and whether it
+// multiplies by the geometry's Alpha (Principled "Use point alpha"), for the real-time renderer.
+pub(crate) const OPACITY_ATTR: &str = "prim:__opacity";
 
 // The Material SOP: later slots (and later Material nodes) override earlier ones.
 fn material_assign(input: &Mesh, slots: &[(String, Option<NodeId>)]) -> Result<Mesh, String> {
@@ -12995,8 +13037,15 @@ impl ProceduralFxStudioApp {
                 .get("Cd")
                 .filter(|c| c.len() == mesh.vertices.len() * 3)
                 .or_else(|| mesh.point_attributes.get("prim:Cd").filter(|c| c.len() == mesh.indices.len() * 3));
-            if cd.is_some() {
-                writeln!(f, "    [\"primitive_attributes\"] = {{ UserData(\"/scene/objects/mesh{index}_Cd\") }},") .map_err(|e| e.to_string())?;
+            // Alpha too, for shaders using point alpha.
+            let alpha = mesh
+                .point_attributes
+                .get("Alpha")
+                .filter(|a| a.len() == mesh.vertices.len())
+                .or_else(|| mesh.point_attributes.get("prim:Alpha").filter(|a| a.len() == mesh.indices.len()));
+            let user_data: Vec<String> = [cd.map(|_| "Cd"), alpha.map(|_| "Alpha")].into_iter().flatten().map(|key| format!("UserData(\"/scene/objects/mesh{index}_{key}\")")).collect();
+            if !user_data.is_empty() {
+                writeln!(f, "    [\"primitive_attributes\"] = {{ {} }},", user_data.join(", ")) .map_err(|e| e.to_string())?;
             }
             writeln!(f, "    [\"is_subd\"] = false") .map_err(|e| e.to_string())?;
             writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
@@ -13004,6 +13053,14 @@ impl ProceduralFxStudioApp {
                 let mut body = format!("UserData(\"/scene/objects/mesh{index}_Cd\") {{\n    [\"color_key\"] = \"Cd\",\n    [\"color_values_0\"] = {{\n");
                 for c in cd.chunks(3) {
                     body.push_str(&format!("        Rgb({:.4}, {:.4}, {:.4}),\n", c[0], c[1], c[2]));
+                }
+                body.push_str("    }\n}\n\n");
+                f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            if let Some(alpha) = alpha {
+                let mut body = format!("UserData(\"/scene/objects/mesh{index}_Alpha\") {{\n    [\"float_key\"] = \"Alpha\",\n    [\"float_values_0\"] = {{\n");
+                for a in alpha {
+                    body.push_str(&format!("        {a:.4},\n"));
                 }
                 body.push_str("    }\n}\n\n");
                 f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
@@ -15125,7 +15182,7 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::Shader(values) => {
                 ui.small(match values.table {
-                    shading::Table::Principled => "Physically based surface (MoonRay DwaBaseMaterial). Assign it from a Geometry node.",
+                    shading::Table::Principled => "Physically based surface (MoonRay DwaBaseMaterial). Assign it from a Geometry node. Opacity, and Use point alpha (the geometry's Alpha), also show in the viewport and sprite sheets.",
                     shading::Table::Toon => "Cel-shaded surface with banded shadows, a toon highlight and outlines, in the viewport and sprite sheets as in MoonRay (DwaToonMaterial; outlines are real-time only).",
                     shading::Table::Hair => "For hair and fur curves from Hair Generate (HairMaterial_v3).",
                     shading::Table::Pyro => "For Pyro and other fog volumes: smoke colour and density, fire brightness and tint.",
@@ -16228,6 +16285,36 @@ impl ProceduralFxStudioApp {
                 });
                 c |= ui.checkbox(&mut set.invert, "Invert").changed();
                 ui.small("Stored as a 0/1 attribute (group:name / prim:group:name); use the name in any node's Group field.");
+            }
+            NodeKind::AttributeBlur(set) => {
+                ui.horizontal(|ui| {
+                    ui.label("Attributes");
+                    c |= ui
+                        .add(egui::TextEdit::singleline(&mut set.pattern).desired_width(160.0).hint_text("Cd mask"))
+                        .on_hover_text("Point attributes, separated by spaces: * for all, ^name to skip one. P (named) smooths the shape itself")
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Neighbours");
+                    for (value, label) in blur::MODES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.mode, value, *label).changed();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Weighting");
+                    for (value, label) in blur::WEIGHTINGS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.weighting, value, *label).on_hover_text("Edge length: nearer neighbours count more").changed();
+                    }
+                });
+                c |= pfield(ui, pslider(&mut set.iterations, 0..=200).logarithmic(true).text("Blurring iterations")).changed();
+                c |= pfield(ui, pslider(&mut set.step, 0.0..=1.0).text("Step size")).on_hover_text("How far each pass moves toward the neighbours' average").changed();
+                if set.mode == 1 {
+                    c |= pfield(ui, pslider(&mut set.radius, 0.001..=10.0).logarithmic(true).text("Radius")).changed();
+                    c |= pfield(ui, pslider(&mut set.max_points, 1..=100).text("Max points")).changed();
+                } else {
+                    c |= ui.checkbox(&mut set.pin_border, "Pin border").on_hover_text("Points on open edges keep their values").changed();
+                }
+                ui.small("Connectivity: points sharing a polygon edge. Proximity: the nearest points within the radius (works on loose points and particles). The group's points change; the others feed in but stay as they are.");
             }
             NodeKind::Enumerate(set) => {
                 ui.horizontal(|ui| {
@@ -18860,6 +18947,16 @@ impl ProceduralFxStudioApp {
         let mut gpu_toon: Vec<gpu_viewport::ToonVertex> = Vec::new();
         // Smooth point normals push the outline out without gaps at hard edges.
         let smooth_normals = if toon_ids.is_some() { built.compute_normals() } else { Vec::new() };
+        // See-through faces: the material's opacity, times Alpha when it uses point alpha.
+        let opacity = built.point_attributes.get(OPACITY_ATTR).filter(|v| v.len() == built.indices.len() * 2);
+        let point_alpha = built.point_attributes.get("Alpha").filter(|a| a.len() == built.vertices.len());
+        let prim_alpha = built.point_attributes.get("prim:Alpha").filter(|a| a.len() == built.indices.len());
+        let corner_alpha = |tri_index: usize, point: usize| -> f32 {
+            let Some(o) = opacity else { return 1.0 };
+            let (amount, uses_alpha) = (o[tri_index * 2], o[tri_index * 2 + 1] > 0.5);
+            let alpha = if uses_alpha { point_alpha.map(|a| a[point]).or(prim_alpha.map(|a| a[tri_index])).unwrap_or(1.0) } else { 1.0 };
+            (amount * alpha).clamp(0.0, 1.0)
+        };
         for (tri_index, tri) in built.indices.iter().enumerate() {
             if self.isolate_selection {
                 let keep = match self.selection_mode {
@@ -18969,7 +19066,11 @@ impl ProceduralFxStudioApp {
                     }));
                 } else if self.render_mode != RenderMode::Wireframe {
                     // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
-                    gpu_faces.extend((0..3).map(|k| gpu_viewport::Vertex::new(corner(k), rgba(colors[k]), uv.map(|uv| [uv[k].x, uv[k].y]))));
+                    gpu_faces.extend((0..3).map(|k| {
+                        let mut colour = rgba(colors[k]);
+                        colour[3] = corner_alpha(tri_index, tri[k]);
+                        gpu_viewport::Vertex::new(corner(k), colour, uv.map(|uv| [uv[k].x, uv[k].y]))
+                    }));
                 }
                 // Toon faces have their outline instead of the wireframe.
                 if let Some(c) = wire.filter(|_| toon.is_none()) {
@@ -21047,6 +21148,7 @@ mod scene_file_tests {
             NodeKind::AttributeTransfer(transfer::TransferSettings { class: 1, pattern: "Cd ^id".into(), samples: 3, distance: 0.25, blend_width: 0.5 }),
             NodeKind::Color(color::ColorSettings { class: 1, mode: 1, seed: 7, random_by: "piece".into(), ..color::ColorSettings::defaults() }),
             NodeKind::Enumerate(enumerate::EnumerateSettings { class: 1, attribute: "variant".into(), piece_attribute: "name".into(), start: 3.0, increment: 2.0 }),
+            NodeKind::AttributeBlur(blur::BlurSettings { pattern: "Cd mask".into(), mode: 1, weighting: 1, iterations: 7, step: 0.4, radius: 0.3, max_points: 6, pin_border: true }),
             NodeKind::CopyToPoints { scale: 0.5, rotation: [0.0, 45.0, 0.0], piece_attribute: "variant".into() },
             NodeKind::Boolean(boolean::BooleanSettings { operation: 1, mode: 1, resolution: 90 }),
             NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 33, splinter: 7.0, ..fracture::FractureSettings::defaults(2) }),
@@ -21946,6 +22048,36 @@ mod shader_render_tests {
         app.graph.connect(hsv, output, 0);
         app.graph.connect(cells, output, 1);
         (app, principled, toon, builder)
+    }
+
+    #[test]
+    fn principled_opacity_follows_point_alpha() {
+        let (mut app, principled, _, _) = shaded_app();
+        if let NodeKind::Shader(v) = &mut app.graph.nodes.get_mut(&principled).unwrap().kind {
+            v.set("use_point_alpha", [1.0, 0.0, 0.0]);
+            v.set("opacity", [0.8, 0.0, 0.0]);
+        }
+        let mut faded = panel();
+        let n = faded.vertices.len();
+        faded.point_attributes.insert("Alpha".into(), (0..n).map(|i| i as f32 / n as f32).collect());
+        let scene = RenderScene { parts: vec![(faded, PartMaterial::Node(principled))], lights: app.scene_lights(), environment: None, camera: None, volumes: Vec::new() };
+        let path = std::env::temp_dir().join(format!("pfx_alpha_{}.rdla", std::process::id()));
+        app.export_scene_rdla(&path, &scene, 64, 48, 4).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let map = format!("/scene/materials/mat{principled}_point_alpha");
+        assert!(text.contains(&format!("[\"presence\"] = bind(AttributeMap(\"{map}\"))")), "{text}");
+        // The map reads the float Alpha, with Opacity where there's none.
+        assert!(text.contains(&format!("AttributeMap(\"{map}\") {{\n    [\"primitive_attribute_name\"] = \"Alpha\",\n    [\"primitive_attribute_type\"] = 0,")));
+        assert!(text.contains("Rgb(0.8000, 0.8000, 0.8000)") || text.contains("Rgb(0.8, 0.8, 0.8)"));
+        // The mesh carries Alpha (and Cd) as user data.
+        assert!(text.contains("[\"primitive_attributes\"] = { UserData(\"/scene/objects/mesh0_Cd\"), UserData(\"/scene/objects/mesh0_Alpha\") }") || text.contains("[\"primitive_attributes\"] = { UserData(\"/scene/objects/mesh0_Alpha\") }"), "{text}");
+        assert!(text.contains("UserData(\"/scene/objects/mesh0_Alpha\") {\n    [\"float_key\"] = \"Alpha\""));
+        // Off, a constant presence as before.
+        if let NodeKind::Shader(v) = &mut app.graph.nodes.get_mut(&principled).unwrap().kind {
+            v.set("use_point_alpha", [0.0, 0.0, 0.0]);
+        }
+        app.export_scene_rdla(&path, &scene, 64, 48, 4).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[\"presence\"] = 0.8000"));
     }
 
     #[test]
@@ -23746,6 +23878,51 @@ mod realtime_render_tests {
             }
         }
         assert!(app.flipbook_recording.is_none(), "the recording finished: {}", app.status);
+    }
+
+    #[test]
+    fn point_alpha_shows_in_real_time_renders() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        // A square facing the camera, Alpha 0.25 on the left half and 1 on the right,
+        // under a Principled Shader using point alpha.
+        let mut g = Graph::default();
+        let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let grid = g.add(NodeKind::Grid { size: 2.0, res: 8 }, egui::pos2(0.0, 0.0));
+        let turn = g.add(NodeKind::Transform { t: [0.0; 3], r: [90.0, 0.0, 0.0], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        let alpha = g.add(NodeKind::Wrangle { code: "f@Alpha = @P.x < -0.1 ? 0.25 : 1.0;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        for n in [grid, turn, alpha] {
+            g.nodes.get_mut(&n).unwrap().parent = Some(geo);
+        }
+        g.connect(grid, turn, 0);
+        g.connect(turn, alpha, 0);
+        g.displays.insert(geo, alpha);
+        let mut shader = shading::Values::new(shading::Table::Principled);
+        shader.set("base_color", [1.0, 1.0, 1.0]);
+        shader.set("use_point_alpha", [1.0, 0.0, 0.0]);
+        let material = g.add(NodeKind::Shader(shader), egui::pos2(0.0, 0.0));
+        g.nodes.get_mut(&material).unwrap().context = AppContext::Mat;
+        g.nodes.get_mut(&geo).unwrap().kind = NodeKind::Geometry { material: Some(material) };
+        app.graph = g;
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+        (app.playback_start, app.playback_end) = (0.0, 0.0);
+        app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, ..Default::default() };
+        app.dirty = true;
+        app.preview_sprite_sheet();
+        run_recording(&mut app);
+        let frame = &app.flipbook_viewer.as_ref().expect("the preview opens").frames()[0];
+        let at = |x: usize| frame.pixels[32 * 64 + x];
+        // Left of centre: a quarter there; right: solid.
+        let (left, right) = (at(24), at(40));
+        assert!((50..=80).contains(&left.a()), "left {left:?}");
+        assert_eq!(right.a(), 255, "right {right:?}");
+        assert_eq!(at(1).a(), 0, "empty beyond the square");
     }
 
     #[test]

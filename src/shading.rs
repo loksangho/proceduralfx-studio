@@ -70,6 +70,8 @@ pub const PRINCIPLED: &[Param] = &[
     f("iridescence", "Iridescence", "Other", 0.0, 1.0, 0.0),
     f("texture_scale_u", "Texture repeat U", "Textures", 0.01, 100.0, 1.0),
     f("texture_scale_v", "Texture repeat V", "Textures", 0.01, 100.0, 1.0),
+    // Added later: kept at the end so older scenes load their values in place.
+    t("use_point_alpha", "Use point alpha (Alpha)", "Other", false),
 ];
 
 // Text parameters of the Principled Shader, in texts() order.
@@ -458,8 +460,15 @@ pub fn principled_rdla(name: &str, p: &Values, inputs: &HashMap<&str, Input>, ob
         put("emission", inputs.get("emission").map_or(rgb(p.color("emission_color").map(|c| c * emission)), Input::rdla));
     }
     let opacity = p.float("opacity");
-    if opacity < 1.0 || inputs.contains_key("opacity") {
-        put("presence", inputs.get("opacity").map_or(format!("{opacity:.4}"), Input::rdla));
+    if let Some(input) = inputs.get("opacity") {
+        put("presence", input.rdla());
+    } else if p.flag("use_point_alpha") {
+        // The geometry's Alpha (points or primitives); Opacity where it has none.
+        let map = format!("{name}_point_alpha");
+        objects.push_str(&attribute_map(&map, "Alpha", 0, [opacity; 3]));
+        put("presence", Input::Map(format!("AttributeMap(\"{map}\")")).rdla());
+    } else if opacity < 1.0 {
+        put("presence", format!("{opacity:.4}"));
     }
     if p.float("anisotropy") != 0.0 {
         put("anisotropy", format!("{:.4}", p.float("anisotropy")));

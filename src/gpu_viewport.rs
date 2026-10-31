@@ -535,6 +535,8 @@ pub struct GpuViewport {
     // The splats' passes: the surfaces' depth again (without antialiasing), the
     // splats, then the composite over the image.
     depth_only: wgpu::RenderPipeline,
+    // See-through faces: depth-tested, not written, so they don't hide each other.
+    see_through: wgpu::RenderPipeline,
     // Toon faces, their outlines, and their depth for the splats.
     toon: wgpu::RenderPipeline,
     outline: wgpu::RenderPipeline,
@@ -598,6 +600,8 @@ const REVEAL: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 struct Scene {
     key: u64,
     faces: Option<(wgpu::Buffer, u32)>,
+    // Faces with any corner less than opaque, drawn after the rest, blended.
+    see_through: Option<(wgpu::Buffer, u32)>,
     edges: Option<(wgpu::Buffer, u32)>,
     toon: Option<(wgpu::Buffer, u32)>,
     texture: Option<Arc<raster::Texture>>,
@@ -670,6 +674,7 @@ impl GpuViewport {
         // Faces are pushed back by their depth slope (grazing faces change fast), as raster.rs biases its edges.
         let surfaces = pipeline("viewport surfaces", "vs_surface", wgpu::PrimitiveTopology::TriangleList, true, wgpu::DepthBiasState { constant: 0, slope_scale: 1.5, clamp: 0.0 });
         let edges = pipeline("viewport edges", "vs_edge", wgpu::PrimitiveTopology::LineList, false, Default::default());
+        let see_through = pipeline("viewport see-through faces", "vs_surface", wgpu::PrimitiveTopology::TriangleList, false, Default::default());
         let point_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x4, 3 => Float32x4];
         let point_buffers = [wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Point>() as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &point_attributes }];
         let dots = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -824,7 +829,7 @@ impl GpuViewport {
         });
         let white = raster::Texture { width: 1, height: 1, pixels: vec![[255; 4]] };
         let blank = texture_bind_group(&render_state, &layout, &sampler, &white);
-        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, toon, outline, toon_depth, toon_table, toon_group, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
+        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, see_through, toon, outline, toon_depth, toon_table, toon_group, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
     }
 
     // Whether the scene uploaded last has this key (what the mesh, lights and display mode hash to).
@@ -856,7 +861,18 @@ impl GpuViewport {
                 self.texture = Some((texture.clone(), texture_bind_group(&self.render_state, &self.layout, &self.sampler, texture)));
             }
         }
-        self.scene = Some(Scene { key, faces: buffer("viewport faces", faces), edges: buffer("viewport edges", edges), toon: toon_buffer, texture, corners });
+        // See-through faces go last, blended over what's behind them without hiding it.
+        let (opaque, see_through): (Vec<&[Vertex]>, Vec<&[Vertex]>) = faces.chunks(3).partition(|t| t.iter().all(|v| v.color[3] >= 0.999));
+        let (opaque, see_through): (Vec<Vertex>, Vec<Vertex>) = (opaque.concat(), see_through.concat());
+        self.scene = Some(Scene {
+            key,
+            faces: buffer("viewport faces", &opaque),
+            see_through: buffer("viewport see-through faces", &see_through),
+            edges: buffer("viewport edges", edges),
+            toon: toon_buffer,
+            texture,
+            corners,
+        });
     }
 
     // Whether the points uploaded last have this key.
@@ -963,6 +979,11 @@ impl GpuViewport {
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.draw(0..*count, 0..1);
                     }
+                }
+                if let Some((buffer, count)) = &scene.see_through {
+                    pass.set_pipeline(&self.see_through);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
                 }
                 if let Some((buffer, count)) = &scene.edges {
                     pass.set_pipeline(&self.edges);
@@ -1354,6 +1375,26 @@ mod tests {
         let other = middle(&gpu);
         assert!((0..4).all(|c| one[c].abs_diff(other[c]) <= 1), "order doesn't matter: {one:?} vs {other:?}");
         assert!(one[0] > one[2], "the nearer (red) splat weighs more: {one:?}");
+    }
+
+    #[test]
+    fn see_through_faces_blend_over_what_is_behind() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        // A half-transparent white wall in front of a red one; drawn first, it still
+        // doesn't hide the red (see-through faces go last and don't write depth).
+        let front: Vec<Vertex> = wall(0.0).into_iter().map(|v| Vertex { color: [1.0, 1.0, 1.0, 0.5], ..v }).collect();
+        let back: Vec<Vertex> = wall(2.0).into_iter().map(|v| Vertex { color: [1.0, 0.0, 0.0, 1.0], ..v }).collect();
+        gpu.set_scene(1, &[front.clone(), back].concat(), &[], &[], &[], None);
+        let image = gpu.render([20, 20], &straight_on());
+        let p = image[10 * 20 + 10];
+        assert!(p[0] == 255 && (120..=135).contains(&p[1]) && p[3] == 255, "pink: {p:?}");
+        // Alone, it's half there (premultiplied).
+        gpu.set_scene(2, &front, &[], &[], &[], None);
+        let p = gpu.render([20, 20], &straight_on())[10 * 20 + 10];
+        assert!((120..=135).contains(&p[3]) && p[0] == p[3], "half: {p:?}");
     }
 
     #[test]
