@@ -1095,6 +1095,7 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("neighbourcount", 2, 2, "Geometry", "neighbourcount(0, ptnum)"),
     ("primpoints", 2, 2, "Geometry", "primpoints(0, primnum)"),
     ("pointprims", 2, 2, "Geometry", "pointprims(0, ptnum)"),
+    ("getbbox", 2, 4, "Geometry", "getbbox([0, [\"primgroup\",]] min, max) writes the bounding box's corners into min and max"),
     ("getbbox_min", 1, 1, "Geometry", "getbbox_min(0)"),
     ("getbbox_max", 1, 1, "Geometry", "getbbox_max(0)"),
     ("getbbox_center", 1, 1, "Geometry", "getbbox_center(0)"),
@@ -1131,8 +1132,13 @@ const OUT_PARAMS: [(&str, &[usize]); 7] = [
     ("setcomp", &[0]),
 ];
 
-fn out_params(name: &str) -> &'static [usize] {
-    OUT_PARAMS.iter().find(|(n, _)| *n == name).map_or(&[], |(_, outs)| outs)
+// The arguments a builtin writes, given how many it was called with.
+fn out_params(name: &str, count: usize) -> Vec<usize> {
+    // getbbox([input, [group,]] min, max): always the last two.
+    if name == "getbbox" {
+        return vec![count.saturating_sub(2), count.saturating_sub(1)];
+    }
+    OUT_PARAMS.iter().find(|(n, _)| *n == name).map_or(Vec::new(), |(_, outs)| outs.to_vec())
 }
 
 // Builtins that modify their first (array) argument in place.
@@ -1877,7 +1883,7 @@ impl Parser {
             return Self::err_at(token, format!("'{name}' expects {expected} argument(s), got {}", args.len()));
         }
         let mut places = Vec::new();
-        let outs = out_params(static_name);
+        let outs = out_params(static_name, args.len());
         if !outs.is_empty() {
             for (i, arg) in args.iter().enumerate() {
                 let place = if outs.contains(&i) {
@@ -3249,7 +3255,7 @@ impl<'a> Runtime<'a> {
     }
 
     fn call_builtin_values(&mut self, name: &'static str, values: &[Value], places: &'a [Option<Place>], want_vec: bool, fr: &mut Frame<'a>) -> R<Value> {
-        if !out_params(name).is_empty() {
+        if !out_params(name, values.len()).is_empty() {
             let (result, outputs) = self.builtin_with_outputs(name, values).map_err(|e| format!("{name}(): {e}"))?;
             for (i, value) in outputs {
                 if let Some(Some(place)) = places.get(i) {
@@ -3360,7 +3366,10 @@ impl<'a> Runtime<'a> {
             let n = a.first().ok_or("no input number")?.int()?;
             usize::try_from(n).ok().filter(|n| *n < INPUTS).ok_or_else(|| format!("inputs are numbered 0 to {}, not {n}", INPUTS - 1))
         };
-        Ok(if READS_INPUT.contains(&name) || name == "pcfind" || name == "pcopen" {
+        Ok(if name == "getbbox" {
+            // getbbox(min, max) has no input number: it reads input 0.
+            if a.len() > 2 { Some(handle()?).filter(|n| *n > 0) } else { None }
+        } else if READS_INPUT.contains(&name) || name == "pcfind" || name == "pcopen" {
             Some(handle()?).filter(|n| *n > 0)
         } else if WRITES_INPUT.contains(&name) {
             if handle()? != 0 {
@@ -3430,6 +3439,23 @@ impl<'a> Runtime<'a> {
     // Builtins with output arguments: the result plus (argument index, value) to write back.
     fn builtin_with_outputs(&mut self, name: &str, a: &[Value]) -> R<(Value, Vec<(usize, Value)>)> {
         Ok(match name {
+            "getbbox" => {
+                let n = a.len();
+                // Only the group's primitives (and their points) count; no group: everything.
+                let (lo, hi) = match (n == 4).then(|| a[1].string()).transpose()?.filter(|g| !g.trim().is_empty()) {
+                    Some(group) => {
+                        let mask = crate::groups::prim_mask(self.input, &crate::groups::NodeGroup { pattern: group.to_string(), kind: 2 })?.unwrap_or_default();
+                        let points = self.input.indices.iter().zip(&mask).filter(|(_, m)| **m).flat_map(|(t, _)| t.iter().map(|&p| self.input.vertices[p]));
+                        points
+                            .fold(None, |acc: Option<(Vec3, Vec3)>, p| {
+                                Some(acc.map_or((p, p), |(lo, hi)| (Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)), Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)))))
+                            })
+                            .unwrap_or((Vec3::zero(), Vec3::zero()))
+                    }
+                    None => self.bounds(),
+                };
+                (Value::Int(0), vec![(n - 2, Value::Vec(arr3(lo))), (n - 1, Value::Vec(arr3(hi)))])
+            }
             "xyzdist" => {
                 let p = vec3(a[1].vec()?);
                 match closest_on_surface(self.input, p) {
@@ -4182,7 +4208,7 @@ impl<'a> Runtime<'a> {
                     Float(sum / total)
                 }
             }
-            "xyzdist" | "intersect" | "pcimport" | "translate" | "rotate" | "scale" | "setcomp" => self.builtin_with_outputs(name, a)?.0,
+            "xyzdist" | "intersect" | "pcimport" | "translate" | "rotate" | "scale" | "setcomp" | "getbbox" => self.builtin_with_outputs(name, a)?.0,
             "minpos" => match closest_on_surface(self.input, vec3(a[1].vec()?)) {
                 Some(hit) => V(arr3(hit.position)),
                 None => V(a[1].vec()?),
@@ -4884,6 +4910,31 @@ mod tests {
         assert!(error("int f(int n) { return f(n + 1); }\nf(0);").contains("nested function calls"));
         assert!(error("string s = \"a\";\nfloat x = s * 2;").starts_with("line 2"));
         assert!(error("error(\"custom %d\", 4);").contains("custom 4"));
+    }
+
+    #[test]
+    fn getbbox_writes_the_corners() {
+        let mut raised = grid();
+        raised.vertices.iter_mut().for_each(|p| p.y = 3.0);
+        // The first two triangles (x from -1 to 0, z from -1 to 0) are in group "corner".
+        let mut grouped = grid();
+        grouped.point_attributes.insert("prim:group:corner".into(), vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let inputs = [raised];
+        let run = |mesh: Mesh, code: &str| run_masked(mesh, &inputs, code, 0.0, 1.0, 0, None, None);
+        let corners = |out: &Mesh| (out.point_attributes["detail:lo"].clone(), out.point_attributes["detail:hi"].clone());
+        let (out, report) = run(grid(), "vector lo, hi; getbbox(lo, hi); v@lo = lo; v@hi = hi;");
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(corners(&out), (vec![-1.0, 0.0, -1.0], vec![1.0, 0.0, 1.0]));
+        let (out, _) = run(grid(), "vector lo, hi; getbbox(1, lo, hi); v@lo = lo; v@hi = hi;");
+        assert_eq!(corners(&out), (vec![-1.0, 3.0, -1.0], vec![1.0, 3.0, 1.0]));
+        let (out, report) = run(grouped.clone(), "vector lo, hi; getbbox(0, \"corner\", lo, hi); v@lo = lo; v@hi = hi;");
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(corners(&out), (vec![-1.0, 0.0, -1.0], vec![0.0, 0.0, 0.0]));
+        // An empty group string means everything; it agrees with getbbox_min/max.
+        let (out, _) = run(grouped, "vector lo, hi; getbbox(0, \"\", lo, hi); v@lo = lo - getbbox_min(0); v@hi = hi - getbbox_max(0);");
+        assert_eq!(corners(&out), (vec![0.0; 3], vec![0.0; 3]));
+        // min and max are outputs.
+        assert!(run(grid(), "vector hi; getbbox(0, {0, 0, 0}, hi);").1.error.unwrap().contains("must be a variable"));
     }
 
     #[test]
