@@ -29,7 +29,8 @@ pub struct Op {
     // Input names, with the VEX used when an input isn't connected.
     pub inputs: &'static [(&'static str, &'static str)],
     out: Out,
-    // VEX for the result, with {0}, {1}... for the inputs.
+    // VEX for the result, with {0}, {1}... for the inputs, and {geo} for the geometry
+    // input it reads (0-3; see VopNode::input).
     template: &'static str,
     pub help: &'static str,
 }
@@ -93,14 +94,14 @@ pub const OPS: &[Op] = &[
     // New ops go at the end: scenes store the op's position in this list.
     Op { label: "Get Attribute", category: "Geometry", inputs: &[("point", "@ptnum")], out: Out::Chosen, template: "", help: "Reads an attribute from any point of the input (by number)" },
     Op { label: "Point Cloud Average", category: "Geometry", inputs: &[("position", "v@P"), ("radius", "0.5"), ("max points", "10")], out: Out::Chosen, template: "", help: "Distance-weighted average of an attribute over nearby points" },
-    Op { label: "Nearest Point", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Int, template: "nearpoint(0, {0})", help: "Number of the closest point" },
-    Op { label: "Distance to Surface", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Float, template: "xyzdist(0, {0})", help: "Distance to the input's surface" },
-    Op { label: "Closest Point on Surface", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Vector, template: "minpos(0, {0})", help: "The nearest position on the input's surface" },
-    Op { label: "Neighbour Count", category: "Geometry", inputs: &[("point", "@ptnum")], out: Out::Int, template: "neighbourcount(0, {0})", help: "How many points are connected to this one" },
-    Op { label: "Point Count", category: "Geometry", inputs: &[], out: Out::Int, template: "npoints(0)", help: "Number of points in the input" },
-    Op { label: "Bounding Box Centre", category: "Geometry", inputs: &[], out: Out::Vector, template: "getbbox_center(0)", help: "Centre of the input's bounding box" },
-    Op { label: "Bounding Box Size", category: "Geometry", inputs: &[], out: Out::Vector, template: "getbbox_size(0)", help: "Size of the input's bounding box" },
-    Op { label: "Relative to Bounding Box", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Vector, template: "relpointbbox(0, {0})", help: "Where a position sits inside the bounding box, 0..1 per axis" },
+    Op { label: "Nearest Point", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Int, template: "nearpoint({geo}, {0})", help: "Number of the closest point" },
+    Op { label: "Distance to Surface", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Float, template: "xyzdist({geo}, {0})", help: "Distance to the input's surface" },
+    Op { label: "Closest Point on Surface", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Vector, template: "minpos({geo}, {0})", help: "The nearest position on the input's surface" },
+    Op { label: "Neighbour Count", category: "Geometry", inputs: &[("point", "@ptnum")], out: Out::Int, template: "neighbourcount({geo}, {0})", help: "How many points are connected to this one" },
+    Op { label: "Point Count", category: "Geometry", inputs: &[], out: Out::Int, template: "npoints({geo})", help: "Number of points in the input" },
+    Op { label: "Bounding Box Centre", category: "Geometry", inputs: &[], out: Out::Vector, template: "getbbox_center({geo})", help: "Centre of the input's bounding box" },
+    Op { label: "Bounding Box Size", category: "Geometry", inputs: &[], out: Out::Vector, template: "getbbox_size({geo})", help: "Size of the input's bounding box" },
+    Op { label: "Relative to Bounding Box", category: "Geometry", inputs: &[("position", "v@P")], out: Out::Vector, template: "relpointbbox({geo}, {0})", help: "Where a position sits inside the bounding box, 0..1 per axis" },
     Op { label: "Modulo", category: "Math", inputs: &[("a", "0"), ("b", "1")], out: Out::Widest(&[0, 1]), template: "{0} % {1}", help: "Remainder of a / b" },
     Op { label: "Round", category: "Math", inputs: &[("a", "0")], out: Out::Widest(&[0]), template: "round({0})", help: "round(a)" },
     Op { label: "Ceiling", category: "Math", inputs: &[("a", "0")], out: Out::Widest(&[0]), template: "ceil({0})", help: "ceil(a)" },
@@ -127,6 +128,9 @@ pub struct VopNode {
     pub ty: usize,
     // Constant's value, or a Parameter's default.
     pub value: [f32; 3],
+    // The Attribute VOP's input that Bind and the Geometry ops read: 0 (the geometry
+    // being changed) to 3.
+    pub input: usize,
 }
 
 impl VopNode {
@@ -138,14 +142,24 @@ impl VopNode {
             SNIPPET => ("$0 * 2".to_owned(), 0),
             _ => (String::new(), 0),
         };
-        VopNode { op: op.min(OPS.len() - 1), name, ty, value: if op == CONSTANT { [1.0, 0.0, 0.0] } else { [0.0; 3] } }
+        VopNode { op: op.min(OPS.len() - 1), name, ty, value: if op == CONSTANT { [1.0, 0.0, 0.0] } else { [0.0; 3] }, input: 0 }
     }
 
     pub fn def(&self) -> &'static Op {
         &OPS[self.op.min(OPS.len() - 1)]
     }
 
+    // Whether it reads geometry, so its input can be chosen.
+    pub fn reads_geometry(&self) -> bool {
+        matches!(self.op, BIND | GET_ATTRIB | PC_AVERAGE) || self.def().template.contains("{geo}")
+    }
+
     pub fn label(&self, id: NodeId) -> String {
+        let label = self.base_label(id);
+        if self.input > 0 && self.reads_geometry() { format!("{label} ‹{}›", self.input) } else { label }
+    }
+
+    fn base_label(&self, id: NodeId) -> String {
         match self.op {
             BIND => format!("bind {}", self.name),
             EXPORT => format!("export {}", self.name),
@@ -261,6 +275,7 @@ pub fn compile(nodes: &HashMap<NodeId, VopNode>, input: impl Fn(NodeId, usize) -
             BIND | PARAMETER | EXPORT | GET_ATTRIB | PC_AVERAGE if !valid_name(&node.name) => {
                 return Err(format!("'{}' isn't a valid {} name", node.name, if node.op == PARAMETER { "parameter" } else { "attribute" }));
             }
+            BIND if node.input > 0 => format!("{prefix}@opinput{}_{}", node.input.min(3), node.name),
             BIND => format!("{prefix}@{}", node.name),
             CONSTANT => match ty {
                 1 => format!("{{{}, {}, {}}}", number(node.value[0]), number(node.value[1]), number(node.value[2])),
@@ -280,8 +295,8 @@ pub fn compile(nodes: &HashMap<NodeId, VopNode>, input: impl Fn(NodeId, usize) -
                 continue;
             }
             COMPONENT => format!("getcomp({}, {})", args[0].0, node.ty.min(2)),
-            GET_ATTRIB => format!("point(0, \"{}\", {})", node.name, args[0].0),
-            PC_AVERAGE => format!("pcfilter(pcopen(0, \"P\", {}, {}, {}), \"{}\")", args[0].0, args[1].0, args[2].0, node.name),
+            GET_ATTRIB => format!("point({}, \"{}\", {})", node.input.min(3), node.name, args[0].0),
+            PC_AVERAGE => format!("pcfilter(pcopen({}, \"P\", {}, {}, {}), \"{}\")", node.input.min(3), args[0].0, args[1].0, args[2].0, node.name),
             COMPARE => format!("{} {} {}", args[0].0, COMPARES[node.ty.min(5)], args[1].0),
             SNIPPET => {
                 if node.name.trim().is_empty() {
@@ -294,7 +309,7 @@ pub fn compile(nodes: &HashMap<NodeId, VopNode>, input: impl Fn(NodeId, usize) -
                 code
             }
             _ => {
-                let mut code = def.template.to_owned();
+                let mut code = def.template.replace("{geo}", &node.input.min(3).to_string());
                 for (i, (arg, _)) in args.iter().enumerate() {
                     code = code.replace(&format!("{{{i}}}"), arg);
                 }
@@ -313,6 +328,25 @@ mod tests {
 
     fn op(name: &str) -> usize {
         OPS.iter().position(|o| o.label == name).unwrap()
+    }
+
+    #[test]
+    fn geometry_nodes_read_the_chosen_input() {
+        let mut nodes = HashMap::new();
+        nodes.insert(1, VopNode { input: 1, ..VopNode::new(BIND) });
+        nodes.insert(2, VopNode { input: 2, ..VopNode::new(op("Closest Point on Surface")) });
+        nodes.insert(3, VopNode { name: "Cd".into(), input: 3, ..VopNode::new(GET_ATTRIB) });
+        nodes.insert(4, VopNode::new(op("Point Count")));
+        nodes.insert(5, VopNode::new(op("Add")));
+        nodes.insert(6, VopNode::new(op("Add")));
+        nodes.insert(7, VopNode::new(EXPORT));
+        let links: HashMap<(NodeId, usize), NodeId> = [((2, 0), 1), ((5, 0), 2), ((5, 1), 3), ((6, 0), 5), ((6, 1), 4), ((7, 0), 6)].into_iter().collect();
+        let code = compile(&nodes, |id, slot| links.get(&(id, slot)).copied()).unwrap();
+        for expected in ["vector v1 = v@opinput1_P;", "minpos(2, v1)", "point(3, \"Cd\", @ptnum)", "npoints(0)"] {
+            assert!(code.contains(expected), "{expected} in\n{code}");
+        }
+        assert_eq!(nodes[&2].label(2), "closest_point_on_surface2 ‹2›");
+        assert!(!VopNode::new(op("Add")).reads_geometry());
     }
 
     #[test]

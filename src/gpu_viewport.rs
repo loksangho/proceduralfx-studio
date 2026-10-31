@@ -26,6 +26,9 @@ use crate::raster;
 const COLOR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SAMPLES: u32 = 4;
+// Which way round an outward-facing triangle of the app's meshes winds on screen
+// (the outline culls the faces toward the camera).
+const TOON_FRONT: wgpu::FrontFace = wgpu::FrontFace::Cw;
 
 // One corner: world position, colour (0..1, display encoding) and texture coordinates.
 #[repr(C)]
@@ -42,6 +45,53 @@ pub struct Vertex {
 impl Vertex {
     pub fn new(position: [f32; 3], color: [f32; 4], uv: Option<[f32; 2]>) -> Self {
         Vertex { position, textured: uv.is_some() as u8 as f32, color, uv: uv.unwrap_or_default(), _pad: [0.0; 2] }
+    }
+}
+
+// A corner of a toon-shaded face (Toon Shader): its base colour, how lit it is (0
+// shadow side to 1 facing the light, before banding), its smooth normal (for the
+// outline) and which entry of the toon table its material is. The banding happens
+// per pixel, so band edges are crisp however coarse the mesh.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ToonVertex {
+    pub position: [f32; 3],
+    pub light: f32,
+    pub color: [f32; 4],
+    pub normal: [f32; 3],
+    pub material: f32,
+}
+
+// A toon material as the shader reads it (see shading::Values::toon_look).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ToonMaterial {
+    // Bands, softness, shadow size (terminator shift), highlight size.
+    pub shade: [f32; 4],
+    // Shadow tint, and outline width in pixels.
+    pub shadow: [f32; 4],
+    // Highlight colour times its strength.
+    pub highlight: [f32; 4],
+    // Emission colour times its intensity.
+    pub emission: [f32; 4],
+    pub outline: [f32; 4],
+}
+
+// Toon materials one scene can use; more share the last.
+pub const MAX_TOONS: usize = 16;
+
+impl ToonMaterial {
+    // fs_toon at one point, without the antialiasing: for the CPU viewport.
+    pub fn shade(&self, base: [f32; 3], light: f32) -> [f32; 3] {
+        let bands = self.shade[0].max(2.0);
+        let t = (light + self.shade[2]).clamp(0.0, 1.0);
+        let x = t * bands;
+        let w = self.shade[1].clamp(1e-4, 1.0);
+        let f = x.fract();
+        let k = ((f - (1.0 - w)) / w).clamp(0.0, 1.0);
+        let band = ((x.floor() + k * k * (3.0 - 2.0 * k)) / (bands - 1.0)).clamp(0.0, 1.0);
+        let spot = if t >= 1.0 - 0.3 * self.shade[3] { 1.0 } else { 0.0 };
+        std::array::from_fn(|c| (base[c] * (self.shadow[c] + (1.0 - self.shadow[c]) * band) + self.highlight[c] * spot + self.emission[c]).clamp(0.0, 1.0))
     }
 }
 
@@ -359,6 +409,87 @@ fn fs_splat(in: PointOut) -> Blended {
     return Blended(vec4<f32>(in.color.rgb * a, a) * w, vec4<f32>(a), vec4<f32>(in.emission * a * GLOW, 0.0));
 }
 
+// Toon shading (Toon Shader): the light quantised into bands from the shadow tint up to
+// the base colour, a hard highlight where it's brightest, and outlines drawn as the
+// back faces pushed out along their normals by a number of pixels (an inverted hull).
+struct Toon {
+    shade: vec4<f32>,     // bands, softness, shadow size, highlight size
+    shadow: vec4<f32>,    // shadow tint, outline width (pixels)
+    highlight: vec4<f32>, // colour × strength
+    emission: vec4<f32>,  // colour × intensity
+    outline: vec4<f32>,   // colour
+};
+@group(2) @binding(0) var<uniform> toons: array<Toon, 16>;
+
+struct ToonIn {
+    @location(0) position: vec3<f32>,
+    @location(1) light: f32,
+    @location(2) color: vec4<f32>,
+    @location(3) normal: vec3<f32>,
+    @location(4) material: f32,
+};
+struct ToonOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) light: f32,
+    @location(2) @interpolate(flat) material: u32,
+};
+
+@vertex
+fn vs_toon(in: ToonIn) -> ToonOut {
+    return ToonOut(to_clip(in.position), in.color, in.light, u32(in.material));
+}
+
+@fragment
+fn fs_toon(in: ToonOut) -> @location(0) vec4<f32> {
+    let m = toons[min(in.material, 15u)];
+    let bands = max(m.shade.x, 2.0);
+    let t = clamp(in.light + m.shade.z, 0.0, 1.0);
+    // The band (0: shadow, bands - 1: fully lit), stepping up at each band's top over
+    // the softness, or over a pixel so the edge is antialiased.
+    let x = t * bands;
+    let w = clamp(max(m.shade.y, fwidth(x)), 1e-4, 1.0);
+    let level = floor(x) + smoothstep(1.0 - w, 1.0, fract(x));
+    let band = clamp(level / (bands - 1.0), 0.0, 1.0);
+    var rgb = in.color.rgb * mix(m.shadow.rgb, vec3<f32>(1.0), band);
+    let edge = 1.0 - 0.3 * m.shade.w;
+    let spot = smoothstep(edge - fwidth(t), edge, t);
+    rgb = rgb + m.highlight.rgb * spot + m.emission.rgb;
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+// The outline's hull: each corner moved out across the screen, along its normal,
+// by the outline's width in pixels (so it's as thick near as far, at any render size).
+@vertex
+fn vs_outline(in: ToonIn) -> ToonOut {
+    let material = min(u32(in.material), 15u);
+    let m = toons[material];
+    let width = m.shadow.w;
+    let c = to_cam(in.position);
+    var p = cam_to_clip(c);
+    if (width <= 0.0) {
+        // No outline: off screen.
+        return ToonOut(vec4<f32>(0.0, 0.0, 2.0, 1.0), m.outline, 0.0, material);
+    }
+    // The normal's direction on screen (camera space is linear in the position).
+    let n = to_cam(in.position + in.normal) - c;
+    var d = n.xy;
+    if (camera.mode.x < 0.5) {
+        d = (n.xy * c.z - c.xy * n.z) / max(c.z * c.z, 1e-8);
+    }
+    if (length(d) > 1e-8) {
+        let dir = normalize(d);
+        p.x += dir.x * width * 2.0 / camera.screen.z * p.w;
+        p.y += dir.y * width * 2.0 / camera.screen.w * p.w;
+    }
+    return ToonOut(p, m.outline, 0.0, material);
+}
+
+@fragment
+fn fs_outline(in: ToonOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
 // Premultiplied output, as egui's textures are.
 @fragment
 fn fs(in: Out) -> @location(0) vec4<f32> {
@@ -404,6 +535,12 @@ pub struct GpuViewport {
     // The splats' passes: the surfaces' depth again (without antialiasing), the
     // splats, then the composite over the image.
     depth_only: wgpu::RenderPipeline,
+    // Toon faces, their outlines, and their depth for the splats.
+    toon: wgpu::RenderPipeline,
+    outline: wgpu::RenderPipeline,
+    toon_depth: wgpu::RenderPipeline,
+    toon_table: wgpu::Buffer,
+    toon_group: wgpu::BindGroup,
     splats: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     composite_layout: wgpu::BindGroupLayout,
@@ -462,6 +599,7 @@ struct Scene {
     key: u64,
     faces: Option<(wgpu::Buffer, u32)>,
     edges: Option<(wgpu::Buffer, u32)>,
+    toon: Option<(wgpu::Buffer, u32)>,
     texture: Option<Arc<raster::Texture>>,
     corners: Vec<[f32; 3]>,
 }
@@ -588,6 +726,48 @@ impl GpuViewport {
             multiview: None,
             cache: None,
         });
+        // Toon faces and outlines: their own vertices, and the toon table as group 2.
+        let toon_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewport toon"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let toon_table = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("viewport toon"),
+            size: (std::mem::size_of::<ToonMaterial>() * MAX_TOONS) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let toon_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("viewport toon"), layout: &toon_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: toon_table.as_entire_binding() }] });
+        let toon_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport toon"), bind_group_layouts: &[&layout, &camera_layout, &toon_layout], push_constant_ranges: &[] });
+        let toon_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x4, 3 => Float32x3, 4 => Float32];
+        let toon_buffers = [wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<ToonVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &toon_attributes }];
+        let toon_pipeline = |label: &str, vertex: &str, fragment: Option<&str>, cull_mode: Option<wgpu::Face>, samples: u32, bias: wgpu::DepthBiasState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&toon_pipeline_layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some(vertex), compilation_options: Default::default(), buffers: &toon_buffers },
+                fragment: fragment.map(|entry| wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: COLOR, blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                primitive: wgpu::PrimitiveState { cull_mode, front_face: TOON_FRONT, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::LessEqual, stencil: Default::default(), bias }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                multiview: None,
+                cache: None,
+            })
+        };
+        let toon = toon_pipeline("viewport toon", "vs_toon", Some("fs_toon"), None, SAMPLES, wgpu::DepthBiasState { constant: 0, slope_scale: 1.5, clamp: 0.0 });
+        // The hull shows only where it faces away, around and behind the surface.
+        let outline = toon_pipeline("viewport outline", "vs_outline", Some("fs_outline"), Some(wgpu::Face::Front), SAMPLES, Default::default());
+        let toon_depth = toon_pipeline("viewport toon depth", "vs_toon", None, None, 1, Default::default());
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let keep = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrc, operation: wgpu::BlendOperation::Add };
         let splats = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -644,7 +824,7 @@ impl GpuViewport {
         });
         let white = raster::Texture { width: 1, height: 1, pixels: vec![[255; 4]] };
         let blank = texture_bind_group(&render_state, &layout, &sampler, &white);
-        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
+        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, toon, outline, toon_depth, toon_table, toon_group, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None }
     }
 
     // Whether the scene uploaded last has this key (what the mesh, lights and display mode hash to).
@@ -654,19 +834,29 @@ impl GpuViewport {
 
     // Uploads faces (triangles, three vertices each) and edges (two each) under `key`,
     // with the texture the textured faces use.
-    pub fn set_scene(&mut self, key: u64, faces: &[Vertex], edges: &[Vertex], texture: Option<Arc<raster::Texture>>) {
+    // Toon faces (three ToonVertex each) use the materials in `toons` (at most MAX_TOONS).
+    pub fn set_scene(&mut self, key: u64, faces: &[Vertex], edges: &[Vertex], toon: &[ToonVertex], toons: &[ToonMaterial], texture: Option<Arc<raster::Texture>>) {
         let device = &self.render_state.device;
         let buffer = |label: &str, vertices: &[Vertex]| {
             (!vertices.is_empty()).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(vertices), usage: wgpu::BufferUsages::VERTEX }), vertices.len() as u32))
         };
-        let (lo, hi) = faces.iter().chain(edges).fold(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |(lo, hi), v| (std::array::from_fn(|k| lo[k].min(v.position[k])), std::array::from_fn(|k| hi[k].max(v.position[k]))));
+        let toon_buffer = (!toon.is_empty()).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("viewport toon faces"), contents: bytemuck::cast_slice(toon), usage: wgpu::BufferUsages::VERTEX }), toon.len() as u32));
+        if !toons.is_empty() {
+            let mut table = [ToonMaterial::default(); MAX_TOONS];
+            for (slot, material) in table.iter_mut().zip(toons) {
+                *slot = *material;
+            }
+            self.render_state.queue.write_buffer(&self.toon_table, 0, bytemuck::cast_slice(&table));
+        }
+        let positions = faces.iter().chain(edges).map(|v| v.position).chain(toon.iter().map(|v| v.position));
+        let (lo, hi) = positions.fold(([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]), |(lo, hi), v| (std::array::from_fn(|k| lo[k].min(v[k])), std::array::from_fn(|k| hi[k].max(v[k]))));
         let corners = if lo[0] <= hi[0] { (0..8).map(|i| std::array::from_fn(|k| if i >> k & 1 == 0 { lo[k] } else { hi[k] })).collect() } else { Vec::new() };
         if let Some(texture) = &texture {
             if self.texture.as_ref().is_none_or(|(t, _)| !Arc::ptr_eq(t, texture)) {
                 self.texture = Some((texture.clone(), texture_bind_group(&self.render_state, &self.layout, &self.sampler, texture)));
             }
         }
-        self.scene = Some(Scene { key, faces: buffer("viewport faces", faces), edges: buffer("viewport edges", edges), texture, corners });
+        self.scene = Some(Scene { key, faces: buffer("viewport faces", faces), edges: buffer("viewport edges", edges), toon: toon_buffer, texture, corners });
     }
 
     // Whether the points uploaded last have this key.
@@ -761,8 +951,21 @@ impl GpuViewport {
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_bind_group(1, &self.camera_group, &[]);
             if let Some(scene) = &self.scene {
-                for ((buffer, count), pipeline) in [(&scene.faces, &self.surfaces), (&scene.edges, &self.edges)].into_iter().filter_map(|(b, p)| Some((b.as_ref()?, p))) {
-                    pass.set_pipeline(pipeline);
+                if let Some((buffer, count)) = &scene.faces {
+                    pass.set_pipeline(&self.surfaces);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
+                if let Some((buffer, count)) = &scene.toon {
+                    pass.set_bind_group(2, &self.toon_group, &[]);
+                    for pipeline in [&self.toon, &self.outline] {
+                        pass.set_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..*count, 0..1);
+                    }
+                }
+                if let Some((buffer, count)) = &scene.edges {
+                    pass.set_pipeline(&self.edges);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
@@ -784,10 +987,16 @@ impl GpuViewport {
             // The surfaces' depth, so splats behind them are hidden.
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("viewport depth"), color_attachments: &[], depth_stencil_attachment: depth(wgpu::LoadOp::Clear(1.0)), timestamp_writes: None, occlusion_query_set: None });
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.set_bind_group(1, &self.camera_group, &[]);
                 if let Some((faces, faces_count)) = self.scene.as_ref().and_then(|s| s.faces.as_ref()) {
-                    pass.set_bind_group(0, bind_group, &[]);
-                    pass.set_bind_group(1, &self.camera_group, &[]);
                     pass.set_pipeline(&self.depth_only);
+                    pass.set_vertex_buffer(0, faces.slice(..));
+                    pass.draw(0..*faces_count, 0..1);
+                }
+                if let Some((faces, faces_count)) = self.scene.as_ref().and_then(|s| s.toon.as_ref()) {
+                    pass.set_bind_group(2, &self.toon_group, &[]);
+                    pass.set_pipeline(&self.toon_depth);
                     pass.set_vertex_buffer(0, faces.slice(..));
                     pass.draw(0..*faces_count, 0..1);
                 }
@@ -964,7 +1173,7 @@ mod tests {
                 (0..3).map(move |k| Vertex::new(corners[k], [rgb[k][0], rgb[k][1], rgb[k][2], 1.0], (i == 3).then_some(uv[k])))
             })
             .collect();
-        gpu.set_scene(1, &faces, &[], Some(checker.clone()));
+        gpu.set_scene(1, &faces, &[], &[], &[], Some(checker.clone()));
         for orthographic in [false, true] {
             let camera = camera(orthographic, w as f32, h as f32);
             let cpu = on_cpu(&camera, w, h, &faces, &checker, false);
@@ -1007,10 +1216,10 @@ mod tests {
             let depth = z + 5.0;
             [0.0, 10.0].map(|x: f32| Vertex::new([(x - 10.0) / 20.0 * depth, (10.0 - 5.5) / 20.0 * depth, z], [1.0, 0.0, 0.0, 1.0], None)).to_vec()
         };
-        gpu.set_scene(1, &face, &edge(3.0), None);
+        gpu.set_scene(1, &face, &edge(3.0), &[], &[], None);
         gpu.draw([20, 20], &camera);
         assert_eq!(read(&gpu)[5 * 20 + 3], [255, 255, 255, 255], "an edge behind the surface is hidden");
-        gpu.set_scene(2, &face, &edge(0.0), None);
+        gpu.set_scene(2, &face, &edge(0.0), &[], &[], None);
         gpu.draw([20, 20], &camera);
         assert_eq!(read(&gpu)[5 * 20 + 3], [255, 0, 0, 255], "an edge on the surface shows");
         assert_eq!(read(&gpu)[19 * 20 + 19][3], 0, "outside the face stays empty");
@@ -1026,7 +1235,7 @@ mod tests {
         let camera = Camera { target: [0.0; 3], rotation: Camera::rotation(0.0, 0.0), zoom: 5.0, center: egui::vec2(16.0, 16.0), size: egui::vec2(32.0, 32.0), focal: 32.0, ortho_scale: 4.0, orthographic: false, near: 0.1 };
         let grey = [0.5, 0.5, 0.5, 1.0];
         let floor: Vec<Vertex> = [[-4.0, -1.0, 8.0], [4.0, -1.0, 8.0], [0.0, -1.0, -30.0]].map(|p| Vertex::new(p, grey, None)).to_vec();
-        gpu.set_scene(1, &floor, &[], None);
+        gpu.set_scene(1, &floor, &[], &[], &[], None);
         gpu.draw([32, 32], &camera);
         let image = read(&gpu);
         assert!(image[31 * 32 + 16][3] > 0, "the floor just in front of the camera shows at the bottom");
@@ -1055,7 +1264,7 @@ mod tests {
         let strand = |width: f32, z: f32| Strand { a: [-2.0, -0.125, z], width_a: width, b: [2.0, -0.125, z], width_b: width, color: [1.0, 0.0, 0.0, 1.0] };
         // The middle column: how many pixels it covers, and the most it covers one.
         let column = |gpu: &mut GpuViewport, s: Strand| {
-            gpu.set_scene(1, &[], &[], None);
+            gpu.set_scene(1, &[], &[], &[], &[], None);
             gpu.set_points(1, &[], &[], &[s]);
             gpu.draw([20, 20], &straight_on());
             let image = read(gpu);
@@ -1078,7 +1287,7 @@ mod tests {
         let (_, line) = column(&mut gpu, strand(-1.0, 0.0));
         assert_eq!(line, 255);
         // Behind a surface: hidden.
-        gpu.set_scene(2, &wall(0.0), &[], None);
+        gpu.set_scene(2, &wall(0.0), &[], &[], &[], None);
         gpu.set_points(2, &[], &[], &[strand(1.0, 2.0)]);
         gpu.draw([20, 20], &straight_on());
         assert_eq!(read(&gpu)[10 * 20 + 10], [255, 255, 255, 255], "a strand behind the surface is hidden");
@@ -1091,7 +1300,7 @@ mod tests {
             return;
         };
         let red = [1.0, 0.0, 0.0, 1.0];
-        gpu.set_scene(1, &wall(0.0), &[], None);
+        gpu.set_scene(1, &wall(0.0), &[], &[], &[], None);
         // On the surface, 3 points across: shows, and only near the middle.
         gpu.set_points(1, &[Point::new([0.0; 3], 3.0, red, [0.0; 3])], &[], &[]);
         gpu.draw([20, 20], &straight_on());
@@ -1113,7 +1322,7 @@ mod tests {
         let middle = |gpu: &GpuViewport| read(gpu)[10 * 20 + 10];
         // A dark wall at z = 1, so blending and glow show.
         let dark: Vec<Vertex> = wall(1.0).into_iter().map(|v| Vertex { color: [0.2, 0.2, 0.2, 1.0], ..v }).collect();
-        gpu.set_scene(1, &dark, &[], None);
+        gpu.set_scene(1, &dark, &[], &[], &[], None);
         let smoke = |z: f32, rgb: [f32; 3], emission: [f32; 3]| Point::new([0.0, 0.0, z], 2.0, [rgb[0], rgb[1], rgb[2], 0.5], emission);
         // In front: half covers the wall at its centre.
         gpu.set_points(1, &[], &[smoke(0.0, [1.0; 3], [0.0; 3])], &[]);
@@ -1148,6 +1357,58 @@ mod tests {
     }
 
     #[test]
+    fn toon_faces_band_crisply_and_are_outlined() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        // A white sphere lit from the upper left, in three bands, with a blue outline.
+        let sphere = crate::node_sphere(1.0, 32, 64);
+        let normals = sphere.compute_normals();
+        let to_light = crate::Vec3::new(-0.5, 0.5, -0.7).normalize();
+        let toon: Vec<ToonVertex> = sphere.indices.iter().flatten().map(|&i| {
+            let (p, n) = (sphere.vertices[i], normals[i]);
+            ToonVertex { position: [p.x, p.y, p.z], light: n.dot(to_light).max(0.0), color: [1.0; 4], normal: [n.x, n.y, n.z], material: 0.0 }
+        }).collect();
+        let look = ToonMaterial { shade: [3.0, 0.0, 0.0, 0.0], shadow: [0.2, 0.2, 0.2, 3.0], highlight: [0.0; 4], emission: [0.0; 4], outline: [0.0, 0.0, 1.0, 1.0] };
+        gpu.set_scene(1, &[], &[], &toon, &[look], None);
+        let camera = Camera { size: egui::vec2(120.0, 120.0), center: egui::vec2(60.0, 60.0), focal: 150.0, ..straight_on() };
+        let image = gpu.render([120, 120], &camera);
+        let at = |x: usize, y: usize| image[y * 120 + x];
+        let blue = |p: [u8; 4]| p[2] > 200 && p[0] < 40 && p[1] < 40 && p[3] > 200;
+        // Inside: the bands, not the outline (the hull's faces toward the camera are culled).
+        assert!(!blue(at(60, 60)) && at(60, 60)[3] == 255, "centre {:?}", at(60, 60));
+        // Only three greys inside, apart from the antialiased band edges.
+        let levels = [0.2f32, 0.6, 1.0].map(|l| (l * 255.0) as i32);
+        let (mut inside, mut between) = (0, 0);
+        for y in 35..85 {
+            for x in 35..85 {
+                let (dx, dy) = (x as f32 - 60.0, y as f32 - 60.0);
+                if dx.hypot(dy) < 25.0 {
+                    inside += 1;
+                    if !levels.iter().any(|l| (at(x, y)[0] as i32 - l).abs() <= 6) {
+                        between += 1;
+                    }
+                }
+            }
+        }
+        assert!(between * 10 < inside, "{between} of {inside} pixels between the bands");
+        // The lit side faces the light, the shadow side away from it.
+        assert!(at(48, 48)[0] > at(72, 72)[0]);
+        // Around the silhouette (radius about 30 pixels): a ring of outline, then nothing.
+        for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+            let along = |r: i32| at((60 + dx * r) as usize, (60 + dy * r) as usize);
+            let ring = (25..40).filter(|r| blue(along(*r))).count();
+            assert!((2..=5).contains(&ring), "outline {ring} pixels wide toward {dx},{dy}");
+            assert_eq!(along(45)[3], 0, "transparent beyond the outline");
+        }
+        // CPU shading gives the same bands.
+        assert_eq!(look.shade([1.0; 3], 0.1), [0.2; 3]);
+        assert_eq!(look.shade([1.0; 3], 0.5), [0.6; 3]);
+        assert_eq!(look.shade([1.0; 3], 0.9), [1.0; 3]);
+    }
+
+    #[test]
     fn off_screen_renders_match_the_viewport_at_any_size() {
         let Some(mut gpu) = headless() else {
             eprintln!("no GPU here; skipping");
@@ -1156,7 +1417,7 @@ mod tests {
         // A small red square in the middle of an empty view.
         let red = [1.0, 0.0, 0.0, 1.0];
         let square: Vec<Vertex> = [[-1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, -1.0, 0.0]].map(|p| Vertex::new(p, red, None)).to_vec();
-        gpu.set_scene(1, &square, &[], None);
+        gpu.set_scene(1, &square, &[], &[], &[], None);
         let camera = Camera { size: egui::vec2(40.0, 30.0), center: egui::vec2(20.0, 15.0), focal: 30.0, ..straight_on() };
         gpu.draw([40, 30], &camera);
         let shown = read(&gpu);

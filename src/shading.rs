@@ -102,6 +102,10 @@ pub const TOON: &[Param] = &[
     c("highlight_color", "Highlight color", "Highlight", [1.0, 1.0, 1.0]),
     c("emission_color", "Emission color", "Emission", [1.0, 1.0, 1.0]),
     f("emission_intensity", "Emission intensity", "Emission", 0.0, 50.0, 0.0),
+    // Added later: kept at the end so older scenes load their values in place.
+    t("use_point_color", "Use point colour (Cd)", "Toon", false),
+    f("outline_width", "Outline width (pixels)", "Outline", 0.0, 12.0, 2.0),
+    c("outline_color", "Outline color", "Outline", [0.06, 0.05, 0.08]),
 ];
 
 pub type Preset = (&'static str, &'static [(&'static str, [f32; 3])]);
@@ -185,6 +189,8 @@ pub const TOON_PRESETS: &[Preset] = &[
     ("Cel 3 Tone", &[("bands", v(3.0)), ("softness", v(0.0))]),
     ("Soft Toon", &[("bands", v(3.0)), ("softness", v(1.0)), ("highlight", v(0.6)), ("highlight_size", v(0.5))]),
     ("Toon Metal", &[("base_color", [0.8, 0.8, 0.85]), ("shadow_color", [0.15, 0.15, 0.25]), ("bands", v(4.0)), ("highlight", v(2.0)), ("highlight_size", v(0.08))]),
+    // For effects coloured by their own Cd (e.g. Toon Fire's flame bands): flat, outlined.
+    ("Toon FX", &[("use_point_color", v(1.0)), ("shadow_color", [0.72, 0.6, 0.78]), ("bands", v(2.0)), ("terminator", v(0.35)), ("highlight", v(0.0)), ("outline_width", v(2.5))]),
 ];
 
 pub const HAIR_PRESETS: &[Preset] = &[
@@ -340,6 +346,23 @@ impl Values {
     }
 }
 
+impl Values {
+    // A Toon Shader as the real-time renderer draws it (viewport and sprite sheets).
+    pub fn toon_look(&self) -> crate::gpu_viewport::ToonMaterial {
+        let [sr, sg, sb] = self.color("shadow_color");
+        let highlight = self.color("highlight_color").map(|c| c * self.float("highlight"));
+        let emission = self.color("emission_color").map(|c| c * self.float("emission_intensity"));
+        let [or, og, ob] = self.color("outline_color");
+        crate::gpu_viewport::ToonMaterial {
+            shade: [self.float("bands").round().clamp(2.0, 8.0), self.float("softness").clamp(0.0, 1.0), self.float("terminator"), self.float("highlight_size").clamp(0.0, 1.0)],
+            shadow: [sr, sg, sb, self.float("outline_width").max(0.0)],
+            highlight: [highlight[0], highlight[1], highlight[2], 0.0],
+            emission: [emission[0], emission[1], emission[2], 0.0],
+            outline: [or, og, ob, 1.0],
+        }
+    }
+}
+
 // --- MoonRay output ------------------------------------------------------------
 
 pub fn rgb(c: [f32; 3]) -> String {
@@ -473,7 +496,7 @@ pub fn hair_rdla(name: &str, p: &Values) -> (&'static str, String) {
 
 // DwaToonMaterial: banded ramp diffuse from the shadow tint up to the lit colour,
 // with a hard-edged toon highlight.
-pub fn toon_rdla(name: &str, p: &Values) -> (&'static str, String) {
+pub fn toon_rdla(name: &str, p: &Values, objects: &mut String) -> (&'static str, String) {
     let bands = (p.float("bands").round() as usize).clamp(2, 8);
     let shadow = p.color("shadow_color");
     let mut positions = Vec::new();
@@ -485,7 +508,14 @@ pub fn toon_rdla(name: &str, p: &Values) -> (&'static str, String) {
     }
     let interpolation = if p.float("softness") > 0.5 { 1 } else { 0 };
     let mut body = String::new();
-    body.push_str(&format!("    [\"albedo\"] = {},\n", rgb(p.color("base_color"))));
+    let albedo = if p.flag("use_point_color") {
+        let map = format!("{name}_point_color");
+        objects.push_str(&attribute_map(&map, "Cd", 3, p.color("base_color")));
+        format!("AttributeMap(\"{map}\")")
+    } else {
+        rgb(p.color("base_color"))
+    };
+    body.push_str(&format!("    [\"albedo\"] = {albedo},\n"));
     body.push_str("    [\"diffuse_model\"] = 1,\n");
     body.push_str(&format!("    [\"positions\"] = {{{}}},\n", positions.join(", ")));
     body.push_str(&format!("    [\"colors\"] = {{{}}},\n", colours.join(", ")));
@@ -1006,7 +1036,7 @@ mod tests {
         let skin = Values::preset(Table::Principled, PRINCIPLED_PRESETS.iter().position(|p| p.0 == "Skin").unwrap());
         let (_, body) = principled_rdla("/m/s", &skin, &HashMap::new(), &mut String::new());
         assert!(body.contains("scattering_radius"));
-        let (class, body) = toon_rdla("/m/toon", &Values::preset(Table::Toon, 2));
+        let (class, body) = toon_rdla("/m/toon", &Values::preset(Table::Toon, 2), &mut String::new());
         assert_eq!(class, "DwaToonMaterial");
         assert!(body.contains("[\"diffuse_model\"] = 1") && body.contains("[\"interpolations\"] = {0, 0, 0}"));
     }

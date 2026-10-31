@@ -802,6 +802,8 @@ impl AttrKind {
 
 // Type of well-known attributes when no f@/i@/v@ prefix is given.
 fn known_hint(name: &str) -> Option<Ty> {
+    // @opinput1_P is a vector like @P.
+    let name = opinput(name).map_or(name, |(_, attribute)| attribute);
     match name {
         "P" | "N" | "Cd" | "v" | "up" | "rest" | "scale" | "force" | "accel" | "uv" | "w" => Some(Ty::Vector),
         "ptnum" | "primnum" | "vtxnum" | "numpt" | "numprim" | "numvtx" | "elemnum" | "numelem" | "id" => Some(Ty::Int),
@@ -1065,7 +1067,7 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("npoints", 1, 1, "Geometry", "npoints(0)"),
     ("nprimitives", 1, 1, "Geometry", "nprimitives(0)"),
     ("nvertices", 1, 1, "Geometry", "nvertices(0)"),
-    ("point", 3, 3, "Geometry", "point(0, \"name\", ptnum) reads the input geometry"),
+    ("point", 3, 3, "Geometry", "point(0, \"name\", ptnum) reads input 0 (the geometry being changed) or 1-3; @opinput1_name reads input 1's on the same element"),
     ("prim", 3, 3, "Geometry", "prim(0, \"name\", primnum)"),
     ("vertex", 3, 3, "Geometry", "vertex(0, \"name\", vtxnum)"),
     ("detail", 2, 2, "Geometry", "detail(0, \"name\")"),
@@ -2037,9 +2039,45 @@ struct Frame<'a> {
     types: &'a [Option<Ty>],
 }
 
+// Inputs 1-3 of a wrangle (empty when not connected), and what's cached about each.
+// A function reading another input swaps its geometry in for the call (Runtime::swap_input).
+struct OtherInput<'a> {
+    input: &'a Mesh,
+    normals: &'a [Vec3],
+    neighbours: Option<Vec<Vec<usize>>>,
+    point_prims: Option<Vec<Vec<usize>>>,
+    point_grid: Option<PointGrid>,
+    fields: Vec<(String, crate::fields::Field)>,
+    polys: Vec<std::ops::Range<usize>>,
+    poly_of: Vec<usize>,
+}
+
+// The number of geometry inputs a wrangle has (0 is its own).
+pub const INPUTS: usize = 4;
+
+// Builtins whose first argument is the input they read.
+const READS_INPUT: [&str; 38] = [
+    "npoints", "nprimitives", "nvertices", "point", "prim", "vertex", "detail", "haspointattrib", "hasprimattrib", "inpointgroup", "inprimgroup",
+    "nearpoint", "nearpoints", "volumesample", "volumegradient", "volumeindex", "volumepostoindex", "volumeindextopos", "neighbours", "neighbourcount",
+    "primpoints", "pointprims", "getbbox_min", "getbbox_max", "getbbox_center", "getbbox_size", "relpointbbox", "primuv", "findattribval", "idtopoint",
+    "primpoint", "primvertexcount", "vertexpoint", "vertexprim", "primintrinsic", "xyzdist", "minpos", "intersect",
+];
+// Builtins whose first argument is the geometry they change: only the wrangle's own (0).
+const WRITES_INPUT: [&str; 9] = ["setpointattrib", "setprimattrib", "setdetailattrib", "setpointgroup", "setprimgroup", "addpoint", "addprim", "removepoint", "removeprim"];
+
+// `opinput1_P` (as in @opinput1_P): input 1's P, for the same element.
+fn opinput(name: &str) -> Option<(usize, &str)> {
+    let rest = name.strip_prefix("opinput")?;
+    let (digit, attribute) = rest.split_once('_')?;
+    let n: usize = digit.parse().ok().filter(|n| *n < INPUTS)?;
+    (!attribute.is_empty()).then_some((n, attribute))
+}
+
 struct Runtime<'a> {
     prog: &'a Program,
     input: &'a Mesh,
+    // Inputs 1 to 3.
+    others: Vec<OtherInput<'a>>,
     normals: &'a [Vec3],
     out: Mesh,
     domain: Domain,
@@ -2070,6 +2108,8 @@ struct Runtime<'a> {
     polys: Vec<std::ops::Range<usize>>,
     poly_of: Vec<usize>,
     prim: usize,
+    // The input swapped in for the call being run (0: the wrangle's own).
+    reading: usize,
 }
 
 // A polygon's uv names a point on one of its triangles: u spans the triangles
@@ -2684,6 +2724,8 @@ impl PointGrid {
 }
 
 struct PcHandle {
+    // The input the points are from.
+    input: usize,
     found: Vec<(usize, f32)>,
     radius: f32,
     next: usize,
@@ -3194,8 +3236,21 @@ impl<'a> Runtime<'a> {
         for arg in args {
             values.push(self.eval(arg, fr)?);
         }
+        // Reading another input: its geometry stands in for the call.
+        let other = self.input_of_call(name, &values).map_err(|e| format!("{name}(): {e}"))?;
+        if let Some(n) = other {
+            self.swap_input(n);
+        }
+        let result = self.call_builtin_values(name, &values, places, want_vec, fr);
+        if let Some(n) = other {
+            self.swap_input(n);
+        }
+        result
+    }
+
+    fn call_builtin_values(&mut self, name: &'static str, values: &[Value], places: &'a [Option<Place>], want_vec: bool, fr: &mut Frame<'a>) -> R<Value> {
         if !out_params(name).is_empty() {
-            let (result, outputs) = self.builtin_with_outputs(name, &values).map_err(|e| format!("{name}(): {e}"))?;
+            let (result, outputs) = self.builtin_with_outputs(name, values).map_err(|e| format!("{name}(): {e}"))?;
             for (i, value) in outputs {
                 if let Some(Some(place)) = places.get(i) {
                     self.write_place(place, value, fr)?;
@@ -3203,13 +3258,30 @@ impl<'a> Runtime<'a> {
             }
             return Ok(result);
         }
-        self.builtin(name, &values, want_vec).map_err(|e| if name == "error" { e } else { format!("{name}(): {e}") })
+        self.builtin(name, values, want_vec).map_err(|e| if name == "error" { e } else { format!("{name}(): {e}") })
     }
 
     fn attr_read(&mut self, id: usize) -> R<Value> {
         let prog: &'a Program = self.prog;
         let attr = &prog.attrs[id];
         let int = |n: usize| Value::Int(n as i32);
+        // @opinput1_P and the like: another input's attribute on the same element number.
+        if let Some((n, name)) = opinput(&attr.name) {
+            let index = match self.domain {
+                Domain::Point => self.point_index().unwrap_or(0),
+                Domain::Vertex => self.elem,
+                Domain::Prim => self.prim,
+                Domain::Detail => 0,
+            };
+            if n > 0 {
+                self.swap_input(n);
+            }
+            let value = self.input_attr_as(self.domain, name, index as i32, attr.hint.or(known_hint(name)));
+            if n > 0 {
+                self.swap_input(n);
+            }
+            return Ok(value);
+        }
         Ok(match attr.kind {
             AttrKind::Ptnum => int(self.point_index().unwrap_or(0)),
             AttrKind::Primnum => int(match self.domain {
@@ -3267,10 +3339,48 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
+    // Puts input `n` (1-3) where the wrangle's own input is, or back again.
+    fn swap_input(&mut self, n: usize) {
+        let other = &mut self.others[n - 1];
+        std::mem::swap(&mut self.input, &mut other.input);
+        std::mem::swap(&mut self.normals, &mut other.normals);
+        std::mem::swap(&mut self.neighbours, &mut other.neighbours);
+        std::mem::swap(&mut self.point_prims, &mut other.point_prims);
+        std::mem::swap(&mut self.point_grid, &mut other.point_grid);
+        std::mem::swap(&mut self.fields, &mut other.fields);
+        std::mem::swap(&mut self.polys, &mut other.polys);
+        std::mem::swap(&mut self.poly_of, &mut other.poly_of);
+        self.reading = if self.reading == n { 0 } else { n };
+    }
+
+    // The input a builtin reads or writes, from its first argument (and for pcimport and
+    // pcfilter, from the handle): Some(n) for inputs 1-3.
+    fn input_of_call(&self, name: &str, a: &[Value]) -> R<Option<usize>> {
+        let handle = || -> R<usize> {
+            let n = a.first().ok_or("no input number")?.int()?;
+            usize::try_from(n).ok().filter(|n| *n < INPUTS).ok_or_else(|| format!("inputs are numbered 0 to {}, not {n}", INPUTS - 1))
+        };
+        Ok(if READS_INPUT.contains(&name) || name == "pcfind" || name == "pcopen" {
+            Some(handle()?).filter(|n| *n > 0)
+        } else if WRITES_INPUT.contains(&name) {
+            if handle()? != 0 {
+                return Err("only the wrangle's own geometry (0) can be changed; the other inputs are read-only".into());
+            }
+            None
+        } else if matches!(name, "pcimport" | "pcfilter") {
+            Some(self.pc_handle(&a[0])?.input).filter(|n| *n > 0)
+        } else {
+            None
+        })
+    }
+
     // Reads an attribute of the input geometry (point(), prim(), vertex(), detail()).
     fn input_attr(&self, domain: Domain, name: &str, index: i32) -> Value {
+        self.input_attr_as(domain, name, index, known_hint(name))
+    }
+
+    fn input_attr_as(&self, domain: Domain, name: &str, index: i32, hint: Option<Ty>) -> Value {
         let mesh = self.input;
-        let hint = known_hint(name);
         // Primitive numbers are polygons: read the polygon's first triangle.
         if domain == Domain::Prim {
             let Some(run) = usize::try_from(index).ok().and_then(|p| self.polys.get(p)) else {
@@ -3973,6 +4083,10 @@ impl<'a> Runtime<'a> {
             "volumesample" | "volumegradient" | "volumeindex" | "volumepostoindex" | "volumeindextopos" => {
                 let field_name = a[1].string()?;
                 let input = self.input;
+                // An input with nothing connected reads as nothing, as in Houdini.
+                if self.reading != 0 && input.vertices.is_empty() {
+                    return Ok(if name == "volumesample" { Float(0.0) } else { V([0.0; 3]) });
+                }
                 if !self.fields.iter().any(|(n, _)| **n == *field_name) {
                     let field = crate::fields::Field::from_mesh(input, &field_name).map_err(|e| format!("{name}(): {e}"))?;
                     self.fields.push((field_name.to_string(), field));
@@ -4017,7 +4131,8 @@ impl<'a> Runtime<'a> {
                         self.pc_handles.clear();
                         self.pc_elem = self.elem;
                     }
-                    self.pc_handles.push(PcHandle { found, radius, next: 0, current: None });
+                    let input = self.reading;
+                    self.pc_handles.push(PcHandle { input, found, radius, next: 0, current: None });
                     Int(self.pc_handles.len() as i32 - 1)
                 }
             }
@@ -4354,16 +4469,18 @@ pub fn eval_expression(expr: &str, time: f32) -> Result<f32, String> {
         .replace("$F", &format!("({:?})", frame.round()))
         .replace("$T", &format!("({time:?})"));
     let code = format!("f@__value = {source};");
-    let (mesh, report) = run_masked(Mesh::default(), &code, time, 1.0 / fps, 0, None, None);
+    let (mesh, report) = run_masked(Mesh::default(), &[], &code, time, 1.0 / fps, 0, None, None);
     if let Some(error) = report.error {
         return Err(error.replace("f@__value = ", ""));
     }
     mesh.point_attributes.get("detail:__value").and_then(|v| v.first().copied()).filter(|v| v.is_finite()).ok_or_else(|| "the expression has no value".to_string())
 }
 
-pub fn run_wrangle(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>, channels: Option<&Channels>) -> Mesh {
+// `inputs`: the wrangle's inputs 1-3 (fewer when they aren't connected), read by point(1, ...),
+// @opinput1_P and the like.
+pub fn run_wrangle(mesh: Mesh, inputs: &[Mesh], code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>, channels: Option<&Channels>) -> Mesh {
     let start = Instant::now();
-    let (mesh, mut report) = run_masked(mesh, code, time, time_inc, domain_index, mask, channels);
+    let (mesh, mut report) = run_masked(mesh, inputs, code, time, time_inc, domain_index, mask, channels);
     report.millis = start.elapsed().as_secs_f32() * 1000.0;
     if let Ok(mut map) = reports().lock() {
         if map.len() > 256 {
@@ -4380,11 +4497,12 @@ fn run(mesh: Mesh, code: &str, time: f32, domain_index: usize) -> (Mesh, VexRepo
 }
 
 fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> (Mesh, VexReport) {
-    run_masked(mesh, code, time, time_inc, domain_index, None, None)
+    run_masked(mesh, &[], code, time, time_inc, domain_index, None, None)
 }
 
 fn run_masked(
     mesh: Mesh,
+    inputs: &[Mesh],
     code: &str,
     time: f32,
     time_inc: f32,
@@ -4405,9 +4523,27 @@ fn run_masked(
     let normals = mesh.compute_normals();
     let count = domain.count(&mesh);
     let input = mesh.clone();
+    let empty = Mesh::default();
+    let others_geometry: Vec<&Mesh> = (1..INPUTS).map(|n| inputs.get(n - 1).unwrap_or(&empty)).collect();
+    let others_normals: Vec<Vec<Vec3>> = others_geometry.iter().map(|m| m.compute_normals()).collect();
+    let others = others_geometry
+        .iter()
+        .zip(&others_normals)
+        .map(|(m, normals)| OtherInput {
+            input: m,
+            normals,
+            neighbours: None,
+            point_prims: None,
+            point_grid: None,
+            fields: Vec::new(),
+            polys: crate::poly::runs(m),
+            poly_of: crate::poly::of_triangles(m),
+        })
+        .collect();
     let mut rt = Runtime {
         prog: &program,
         input: &input,
+        others,
         normals: &normals,
         out: mesh,
         domain,
@@ -4431,13 +4567,14 @@ fn run_masked(
         polys: crate::poly::runs(&input),
         poly_of: crate::poly::of_triangles(&input),
         prim: 0,
+        reading: 0,
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
     let missing: Vec<String> = program
         .attrs
         .iter()
         .zip(&rt.keys)
-        .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key))
+        .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key) && opinput(&attr.name).is_none())
         .map(|(attr, _)| format!("Warning: @{} does not exist on the input and is never set, so it reads as 0", attr.name))
         .collect();
     for warning in missing {
@@ -4750,6 +4887,35 @@ mod tests {
     }
 
     #[test]
+    fn wrangles_read_their_other_inputs() {
+        // Input 1: the grid raised by 2, with a colour; input 2: three loose points.
+        let mut raised = grid();
+        raised.vertices.iter_mut().for_each(|p| p.y = 2.0);
+        raised.point_attributes.insert("Cd".into(), (0..9).flat_map(|i| [i as f32, 0.0, 0.0]).collect());
+        let three = Mesh { vertices: vec![Vec3::new(5.0, 0.0, 0.0), Vec3::new(6.0, 0.0, 0.0), Vec3::new(7.0, 0.0, 0.0)], ..Mesh::default() };
+        let inputs = [raised, three];
+        let run = |code: &str| run_masked(grid(), &inputs, code, 0.0, 1.0, 2, None, None);
+        let (out, report) = run("@P = point(1, \"P\", @ptnum); @Cd = @opinput1_Cd; i@n2 = npoints(2); i@n3 = npoints(3); i@own = npoints(0);");
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(out.vertices.iter().all(|p| p.y == 2.0));
+        assert_eq!(&out.point_attributes["Cd"][..9], &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        // Input 3 isn't connected: empty.
+        assert_eq!((out.point_attributes["n2"][0], out.point_attributes["n3"][0], out.point_attributes["own"][0]), (3.0, 0.0, 9.0));
+        // v@opinput1_P is a vector, like @P.
+        let (out, _) = run("v@lift = @opinput1_P - @P;");
+        assert_eq!(&out.point_attributes["lift"][..3], &[0.0, 2.0, 0.0]);
+        // Searches and point clouds on another input, and back on the wrangle's own.
+        let (out, report) = run("i@near = nearpoint(2, @P); int h = pcopen(1, \"P\", @P, 3.0, 1); vector c; while (pciterate(h)) pcimport(h, \"Cd\", c); f@red = c.x; i@mine = nearpoint(0, @P);");
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(out.point_attributes["near"].iter().all(|n| *n == 0.0), "the nearest of input 2 is its first point");
+        assert_eq!(out.point_attributes["red"], (0..9).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(out.point_attributes["mine"], (0..9).map(|i| i as f32).collect::<Vec<_>>());
+        // The other inputs are read-only, and there are four.
+        assert!(run("setpointattrib(1, \"x\", 0, 1);").1.error.unwrap().contains("read-only"));
+        assert!(run("f@x = point(4, \"P\", 0).x;").1.error.unwrap().contains("numbered 0 to 3"));
+    }
+
+    #[test]
     fn every_listed_builtin_is_implemented() {
         let input = grid();
         let normals = input.compute_normals();
@@ -4757,6 +4923,7 @@ mod tests {
         let mut rt = Runtime {
             prog: &program,
             input: &input,
+            others: Vec::new(),
             normals: &normals,
             out: input.clone(),
             domain: Domain::Point,
@@ -4780,6 +4947,7 @@ mod tests {
             polys: crate::poly::runs(&input),
             poly_of: crate::poly::of_triangles(&input),
             prim: 0,
+            reading: 0,
         };
         for (name, min, ..) in BUILTINS {
             if MUTATING.contains(name) {
@@ -4981,7 +5149,7 @@ mod tests {
         channels.insert("amp".into(), [2.5, 0.0, 0.0]);
         channels.insert("count".into(), [3.2, 0.0, 0.0]);
         channels.insert("dir".into(), [0.0, 1.0, 0.0]);
-        let (mesh, report) = run_masked(grid(), "@P += chv(\"dir\") * ch(\"amp\"); i@n = chi(\"count\"); f@missing = chf(\"nope\");", 0.0, 1.0, 2, None, Some(&channels));
+        let (mesh, report) = run_masked(grid(), &[], "@P += chv(\"dir\") * ch(\"amp\"); i@n = chi(\"count\"); f@missing = chf(\"nope\");", 0.0, 1.0, 2, None, Some(&channels));
         assert_eq!(report.error, None);
         assert_eq!(mesh.vertices[0].y, 2.5);
         assert_eq!((mesh.point_attributes["n"][0], mesh.point_attributes["missing"][0]), (3.0, 0.0));

@@ -46,7 +46,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | tube | `tube` | bottom_radius=0.5, top_radius=0.5, height=2, rows=8, columns=24, caps=1 |
 | lsystem | `lsystem` | 2 text field(s); generations=6, angle=28, step=0.6, step_scale=0.78, thickness=0.06, thickness_scale=0.7, angle_random=0, seed=1 |
 | test_geometry | `test_geometry` | shape=0, size=2, on_ground=1, colours=1, p=2, q=3, detail=48, clip=1, look=0, looping=1 |
-| particle_surface | `particle_surface` | particle_radius=0.12, join_distance=0.08, resolution=48, smoothing=0 |
+| particle_surface | `particle_surface` | particle_radius=0.05, join_distance=0, resolution=160, smoothing=1 |
 
 ## Groom
 
@@ -120,7 +120,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | fuse | `fuse` | distance=0.001 |
 | mirror | `mirror` | axis=0 |
 | copy | `copy` | copies=5, t.x=1.5, t.y=0, t.z=0, r.x=0, r.y=0, r.z=0, uniform_scale=1 |
-| copy_to_points | `copy_to_points` | scale=1, r.x=0, r.y=0, r.z=0 |
+| copy_to_points | `copy_to_points` | 1 text field(s); scale=1, r.x=0, r.y=0, r.z=0 |
 | extrude | `extrude` | 3 text field(s); distance=0.2, inset=0, connected=1, divisions=1, output_front=1, output_back=0, output_side=1, output_groups=1 |
 | clip | `clip` | axis=1, offset=0, invert=0 |
 | blast | `blast` | component=1, invert=0, #2=0 |
@@ -213,6 +213,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | attribute_delete | `attribute_delete` | 1 text field(s); #0=4, class=0 |
 | color | `color` | 1 text field(s); class=0, mode=0, color.r=1, color.g=0.45, color.b=0.1, color2.r=0.1, color2.g=0.3, color2.b=1, seed=1, axis=1 |
 | attribute_transfer | `attribute_transfer` | 1 text field(s); class=0, samples=4, distance=1, blend_width=0 |
+| enumerate | `enumerate` | 2 text field(s); class=0, start=0, increment=1 |
 | wrangle | `wrangle` | the run-over domain (0–3), `:`, then the code in hex |
 | attribute_vop | `attribute_vop` | run_over=2 |
 | normal | `normal` | domain=1, cusp_angle=60, weighting=0, reverse=0 |
@@ -247,7 +248,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | Node | Saved as | Parameters |
 | --- | --- | --- |
 | Principled | `principled_shader` | 3 text field(s); #0=0, base_color.r=0.8, base_color.g=0.8, base_color.b=0.8, use_point_color=0, metallic=0, roughness=0.4, specular=1, ior=1.5, transmission=0, transmission_color.r=1, transmission_color.g=1, transmission_color.b=1, thin_walled=0, subsurface=0, subsurface_color.r=1, subsurface_color.g=0.45, subsurface_color.b=0.3, subsurface_radius=1, sheen=0, sheen_color.r=1, sheen_color.g=1, sheen_color.b=1, sheen_roughness=0.3, clearcoat=0, clearcoat_roughness=0.05, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, opacity=1, anisotropy=0, iridescence=0, texture_scale_u=1, texture_scale_v=1 |
-| Toon Shader | `toon_shader` | #0=0, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=2, softness=0, terminator=0.05, highlight=1, highlight_size=0.3, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0 |
+| Toon Shader | `toon_shader` | #0=0, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=2, softness=0, terminator=0.05, highlight=1, highlight_size=0.3, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, use_point_color=0, outline_width=2, outline_color.r=0.06, outline_color.g=0.05, outline_color.b=0.08 |
 | Hair Shader | `hair_shader` | #0=0, hair_color.r=0.3, hair_color.g=0.17, hair_color.b=0.08, roughness=0.35, ior=1.55, specular_tint.r=1, specular_tint.g=1, specular_tint.b=1, glint=0 |
 | Pyro Shader | `pyro_shader` | #0=0, smoke_color.r=0.2, smoke_color.g=0.2, smoke_color.b=0.2, smoke_density=1, anisotropy=0.3, fire_color.r=1, fire_color.g=1, fire_color.b=1, fire_intensity=1 |
 | material_builder | `material_builder` | none |
@@ -335,10 +336,11 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Anime | `toon_shader` | #0=1, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=2, softness=0, terminator=0.05, highlight=1.2, highlight_size=0.15, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0 |
-| Cel 3 Tone | `toon_shader` | #0=2, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=3, softness=0, terminator=0.05, highlight=1, highlight_size=0.3, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0 |
-| Soft Toon | `toon_shader` | #0=3, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=3, softness=1, terminator=0.05, highlight=0.6, highlight_size=0.5, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0 |
-| Toon Metal | `toon_shader` | #0=4, base_color.r=0.8, base_color.g=0.8, base_color.b=0.85, shadow_color.r=0.15, shadow_color.g=0.15, shadow_color.b=0.25, bands=4, softness=0, terminator=0.05, highlight=2, highlight_size=0.08, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0 |
+| Anime | `toon_shader` | #0=1, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=2, softness=0, terminator=0.05, highlight=1.2, highlight_size=0.15, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, use_point_color=0, outline_width=2, outline_color.r=0.06, outline_color.g=0.05, outline_color.b=0.08 |
+| Cel 3 Tone | `toon_shader` | #0=2, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=3, softness=0, terminator=0.05, highlight=1, highlight_size=0.3, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, use_point_color=0, outline_width=2, outline_color.r=0.06, outline_color.g=0.05, outline_color.b=0.08 |
+| Soft Toon | `toon_shader` | #0=3, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.25, shadow_color.g=0.2, shadow_color.b=0.35, bands=3, softness=1, terminator=0.05, highlight=0.6, highlight_size=0.5, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, use_point_color=0, outline_width=2, outline_color.r=0.06, outline_color.g=0.05, outline_color.b=0.08 |
+| Toon Metal | `toon_shader` | #0=4, base_color.r=0.8, base_color.g=0.8, base_color.b=0.85, shadow_color.r=0.15, shadow_color.g=0.15, shadow_color.b=0.25, bands=4, softness=0, terminator=0.05, highlight=2, highlight_size=0.08, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, use_point_color=0, outline_width=2, outline_color.r=0.06, outline_color.g=0.05, outline_color.b=0.08 |
+| Toon FX | `toon_shader` | #0=5, base_color.r=0.9, base_color.g=0.35, base_color.b=0.25, shadow_color.r=0.72, shadow_color.g=0.6, shadow_color.b=0.78, bands=2, softness=0, terminator=0.35, highlight=0, highlight_size=0.3, highlight_color.r=1, highlight_color.g=1, highlight_color.b=1, emission_color.r=1, emission_color.g=1, emission_color.b=1, emission_intensity=0, use_point_color=1, outline_width=2.5, outline_color.r=0.06, outline_color.g=0.05, outline_color.b=0.08 |
 | Brown Hair | `hair_shader` | #0=1, hair_color.r=0.3, hair_color.g=0.17, hair_color.b=0.08, roughness=0.35, ior=1.55, specular_tint.r=1, specular_tint.g=1, specular_tint.b=1, glint=0 |
 | Blonde Hair | `hair_shader` | #0=2, hair_color.r=0.75, hair_color.g=0.58, hair_color.b=0.33, roughness=0.35, ior=1.55, specular_tint.r=1, specular_tint.g=1, specular_tint.b=1, glint=0 |
 | Black Hair | `hair_shader` | #0=3, hair_color.r=0.03, hair_color.g=0.02, hair_color.b=0.015, roughness=0.25, ior=1.55, specular_tint.r=1, specular_tint.g=1, specular_tint.b=1, glint=0 |
@@ -449,91 +451,91 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Bind | `vop` | 1 text field(s); operation=0, #1=1, #2=0, #3=0, #4=0 |
-| Parameter | `vop` | 1 text field(s); operation=2, #1=0, #2=0, #3=0, #4=0 |
+| Bind | `vop` | 1 text field(s); operation=0, #1=1, #2=0, #3=0, #4=0, #5=0 |
+| Parameter | `vop` | 1 text field(s); operation=2, #1=0, #2=0, #3=0, #4=0, #5=0 |
 
 ## Math
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Add | `vop` | 1 text field(s); operation=7, #1=0, #2=0, #3=0, #4=0 |
-| Subtract | `vop` | 1 text field(s); operation=8, #1=0, #2=0, #3=0, #4=0 |
-| Multiply | `vop` | 1 text field(s); operation=9, #1=0, #2=0, #3=0, #4=0 |
-| Divide | `vop` | 1 text field(s); operation=10, #1=0, #2=0, #3=0, #4=0 |
-| Negate | `vop` | 1 text field(s); operation=11, #1=0, #2=0, #3=0, #4=0 |
-| Absolute | `vop` | 1 text field(s); operation=12, #1=0, #2=0, #3=0, #4=0 |
-| Floor | `vop` | 1 text field(s); operation=13, #1=0, #2=0, #3=0, #4=0 |
-| Fraction | `vop` | 1 text field(s); operation=14, #1=0, #2=0, #3=0, #4=0 |
-| Power | `vop` | 1 text field(s); operation=15, #1=0, #2=0, #3=0, #4=0 |
-| Square Root | `vop` | 1 text field(s); operation=16, #1=0, #2=0, #3=0, #4=0 |
-| Sine | `vop` | 1 text field(s); operation=17, #1=0, #2=0, #3=0, #4=0 |
-| Cosine | `vop` | 1 text field(s); operation=18, #1=0, #2=0, #3=0, #4=0 |
-| Minimum | `vop` | 1 text field(s); operation=19, #1=0, #2=0, #3=0, #4=0 |
-| Maximum | `vop` | 1 text field(s); operation=20, #1=0, #2=0, #3=0, #4=0 |
-| Clamp | `vop` | 1 text field(s); operation=22, #1=0, #2=0, #3=0, #4=0 |
-| Fit Range | `vop` | 1 text field(s); operation=23, #1=0, #2=0, #3=0, #4=0 |
-| Ramp Smooth | `vop` | 1 text field(s); operation=24, #1=0, #2=0, #3=0, #4=0 |
-| Modulo | `vop` | 1 text field(s); operation=48, #1=0, #2=0, #3=0, #4=0 |
-| Round | `vop` | 1 text field(s); operation=49, #1=0, #2=0, #3=0, #4=0 |
-| Ceiling | `vop` | 1 text field(s); operation=50, #1=0, #2=0, #3=0, #4=0 |
-| Exponential | `vop` | 1 text field(s); operation=51, #1=0, #2=0, #3=0, #4=0 |
-| Logarithm | `vop` | 1 text field(s); operation=52, #1=0, #2=0, #3=0, #4=0 |
-| Tangent | `vop` | 1 text field(s); operation=53, #1=0, #2=0, #3=0, #4=0 |
-| Arctangent2 | `vop` | 1 text field(s); operation=54, #1=0, #2=0, #3=0, #4=0 |
-| Average | `vop` | 1 text field(s); operation=55, #1=0, #2=0, #3=0, #4=0 |
-| Sign | `vop` | 1 text field(s); operation=56, #1=0, #2=0, #3=0, #4=0 |
+| Add | `vop` | 1 text field(s); operation=7, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Subtract | `vop` | 1 text field(s); operation=8, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Multiply | `vop` | 1 text field(s); operation=9, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Divide | `vop` | 1 text field(s); operation=10, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Negate | `vop` | 1 text field(s); operation=11, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Absolute | `vop` | 1 text field(s); operation=12, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Floor | `vop` | 1 text field(s); operation=13, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Fraction | `vop` | 1 text field(s); operation=14, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Power | `vop` | 1 text field(s); operation=15, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Square Root | `vop` | 1 text field(s); operation=16, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Sine | `vop` | 1 text field(s); operation=17, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Cosine | `vop` | 1 text field(s); operation=18, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Minimum | `vop` | 1 text field(s); operation=19, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Maximum | `vop` | 1 text field(s); operation=20, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Clamp | `vop` | 1 text field(s); operation=22, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Fit Range | `vop` | 1 text field(s); operation=23, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Ramp Smooth | `vop` | 1 text field(s); operation=24, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Modulo | `vop` | 1 text field(s); operation=48, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Round | `vop` | 1 text field(s); operation=49, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Ceiling | `vop` | 1 text field(s); operation=50, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Exponential | `vop` | 1 text field(s); operation=51, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Logarithm | `vop` | 1 text field(s); operation=52, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Tangent | `vop` | 1 text field(s); operation=53, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Arctangent2 | `vop` | 1 text field(s); operation=54, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Average | `vop` | 1 text field(s); operation=55, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Sign | `vop` | 1 text field(s); operation=56, #1=0, #2=0, #3=0, #4=0, #5=0 |
 
 ## Vector
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Component | `vop` | 1 text field(s); operation=4, #1=0, #2=0, #3=0, #4=0 |
-| Dot Product | `vop` | 1 text field(s); operation=25, #1=0, #2=0, #3=0, #4=0 |
-| Cross Product | `vop` | 1 text field(s); operation=26, #1=0, #2=0, #3=0, #4=0 |
-| Length | `vop` | 1 text field(s); operation=27, #1=0, #2=0, #3=0, #4=0 |
-| Normalize | `vop` | 1 text field(s); operation=28, #1=0, #2=0, #3=0, #4=0 |
-| Distance | `vop` | 1 text field(s); operation=29, #1=0, #2=0, #3=0, #4=0 |
-| Make Vector | `vop` | 1 text field(s); operation=30, #1=0, #2=0, #3=0, #4=0 |
-| Rotate | `vop` | 1 text field(s); operation=31, #1=0, #2=0, #3=0, #4=0 |
-| Reflect | `vop` | 1 text field(s); operation=57, #1=0, #2=0, #3=0, #4=0 |
+| Component | `vop` | 1 text field(s); operation=4, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Dot Product | `vop` | 1 text field(s); operation=25, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Cross Product | `vop` | 1 text field(s); operation=26, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Length | `vop` | 1 text field(s); operation=27, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Normalize | `vop` | 1 text field(s); operation=28, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Distance | `vop` | 1 text field(s); operation=29, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Make Vector | `vop` | 1 text field(s); operation=30, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Rotate | `vop` | 1 text field(s); operation=31, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Reflect | `vop` | 1 text field(s); operation=57, #1=0, #2=0, #3=0, #4=0, #5=0 |
 
 ## Geometry
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Get Attribute | `vop` | 1 text field(s); operation=38, #1=1, #2=0, #3=0, #4=0 |
-| Point Cloud Average | `vop` | 1 text field(s); operation=39, #1=1, #2=0, #3=0, #4=0 |
-| Nearest Point | `vop` | 1 text field(s); operation=40, #1=0, #2=0, #3=0, #4=0 |
-| Distance to Surface | `vop` | 1 text field(s); operation=41, #1=0, #2=0, #3=0, #4=0 |
-| Closest Point on Surface | `vop` | 1 text field(s); operation=42, #1=0, #2=0, #3=0, #4=0 |
-| Neighbour Count | `vop` | 1 text field(s); operation=43, #1=0, #2=0, #3=0, #4=0 |
-| Point Count | `vop` | 1 text field(s); operation=44, #1=0, #2=0, #3=0, #4=0 |
-| Bounding Box Centre | `vop` | 1 text field(s); operation=45, #1=0, #2=0, #3=0, #4=0 |
-| Bounding Box Size | `vop` | 1 text field(s); operation=46, #1=0, #2=0, #3=0, #4=0 |
-| Relative to Bounding Box | `vop` | 1 text field(s); operation=47, #1=0, #2=0, #3=0, #4=0 |
+| Get Attribute | `vop` | 1 text field(s); operation=38, #1=1, #2=0, #3=0, #4=0, #5=0 |
+| Point Cloud Average | `vop` | 1 text field(s); operation=39, #1=1, #2=0, #3=0, #4=0, #5=0 |
+| Nearest Point | `vop` | 1 text field(s); operation=40, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Distance to Surface | `vop` | 1 text field(s); operation=41, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Closest Point on Surface | `vop` | 1 text field(s); operation=42, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Neighbour Count | `vop` | 1 text field(s); operation=43, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Point Count | `vop` | 1 text field(s); operation=44, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Bounding Box Centre | `vop` | 1 text field(s); operation=45, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Bounding Box Size | `vop` | 1 text field(s); operation=46, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Relative to Bounding Box | `vop` | 1 text field(s); operation=47, #1=0, #2=0, #3=0, #4=0, #5=0 |
 
 ## Noise
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Signed Noise | `vop` | 1 text field(s); operation=33, #1=0, #2=0, #3=0, #4=0 |
-| Curl Noise | `vop` | 1 text field(s); operation=34, #1=0, #2=0, #3=0, #4=0 |
-| Worley Noise | `vop` | 1 text field(s); operation=35, #1=0, #2=0, #3=0, #4=0 |
-| Random | `vop` | 1 text field(s); operation=36, #1=0, #2=0, #3=0, #4=0 |
-| Alligator Noise | `vop` | 1 text field(s); operation=58, #1=0, #2=0, #3=0, #4=0 |
+| Signed Noise | `vop` | 1 text field(s); operation=33, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Curl Noise | `vop` | 1 text field(s); operation=34, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Worley Noise | `vop` | 1 text field(s); operation=35, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Random | `vop` | 1 text field(s); operation=36, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Alligator Noise | `vop` | 1 text field(s); operation=58, #1=0, #2=0, #3=0, #4=0, #5=0 |
 
 ## Logic
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Compare | `vop` | 1 text field(s); operation=5, #1=0, #2=0, #3=0, #4=0 |
-| Snippet | `vop` | 1 text field(s); operation=6, #1=0, #2=0, #3=0, #4=0 |
-| And | `vop` | 1 text field(s); operation=59, #1=0, #2=0, #3=0, #4=0 |
-| Or | `vop` | 1 text field(s); operation=60, #1=0, #2=0, #3=0, #4=0 |
-| Not | `vop` | 1 text field(s); operation=61, #1=0, #2=0, #3=0, #4=0 |
+| Compare | `vop` | 1 text field(s); operation=5, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Snippet | `vop` | 1 text field(s); operation=6, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| And | `vop` | 1 text field(s); operation=59, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Or | `vop` | 1 text field(s); operation=60, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Not | `vop` | 1 text field(s); operation=61, #1=0, #2=0, #3=0, #4=0, #5=0 |
 
 ## Outputs
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Export | `vop` | 1 text field(s); operation=3, #1=1, #2=0, #3=0, #4=0 |
+| Export | `vop` | 1 text field(s); operation=3, #1=1, #2=0, #3=0, #4=0, #5=0 |

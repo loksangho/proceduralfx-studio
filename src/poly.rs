@@ -17,7 +17,7 @@ pub const KEY: &str = "prim:__poly";
 
 // Attributes the user never sees (spreadsheet, attribute menus).
 pub fn is_internal(key: &str) -> bool {
-    key == KEY
+    key == KEY || key == crate::TOON_ATTR
 }
 
 fn ids(mesh: &Mesh) -> Option<&[f32]> {

@@ -195,48 +195,48 @@ fn connected_prims(mesh: &Mesh) -> Vec<Vec<usize>> {
     order.into_iter().map(|r| groups.remove(&r).unwrap()).collect()
 }
 
+// The pieces made by each value of an attribute (`name`, `piece`, `variant`…), in the
+// order they first appear, each with its value: primitives by their primitive
+// attribute (or their first point's), or points alone when there are no primitives.
+pub fn named_pieces(mesh: &Mesh, name: &str) -> Result<Vec<(f32, Mesh)>, String> {
+    let (np, nt) = (mesh.vertices.len(), mesh.indices.len());
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("enter the attribute whose values make the pieces (name, piece, class…)".into());
+    }
+    let key = |v: f32| (v * 1000.0).round() as i64;
+    let prim = mesh.point_attributes.get(&format!("prim:{name}")).filter(|v| nt > 0 && v.len() == nt);
+    let point = mesh.point_attributes.get(name).filter(|v| np > 0 && v.len() == np);
+    let (values, elements): (Vec<f32>, usize) = match (prim, point) {
+        (Some(v), _) => (v.clone(), nt),
+        (None, Some(v)) if nt > 0 => (mesh.indices.iter().map(|t| v[t[0]]).collect(), nt),
+        (None, Some(v)) => (v.clone(), np),
+        _ => return Err(format!("the input has no `{name}` attribute (primitive or point)")),
+    };
+    let mut order = Vec::new();
+    let mut groups: std::collections::HashMap<i64, Vec<usize>> = Default::default();
+    for (i, &v) in values.iter().enumerate().take(elements) {
+        groups.entry(key(v)).or_insert_with(|| {
+            order.push(v);
+            Vec::new()
+        }).push(i);
+    }
+    Ok(order
+        .into_iter()
+        .map(|v| {
+            let members = &groups[&key(v)];
+            (v, if nt > 0 { extract_prims(mesh, members) } else { extract_points(mesh, members) })
+        })
+        .collect())
+}
+
 // The pieces a piece-based loop runs over.
 pub fn pieces(mesh: &Mesh, set: &ForEachSettings) -> Result<Vec<Mesh>, String> {
     let (np, nt) = (mesh.vertices.len(), mesh.indices.len());
     Ok(match set.mode {
         POINT => (0..np).map(|p| extract_points(mesh, &[p])).collect(),
         PRIMITIVE => (0..nt).map(|t| extract_prims(mesh, &[t])).collect(),
-        NAMED => {
-            let name = set.attribute.trim();
-            if name.is_empty() {
-                return Err("enter the attribute whose values make the pieces (name, piece, class…)".into());
-            }
-            let prim = mesh.point_attributes.get(&format!("prim:{name}")).filter(|v| v.len() == nt);
-            let point = mesh.point_attributes.get(name).filter(|v| v.len() == np);
-            let key_of: Box<dyn Fn(usize) -> i64> = match (prim, point) {
-                (Some(v), _) => Box::new(move |t| (v[t] * 1000.0).round() as i64),
-                (None, Some(v)) if nt > 0 => Box::new(move |t: usize| (v[mesh.indices[t][0]] * 1000.0).round() as i64),
-                (None, Some(v)) => {
-                    // Points only: group the points.
-                    let mut order = Vec::new();
-                    let mut groups: std::collections::BTreeMap<i64, Vec<usize>> = Default::default();
-                    for p in 0..np {
-                        let k = (v[p] * 1000.0).round() as i64;
-                        groups.entry(k).or_insert_with(|| {
-                            order.push(k);
-                            Vec::new()
-                        }).push(p);
-                    }
-                    return Ok(order.into_iter().map(|k| extract_points(mesh, &groups[&k])).collect());
-                }
-                _ => return Err(format!("the input has no `{name}` attribute (primitive or point)")),
-            };
-            let mut order = Vec::new();
-            let mut groups: std::collections::HashMap<i64, Vec<usize>> = Default::default();
-            for t in 0..nt {
-                let k = key_of(t);
-                groups.entry(k).or_insert_with(|| {
-                    order.push(k);
-                    Vec::new()
-                }).push(t);
-            }
-            order.into_iter().map(|k| extract_prims(mesh, &groups[&k])).collect()
-        }
+        NAMED => named_pieces(mesh, &set.attribute)?.into_iter().map(|(_, piece)| piece).collect(),
         _ => {
             if nt == 0 {
                 // Loose points are each their own piece.

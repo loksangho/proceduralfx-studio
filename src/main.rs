@@ -68,6 +68,8 @@ mod testgeo;
 mod textures;
 mod tops;
 mod transfer;
+mod enumerate;
+mod fluidsurface;
 mod updater;
 mod vellum;
 mod usd;
@@ -993,8 +995,8 @@ fn write_vdb_file(mesh: &Mesh, path: &str) -> Result<(), String> {
     }
 }
 
-fn node_wrangle(mesh: Mesh, code: &str, time: f32, domain: usize, mask: Option<&[bool]>, channels: Option<&vex::Channels>) -> Mesh {
-    vex::run_wrangle(mesh, code, time, SOLVER_TIME_INC.with(|inc| inc.get()), domain, mask, channels)
+fn node_wrangle(mesh: Mesh, inputs: &[Mesh], code: &str, time: f32, domain: usize, mask: Option<&[bool]>, channels: Option<&vex::Channels>) -> Mesh {
+    vex::run_wrangle(mesh, inputs, code, time, SOLVER_TIME_INC.with(|inc| inc.get()), domain, mask, channels)
 }
 
 // Renumbers the nodes a node refers to (its material, Object Merge sources and so on), for
@@ -1373,6 +1375,33 @@ fn node_add(count: usize, spacing: f32, layout: usize) -> Mesh {
 }
 
 fn node_copy_to_points(piece: Mesh, points: Mesh, scale: f32, rotation: [f32; 3]) -> Mesh {
+    copy_to_points_with(points, scale, rotation, |_| Some(&piece))
+}
+
+// Copy to Points with a piece attribute: each point gets the piece of the first input
+// whose value of the attribute matches its own (pieces by a primitive attribute, or
+// point attribute; points by a point attribute). Points matching no piece get nothing.
+fn node_copy_pieces_to_points(source: Mesh, points: Mesh, scale: f32, rotation: [f32; 3], piece_attribute: &str) -> Result<Mesh, String> {
+    let name = piece_attribute.trim();
+    if name.is_empty() {
+        return Ok(node_copy_to_points(source, points, scale, rotation));
+    }
+    let key = |v: f32| (v * 1000.0).round() as i64;
+    let pieces: HashMap<i64, Mesh> = flow::named_pieces(&source, name)
+        .map_err(|e| format!("first input: {e}"))?
+        .into_iter()
+        .map(|(value, piece)| (key(value), piece))
+        .collect();
+    let n = points.vertices.len();
+    let chosen: Vec<f32> = match points.point_attributes.get(name).filter(|v| n > 0 && v.len() % n == 0) {
+        Some(values) => values.chunks(values.len() / n).map(|c| c[0]).collect(),
+        None if n == 0 => Vec::new(),
+        None => return Err(format!("the points have no `{name}` attribute to choose their piece; give them one (Attribute Randomize, integer, 0 to the number of pieces − 1)")),
+    };
+    Ok(copy_to_points_with(points, scale, rotation, |i| pieces.get(&key(chosen[i]))))
+}
+
+fn copy_to_points_with<'a>(points: Mesh, scale: f32, rotation: [f32; 3], piece_for: impl Fn(usize) -> Option<&'a Mesh>) -> Mesh {
     let mut out = Mesh::default();
     let scales = points.point_attributes.get("pscale");
     let orientations = points.point_attributes.get("orient");
@@ -1381,6 +1410,9 @@ fn node_copy_to_points(piece: Mesh, points: Mesh, scale: f32, rotation: [f32; 3]
     // orient: a quaternion per point (as in Houdini), or one number, a turn about Y in degrees.
     let quaternions = orientations.filter(|o| point_count > 0 && o.len() == point_count * 4);
     for (index, point) in points.vertices.into_iter().enumerate() {
+        let Some(piece) = piece_for(index) else {
+            continue;
+        };
         let point_scale = scales.and_then(|v| v.get(index)).copied().unwrap_or(1.0);
         let point_rotation = if quaternions.is_some() { 0.0 } else { orientations.and_then(|v| v.get(index)).copied().unwrap_or(0.0) };
         let mut copy = node_transform(
@@ -1655,98 +1687,7 @@ fn node_particle_surface(
     resolution: usize,
     smoothing: usize,
 ) -> Mesh {
-    let Some((lo, hi)) = input.bounds() else {
-        return Mesh::default();
-    };
-    if input.vertices.is_empty() {
-        return Mesh::default();
-    }
-    let resolution = resolution.clamp(8, 96);
-    let radius = radius.max(0.001);
-    let join_distance = join_distance.max(0.0);
-    let extent = hi.sub(lo);
-    let longest = extent.x.max(extent.y).max(extent.z).max(radius * 2.0);
-    let cell = (longest / resolution as f32).max(radius * 0.5);
-    let origin = lo.sub(Vec3::new(cell, cell, cell));
-    let dims = [
-        ((extent.x / cell).ceil() as i32 + 2).clamp(2, 98),
-        ((extent.y / cell).ceil() as i32 + 2).clamp(2, 98),
-        ((extent.z / cell).ceil() as i32 + 2).clamp(2, 98),
-    ];
-    let support_radius = radius + join_distance;
-    let reach = (support_radius / cell).ceil() as i32;
-    let mut occupied = HashSet::new();
-    for point in input.vertices {
-        let base = [
-            ((point.x - origin.x) / cell).floor() as i32,
-            ((point.y - origin.y) / cell).floor() as i32,
-            ((point.z - origin.z) / cell).floor() as i32,
-        ];
-        for z in (base[2] - reach)..=(base[2] + reach) {
-            for y in (base[1] - reach)..=(base[1] + reach) {
-                for x in (base[0] - reach)..=(base[0] + reach) {
-                    let dx = (x as f32 + 0.5) * cell + origin.x - point.x;
-                    let dy = (y as f32 + 0.5) * cell + origin.y - point.y;
-                    let dz = (z as f32 + 0.5) * cell + origin.z - point.z;
-                    if dx * dx + dy * dy + dz * dz <= (support_radius + cell * 0.5).powi(2)
-                        && x >= 0 && y >= 0 && z >= 0
-                        && x < dims[0] && y < dims[1] && z < dims[2]
-                    {
-                        occupied.insert((x, y, z));
-                    }
-                }
-            }
-        }
-    }
-    for _ in 0..smoothing.min(3) {
-        let mut expanded = occupied.clone();
-        for &(x, y, z) in &occupied {
-            for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
-                let p = (x + dx, y + dy, z + dz);
-                if p.0 >= 0 && p.1 >= 0 && p.2 >= 0
-                    && p.0 < dims[0] && p.1 < dims[1] && p.2 < dims[2]
-                {
-                    expanded.insert(p);
-                }
-            }
-        }
-        occupied = expanded;
-    }
-
-    let mut out = Mesh::default();
-    let mut corners = HashMap::new();
-    let corner = |p: (i32, i32, i32), out: &mut Mesh, corners: &mut HashMap<(i32, i32, i32), usize>| {
-        if let Some(&index) = corners.get(&p) {
-            return index;
-        }
-        let index = out.vertices.len();
-        out.vertices.push(Vec3::new(
-            origin.x + p.0 as f32 * cell,
-            origin.y + p.1 as f32 * cell,
-            origin.z + p.2 as f32 * cell,
-        ));
-        corners.insert(p, index);
-        index
-    };
-    let faces: [((i32, i32, i32), [(i32, i32, i32); 4]); 6] = [
-        ((-1, 0, 0), [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)]),
-        ((1, 0, 0), [(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)]),
-        ((0, -1, 0), [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)]),
-        ((0, 1, 0), [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)]),
-        ((0, 0, -1), [(0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)]),
-        ((0, 0, 1), [(0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]),
-    ];
-    for &(x, y, z) in &occupied {
-        for &((dx, dy, dz), offsets) in &faces {
-            if occupied.contains(&(x + dx, y + dy, z + dz)) {
-                continue;
-            }
-            let ids = offsets.map(|(ox, oy, oz)| corner((x + ox, y + oy, z + oz), &mut out, &mut corners));
-            out.indices.push([ids[0], ids[1], ids[2]]);
-            out.indices.push([ids[0], ids[2], ids[3]]);
-        }
-    }
-    out
+    fluidsurface::surface(&input, &fluidsurface::SurfaceSettings { radius, join_distance, resolution, smoothing })
 }
 
 fn cache_file_path(cache_id: usize, time: f32) -> std::path::PathBuf {
@@ -3744,7 +3685,8 @@ enum NodeKind {
     Remesh { target: usize },
     Mirror { axis: usize },
     Copy { count: usize, t: [f32; 3], r: [f32; 3], s: f32 },
-    CopyToPoints { scale: f32, rotation: [f32; 3] },
+    // Optional piece attribute: each point copies the piece with its value of it.
+    CopyToPoints { scale: f32, rotation: [f32; 3], piece_attribute: String },
     AttributeCreate(attrib::CreateSettings),
     AttributeRandomize(randomize::RandomizeSettings),
     AttributeDelete(attrib::DeleteSettings),
@@ -3934,6 +3876,8 @@ enum NodeKind {
     GroupCreate(groups::GroupCreateSettings),
     // Sets Cd on points or primitives: one colour, random colours or a ramp.
     Color(color::ColorSettings),
+    // Numbers points or primitives (or pieces) in an attribute.
+    Enumerate(enumerate::EnumerateSettings),
     // Copies attributes from the nearest points or primitives of its second input.
     AttributeTransfer(transfer::TransferSettings),
     // Node-based VEX: a container of VOP nodes compiled to VEX and run over `domain` (like Wrangle).
@@ -4149,6 +4093,7 @@ impl NodeKind {
             NodeKind::UvTexture(_) => names(&["projection", "axis", "scale.u", "scale.v", "offset.u", "offset.v"]),
             NodeKind::AttributeTransfer(_) => names(&["class", "samples", "distance", "blend_width"]),
             NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis"]),
+            NodeKind::Enumerate(_) => names(&["class", "start", "increment"]),
             NodeKind::UvTransform(_) => names(&["translate.u", "translate.v", "rotate", "scale.u", "scale.v", "pivot.u", "pivot.v"]),
             NodeKind::VellumSolver(_) => names(&["type", "stretch_stiffness", "bend_stiffness", "shape_stiffness", "mass", "thickness", "gravity", "damping", "friction", "substeps", "iterations", "ground", "self_collision", "pin_to_animation"]),
             NodeKind::SopSolver { .. } => names(&["substeps"]),
@@ -4252,6 +4197,8 @@ impl NodeKind {
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
             NodeKind::Color(s) => vec![s.random_by.clone()],
+            NodeKind::CopyToPoints { piece_attribute, .. } => vec![piece_attribute.clone()],
+            NodeKind::Enumerate(s) => vec![s.attribute.clone(), s.piece_attribute.clone()],
             NodeKind::AttributeTransfer(s) => vec![s.pattern.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
@@ -4315,6 +4262,11 @@ impl NodeKind {
                 next(&mut g.expression);
             }
             NodeKind::Color(s) => next(&mut s.random_by),
+            NodeKind::CopyToPoints { piece_attribute, .. } => next(piece_attribute),
+            NodeKind::Enumerate(s) => {
+                next(&mut s.attribute);
+                next(&mut s.piece_attribute);
+            }
             NodeKind::AttributeTransfer(s) => next(&mut s.pattern),
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
@@ -4334,7 +4286,7 @@ impl NodeKind {
     // Nodes whose network lives in their children: Geometry objects and SOP Solvers.
     // Nodes with any number of inputs (a free port is always shown).
     fn is_multi_input(&self) -> bool {
-        matches!(self, NodeKind::Merge | NodeKind::LopMerge)
+        matches!(self, NodeKind::Merge | NodeKind::LopMerge | NodeKind::Switch { .. })
     }
 
     fn is_container(&self) -> bool {
@@ -4468,10 +4420,10 @@ impl NodeKind {
                     NodeKind::LSystem(lsystem::LSystemSettings::defaults()),
                     NodeKind::TestGeometry(testgeo::TestGeoSettings::defaults()),
                     NodeKind::ParticleSurface {
-                        radius: 0.12,
-                        join_distance: 0.08,
-                        resolution: 48,
-                        smoothing: 0,
+                        radius: 0.05,
+                        join_distance: 0.0,
+                        resolution: 160,
+                        smoothing: 1,
                     },
                 ],
             ),
@@ -4587,7 +4539,7 @@ impl NodeKind {
                     NodeKind::Fuse { tol: 0.001 },
                     NodeKind::Mirror { axis: 0 },
                     NodeKind::Copy { count: 5, t: [1.5, 0.0, 0.0], r: [0.0; 3], s: 1.0 },
-                    NodeKind::CopyToPoints { scale: 1.0, rotation: [0.0; 3] },
+                    NodeKind::CopyToPoints { scale: 1.0, rotation: [0.0; 3], piece_attribute: String::new() },
                     NodeKind::Extrude(extrude::ExtrudeSettings::defaults()),
                     NodeKind::Clip { axis: 1, offset: 0.0, invert: false },
                     NodeKind::Blast { component: 1, indices: Vec::new(), invert: false },
@@ -4677,6 +4629,7 @@ impl NodeKind {
                     NodeKind::AttributeDelete(attrib::DeleteSettings::defaults()),
                     NodeKind::Color(color::ColorSettings::defaults()),
                     NodeKind::AttributeTransfer(transfer::TransferSettings::defaults()),
+                    NodeKind::Enumerate(enumerate::EnumerateSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
@@ -4887,6 +4840,7 @@ impl NodeKind {
             NodeKind::UvTexture(_) => "uv_texture",
             NodeKind::UvTransform(_) => "uv_transform",
             NodeKind::Color(_) => "color",
+            NodeKind::Enumerate(_) => "enumerate",
             NodeKind::AttributeTransfer(_) => "attribute_transfer",
             NodeKind::UvQuickShade { .. } => "uv_quickshade",
             NodeKind::AttributePaint { .. } => "attribute_paint",
@@ -4925,6 +4879,10 @@ impl NodeKind {
             NodeKind::MaterialFracture(_) | NodeKind::RbdConfigure(_) => (&["Geometry", "Constraints", "Proxy"], &["Geometry", "Constraints", "Proxy"]),
             NodeKind::RbdBullet(_) => (&["Geometry", "Constraints", "Proxy", "Collision"], &["Geometry", "Constraints", "Proxy"]),
             NodeKind::AttributeTransfer(_) => (&["Geometry to change", "Source of the attributes"], &[]),
+            // As VEX numbers them: point(1, ...) reads the second.
+            NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => {
+                (&["0: geometry to change", "1 (read-only)", "2 (read-only)", "3 (read-only)"], &[])
+            }
             _ => (&[], &[]),
         }
     }
@@ -4968,10 +4926,11 @@ impl NodeKind {
             NodeKind::AttributeCreate(_)
             | NodeKind::AttributeRandomize(_)
             | NodeKind::AttributeDelete(_)
-            | NodeKind::Color(_) => 1,
-            NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } => 1,
+            | NodeKind::Color(_)
+            | NodeKind::Enumerate(_) => 1,
+            // Input 0 is the geometry they change; 1-3 are read by point(1, ...), @opinput1_P and the like.
+            NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => vex::INPUTS,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
-            NodeKind::AttributeVop { .. } => 1,
             NodeKind::Vop(v) => v.def().inputs.len(),
             NodeKind::MoonRayRender { .. } => 0,
             NodeKind::Camera { .. } | NodeKind::Light { .. } | NodeKind::Geometry { .. } | NodeKind::Material { .. } => 0,
@@ -5059,7 +5018,7 @@ impl NodeKind {
             NodeKind::Copy { count, t, r, s } => {
                 [vec![*count as f32], t.to_vec(), r.to_vec(), vec![*s]].concat()
             }
-            NodeKind::CopyToPoints { scale, rotation } => {
+            NodeKind::CopyToPoints { scale, rotation, .. } => {
                 vec![*scale, rotation[0], rotation[1], rotation[2]]
             }
             NodeKind::AttributeCreate(s) => s.to_params(),
@@ -5069,7 +5028,7 @@ impl NodeKind {
             NodeKind::LSystem(l) => l.to_params(),
             NodeKind::TestGeometry(t) => t.to_params(),
             NodeKind::AttributeVop { domain } => vec![*domain as f32],
-            NodeKind::Vop(v) => vec![v.op as f32, v.ty as f32, v.value[0], v.value[1], v.value[2]],
+            NodeKind::Vop(v) => vec![v.op as f32, v.ty as f32, v.value[0], v.value[1], v.value[2], v.input as f32],
             NodeKind::Tube { r_bot, r_top, height, rows, cols, caps } => {
                 vec![*r_bot, *r_top, *height, *rows as f32, *cols as f32, *caps as u8 as f32]
             }
@@ -5291,6 +5250,7 @@ impl NodeKind {
             .concat(),
             NodeKind::UvTexture(s) => vec![s.projection as f32, s.axis as f32, s.scale[0], s.scale[1], s.offset[0], s.offset[1]],
             NodeKind::Color(s) => s.params(),
+            NodeKind::Enumerate(s) => s.params(),
             NodeKind::AttributeTransfer(s) => s.params(),
             NodeKind::UvTransform(s) => vec![s.translate[0], s.translate[1], s.rotate, s.scale[0], s.scale[1], s.pivot[0], s.pivot[1]],
             NodeKind::VellumSolver(s) => vec![
@@ -5375,6 +5335,7 @@ impl NodeKind {
             "copy_to_points" => NodeKind::CopyToPoints {
                 scale: g(0).max(0.001),
                 rotation: v3(1),
+                piece_attribute: String::new(),
             },
             "attribute_create" => NodeKind::AttributeCreate(attrib::CreateSettings::from_params(p)),
             "attribute_randomize" => NodeKind::AttributeRandomize(randomize::RandomizeSettings::from_params(p)),
@@ -5390,6 +5351,7 @@ impl NodeKind {
                 name: String::new(),
                 ty: u(1),
                 value: [g(2), g(3), g(4)],
+                input: u(5).min(3),
             }),
             "merge" => NodeKind::Merge,
             "null" => NodeKind::Null,
@@ -5438,8 +5400,8 @@ impl NodeKind {
             "particle_surface" => NodeKind::ParticleSurface {
                 radius: g(0).max(0.001),
                 join_distance: g(1).max(0.0),
-                resolution: u(2).clamp(8, 96),
-                smoothing: u(3).min(3),
+                resolution: u(2).clamp(8, 512),
+                smoothing: u(3).min(8),
             },
             "extrude" => NodeKind::Extrude(extrude::ExtrudeSettings::from_params(p)),
             "clip" => NodeKind::Clip { axis: u(0), offset: g(1), invert: g(2) > 0.5 },
@@ -5740,6 +5702,7 @@ impl NodeKind {
                 offset: [g(4), g(5)],
             }),
             "color" => NodeKind::Color(color::ColorSettings::from_params(p, String::new())),
+            "enumerate" => NodeKind::Enumerate(enumerate::EnumerateSettings::from_params(p)),
             "attribute_transfer" => NodeKind::AttributeTransfer(transfer::TransferSettings::from_params(p, "*".into())),
             "uv_transform" => NodeKind::UvTransform(sops::UvTransformSettings {
                 translate: [g(0), g(1)],
@@ -6288,8 +6251,12 @@ impl Graph {
                     }).collect()
                 });
                 let mut textures: Vec<Option<String>> = Vec::new();
+                let mut toon = vec![0.0f32; n];
                 for (t, m) in ids.iter().enumerate() {
                     let material = if *m >= 0.5 { Some((*m - 1.0).round() as usize) } else { object_material };
+                    if let Some(id) = material.filter(|id| self.is_toon(*id)) {
+                        toon[t] = id as f32 + 1.0;
+                    }
                     let preview = material.and_then(|m| self.material_preview(m));
                     if let Some((colour, texture, uses_cd)) = preview {
                         if !(uses_cd && point_cd.is_some()) {
@@ -6302,6 +6269,9 @@ impl Graph {
                 }
                 mesh.point_attributes.remove("Cd");
                 mesh.point_attributes.insert("prim:Cd".into(), colours);
+                if toon.iter().any(|t| *t > 0.0) {
+                    mesh.point_attributes.insert(TOON_ATTR.into(), toon);
+                }
                 // One texture for the whole mesh shows (the viewport has one per object).
                 textures.dedup();
                 if let [Some(texture)] = textures.as_slice() {
@@ -6314,6 +6284,9 @@ impl Graph {
                 if !(coloured && uses_cd) && !mesh.indices.is_empty() {
                     mesh.point_attributes.remove("Cd");
                     mesh.point_attributes.insert("prim:Cd".into(), color.repeat(mesh.indices.len()));
+                }
+                if let Some(id) = object_material.filter(|id| self.is_toon(*id) && !mesh.indices.is_empty()) {
+                    mesh.point_attributes.insert(TOON_ATTR.into(), vec![id as f32 + 1.0; mesh.indices.len()]);
                 }
                 // Image textures show in the viewport like UV Quick Shade.
                 if let Some(texture) = texture {
@@ -6957,12 +6930,17 @@ impl Graph {
     }
 
     // What the viewport shows for a MAT node: (colour, image texture, whether point Cd is used).
+    fn is_toon(&self, material: NodeId) -> bool {
+        matches!(self.nodes.get(&material).map(|n| &n.kind), Some(NodeKind::Shader(v)) if v.table == shading::Table::Toon)
+    }
+
     fn material_preview(&self, material: NodeId) -> Option<([f32; 3], Option<String>, bool)> {
         match &self.nodes.get(&material)?.kind {
             NodeKind::Material { color, .. } => Some((*color, None, true)),
             NodeKind::Shader(v) => {
                 let texture = (v.table == shading::Table::Principled && !v.texture(0).is_empty()).then(|| v.texture(0).to_owned());
-                Some((v.viewport_color(), texture, v.table == shading::Table::Principled && v.flag("use_point_color")))
+                let uses_cd = matches!(v.table, shading::Table::Principled | shading::Table::Toon) && v.flag("use_point_color");
+                Some((v.viewport_color(), texture, uses_cd))
             }
             NodeKind::MaterialBuilder => {
                 let nodes = self.builder_nodes(material);
@@ -7361,8 +7339,9 @@ impl Graph {
                 NodeKind::Remesh { target } => node_remesh(input(0, cache), *target),
                 NodeKind::Mirror { axis } => node_mirror(input(0, cache), *axis),
                 NodeKind::Copy { count, t, r, s } => node_copy(input(0, cache), *count, *t, *r, *s),
-                NodeKind::CopyToPoints { scale, rotation } => {
-                    node_copy_to_points(input(0, cache), input(1, cache), *scale, *rotation)
+                NodeKind::CopyToPoints { scale, rotation, piece_attribute } => {
+                    let copies = node_copy_pieces_to_points(input(0, cache), input(1, cache), *scale, *rotation, piece_attribute);
+                    self.report(id, copies)
                 }
                 NodeKind::AttributeCreate(settings) => {
                     let result = attrib::create(input(0, cache), settings);
@@ -7385,7 +7364,8 @@ impl Graph {
                         match mask {
                             Ok(mask) => {
                                 node_errors(|e| e.remove(&id));
-                                node_wrangle(source, &code, time, *domain, mask.as_deref(), Some(&node.channels))
+                                let others: Vec<Mesh> = (1..vex::INPUTS).map(|slot| input(slot, cache)).collect();
+                                node_wrangle(source, &others, &code, time, *domain, mask.as_deref(), Some(&node.channels))
                             }
                             Err(e) => self.report(id, Err(e)),
                         }
@@ -7403,20 +7383,23 @@ impl Graph {
                         3 => groups::prim_mask(&source, &node.group).map(|m| m.map(|m| m.iter().flat_map(|&b| [b; 3]).collect())),
                         _ => Ok(None),
                     };
+                    let others: Vec<Mesh> = (1..vex::INPUTS).map(|slot| input(slot, cache)).collect();
                     match mask {
-                        Ok(mask) => node_wrangle(source, code, time, *domain, mask.as_deref(), Some(&node.channels)),
+                        Ok(mask) => node_wrangle(source, &others, code, time, *domain, mask.as_deref(), Some(&node.channels)),
                         Err(e) => self.report(id, Err(e)),
                     }
                 }
                 NodeKind::VolumeWrangle { code } => {
                     let inc = SOLVER_TIME_INC.with(|inc| inc.get());
-                    self.report(id, fields::volume_wrangle(input(0, cache), code, time, inc, Some(&node.channels)))
+                    let others: Vec<Mesh> = (1..vex::INPUTS).map(|slot| input(slot, cache)).collect();
+                    self.report(id, fields::volume_wrangle(input(0, cache), &others, code, time, inc, Some(&node.channels)))
                 }
                 NodeKind::HeightfieldWrangle { code } => {
                     let source = input(0, cache);
                     let inc = SOLVER_TIME_INC.with(|inc| inc.get());
+                    let others: Vec<Mesh> = (1..vex::INPUTS).map(|slot| input(slot, cache)).collect();
                     match groups::point_mask(&source, &node.group) {
-                        Ok(mask) => self.report(id, fields::heightfield_wrangle(source, code, time, inc, mask.as_deref(), Some(&node.channels))),
+                        Ok(mask) => self.report(id, fields::heightfield_wrangle(source, &others, code, time, inc, mask.as_deref(), Some(&node.channels))),
                         Err(e) => self.report(id, Err(e)),
                     }
                 }
@@ -7830,6 +7813,7 @@ impl Graph {
                 NodeKind::UvTexture(settings) => sops::uv_texture(&input(0, cache), settings),
                 NodeKind::UvTransform(settings) => self.report(id, sops::uv_transform(&input(0, cache), settings)),
                 NodeKind::Color(settings) => self.report(id, color::color(&input(0, cache), settings)),
+                NodeKind::Enumerate(settings) => self.report(id, enumerate::enumerate(&input(0, cache), settings)),
                 NodeKind::AttributeTransfer(settings) => self.report(id, transfer::transfer(&input(0, cache), &input(1, cache), settings)),
                 NodeKind::UvQuickShade { file } => self.report(id, sops::uv_quickshade(&input(0, cache), file)),
                 NodeKind::VellumSolver(settings) => {
@@ -7902,7 +7886,11 @@ impl Graph {
                         _ => solver.and_then(|s| self.input_of(s, 0)).map(|src| self.cook(src, time, cache)).unwrap_or_default(),
                     }
                 }
-                NodeKind::Switch { index } => input((*index).min(1), cache),
+                NodeKind::Switch { index } => {
+                    // Inputs count from 0; past the last one, the last one.
+                    let last = self.links.iter().filter(|l| l.to == id).map(|l| l.slot).max().unwrap_or(0);
+                    input((*index).min(last), cache)
+                }
             }
         };
         let mut out = out;
@@ -8584,6 +8572,9 @@ fn open_documentation_at(anchor: Option<&str>) -> Result<String, String> {
 // Primitive attribute with each primitive's MAT material: node id + 1, or 0 for the object's
 // own material (so primitives merged in without one keep it).
 const PRIM_MATERIAL: &str = "prim:material";
+// On displayed geometry only: each primitive's Toon Shader (node id + 1; 0: none), so the
+// real-time renderer cel-shades and outlines it.
+pub(crate) const TOON_ATTR: &str = "prim:__toon";
 
 // The Material SOP: later slots (and later Material nodes) override earlier ones.
 fn material_assign(input: &Mesh, slots: &[(String, Option<NodeId>)]) -> Result<Mesh, String> {
@@ -13170,7 +13161,7 @@ impl ProceduralFxStudioApp {
                     let name = format!("/scene/materials/mat{id}");
                     let mut objects = String::new();
                     let (class, body) = match v.table {
-                        shading::Table::Toon => shading::toon_rdla(&name, v),
+                        shading::Table::Toon => shading::toon_rdla(&name, v, &mut objects),
                         shading::Table::Hair => shading::hair_rdla(&name, v),
                         _ => shading::principled_rdla(&name, v, &HashMap::new(), &mut objects),
                     };
@@ -13683,6 +13674,15 @@ impl ProceduralFxStudioApp {
         }
         if self.isolate_selection {
             (self.selection_mode as u8, &self.selected_vertices, &self.selected_triangles, &self.selected_edges).hash(&mut h);
+        }
+        // Toon Shader settings shade the faces without changing the mesh.
+        for (id, node) in &self.graph.nodes {
+            if let NodeKind::Shader(v) = &node.kind {
+                if v.table == shading::Table::Toon {
+                    id.hash(&mut h);
+                    v.values.iter().for_each(|x| x.to_bits().hash(&mut h));
+                }
+            }
         }
         h.finish()
     }
@@ -14728,6 +14728,7 @@ impl ProceduralFxStudioApp {
                 _ => None,
             })
             .collect();
+        let switch_inputs = self.graph.links.iter().filter(|l| l.to == id).map(|l| l.slot + 1).max().unwrap_or(0);
         // Joint names of the input skeleton, for KineFX nodes' joint menus.
         let joint_names: Vec<String> = match self.graph.nodes.get(&id).map(|n| &n.kind) {
             Some(NodeKind::RigPose(_) | NodeKind::TwoBoneIk(_)) => {
@@ -15125,7 +15126,7 @@ impl ProceduralFxStudioApp {
             NodeKind::Shader(values) => {
                 ui.small(match values.table {
                     shading::Table::Principled => "Physically based surface (MoonRay DwaBaseMaterial). Assign it from a Geometry node.",
-                    shading::Table::Toon => "Cel-shaded surface with banded shadows and a toon highlight (DwaToonMaterial).",
+                    shading::Table::Toon => "Cel-shaded surface with banded shadows, a toon highlight and outlines, in the viewport and sprite sheets as in MoonRay (DwaToonMaterial; outlines are real-time only).",
                     shading::Table::Hair => "For hair and fur curves from Hair Generate (HairMaterial_v3).",
                     shading::Table::Pyro => "For Pyro and other fog volumes: smoke colour and density, fire brightness and tint.",
                 });
@@ -15305,10 +15306,23 @@ impl ProceduralFxStudioApp {
                 c |= vec3_ui(ui, "Rotate°  ", r, 0.5);
                 c |= pfield(ui, pslider(s, 0.5..=1.5).text("Uniform Scale")).changed();
             }
-            NodeKind::CopyToPoints { scale, rotation } => {
+            NodeKind::CopyToPoints { scale, rotation, piece_attribute } => {
                 ui.label("Copy the first input onto every point from the second input.");
                 c |= pfield(ui, pslider(scale, 0.01..=10.0).logarithmic(true).text("Copy scale")).changed();
                 c |= vec3_ui(ui, "Rotation°", rotation, 0.5);
+                let mut use_pieces = !piece_attribute.is_empty();
+                if ui
+                    .checkbox(&mut use_pieces, "Piece attribute")
+                    .on_hover_text("Each point copies only the piece of the first input with its value of this attribute")
+                    .changed()
+                {
+                    *piece_attribute = if use_pieces { "variant".into() } else { String::new() };
+                    c = true;
+                }
+                if use_pieces {
+                    c |= ui.add(egui::TextEdit::singleline(piece_attribute).desired_width(140.0)).changed();
+                    ui.small("Pieces: number them with Enumerate (Primitives, piece attribute name) or Connectivity. Points: Attribute Randomize an integer from 0 to the number of pieces − 1 to choose randomly.");
+                }
                 ui.small("Use Add or a particle output as the point input.");
             }
             NodeKind::AttributeCreate(a) => {
@@ -15511,6 +15525,14 @@ impl ProceduralFxStudioApp {
                     } else {
                         c |= pfield(ui, pdrag(&mut v.value[0]).speed(0.01).prefix(format!("{label} "))).changed();
                     }
+                }
+                if v.reads_geometry() {
+                    ui.horizontal(|ui| {
+                        ui.label("Geometry");
+                        for (i, label) in ["0: being changed", "1", "2", "3"].iter().enumerate() {
+                            c |= ui.selectable_value(&mut v.input, i, *label).on_hover_text("Which of the Attribute VOP's inputs it reads").changed();
+                        }
+                    });
                 }
                 if !def.inputs.is_empty() {
                     let names: Vec<String> = def.inputs.iter().map(|(n, d)| format!("{n} ({d})")).collect();
@@ -15758,12 +15780,13 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pslider(&mut w.seed, 0..=9999).text("Seed")).changed();
             }
             NodeKind::ParticleSurface { radius, join_distance, resolution, smoothing } => {
-                ui.label("Voxel particle-fluid surface");
-                c |= pfield(ui, pslider(radius, 0.01..=1.0).logarithmic(true).text("Particle radius")).changed();
-                c |= pfield(ui, pslider(join_distance, 0.0..=1.0).text("Join distance")).changed();
-                c |= pfield(ui, pslider(resolution, 8..=96).text("Resolution")).changed();
-                c |= pfield(ui, pslider(smoothing, 0..=3).text("Smoothing")).changed();
-                ui.small("Nearby particles are unioned into one fluid-like surface before polygon extraction.");
+                c |= pfield(ui, pslider(radius, 0.001..=1.0).logarithmic(true).text("Particle radius"))
+                    .on_hover_text("A lone droplet's radius. 1–1.5× the particles' spacing, which for FLIP is ∛(emitter volume ÷ particles): 100,000 particles in a 1 m cube → about 0.03")
+                    .changed();
+                c |= pfield(ui, pslider(join_distance, 0.0..=1.0).text("Join distance")).on_hover_text("Extra reach: particles this much further apart still join into one surface. More fills gaps but rounds off splashes").changed();
+                c |= pfield(ui, pslider(resolution, 16..=512).text("Resolution")).on_hover_text("Voxels across the particles' longest side. Never finer than a quarter of the radius; very large grids are made coarser").changed();
+                c |= pfield(ui, pslider(smoothing, 0..=8).text("Smoothing")).on_hover_text("Passes that even out the surface. 1–2 for water; more melts away thin sheets").changed();
+                ui.small("Particles (e.g. FLIP) to one smooth, closed surface. The particles' v, Cd and other point attributes carry onto it. For water: a glass material with IOR 1.33.");
             }
             NodeKind::Extrude(set) => {
                 ui.small("Extrudes the node's group (or everything) along the normals. Faces outside the group stay as they are.");
@@ -15999,10 +16022,11 @@ impl ProceduralFxStudioApp {
                 ui.small("Directional lights use rotation. Point lights use position and are evaluated per surface.\nActive lights drive both the viewport and MoonRay; with none active, a default key/fill rig is used.");
             }
             NodeKind::Switch { index } => {
-                ui.horizontal(|ui| {
-                    c |= ui.selectable_value(index, 0, "Input 1").changed();
-                    c |= ui.selectable_value(index, 1, "Input 2").changed();
-                });
+                c |= pfield(ui, pslider(index, 0..=switch_inputs.max(2) - 1).text("Input")).changed();
+                ui.small(format!(
+                    "{switch_inputs} input(s) connected; 0 passes the first, 1 the second, and so on (past the last, the last). Type an expression to choose by frame, e.g. $F > 24 or $F % {}.",
+                    switch_inputs.max(2)
+                ));
             }
             NodeKind::Reverse => {
                 ui.label("Flips triangle winding (normals).");
@@ -16204,6 +16228,28 @@ impl ProceduralFxStudioApp {
                 });
                 c |= ui.checkbox(&mut set.invert, "Invert").changed();
                 ui.small("Stored as a 0/1 attribute (group:name / prim:group:name); use the name in any node's Group field.");
+            }
+            NodeKind::Enumerate(set) => {
+                ui.horizontal(|ui| {
+                    ui.label("Class");
+                    for (value, label) in enumerate::CLASSES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.class, value, *label).changed();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Attribute");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.attribute).desired_width(140.0)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Piece attribute");
+                    c |= ui
+                        .add(egui::TextEdit::singleline(&mut set.piece_attribute).desired_width(140.0).hint_text("optional"))
+                        .on_hover_text("Elements sharing a value of this attribute share a number: the pieces are numbered, in the order they first appear")
+                        .changed();
+                });
+                c |= pfield(ui, pdrag(&mut set.start).speed(0.1).prefix("Start ")).changed();
+                c |= pfield(ui, pdrag(&mut set.increment).speed(0.1).prefix("Increment ")).changed();
+                ui.small("Writes 0, 1, 2… (from Start, by Increment) on each point or primitive (a polygon counts once). For Copy to Points' piece attribute: Class Primitives on the shapes to copy.");
             }
             NodeKind::Color(set) => {
                 ui.horizontal(|ui| {
@@ -18807,6 +18853,13 @@ impl ProceduralFxStudioApp {
         let mut queue: Vec<Poly> = Vec::new();
         let (mut gpu_faces, mut gpu_edges) = (Vec::new(), Vec::new());
         let outlines = poly::outline_edges(built);
+        // Toon Shader faces: cel-shaded per pixel on the GPU, with outlines (gpu_viewport.rs).
+        let toon_ids = built.point_attributes.get(TOON_ATTR).filter(|v| v.len() == built.indices.len() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals));
+        let mut toon_slots: HashMap<usize, usize> = HashMap::new();
+        let mut toon_table: Vec<gpu_viewport::ToonMaterial> = Vec::new();
+        let mut gpu_toon: Vec<gpu_viewport::ToonVertex> = Vec::new();
+        // Smooth point normals push the outline out without gaps at hard edges.
+        let smooth_normals = if toon_ids.is_some() { built.compute_normals() } else { Vec::new() };
         for (tri_index, tri) in built.indices.iter().enumerate() {
             if self.isolate_selection {
                 let keep = match self.selection_mode {
@@ -18877,15 +18930,49 @@ impl ProceduralFxStudioApp {
                 [lit_color(0, v0, corner_n[0]), lit_color(1, v1, corner_n[1]), lit_color(2, v2, corner_n[2])]
             };
             let uv = quickshade.as_ref().filter(|_| textured).map(|(_, uvs)| uvs[tri_index].map(|c| egui::pos2(c[0], 1.0 - c[1])));
+            // A toon face: its material's slot in the table, its corners' colours and light.
+            let toon = toon_ids.map(|ids| ids[tri_index]).filter(|id| *id >= 0.5).and_then(|id| {
+                let id = (id - 1.0).round() as usize;
+                let look = match &self.graph.nodes.get(&id)?.kind {
+                    NodeKind::Shader(v) if v.table == shading::Table::Toon => v.toon_look(),
+                    _ => return None,
+                };
+                let slot = *toon_slots.entry(id).or_insert_with(|| {
+                    toon_table.push(look);
+                    toon_table.len() - 1
+                });
+                let corners = [v0, v1, v2];
+                let base = |k: usize| corner_color(tri_index, k, tri[k]).map_or([0.8; 3], |c| [c.r(), c.g(), c.b()].map(|v| v as f32 / 255.0));
+                let light = |k: usize| {
+                    let n = if self.render_mode == RenderMode::FlatShaded { face_normal } else { corner_n[k] };
+                    let rgb = illumination(n, corners[k]);
+                    ((rgb[0] + rgb[1] + rgb[2]) / 3.0 - ambient).clamp(0.0, 1.0)
+                };
+                Some((slot.min(gpu_viewport::MAX_TOONS - 1), look, [base(0), base(1), base(2)], [light(0), light(1), light(2)]))
+            });
+            let colors = match &toon {
+                // The CPU viewport bands each corner.
+                Some((_, look, base, light)) if gpu_key.is_none() => std::array::from_fn(|k| {
+                    let c = look.shade(base[k], light[k]);
+                    egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+                }),
+                _ => colors,
+            };
             if gpu_key.is_some() {
                 // World-space corners; the GPU does the camera.
                 let corner = |k: usize| [[v0, v1, v2][k].x, [v0, v1, v2][k].y, [v0, v1, v2][k].z];
                 let rgba = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
-                // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
-                if self.render_mode != RenderMode::Wireframe {
+                if let Some((slot, _, base, light)) = &toon {
+                    gpu_toon.extend((0..3).map(|k| {
+                        let n = smooth_normals.get(tri[k]).copied().unwrap_or(face_normal);
+                        gpu_viewport::ToonVertex { position: corner(k), light: light[k], color: [base[k][0], base[k][1], base[k][2], 1.0], normal: [n.x, n.y, n.z], material: *slot as f32 }
+                    }));
+                } else if self.render_mode != RenderMode::Wireframe {
+                    // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
                     gpu_faces.extend((0..3).map(|k| gpu_viewport::Vertex::new(corner(k), rgba(colors[k]), uv.map(|uv| [uv[k].x, uv[k].y]))));
                 }
-                if let Some(c) = wire {
+                // Toon faces have their outline instead of the wireframe.
+                if let Some(c) = wire.filter(|_| toon.is_none()) {
                     let colour = c.map(|v| v as f32 / 255.0);
                     gpu_edges.extend((0..3).filter(|&k| outlines[tri_index][k]).flat_map(|k| [k, (k + 1) % 3]).map(|k| gpu_viewport::Vertex::new(corner(k), colour, None)));
                 }
@@ -18998,7 +19085,7 @@ impl ProceduralFxStudioApp {
             let render_camera = capture.flatten().map(|size| (self.resolve_render_camera().0.realtime_camera(size, near_plane, focal), size));
             if let (Some(gpu), Some(key)) = (self.gpu_viewport.as_mut(), gpu_key) {
                 if !gpu_fresh {
-                    gpu.set_scene(key, &gpu_faces, &gpu_edges, quickshade.as_ref().map(|(texture, _)| texture.clone()));
+                    gpu.set_scene(key, &gpu_faces, &gpu_edges, &gpu_toon, &toon_table, quickshade.as_ref().map(|(texture, _)| texture.clone()));
                 }
                 if !gpu.has_points(points_key) {
                     let at = |i: usize| [mesh.vertices[i].x, mesh.vertices[i].y, mesh.vertices[i].z];
@@ -20192,9 +20279,9 @@ mod tests {
 
     #[test]
     fn spreadsheet_lists_attributes_created_by_a_wrangle() {
-        let mesh = node_wrangle(quad(), "@Cd = {1, 0, 0}; f@mass = 2.5; i@group = @ptnum;", 0.0, 2, None, None);
-        let mesh = node_wrangle(mesh, "f@area = 0.5;", 0.0, 1, None, None);
-        let mesh = node_wrangle(mesh, "i@count = npoints(0);", 0.0, 0, None, None);
+        let mesh = node_wrangle(quad(), &[], "@Cd = {1, 0, 0}; f@mass = 2.5; i@group = @ptnum;", 0.0, 2, None, None);
+        let mesh = node_wrangle(mesh, &[], "f@area = 0.5;", 0.0, 1, None, None);
+        let mesh = node_wrangle(mesh, &[], "i@count = npoints(0);", 0.0, 0, None, None);
         let headers = |domain| sheet_columns(&mesh, domain).into_iter().map(|c| c.header).collect::<Vec<_>>();
         let points = headers(SheetDomain::Points);
         for expected in ["#", "P.x", "N.z", "Cd.r", "Cd.b", "group", "mass"] {
@@ -20664,7 +20751,7 @@ mod scene_file_tests {
     use super::*;
 
     #[test]
-    fn presets_load_and_cook_into_glowing_points() {
+    fn presets_load_and_cook_into_something_to_see() {
         for preset in presets::PRESETS {
             let g = Graph::deserialize(preset.scene);
             let cameras = g.nodes.values().filter(|n| matches!(n.kind, NodeKind::Camera { .. }) && n.name == "sheet_camera").count();
@@ -20675,10 +20762,30 @@ mod scene_file_tests {
             let (start, end) = preset.range;
             let mesh = g.cook(display, start + (end - start) * 0.4, &mut HashMap::new());
             assert!(node_errors(|e| e.get(&display).cloned()).is_none(), "{}: {:?}", preset.name, node_errors(|e| e.get(&display).cloned()));
-            let alpha = mesh.point_attributes.get("Alpha").unwrap_or_else(|| panic!("{}: no Alpha", preset.name));
-            assert!(alpha.iter().filter(|a| **a > 0.05).count() > 20, "{}: too little shows", preset.name);
+            // Glowing points (Alpha), or a surface (Toon fire).
+            if mesh.indices.is_empty() {
+                let alpha = mesh.point_attributes.get("Alpha").unwrap_or_else(|| panic!("{}: no Alpha", preset.name));
+                assert!(alpha.iter().filter(|a| **a > 0.05).count() > 20, "{}: too little shows", preset.name);
+            } else {
+                assert!(mesh.indices.len() > 100, "{}: too little shows", preset.name);
+            }
             assert!(presets::find(&preset.name.to_uppercase()).is_some());
         }
+    }
+
+    #[test]
+    fn the_toon_fire_preset_shows_as_toon_faces() {
+        let preset = presets::find("Toon fire").unwrap();
+        let g = Graph::deserialize(preset.scene);
+        let geo = g.geometry_ids()[0];
+        let shown = g.cook_display(&[geo], preset.range.0 + 0.2, &mut HashMap::new());
+        let toon = shown.point_attributes.get(TOON_ATTR).expect("its faces are marked for toon shading");
+        assert_eq!(toon.len(), shown.indices.len());
+        let material = (toon[0] - 1.0).round() as usize;
+        assert!(g.is_toon(material) && toon.iter().all(|t| *t == toon[0]));
+        // Coloured by its own flame bands (the Toon FX preset uses Cd).
+        let cd = &shown.point_attributes["Cd"];
+        assert!(cd.chunks(3).any(|c| c[0] > 0.9 && c[1] > 0.5) && cd.chunks(3).any(|c| c[0] > 0.9 && c[1] < 0.3), "yellow and red bands");
     }
 
     #[test]
@@ -20939,6 +21046,8 @@ mod scene_file_tests {
             NodeKind::UvQuickShade { file: "/textures/grid.png".into() },
             NodeKind::AttributeTransfer(transfer::TransferSettings { class: 1, pattern: "Cd ^id".into(), samples: 3, distance: 0.25, blend_width: 0.5 }),
             NodeKind::Color(color::ColorSettings { class: 1, mode: 1, seed: 7, random_by: "piece".into(), ..color::ColorSettings::defaults() }),
+            NodeKind::Enumerate(enumerate::EnumerateSettings { class: 1, attribute: "variant".into(), piece_attribute: "name".into(), start: 3.0, increment: 2.0 }),
+            NodeKind::CopyToPoints { scale: 0.5, rotation: [0.0, 45.0, 0.0], piece_attribute: "variant".into() },
             NodeKind::Boolean(boolean::BooleanSettings { operation: 1, mode: 1, resolution: 90 }),
             NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 33, splinter: 7.0, ..fracture::FractureSettings::defaults(2) }),
             NodeKind::CrowdSolver(crowd::CrowdSettings { goal: [1.0, 2.0, 3.0], display: 0, ..crowd::CrowdSettings::defaults() }),
@@ -21640,6 +21749,25 @@ mod vop_node_tests {
     }
 
     #[test]
+    fn attribute_vops_read_their_other_inputs() {
+        // The lift network, but its Bind reads P from a raised copy wired into input 1.
+        let (mut g, grid, net) = lift_network();
+        assert_eq!(g.nodes[&net].kind.num_inputs(), 4);
+        let raised = g.add(NodeKind::Transform { t: [0.0, 5.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        g.connect(grid, raised, 0);
+        g.connect(raised, net, 1);
+        let bind = g.children(net).into_iter().find(|c| matches!(&g.nodes[c].kind, NodeKind::Vop(v) if v.op == vop::BIND)).unwrap();
+        if let NodeKind::Vop(v) = &mut g.nodes.get_mut(&bind).unwrap().kind {
+            v.input = 1;
+        }
+        let after = g.cook(net, 0.0, &mut HashMap::new());
+        assert!(after.vertices.iter().all(|p| (p.y - 7.0).abs() < 1e-5), "input 1's P (5) plus the lift (2)");
+        // The choice is saved with the scene.
+        let loaded = Graph::deserialize(&g.serialize());
+        assert!(matches!(&loaded.nodes[&bind].kind, NodeKind::Vop(v) if v.input == 1));
+    }
+
+    #[test]
     fn vop_menus_name_each_operation() {
         let mut app = ProceduralFxStudioApp::default();
         let (g, _, net) = lift_network();
@@ -21677,7 +21805,7 @@ mod vop_node_tests {
             nodes.insert(1, node);
             nodes.insert(2, vop::VopNode { name: "result".into(), ty: 0, ..vop::VopNode::new(vop::EXPORT) });
             let code = vop::compile(&nodes, |id, slot| (id == 2 && slot == 0).then_some(1)).unwrap();
-            let _ = vex::run_wrangle(grid.clone(), &code, 0.0, 1.0 / 24.0, 2, None, None);
+            let _ = vex::run_wrangle(grid.clone(), &[], &code, 0.0, 1.0 / 24.0, 2, None, None);
             let report = vex::last_report(&code, 2).unwrap();
             assert_eq!(report.error, None, "{}:\n{code}", vop::OPS[op].label);
         }
@@ -22934,24 +23062,24 @@ mod polygon_tests {
     #[test]
     fn vex_runs_once_per_polygon() {
         // @primnum counts polygons, and what one writes covers both its triangles.
-        let out = node_wrangle(quads(), "f@n = @primnum; f@np = @numprim; f@r = rand(@primnum + 0.5);", 0.0, 1, None, None);
+        let out = node_wrangle(quads(), &[], "f@n = @primnum; f@np = @numprim; f@r = rand(@primnum + 0.5);", 0.0, 1, None, None);
         assert_eq!(out.point_attributes["prim:n"], vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
         assert!(out.point_attributes["prim:np"].iter().all(|v| *v == 4.0));
         let r = &out.point_attributes["prim:r"];
         assert!(r.chunks(2).all(|pair| pair[0] == pair[1]));
         // @P is the polygon's centre; removeprim removes the whole quad.
-        let out = node_wrangle(quads(), "if (@P.x > 0 && @P.z > 0) removeprim(0, @primnum, 1);", 0.0, 1, None, None);
+        let out = node_wrangle(quads(), &[], "if (@P.x > 0 && @P.z > 0) removeprim(0, @primnum, 1);", 0.0, 1, None, None);
         assert_eq!((poly::count(&out), out.indices.len(), out.vertices.len()), (3, 6, 8));
         // Point domain functions see polygons too.
-        let out = node_wrangle(quads(), "i@n = nprimitives(0); i@c = len(primpoints(0, 0)); i@p = len(pointprims(0, 4));", 0.0, 2, None, None);
+        let out = node_wrangle(quads(), &[], "i@n = nprimitives(0); i@c = len(primpoints(0, 0)); i@p = len(pointprims(0, 4));", 0.0, 2, None, None);
         assert_eq!((out.point_attributes["n"][0], out.point_attributes["c"][0], out.point_attributes["p"][0]), (4.0, 4.0, 4.0));
         // addprim adds one polygon of any number of points.
-        let out = node_wrangle(quads(), "int a = addpoint(0, {0, 1, 0}); addprim(0, \"poly\", 0, 1, 2, 5, a);", 0.0, 0, None, None);
+        let out = node_wrangle(quads(), &[], "int a = addpoint(0, {0, 1, 0}); addprim(0, \"poly\", 0, 1, 2, 5, a);", 0.0, 0, None, None);
         assert_eq!((poly::count(&out), out.indices.len()), (5, 8 + 3));
-        let out = node_wrangle(quads(), "int pts[] = array(0, 1, 2); addprim(0, \"poly\", pts);", 0.0, 0, None, None);
+        let out = node_wrangle(quads(), &[], "int pts[] = array(0, 1, 2); addprim(0, \"poly\", pts);", 0.0, 0, None, None);
         assert_eq!(out.indices.len(), 9);
         // xyzdist gives a polygon and a uv that primuv reads back.
-        let out = node_wrangle(quads(), "int prim; vector uv; xyzdist(0, {0.7, 0.3, 0.6}, prim, uv); i@hit = prim; v@back = primuv(0, \"P\", prim, uv);", 0.0, 0, None, None);
+        let out = node_wrangle(quads(), &[], "int prim; vector uv; xyzdist(0, {0.7, 0.3, 0.6}, prim, uv); i@hit = prim; v@back = primuv(0, \"P\", prim, uv);", 0.0, 0, None, None);
         assert_eq!(out.point_attributes["detail:hit"][0], 3.0);
         let back = &out.point_attributes["detail:back"];
         assert!((back[0] - 0.7).abs() < 1e-4 && back[1].abs() < 1e-4 && (back[2] - 0.6).abs() < 1e-4, "{back:?}");
@@ -23121,6 +23249,79 @@ mod expression_tests {
     }
 
     #[test]
+    fn wrangles_have_four_inputs() {
+        let mut g = Graph::default();
+        let grid = g.add(NodeKind::Grid { size: 1.0, res: 4 }, egui::pos2(0.0, 0.0));
+        let sphere = g.add(NodeKind::Sphere { radius: 2.0, rows: 16, cols: 32 }, egui::pos2(0.0, 0.0));
+        let wrangle = g.add(NodeKind::Wrangle { code: "// Onto the sphere in input 1.\n@P = minpos(1, @P);".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        assert_eq!(g.nodes[&wrangle].kind.num_inputs(), 4);
+        g.connect(grid, wrangle, 0);
+        g.connect(sphere, wrangle, 3);
+        // Wired to the fourth input, the sphere is input 3 to VEX; input 1 is empty.
+        let out = g.cook(wrangle, 0.0, &mut HashMap::new());
+        assert!(out.vertices.iter().all(|p| p.y == 0.0), "input 1 is empty, so the points stay");
+        g.disconnect(wrangle, 3);
+        g.connect(sphere, wrangle, 1);
+        let out = g.cook(wrangle, 0.0, &mut HashMap::new());
+        assert!(out.vertices.iter().all(|p| (p.length() - 2.0).abs() < 0.05), "on the sphere");
+        // A Volume Wrangle samples a second volume.
+        let fog = |size: f32| volume::to_mesh(&volume::to_fog(&volume::from_polygons(&node_box(size, 1), 0.1, 3.0).unwrap()));
+        let out = fields::volume_wrangle(fog(1.0), &[fog(3.0)], "@density = volumesample(1, \"density\", @P + set(1.2, 0, 0));", 0.0, 1.0, None).unwrap();
+        assert!(out.point_attributes["density"].iter().any(|d| *d > 0.5), "the bigger box reaches 1.2 further");
+        let alone = fields::volume_wrangle(fog(1.0), &[], "@density = volumesample(1, \"density\", @P);", 0.0, 1.0, None).unwrap();
+        assert!(alone.point_attributes["density"].iter().all(|d| *d == 0.0), "nothing connected: nothing there");
+    }
+
+    #[test]
+    fn a_switch_expression_chooses_the_input_by_frame() {
+        let mut g = Graph::default();
+        let switch = g.add(NodeKind::Switch { index: 0 }, egui::pos2(0.0, 0.0));
+        let grids: Vec<NodeId> = [2, 4, 8].iter().map(|&res| g.add(NodeKind::Grid { size: 2.0, res }, egui::pos2(0.0, 0.0))).collect();
+        for &grid in &grids {
+            // Each drop adds an input, as on a Merge.
+            let slot = g.drop_slot(switch).unwrap();
+            g.connect(grid, switch, slot);
+        }
+        assert_eq!(g.input_slots(switch), 4, "three inputs and a free one");
+        let (input, _) = g.nodes[&switch].kind.animatable().into_iter().find(|(_, n)| n == "input").unwrap();
+        g.channels.entry(ChannelId { node: switch, target: input }).or_default().expression = Some("$F - 1".into());
+        let count = |g: &Graph, frame: f32| g.cook(switch, (frame - 1.0) / sims::SIM_FPS, &mut HashMap::new()).vertices.len();
+        let grid_count: Vec<usize> = grids.iter().map(|&n| g.cook(n, 0.0, &mut HashMap::new()).vertices.len()).collect();
+        assert_eq!([count(&g, 1.0), count(&g, 2.0), count(&g, 3.0)], [grid_count[0], grid_count[1], grid_count[2]]);
+        assert_eq!(count(&g, 9.0), grid_count[2], "past the last input, the last");
+    }
+
+    #[test]
+    fn copy_to_points_picks_random_pieces() {
+        // Three shapes merged, numbered as pieces, copied onto points with random variants.
+        let mut g = Graph::default();
+        let shapes = [NodeKind::Box { size: 0.2, div: 1 }, NodeKind::Sphere { radius: 0.1, rows: 6, cols: 8 }, NodeKind::Torus { major: 0.1, minor: 0.03, rows: 6, cols: 8 }];
+        let merge = g.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
+        let mut sizes = Vec::new();
+        for (slot, shape) in shapes.into_iter().enumerate() {
+            let n = g.add(shape, egui::pos2(0.0, 0.0));
+            sizes.push(g.cook(n, 0.0, &mut HashMap::new()).indices.len());
+            g.connect(n, merge, slot);
+        }
+        let connectivity = g.add(NodeKind::Connectivity(sopkit::ConnectivitySettings::defaults()), egui::pos2(0.0, 0.0));
+        g.connect(merge, connectivity, 0);
+        let pieces = g.cook(connectivity, 0.0, &mut HashMap::new());
+        // Enumerate the pieces by Connectivity's class into `variant`.
+        let numbered = enumerate::enumerate(&pieces, &enumerate::EnumerateSettings { class: 1, attribute: "variant".into(), piece_attribute: "class".into(), ..enumerate::EnumerateSettings::defaults() }).unwrap();
+        let mut points = Mesh { vertices: (0..6).map(|i| Vec3::new(i as f32, 0.0, 0.0)).collect(), ..Default::default() };
+        points.point_attributes.insert("variant".into(), vec![2.0, 0.0, 1.0, 1.0, 7.0, 0.0]);
+        let copies = node_copy_pieces_to_points(numbered.clone(), points.clone(), 1.0, [0.0; 3], "variant").unwrap();
+        // Variant 7 matches no piece: nothing there.
+        assert_eq!(copies.indices.len(), sizes[2] + sizes[0] + sizes[1] * 2 + sizes[0]);
+        // The torus went to the first point, at x = 0.
+        let first_piece: Vec<Vec3> = copies.vertices.iter().copied().filter(|v| v.x.abs() < 0.5).collect();
+        assert!(first_piece.iter().any(|v| v.y.abs() < 1e-4 && (v.x.hypot(v.z) - 0.13).abs() < 1e-3), "a torus at the first point");
+        assert!(node_copy_pieces_to_points(numbered.clone(), Mesh { vertices: vec![Vec3::zero()], ..Default::default() }, 1.0, [0.0; 3], "variant").is_err());
+        // Empty: every point gets everything.
+        assert_eq!(node_copy_pieces_to_points(numbered, points, 1.0, [0.0; 3], "").unwrap().indices.len(), 6 * sizes.iter().sum::<usize>());
+    }
+
+    #[test]
     fn a_seed_expression_changes_the_scatter_every_frame() {
         let mut g = Graph::default();
         let grid = g.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
@@ -23264,14 +23465,14 @@ mod field_node_tests {
         let fog = volume::encode_voxels(&voxels, volume::Class::Fog, 0.4, Vec3::zero(), 0.0);
         for (label, code) in VOLUME_WRANGLE_EXAMPLES {
             vex::check(code).unwrap_or_else(|e| panic!("{label}: {e}"));
-            let out = fields::volume_wrangle(fog.clone(), code, 0.0, 1.0 / 24.0, None).unwrap();
+            let out = fields::volume_wrangle(fog.clone(), &[], code, 0.0, 1.0 / 24.0, None).unwrap();
             assert!(vex::last_report(code, 2).unwrap().error.is_none(), "{label}: {:?}", vex::last_report(code, 2).unwrap().error);
             assert_ne!(out.point_attributes["density"], fog.point_attributes["density"], "{label} changed nothing");
         }
         let terrain = terrain::terrain_noise(&terrain::terrain(&terrain::TerrainSettings { size: [10.0, 10.0], resolution: 32 }), &terrain::NoiseSettings::defaults()).unwrap();
         for (label, code) in HEIGHTFIELD_WRANGLE_EXAMPLES {
             vex::check(code).unwrap_or_else(|e| panic!("{label}: {e}"));
-            let out = fields::heightfield_wrangle(terrain.clone(), code, 0.0, 1.0 / 24.0, None, None).unwrap();
+            let out = fields::heightfield_wrangle(terrain.clone(), &[], code, 0.0, 1.0 / 24.0, None, None).unwrap();
             assert!(vex::last_report(code, 2).unwrap().error.is_none(), "{label}: {:?}", vex::last_report(code, 2).unwrap().error);
             let changed = out.vertices != terrain.vertices || out.point_attributes.get("mask") != terrain.point_attributes.get("mask");
             assert!(changed, "{label} changed nothing");
@@ -23508,7 +23709,7 @@ mod node_info_tests {
             }
         }
         let has = |s: &str| texts.iter().any(|t| t.contains(s));
-        for expected in ["Type", "Wrangle", "Inputs", "1 of 1 connected", "Points", "Primitives", "6 (12 triangles)", "Bounds", "Attributes", "vel (3)", "up (1)", "Groups", "top (4)"] {
+        for expected in ["Type", "Wrangle", "Inputs", "1 of 4 connected", "Points", "Primitives", "6 (12 triangles)", "Bounds", "Attributes", "vel (3)", "up (1)", "Groups", "top (4)"] {
             assert!(has(expected), "'{expected}' missing from {texts:?}");
         }
     }
@@ -23520,9 +23721,17 @@ mod realtime_render_tests {
 
     // Runs the app's own frame steps until the recording finishes.
     fn run_recording(app: &mut ProceduralFxStudioApp) {
+        run_recording_for(app, 400);
+    }
+
+    // `steps` frames of the app, or until the recording is done (simulations cook in the background).
+    pub(super) fn run_recording_for(app: &mut ProceduralFxStudioApp, steps: usize) {
         let ctx = egui::Context::default();
         let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))), ..Default::default() };
-        for _ in 0..400 {
+        for _ in 0..steps {
+            if app.simulation_rx.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             let _ = ctx.run(screen.clone(), |ctx| {
                 app.flipbook_step(ctx);
                 if app.dirty || app.simulation_rx.is_some() {

@@ -127,10 +127,10 @@ fn writes(code: &str, name: &str) -> bool {
 
 // VEX over a volume's voxels: @density or @surface, @P (the voxel centre, read-only),
 // and any other float attributes the code creates (they become extra fields).
-pub fn volume_wrangle(input: Mesh, code: &str, time: f32, time_inc: f32, channels: Option<&vex::Channels>) -> Result<Mesh, String> {
+pub fn volume_wrangle(input: Mesh, inputs: &[Mesh], code: &str, time: f32, time_inc: f32, channels: Option<&vex::Channels>) -> Result<Mesh, String> {
     let (_, class, voxel, _, _) = volume::decode_voxels(&input).map_err(|_| "Volume Wrangle works on volumes: VDB, Pyro or Convert VDB output".to_string())?;
     let positions = input.vertices.clone();
-    let mut out = vex::run_wrangle(input, code, time, time_inc, 2, None, channels);
+    let mut out = vex::run_wrangle(input, inputs, code, time, time_inc, 2, None, channels);
     let name = if class == volume::Class::Fog { "density" } else { "surface" };
     // Voxels can be removed (removepoint deactivates them) but not moved or added.
     if out.vertices.len() > positions.len() {
@@ -161,7 +161,7 @@ pub fn volume_wrangle(input: Mesh, code: &str, time: f32, time_inc: f32, channel
 
 // VEX over a terrain's points: @height (P.y), @mask, @P (x and z read-only) and the
 // terrain's other point attributes. Writing @height or @P.y changes the height.
-pub fn heightfield_wrangle(mut input: Mesh, code: &str, time: f32, time_inc: f32, mask: Option<&[bool]>, channels: Option<&vex::Channels>) -> Result<Mesh, String> {
+pub fn heightfield_wrangle(mut input: Mesh, inputs: &[Mesh], code: &str, time: f32, time_inc: f32, mask: Option<&[bool]>, channels: Option<&vex::Channels>) -> Result<Mesh, String> {
     Field::from_mesh(&input, "height").map_err(|e| if e.contains("no longer a grid") { e } else { "Heightfield Wrangle works on terrains: start from a Terrain node".to_string() })?;
     let n = input.vertices.len();
     let before: Vec<f32> = input.vertices.iter().map(|p| p.y).collect();
@@ -170,7 +170,7 @@ pub fn heightfield_wrangle(mut input: Mesh, code: &str, time: f32, time_inc: f32
     if attr(&input, "mask").is_none() {
         input.point_attributes.insert("mask".into(), vec![0.0; n]);
     }
-    let mut out = vex::run_wrangle(input, code, time, time_inc, 2, mask, channels);
+    let mut out = vex::run_wrangle(input, inputs, code, time, time_inc, 2, mask, channels);
     if out.vertices.len() != n {
         return Err("a Heightfield Wrangle can't add or remove points: it changes heights and layers only".into());
     }
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn volume_wrangle_changes_values_not_positions() {
         let cube = fog_cube();
-        let out = volume_wrangle(cube.clone(), "@density *= @P.y; @P.x += 10;", 0.0, 1.0 / 24.0, None).unwrap();
+        let out = volume_wrangle(cube.clone(), &[], "@density *= @P.y; @P.x += 10;", 0.0, 1.0 / 24.0, None).unwrap();
         assert_eq!(out.vertices, cube.vertices);
         let d = &out.point_attributes["density"];
         for (p, v) in out.vertices.iter().zip(d) {
@@ -214,16 +214,16 @@ mod tests {
         let bottom = out.vertices.iter().position(|p| p.y == 0.0).unwrap();
         assert_eq!(alpha[bottom], 0.0);
         // Removing voxels deactivates them.
-        let fewer = volume_wrangle(cube.clone(), "if (@P.y > 1) removepoint(0, @ptnum);", 0.0, 1.0 / 24.0, None).unwrap();
+        let fewer = volume_wrangle(cube.clone(), &[], "if (@P.y > 1) removepoint(0, @ptnum);", 0.0, 1.0 / 24.0, None).unwrap();
         assert_eq!(fewer.vertices.len(), 48);
-        assert!(volume_wrangle(crate::node_box(1.0, 1), "@density = 1;", 0.0, 1.0, None).is_err());
+        assert!(volume_wrangle(crate::node_box(1.0, 1), &[], "@density = 1;", 0.0, 1.0, None).is_err());
     }
 
     #[test]
     fn volumesample_reads_neighbours() {
         let cube = fog_cube();
         // Average of the voxel and its +x neighbour, read from the input.
-        let out = volume_wrangle(cube.clone(), "@density = volumesample(0, \"density\", @P + set(0.25, 0, 0)) * @P.x;", 0.0, 1.0, None).unwrap();
+        let out = volume_wrangle(cube.clone(), &[], "@density = volumesample(0, \"density\", @P + set(0.25, 0, 0)) * @P.x;", 0.0, 1.0, None).unwrap();
         let d = &out.point_attributes["density"];
         for (p, v) in out.vertices.iter().zip(d) {
             // Inside, the field is 1; at the +x edge, half of it is background.
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn heightfield_wrangle_sets_heights_and_layers() {
         let t = terrain::terrain(&terrain::TerrainSettings { size: [4.0, 4.0], resolution: 8 });
-        let out = heightfield_wrangle(t.clone(), "@height = @P.x; @mask = @P.z > 0;", 0.0, 1.0, None, None).unwrap();
+        let out = heightfield_wrangle(t.clone(), &[], "@height = @P.x; @mask = @P.z > 0;", 0.0, 1.0, None, None).unwrap();
         for (p, q) in out.vertices.iter().zip(&t.vertices) {
             assert!((p.y - q.x).abs() < 1e-5 && p.x == q.x && p.z == q.z);
         }
@@ -248,11 +248,11 @@ mod tests {
         let mask = &out.point_attributes["mask"];
         assert!(mask.iter().zip(&out.vertices).all(|(m, p)| (*m > 0.5) == (p.z > 0.0)));
         // @P.y works too, and neighbours come from volumesample.
-        let lifted = heightfield_wrangle(out.clone(), "@P.y = volumesample(0, \"height\", @P + set(0.5, 0, 0));", 0.0, 1.0, None, None).unwrap();
+        let lifted = heightfield_wrangle(out.clone(), &[], "@P.y = volumesample(0, \"height\", @P + set(0.5, 0, 0));", 0.0, 1.0, None, None).unwrap();
         let p = lifted.vertices[3];
         assert!((p.y - (p.x + 0.5)).abs() < 1e-4, "{p:?}");
-        assert!(heightfield_wrangle(crate::node_box(1.0, 1), "@height = 1;", 0.0, 1.0, None, None).is_err());
-        assert!(heightfield_wrangle(t, "removepoint(0, 0);", 0.0, 1.0, None, None).is_err());
+        assert!(heightfield_wrangle(crate::node_box(1.0, 1), &[], "@height = 1;", 0.0, 1.0, None, None).is_err());
+        assert!(heightfield_wrangle(t, &[], "removepoint(0, 0);", 0.0, 1.0, None, None).is_err());
     }
 
     #[test]

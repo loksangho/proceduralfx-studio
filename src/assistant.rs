@@ -1330,7 +1330,7 @@ mod tests {
         let camera = g.nodes.iter().find(|(_, n)| n.name == "sheet_camera").map(|(id, _)| *id).unwrap();
         assert!(matches!(g.nodes[&camera].kind, NodeKind::Camera { position: [0.0, 1.5, 0.0], zoom: 6.0, orthographic: true, .. }), "{:?}", g.nodes[&camera].kind);
         let (text, is_error, _) = run_tool(&mut g, &mut ids, "load_preset", &json!({"name": "rain"}), 0.0);
-        assert!(is_error && text.as_str().unwrap().contains("Fire, Smoke, Impact, Magic burst, Slash"), "{text}");
+        assert!(is_error && text.as_str().unwrap().contains("Fire, Toon fire, Smoke, Impact, Magic burst, Slash"), "{text}");
         assert!(step_label("load_preset", &json!({"name": "Slash"})).contains("Slash"));
         assert!(system_prompt().contains("Magic burst (plays once)"));
     }
