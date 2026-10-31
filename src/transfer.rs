@@ -59,8 +59,60 @@ fn elements(mesh: &Mesh, class: usize) -> Elements {
     }
 }
 
+// The source with its vertex (triangle-corner) attributes also as point attributes, each
+// point the average of its corners, where there's no point attribute of that name: the
+// Normal node's default stores N on corners, and transferring it onto points should work.
+fn with_corners_on_points(source: &Mesh) -> std::borrow::Cow<'_, Mesh> {
+    let corners = source.indices.len() * 3;
+    let promotable: Vec<(&String, &Vec<f32>)> = source
+        .point_attributes
+        .iter()
+        .filter(|(key, values)| {
+            key.strip_prefix("vertex:").is_some_and(|name| !name.starts_with("__") && !source.point_attributes.contains_key(name))
+                && corners > 0
+                && !values.is_empty()
+                && values.len() % corners == 0
+        })
+        .collect();
+    if promotable.is_empty() {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = source.clone();
+    for (key, values) in promotable {
+        let width = values.len() / corners;
+        let mut sums = vec![0.0f32; source.vertices.len() * width];
+        let mut counts = vec![0u32; source.vertices.len()];
+        for (t, tri) in source.indices.iter().enumerate() {
+            for (k, &p) in tri.iter().enumerate() {
+                for c in 0..width {
+                    sums[p * width + c] += values[(t * 3 + k) * width + c];
+                }
+                counts[p] += 1;
+            }
+        }
+        let name = &key["vertex:".len()..];
+        for (p, &n) in counts.iter().enumerate() {
+            let point = &mut sums[p * width..(p + 1) * width];
+            if n > 0 {
+                point.iter_mut().for_each(|v| *v /= n as f32);
+            }
+            // Averaged normals are shorter than unit: put them back to length 1.
+            if name == "N" && width == 3 {
+                let length = point.iter().map(|v| v * v).sum::<f32>().sqrt();
+                if length > 1e-9 {
+                    point.iter_mut().for_each(|v| *v /= length);
+                }
+            }
+        }
+        out.point_attributes.insert(name.to_owned(), sums);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 pub fn transfer(target: &Mesh, source: &Mesh, set: &TransferSettings) -> Result<Mesh, String> {
     let class = set.class.min(1);
+    let source = if class == 0 { with_corners_on_points(source) } else { std::borrow::Cow::Borrowed(source) };
+    let source = source.as_ref();
     let prefix = if class == 0 { "" } else { "prim:" };
     let from = elements(source, class);
     let to = elements(target, class);
@@ -134,6 +186,14 @@ pub fn transfer(target: &Mesh, source: &Mesh, set: &TransferSettings) -> Result<
                     let v = &mut result[slot * width + c];
                     *v += (b - *v) * amount;
                 }
+                // Blended normals come out shorter than unit length.
+                if (key == "N" || key == "prim:N") && width == 3 {
+                    let n = &mut result[slot * 3..slot * 3 + 3];
+                    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    if length > 1e-9 {
+                        n.iter_mut().for_each(|v| *v /= length);
+                    }
+                }
             }
         }
         out.point_attributes.insert(key, result);
@@ -180,6 +240,25 @@ mod tests {
         assert!((heat[0] - 0.5).abs() < 1e-5, "halfway between the two: {}", heat[0]);
         // 1.5 from the nearest source: halfway through the blend band.
         assert!(heat[1] > 0.2 && heat[1] < 0.8, "{}", heat[1]);
+    }
+
+    #[test]
+    fn corner_normals_transfer_onto_points() {
+        // A sphere with its normals on triangle corners (the Normal node's default).
+        let mut sphere = crate::node_sphere(1.0, 12, 24);
+        let corner_n: Vec<f32> = sphere.indices.iter().flat_map(|t| t.iter().flat_map(|&p| { let n = sphere.vertices[p].normalize(); [n.x, n.y, n.z] })).collect();
+        sphere.point_attributes.insert("vertex:N".into(), corner_n);
+        // Points just off its surface, with a placeholder N to replace.
+        let target = points(&[[1.1, 0.0, 0.0], [0.0, -1.05, 0.0], [0.0, 0.3, 0.97]]);
+        let mut target = target;
+        target.point_attributes.insert("N".into(), vec![1.0; 9]);
+        let out = transfer(&target, &sphere, &TransferSettings { pattern: "N".into(), ..TransferSettings::defaults() }).unwrap();
+        let n = &out.point_attributes["N"];
+        for (i, p) in target.vertices.iter().enumerate() {
+            let got = Vec3::new(n[i * 3], n[i * 3 + 1], n[i * 3 + 2]);
+            assert!((got.length() - 1.0).abs() < 1e-4, "unit length");
+            assert!(got.dot(p.normalize()) > 0.98, "point {i} faces out from the sphere: {got:?}");
+        }
     }
 
     #[test]
