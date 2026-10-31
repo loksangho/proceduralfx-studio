@@ -70,6 +70,7 @@ mod tops;
 mod transfer;
 mod enumerate;
 mod blur;
+mod promote;
 mod fluidsurface;
 mod updater;
 mod vellum;
@@ -3881,6 +3882,8 @@ enum NodeKind {
     Enumerate(enumerate::EnumerateSettings),
     // Evens out point attributes (or P) toward their neighbours' average.
     AttributeBlur(blur::BlurSettings),
+    // Moves attributes between points, vertices, primitives and the detail.
+    AttributePromote(promote::PromoteSettings),
     // Copies attributes from the nearest points or primitives of its second input.
     AttributeTransfer(transfer::TransferSettings),
     // Node-based VEX: a container of VOP nodes compiled to VEX and run over `domain` (like Wrangle).
@@ -4099,6 +4102,7 @@ impl NodeKind {
             NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis"]),
             NodeKind::Enumerate(_) => names(&["class", "start", "increment"]),
             NodeKind::AttributeBlur(_) => names(&["mode", "weighting", "iterations", "step", "radius", "max_points", "pin_border"]),
+            NodeKind::AttributePromote(_) => names(&["from", "to", "method", "delete_original"]),
             NodeKind::UvTransform(_) => names(&["translate.u", "translate.v", "rotate", "scale.u", "scale.v", "pivot.u", "pivot.v"]),
             NodeKind::VellumSolver(_) => names(&["type", "stretch_stiffness", "bend_stiffness", "shape_stiffness", "mass", "thickness", "gravity", "damping", "friction", "substeps", "iterations", "ground", "self_collision", "pin_to_animation"]),
             NodeKind::SopSolver { .. } => names(&["substeps"]),
@@ -4205,6 +4209,7 @@ impl NodeKind {
             NodeKind::CopyToPoints { piece_attribute, .. } => vec![piece_attribute.clone()],
             NodeKind::Enumerate(s) => vec![s.attribute.clone(), s.piece_attribute.clone()],
             NodeKind::AttributeBlur(s) => vec![s.pattern.clone()],
+            NodeKind::AttributePromote(s) => vec![s.pattern.clone(), s.rename.clone()],
             NodeKind::AttributeTransfer(s) => vec![s.pattern.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
             NodeKind::Shader(v) => v.textures.clone(),
@@ -4274,6 +4279,10 @@ impl NodeKind {
                 next(&mut s.piece_attribute);
             }
             NodeKind::AttributeBlur(s) => next(&mut s.pattern),
+            NodeKind::AttributePromote(s) => {
+                next(&mut s.pattern);
+                next(&mut s.rename);
+            }
             NodeKind::AttributeTransfer(s) => next(&mut s.pattern),
             NodeKind::Vop(v) => next(&mut v.name),
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
@@ -4638,6 +4647,7 @@ impl NodeKind {
                     NodeKind::AttributeTransfer(transfer::TransferSettings::defaults()),
                     NodeKind::Enumerate(enumerate::EnumerateSettings::defaults()),
                     NodeKind::AttributeBlur(blur::BlurSettings::defaults()),
+                    NodeKind::AttributePromote(promote::PromoteSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
                     NodeKind::Normal(sops::NormalSettings { domain: 1, cusp_angle: 60.0, weighting: 0, reverse: false }),
@@ -4850,6 +4860,7 @@ impl NodeKind {
             NodeKind::Color(_) => "color",
             NodeKind::Enumerate(_) => "enumerate",
             NodeKind::AttributeBlur(_) => "attribute_blur",
+            NodeKind::AttributePromote(_) => "attribute_promote",
             NodeKind::AttributeTransfer(_) => "attribute_transfer",
             NodeKind::UvQuickShade { .. } => "uv_quickshade",
             NodeKind::AttributePaint { .. } => "attribute_paint",
@@ -4937,7 +4948,8 @@ impl NodeKind {
             | NodeKind::AttributeDelete(_)
             | NodeKind::Color(_)
             | NodeKind::Enumerate(_)
-            | NodeKind::AttributeBlur(_) => 1,
+            | NodeKind::AttributeBlur(_)
+            | NodeKind::AttributePromote(_) => 1,
             // Input 0 is the geometry they change; 1-3 are read by point(1, ...), @opinput1_P and the like.
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => vex::INPUTS,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
@@ -5262,6 +5274,7 @@ impl NodeKind {
             NodeKind::Color(s) => s.params(),
             NodeKind::Enumerate(s) => s.params(),
             NodeKind::AttributeBlur(s) => s.params(),
+            NodeKind::AttributePromote(s) => s.params(),
             NodeKind::AttributeTransfer(s) => s.params(),
             NodeKind::UvTransform(s) => vec![s.translate[0], s.translate[1], s.rotate, s.scale[0], s.scale[1], s.pivot[0], s.pivot[1]],
             NodeKind::VellumSolver(s) => vec![
@@ -5715,6 +5728,7 @@ impl NodeKind {
             "color" => NodeKind::Color(color::ColorSettings::from_params(p, String::new())),
             "enumerate" => NodeKind::Enumerate(enumerate::EnumerateSettings::from_params(p)),
             "attribute_blur" => NodeKind::AttributeBlur(blur::BlurSettings::from_params(p, "Cd".into())),
+            "attribute_promote" => NodeKind::AttributePromote(promote::PromoteSettings::from_params(p, "Cd".into(), String::new())),
             "attribute_transfer" => NodeKind::AttributeTransfer(transfer::TransferSettings::from_params(p, "*".into())),
             "uv_transform" => NodeKind::UvTransform(sops::UvTransformSettings {
                 translate: [g(0), g(1)],
@@ -7847,6 +7861,7 @@ impl Graph {
                 NodeKind::UvTransform(settings) => self.report(id, sops::uv_transform(&input(0, cache), settings)),
                 NodeKind::Color(settings) => self.report(id, color::color(&input(0, cache), settings)),
                 NodeKind::Enumerate(settings) => self.report(id, enumerate::enumerate(&input(0, cache), settings)),
+                NodeKind::AttributePromote(settings) => self.report(id, promote::promote(&input(0, cache), settings)),
                 NodeKind::AttributeBlur(settings) => {
                     // The group's points change; the rest are read but kept.
                     let source = input(0, cache);
@@ -8673,6 +8688,17 @@ fn split_by_material(mesh: Mesh, object: Option<NodeId>, is_material: impl Fn(No
 }
 
 // Points the renderer draws as spheres (Whitewater output), not left out like other point clouds.
+// The points a polygon or curve uses (the rest are loose points).
+fn used_points(mesh: &Mesh, curves: &[std::ops::Range<usize>]) -> Vec<bool> {
+    let mut used = vec![false; mesh.vertices.len()];
+    for &p in mesh.indices.iter().flatten().chain(curves.iter().flat_map(|r| r.clone()).collect::<Vec<_>>().iter()) {
+        if let Some(u) = used.get_mut(p) {
+            *u = true;
+        }
+    }
+    used
+}
+
 fn renders_points(mesh: &Mesh) -> bool {
     mesh.indices.is_empty() && !mesh.vertices.is_empty() && mesh.point_attributes.get(whitewater::RENDER_POINTS).is_some_and(|v| v.first() == Some(&1.0))
 }
@@ -16286,6 +16312,34 @@ impl ProceduralFxStudioApp {
                 c |= ui.checkbox(&mut set.invert, "Invert").changed();
                 ui.small("Stored as a 0/1 attribute (group:name / prim:group:name); use the name in any node's Group field.");
             }
+            NodeKind::AttributePromote(set) => {
+                ui.horizontal(|ui| {
+                    ui.label("Attributes");
+                    c |= ui
+                        .add(egui::TextEdit::singleline(&mut set.pattern).desired_width(160.0).hint_text("Cd"))
+                        .on_hover_text("Attributes of the original class, separated by spaces: * for all, ^name to skip one. P (named) gives each polygon its centre")
+                        .changed();
+                });
+                for (label, class) in [("From", &mut set.from), ("To", &mut set.to)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        for (value, name) in promote::CLASSES.iter().enumerate() {
+                            c |= ui.selectable_value(class, value, *name).changed();
+                        }
+                    });
+                }
+                egui::ComboBox::from_label("Promotion method").selected_text(promote::METHODS[set.method.min(promote::METHODS.len() - 1)]).show_ui(ui, |ui| {
+                    for (value, name) in promote::METHODS.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.method, value, *name).changed();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("New name");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.rename).desired_width(140.0).hint_text("same name")).changed();
+                });
+                c |= ui.checkbox(&mut set.delete_original, "Delete original").changed();
+                ui.small("Where several values meet (a point shared by polygons, a polygon's points, everything for the detail), the method combines them. A quad is one primitive with four vertices.");
+            }
             NodeKind::AttributeBlur(set) => {
                 ui.horizontal(|ui| {
                     ui.label("Attributes");
@@ -19140,26 +19194,14 @@ impl ProceduralFxStudioApp {
         let point_attribute_color = |index: usize| -> egui::Color32 {
             cd_color(index).unwrap_or(point_color)
         };
-        let mut referenced = vec![false; projected.len()];
-        for tri in &mesh.indices {
-            for &vertex in tri {
-                if let Some(is_referenced) = referenced.get_mut(vertex) {
-                    *is_referenced = true;
-                }
-            }
-        }
         // Hair and other curves (see groom.rs) are drawn as lines, not loose points.
         let curve_ranges = groom::curves(mesh);
-        for range in &curve_ranges {
-            for i in range.clone() {
-                if let Some(is_referenced) = referenced.get_mut(i) {
-                    *is_referenced = true;
-                }
-            }
-        }
+        let referenced = used_points(mesh, &curve_ranges);
         let has_unreferenced_points = !kinefx::Skeleton::is_skeleton(mesh) && referenced.iter().any(|&is_referenced| !is_referenced);
         let point_count = mesh.vertices.len();
-        let splat_alpha = mesh.point_attributes.get("Alpha").filter(|a| a.len() == point_count && point_count > 0);
+        // Loose points with Alpha (Pyro, smoke, particles) are soft splats. A surface's
+        // Alpha is its opacity (Principled "Use point alpha"), so its points aren't.
+        let splat_alpha = mesh.point_attributes.get("Alpha").filter(|a| a.len() == point_count && point_count > 0 && has_unreferenced_points);
         if gpu_key.is_some() || !queue.is_empty() {
             // The GPU draws at full pixel density; the CPU is capped to stay interactive.
             let max_pixels: f32 = if self.gpu_viewport.is_some() { 1.6e7 } else { 2.5e6 };
@@ -19211,7 +19253,7 @@ impl ProceduralFxStudioApp {
                         let colors = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3));
                         let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
                         let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
-                        splats.extend((0..point_count).filter(|&i| alpha[i] > 0.004).map(|i| {
+                        splats.extend((0..point_count).filter(|&i| alpha[i] > 0.004 && !referenced[i]).map(|i| {
                             let a = alpha[i].clamp(0.0, 1.0);
                             let [r, g, b] = triple(colors, i, 0.8).map(|c| c.clamp(0.0, 1.0));
                             gpu_viewport::Point::new(at(i), pscale.map_or(0.05, |p| p[i]), [r, g, b, 1.0 - (1.0 - a * 0.5) * (1.0 - a * 0.6)], triple(emission, i, 0.0))
@@ -19242,7 +19284,7 @@ impl ProceduralFxStudioApp {
                     let frame = match render_camera {
                         // Transparent where empty (premultiplied, as egui images are).
                         Some((render, size)) => {
-                            let pixels = gpu.render(size, &render);
+                            let pixels = gpu.render_final(size, &render);
                             egui::ColorImage::new([size[0] as usize, size[1] as usize], pixels.into_iter().map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(r, g, b, a)).collect())
                         }
                         // The viewport's view, at most flipbook::MAX_WIDTH wide, over its background.
@@ -19336,7 +19378,7 @@ impl ProceduralFxStudioApp {
                 .enumerate()
                 .step_by(stride)
                 .filter_map(|(i, p)| p.map(|(_, depth)| (i, depth)))
-                .filter(|(i, _)| alpha[*i] > 0.004)
+                .filter(|(i, _)| alpha[*i] > 0.004 && !referenced[*i])
                 .collect();
             order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (i, depth) in order {
@@ -21148,6 +21190,7 @@ mod scene_file_tests {
             NodeKind::AttributeTransfer(transfer::TransferSettings { class: 1, pattern: "Cd ^id".into(), samples: 3, distance: 0.25, blend_width: 0.5 }),
             NodeKind::Color(color::ColorSettings { class: 1, mode: 1, seed: 7, random_by: "piece".into(), ..color::ColorSettings::defaults() }),
             NodeKind::Enumerate(enumerate::EnumerateSettings { class: 1, attribute: "variant".into(), piece_attribute: "name".into(), start: 3.0, increment: 2.0 }),
+            NodeKind::AttributePromote(promote::PromoteSettings { pattern: "Cd mask".into(), from: 2, to: 3, method: 4, rename: String::new(), delete_original: false }),
             NodeKind::AttributeBlur(blur::BlurSettings { pattern: "Cd mask".into(), mode: 1, weighting: 1, iterations: 7, step: 0.4, radius: 0.3, max_points: 6, pin_border: true }),
             NodeKind::CopyToPoints { scale: 0.5, rotation: [0.0, 45.0, 0.0], piece_attribute: "variant".into() },
             NodeKind::Boolean(boolean::BooleanSettings { operation: 1, mode: 1, resolution: 90 }),
@@ -23923,6 +23966,13 @@ mod realtime_render_tests {
         assert!((50..=80).contains(&left.a()), "left {left:?}");
         assert_eq!(right.a(), 255, "right {right:?}");
         assert_eq!(at(1).a(), 0, "empty beyond the square");
+        // The square's Alpha is its opacity: its points aren't drawn as splats.
+        assert_eq!(app.gpu_viewport.as_ref().unwrap().splat_count(), 0);
+        // Loose points with Alpha (smoke, particles) still are.
+        let mut loose = Mesh { vertices: vec![Vec3::zero(), Vec3::new(1.0, 0.0, 0.0)], ..Mesh::default() };
+        loose.point_attributes.insert("Alpha".into(), vec![1.0, 1.0]);
+        assert_eq!(used_points(&loose, &[]), vec![false, false]);
+        assert!(used_points(&node_grid(1.0, 1.0, 2, 2), &[]).iter().all(|u| *u));
     }
 
     #[test]

@@ -875,6 +875,11 @@ impl GpuViewport {
         });
     }
 
+    #[cfg(test)]
+    pub fn splat_count(&self) -> u32 {
+        self.points.as_ref().and_then(|p| p.splats.as_ref()).map_or(0, |(_, n)| *n)
+    }
+
     // Whether the points uploaded last have this key.
     pub fn has_points(&self, key: u64) -> bool {
         self.points.as_ref().is_some_and(|p| p.key == key)
@@ -920,22 +925,31 @@ impl GpuViewport {
             self.blended = Some(BlendTargets::new(&self.render_state, &self.composite_layout, size));
         }
         let (target, id) = self.target.as_ref().expect("made above");
-        self.encode(camera, target, self.blended.as_ref());
+        self.encode(camera, target, self.blended.as_ref(), true);
         *id
     }
 
     // The uploaded scene through `camera` as an image of `size` pixels, off screen:
     // premultiplied RGBA in display encoding, row by row, transparent where empty.
     pub fn render(&self, size: [u32; 2], camera: &Camera) -> Vec<[u8; 4]> {
+        self.render_with(size, camera, true)
+    }
+
+    // A finished frame (real-time renders, sprite sheets): without the wireframe.
+    pub fn render_final(&self, size: [u32; 2], camera: &Camera) -> Vec<[u8; 4]> {
+        self.render_with(size, camera, false)
+    }
+
+    fn render_with(&self, size: [u32; 2], camera: &Camera, edges: bool) -> Vec<[u8; 4]> {
         let size = [size[0].clamp(1, 16384), size[1].clamp(1, 16384)];
         let target = Target::new(&self.render_state, size);
         let blended = self.points.as_ref().is_some_and(|p| p.splats.is_some()).then(|| BlendTargets::new(&self.render_state, &self.composite_layout, size));
-        self.encode(camera, &target, blended.as_ref());
+        self.encode(camera, &target, blended.as_ref(), edges);
         read_texture(&self.render_state, &target.texture, size)
     }
 
     // Draws the scene into `target` (and the splats through `blended`) and submits it.
-    fn encode(&self, camera: &Camera, target: &Target, blended: Option<&BlendTargets>) {
+    fn encode(&self, camera: &Camera, target: &Target, blended: Option<&BlendTargets>, edges: bool) {
         let state = &self.render_state;
         // Orthographic depth runs from the near plane to just past the farthest corner.
         let corners = self.scene.iter().flat_map(|s| &s.corners).chain(self.points.iter().flat_map(|p| &p.extent));
@@ -985,7 +999,7 @@ impl GpuViewport {
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
-                if let Some((buffer, count)) = &scene.edges {
+                if let Some((buffer, count)) = scene.edges.as_ref().filter(|_| edges) {
                     pass.set_pipeline(&self.edges);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);

@@ -215,6 +215,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | attribute_transfer | `attribute_transfer` | 1 text field(s); class=0, samples=4, distance=1, blend_width=0 |
 | enumerate | `enumerate` | 2 text field(s); class=0, start=0, increment=1 |
 | attribute_blur | `attribute_blur` | 1 text field(s); mode=0, weighting=0, iterations=10, step=1, radius=0.2, max_points=10, pin_border=0 |
+| attribute_promote | `attribute_promote` | 2 text field(s); from=0, to=2, method=0, delete_original=1 |
 | wrangle | `wrangle` | the run-over domain (0–3), `:`, then the code in hex |
 | attribute_vop | `attribute_vop` | run_over=2 |
 | normal | `normal` | domain=1, cusp_angle=60, weighting=0, reverse=0 |
