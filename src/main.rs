@@ -70,6 +70,7 @@ mod tops;
 mod transfer;
 mod enumerate;
 mod blur;
+mod pop;
 mod promote;
 mod fluidsurface;
 mod updater;
@@ -3251,6 +3252,10 @@ pub(crate) fn app_config_dir() -> Option<PathBuf> {
 const MAX_RECENT_SCENES: usize = 10;
 
 fn recent_scenes_file() -> Option<PathBuf> {
+    // Tests save and open scenes too; they mustn't add to the user's list.
+    if cfg!(test) {
+        return None;
+    }
     Some(app_config_dir()?.join("recent_scenes.txt"))
 }
 
@@ -3894,6 +3899,11 @@ enum NodeKind {
     AttributePaint { attribute: String, values: Vec<f32>, settings: paint::PaintSettings },
     // Container whose network is cooked once per step on the previous step's output (Prev_Frame).
     SopSolver { substeps: usize },
+    // A POP Network: a particle simulation built from POP nodes inside it (see pop.rs).
+    // Inputs 0-3: geometry its POP Sources birth from, collide with, or its VEX reads.
+    PopNet { substeps: usize },
+    // A node inside a POP Network.
+    Pop(pop::PopNode),
     // Inside a SOP Solver network: 0 = Prev_Frame, 1 = Input_1 (the solver's input at the step time).
     SolverInput { index: usize },
     // STAGE (LOP) nodes: each builds on the USD stage from its first input.
@@ -3977,6 +3987,8 @@ impl NodeKind {
             | NodeKind::AttributeBlur(_)
             | NodeKind::HeightfieldWrangle { .. } => GroupSupport::Native,
             NodeKind::VellumSolver(_) => GroupSupport::Pin,
+            // POPs act on the group's particles only.
+            NodeKind::Pop(n) if !matches!(n.op, pop::OBJECT | pop::SOLVER | pop::SOURCE | pop::STATIC_OBJECT | pop::GROUND_PLANE) => GroupSupport::Native,
             _ => GroupSupport::None,
         }
     }
@@ -4015,7 +4027,14 @@ impl NodeKind {
         let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // Table-driven nodes: an operation number, then each table parameter (colours as .r .g .b).
         let table = |params: &[shading::Param]| -> Vec<String> {
-            params.iter().flat_map(|p| if p.width() == 3 { vec![format!("{}.r", p.key), format!("{}.g", p.key), format!("{}.b", p.key)] } else { vec![p.key.to_owned()] }).collect()
+            params
+                .iter()
+                .flat_map(|p| match p.kind {
+                    shading::Kind::Vector(..) => vec![format!("{}.x", p.key), format!("{}.y", p.key), format!("{}.z", p.key)],
+                    _ if p.width() == 3 => vec![format!("{}.r", p.key), format!("{}.g", p.key), format!("{}.b", p.key)],
+                    _ => vec![p.key.to_owned()],
+                })
+                .collect()
         };
         match self {
             NodeKind::Grid { .. } | NodeKind::Plane { .. } => names(&["size", "resolution"]),
@@ -4129,6 +4148,8 @@ impl NodeKind {
             NodeKind::ShaderNode(n) if n.op == shading::SURFACE_OUTPUT => [String::new(), String::new()].into_iter().chain(table(shading::PRINCIPLED)).collect(),
             NodeKind::ShaderNode(n) => std::iter::once(String::new()).chain(table(n.def().params)).collect(),
             NodeKind::Cop(n) => std::iter::once(String::new()).chain(table(n.def().params)).collect(),
+            NodeKind::Pop(n) => std::iter::once(String::new()).chain(table(n.def().params)).collect(),
+            NodeKind::PopNet { .. } => names(&["substeps"]),
             NodeKind::Top(n) => std::iter::once(String::new()).chain(n.def().params.iter().map(|p| if matches!(p.key, "node" | "param") { String::new() } else { p.key.to_owned() })).collect(),
             NodeKind::Material { .. } => names(&["", "color.r", "color.g", "color.b", "roughness", "value"]),
             _ => Vec::new(),
@@ -4215,6 +4236,7 @@ impl NodeKind {
             NodeKind::Shader(v) => v.textures.clone(),
             NodeKind::ShaderNode(n) => n.texts.clone(),
             NodeKind::Cop(n) => n.texts.clone(),
+            NodeKind::Pop(n) => n.texts.clone(),
             NodeKind::Top(n) => n.texts.clone(),
             NodeKind::RigPose(p) => p.joints.clone(),
             NodeKind::TwoBoneIk(k) => vec![k.root.clone(), k.mid.clone(), k.tip.clone()],
@@ -4288,6 +4310,7 @@ impl NodeKind {
             NodeKind::Shader(v) => v.textures.iter_mut().for_each(|t| next(t)),
             NodeKind::ShaderNode(n) => n.texts.iter_mut().for_each(|t| next(t)),
             NodeKind::Cop(n) => n.texts.iter_mut().for_each(|t| next(t)),
+            NodeKind::Pop(n) => n.texts.iter_mut().for_each(|t| next(t)),
             NodeKind::Top(n) => n.texts.iter_mut().for_each(|t| next(t)),
             NodeKind::RigPose(p) => p.joints.iter_mut().for_each(|t| next(t)),
             NodeKind::TwoBoneIk(k) => {
@@ -4308,8 +4331,8 @@ impl NodeKind {
     fn is_container(&self) -> bool {
         matches!(
             self,
-            NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder | NodeKind::CopNetwork | NodeKind::TopNetwork
-        )
+            NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder | NodeKind::CopNetwork | NodeKind::TopNetwork | NodeKind::PopNet { .. }
+        ) || matches!(self, NodeKind::Pop(n) if n.op == pop::VOP)
     }
 
     fn is_solver(&self) -> bool {
@@ -4325,6 +4348,7 @@ impl NodeKind {
                 | NodeKind::RbdSolver(_)
                 | NodeKind::VellumSolver(_)
                 | NodeKind::SopSolver { .. }
+                | NodeKind::PopNet { .. }
         )
     }
 
@@ -4336,6 +4360,7 @@ impl NodeKind {
             NodeKind::ShaderNode(n) => n.def().label.to_owned(),
             NodeKind::Cop(n) => n.def().label.to_owned(),
             NodeKind::Top(n) => n.def().label.to_owned(),
+            NodeKind::Pop(n) => n.def().label.to_owned(),
             NodeKind::MaterialFracture(f) => format!("material_fracture ({})", fracture::MATERIALS[f.material.min(2)]),
             NodeKind::ForEachEnd(f) => f.menu_name(),
             NodeKind::CompileEnd { .. } => "Compile Block".into(),
@@ -4350,6 +4375,7 @@ impl NodeKind {
             NodeKind::ShaderNode(n) => Some(n.def().help),
             NodeKind::Cop(n) => Some(n.def().help),
             NodeKind::Top(n) => Some(n.def().help),
+            NodeKind::Pop(n) => Some(n.def().help),
             _ => None,
         }
     }
@@ -4364,6 +4390,7 @@ impl NodeKind {
             NodeKind::ShaderNode(n) => n.label(id),
             NodeKind::Cop(n) => n.label(id),
             NodeKind::Top(n) => n.label(id),
+            NodeKind::Pop(n) => n.label(id),
             _ => format!("{}{id}", self.name()),
         }
     }
@@ -4472,6 +4499,7 @@ impl NodeKind {
             (
                 "Solvers",
                 vec![
+                    NodeKind::PopNet { substeps: 1 },
                     NodeKind::Particles {
                         count: 2000,
                         emission_rate: 400.0,
@@ -4727,6 +4755,8 @@ impl NodeKind {
         }
         all.push(("TOP Network", vec![NodeKind::TopNetwork]));
         all.push((tops::CATEGORY, (0..tops::OPS.len()).map(|op| NodeKind::Top(tops::TopNode::new(op))).collect()));
+        // POP nodes (only shown inside a POP Network, with Merge).
+        all.push(("POP", (0..pop::OPS.len()).map(|op| NodeKind::Pop(pop::PopNode::new(op))).collect()));
         // Material Builder nodes (only shown inside a Material Builder).
         all.push((shading::CATEGORY, (0..shading::SHADER_OPS.len()).map(|op| NodeKind::ShaderNode(shading::ShaderNode::new(op))).collect()));
         // VOP networks: one menu per category (only shown inside an Attribute VOP).
@@ -4880,6 +4910,8 @@ impl NodeKind {
             NodeKind::ShaderNode(_) => "shader_node",
             NodeKind::CopNetwork => "cop_network",
             NodeKind::Cop(_) => "cop",
+            NodeKind::Pop(_) => "pop",
+            NodeKind::PopNet { .. } => "popnet",
             NodeKind::TopNetwork => "top_network",
             NodeKind::Top(_) => "top",
         }
@@ -4903,6 +4935,9 @@ impl NodeKind {
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => {
                 (&["0: geometry to change", "1 (read-only)", "2 (read-only)", "3 (read-only)"], &[])
             }
+            NodeKind::PopNet { .. } => (&["0: POP Source input 0 (VEX input 1)", "1: input 1 (VEX input 2)", "2: input 2 (VEX input 3)", "3: input 3"], &[]),
+            NodeKind::Pop(n) if n.op == pop::SOLVER => (&["Objects (POP Object, Static Objects)", "Pre-solve: forces", "Post-solve: POP Sources"], &[]),
+            NodeKind::Pop(_) => (&["Particles"], &[]),
             _ => (&[], &[]),
         }
     }
@@ -4961,6 +4996,8 @@ impl NodeKind {
             NodeKind::ShaderNode(n) => n.def().inputs.len(),
             NodeKind::CopNetwork | NodeKind::TopNetwork => 0,
             NodeKind::Cop(n) => n.def().inputs,
+            NodeKind::Pop(n) => n.def().inputs,
+            NodeKind::PopNet { .. } => 4,
             NodeKind::Top(n) => n.def().inputs,
             _ => 1,
         }
@@ -5318,6 +5355,8 @@ impl NodeKind {
             NodeKind::ShaderNode(n) => n.to_params(),
             NodeKind::CopNetwork | NodeKind::TopNetwork => vec![],
             NodeKind::Cop(n) => n.to_params(),
+            NodeKind::Pop(n) => n.to_params(),
+            NodeKind::PopNet { substeps } => vec![*substeps as f32],
             NodeKind::Top(n) => n.to_params(),
         }
     }
@@ -5797,6 +5836,8 @@ impl NodeKind {
             "shader_node" => NodeKind::ShaderNode(shading::ShaderNode::from_params(p)),
             "cop_network" => NodeKind::CopNetwork,
             "cop" => NodeKind::Cop(cops::CopNode::from_params(p)),
+            "pop" => NodeKind::Pop(pop::PopNode::from_params(p)),
+            "popnet" => NodeKind::PopNet { substeps: u(0).clamp(1, 16) },
             "top_network" => NodeKind::TopNetwork,
             "top" => NodeKind::Top(tops::TopNode::from_params(p)),
             _ => return None,
@@ -5971,6 +6012,7 @@ impl Graph {
                     NodeKind::RbdSolver(_) => Some("RBD"),
                     NodeKind::VellumSolver(_) => Some("Cloth"),
                     NodeKind::SopSolver { .. } => Some("SOP Solver"),
+                    NodeKind::PopNet { .. } => Some("POP Network"),
                     NodeKind::Particles { .. } => Some("Particles"),
                     _ => None,
                 };
@@ -7096,6 +7138,109 @@ impl Graph {
         out
     }
 
+    // One POP Network step: cooks the network's display node on `prev` (see pop.rs).
+    #[allow(clippy::too_many_arguments)]
+    fn pop_step(&self, net: NodeId, prev: &Mesh, inputs: &[Mesh], time: f32, dt: f32, step: usize, frame_start: bool) -> Mesh {
+        let Some(display) = self.display_of(net) else {
+            return prev.clone();
+        };
+        let outer_inc = SOLVER_TIME_INC.with(|inc| inc.replace(dt));
+        // Static Objects and Ground Planes wired into the network, for the solvers.
+        let mut colliders = Vec::new();
+        let (mut stack, mut seen) = (vec![display], HashSet::new());
+        while let Some(at) = stack.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            if self.nodes.get(&at).is_some_and(|n| !n.bypass) {
+                if let NodeKind::Pop(p) = self.kind_at(at, time).as_ref() {
+                    if matches!(p.op, pop::STATIC_OBJECT | pop::GROUND_PLANE) {
+                        colliders.extend(pop::Collider::of(p, inputs));
+                    }
+                }
+            }
+            stack.extend(self.links.iter().filter(|l| l.to == at).map(|l| l.from));
+        }
+        let s = pop::Step { time, dt, step, frame_start, node_seed: 0, inputs, colliders: &colliders };
+        let out = self.pop_eval(display, prev, &s, None, &mut HashSet::new());
+        SOLVER_TIME_INC.with(|inc| inc.set(outer_inc));
+        out
+    }
+
+    // The particles a node inside a POP Network gives. `onto`: the particles it acts on when
+    // it's in a solver's second or third input (or below such a node); None in the main
+    // stream, where a POP with nothing above it acts on the last step's particles.
+    fn pop_eval(&self, id: NodeId, prev: &Mesh, s: &pop::Step, onto: Option<Mesh>, visiting: &mut HashSet<NodeId>) -> Mesh {
+        let Some(node) = self.nodes.get(&id) else {
+            return onto.unwrap_or_else(|| prev.clone());
+        };
+        // A loop in the wiring: stop here.
+        if !visiting.insert(id) {
+            return onto.unwrap_or_else(|| prev.clone());
+        }
+        let mut inputs: Vec<(usize, NodeId)> = self.links.iter().filter(|l| l.to == id).map(|l| (l.slot, l.from)).collect();
+        inputs.sort_unstable();
+        let input = |slot: usize| inputs.iter().find(|(k, _)| *k == slot).map(|(_, from)| *from);
+        let mut upstream = |slot: usize, onto: Option<Mesh>, visiting: &mut HashSet<NodeId>| match input(slot) {
+            Some(from) => self.pop_eval(from, prev, s, onto, visiting),
+            None => onto.unwrap_or_else(|| prev.clone()),
+        };
+        let kind = self.kind_at(id, s.time);
+        let out = match kind.as_ref() {
+            _ if node.bypass => upstream(0, onto, visiting),
+            // Each input in turn: the first gives the particles, the rest act on them.
+            NodeKind::Merge => {
+                let mut particles = onto;
+                for (_, from) in &inputs {
+                    particles = Some(self.pop_eval(*from, prev, s, particles, visiting));
+                }
+                particles.unwrap_or_else(|| prev.clone())
+            }
+            NodeKind::Pop(p) if p.op == pop::OBJECT => onto.unwrap_or_else(|| prev.clone()),
+            NodeKind::Pop(p) if p.op == pop::SOLVER => {
+                let objects = upstream(0, onto, visiting);
+                let mut particles = match input(1) {
+                    Some(pre) => self.pop_eval(pre, prev, s, Some(objects), visiting),
+                    None => objects,
+                };
+                pop::integrate(&mut particles, s.dt);
+                if !s.colliders.is_empty() {
+                    pop::bounce_off(&mut particles, s.colliders, None);
+                }
+                match input(2) {
+                    Some(post) => self.pop_eval(post, prev, s, Some(particles), visiting),
+                    None => particles,
+                }
+            }
+            NodeKind::Pop(p) => {
+                let mut particles = upstream(0, onto, visiting);
+                pop::tidy(&mut particles);
+                let mask = groups::point_mask(&particles, &node.group).ok().flatten();
+                // VEX input 0 is the particles; 1-3 are the POP Network's inputs 0-2.
+                let others = &s.inputs[..s.inputs.len().min(vex::INPUTS - 1)];
+                match p.op {
+                    pop::WRANGLE => node_wrangle(particles, others, p.text(0), s.time, 2, mask.as_deref(), Some(&node.channels)),
+                    pop::VOP => match self.vop_code(id) {
+                        Ok(code) => node_wrangle(particles, others, &code, s.time, 2, mask.as_deref(), Some(&node.channels)),
+                        Err(_) => particles,
+                    },
+                    _ => {
+                        if let Some(code) = p.expression_code() {
+                            particles = node_wrangle(particles, others, &code, s.time, 2, None, Some(&node.channels));
+                        }
+                        let step = pop::Step { node_seed: (id as u32).wrapping_mul(0x9e37_79b9), ..*s };
+                        pop::apply(p, &mut particles, &step, mask.as_deref());
+                        particles
+                    }
+                }
+            }
+            // Anything else passes the particles through.
+            _ => upstream(0, onto, visiting),
+        };
+        visiting.remove(&id);
+        out
+    }
+
     // Identifies a solver's simulation by everything that affects it: its settings,
     // its upstream nodes and, for containers, their networks. Node positions are excluded,
     // so moving nodes keeps cached simulations while any parameter edit restarts them.
@@ -7138,7 +7283,7 @@ impl Graph {
             || matches!(
                 kind.name(),
                 "geometry" | "cop_network" | "cop" | "top" | "top_network" | "solver_input" | "foreach_begin" | "foreach_end" | "vdb" | "usd_export" | "object_merge"
-                    | "sop_solver" | "compile_begin" | "compile_end" | "attribute_vop" | "vop" | "file" | "cache"
+                    | "sop_solver" | "compile_begin" | "compile_end" | "attribute_vop" | "vop" | "file" | "cache" | "popnet" | "pop"
             );
         if reads_beyond_inputs {
             scene.hash(&mut h);
@@ -7197,6 +7342,7 @@ impl Graph {
             NodeKind::Noise { .. }
                 | NodeKind::Ripple { .. }
                 | NodeKind::Particles { .. }
+                | NodeKind::PopNet { .. }
                 | NodeKind::LoopParticles { .. }
                 | NodeKind::MakeLoop { .. }
                 | NodeKind::TimeShift { .. }
@@ -7237,6 +7383,8 @@ impl Graph {
             || (!n.bypass
                 && matches!(n.kind, NodeKind::Geometry { .. } | NodeKind::CopNetwork)
                 && self.display_of(id).is_some_and(|d| self.time_dependent(d)))
+            // Nodes inside a POP Network show its simulation.
+            || n.parent.is_some_and(|p| matches!(self.nodes.get(&p).map(|n| &n.kind), Some(NodeKind::PopNet { .. })))
             || self
                 .links
                 .iter()
@@ -7330,6 +7478,12 @@ impl Graph {
                 .map(|(src, out)| self.cook_output(src, out, time, cache))
                 .unwrap_or_default()
         };
+        // A node inside a POP Network (a POP, or a Merge of POPs) shows the network's particles.
+        if let Some(net) = node.parent.filter(|p| matches!(self.nodes.get(p).map(|n| &n.kind), Some(NodeKind::PopNet { .. }))) {
+            let out = self.cook(net, time, cache);
+            cache.insert(id, out.clone());
+            return out;
+        }
         let out = if node.bypass {
             if node.kind.num_inputs() > 0 {
                 input(0, cache)
@@ -7931,6 +8085,26 @@ impl Graph {
                         |prev, step_time| self.sop_solver_step(id, prev, step_time, 1.0 / (sims::SIM_FPS * (*substeps).clamp(1, 16) as f32)),
                     )
                 }
+                NodeKind::PopNet { substeps } => {
+                    let sources: Vec<Option<NodeId>> = (0..4).map(|slot| self.input_of(id, slot)).collect();
+                    let animated: Vec<bool> = sources.iter().map(|s| s.is_some_and(|s| self.time_dependent(s))).collect();
+                    // Inputs that don't change are cooked once; animated ones at every step.
+                    let mut inputs: Option<Vec<Mesh>> = None;
+                    sims::pop_network(self.sim_key(id), time, *substeps, |prev, t, dt, step, frame_start| {
+                        let inputs = match &mut inputs {
+                            Some(inputs) => {
+                                for k in (0..4).filter(|&k| animated[k]) {
+                                    inputs[k] = self.cook_fresh(sources[k], t);
+                                }
+                                inputs
+                            }
+                            None => inputs.insert((0..4).map(|k| self.cook_fresh(sources[k], if animated[k] { t } else { 0.0 })).collect()),
+                        };
+                        self.pop_step(id, prev, inputs, t, dt, step, frame_start)
+                    })
+                }
+                // Inside a POP Network, every node shows the network's particles (caught above).
+                NodeKind::Pop(_) => Mesh::default(),
                 NodeKind::SolverInput { index } => {
                     let solver = node.parent;
                     let prev = solver.and_then(|s| SOLVER_PREV_FRAME.with(|frames| frames.borrow().get(&s).cloned()));
@@ -8397,6 +8571,22 @@ fn scene_fingerprint(text: &str) -> u64 {
 }
 const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
+// The timeline's playback range and frame rate, saved with the scene as one line after the
+// graph. Older versions of the app skip the line, so files still open in them.
+fn timeline_line(start: f32, end: f32, fps: f32) -> String {
+    format!("timeline {start} {end} {fps}\n")
+}
+
+fn parse_timeline(text: &str) -> Option<(f32, f32, f32)> {
+    text.lines().rev().find_map(|line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["timeline", start, end, fps] => {
+            let (start, end, fps) = (start.parse::<f32>().ok()?, end.parse::<f32>().ok()?, fps.parse::<f32>().ok()?);
+            (start.is_finite() && end.is_finite() && fps.is_finite()).then(|| (start, end.max(start), fps.clamp(1.0, 120.0)))
+        }
+        _ => None,
+    })
+}
+
 // Returns the MoonRay class name and its RDLA definition for a MAT node's settings.
 fn top_state_colour(state: tops::State) -> egui::Color32 {
     match state {
@@ -8441,7 +8631,10 @@ fn shader_param_ui(ui: &mut egui::Ui, param: &shading::Param, slot: &mut [f32]) 
             ui.horizontal(|ui| {
                 let mut rgb = [slot[0], slot[1], slot[2]];
                 let changed = ui.color_edit_button_rgb(&mut rgb).changed();
-                slot.copy_from_slice(&rgb);
+                // Only on an edit: the button's colour conversions nudge values otherwise.
+                if changed {
+                    slot.copy_from_slice(&rgb);
+                }
                 ui.label(param.label);
                 changed
             })
@@ -8452,6 +8645,17 @@ fn shader_param_ui(ui: &mut egui::Ui, param: &shading::Param, slot: &mut [f32]) 
             let changed = ui.checkbox(&mut on, param.label).changed();
             slot[0] = on as u8 as f32;
             changed
+        }
+        shading::Kind::Vector(min, max) => {
+            ui.horizontal(|ui| {
+                let mut changed = false;
+                for value in slot.iter_mut().take(3) {
+                    changed |= pfield(ui, pdrag(value).range(min..=max).speed(0.05)).changed();
+                }
+                ui.label(param.label);
+                changed
+            })
+            .inner
         }
     }
 }
@@ -9556,15 +9760,18 @@ impl Default for ProceduralFxStudioApp {
             },
             egui::pos2(240.0, 20.0),
         );
-        let g = std::fs::read_to_string(SCENE_FILE)
-            .or_else(|_| std::fs::read_to_string(LEGACY_SCENE_FILE))
-            .ok()
-            .map(|scene| Graph::deserialize(&scene))
-            .filter(|scene| !scene.nodes.is_empty())
-            .unwrap_or(g);
+        let startup = std::fs::read_to_string(SCENE_FILE).or_else(|_| std::fs::read_to_string(LEGACY_SCENE_FILE)).ok();
+        let saved = startup.as_deref().map(Graph::deserialize).filter(|scene| !scene.nodes.is_empty());
+        // The saved scene's timeline, if it has one.
+        let (playback_start, playback_end, playback_fps) = saved
+            .as_ref()
+            .and(startup.as_deref())
+            .and_then(parse_timeline)
+            .unwrap_or((0.0, 20.0, sims::SIM_FPS));
+        let g = saved.unwrap_or(g);
         let selected = g.geometry_ids().first().copied();
         let last_state = g.serialize();
-        let saved_fingerprint = scene_fingerprint(&last_state);
+        let saved_fingerprint = scene_fingerprint(&(last_state.clone() + &timeline_line(playback_start, playback_end, playback_fps)));
 
         let detected_moonray = detect_moonray_executable();
         let default_mr_args = String::from("{scene} {output} {width} {height} {samples}");
@@ -9602,11 +9809,11 @@ impl Default for ProceduralFxStudioApp {
             cop_write_request: None,
             cop_texture: None,
             animate: true,
-            playback_fps: sims::SIM_FPS,
+            playback_fps,
             playback_due: 0.0,
-            time: 0.0,
-            playback_start: 0.0,
-            playback_end: 20.0,
+            time: playback_start,
+            playback_start,
+            playback_end,
             pause_on_edit: true,
             graph_editor: anim::GraphEditor::default(),
             auto_key: false,
@@ -11381,6 +11588,7 @@ impl ProceduralFxStudioApp {
         match std::fs::read_to_string(&path) {
             Ok(s) => {
                 self.undo.push(self.last_state.clone());
+                self.use_saved_timeline(&s);
                 self.load_state(s);
                 self.mark_saved();
                 self.status = format!("Loaded {}", path.display());
@@ -11457,7 +11665,7 @@ impl ProceduralFxStudioApp {
     }
 
     fn write_scene(&mut self, path: PathBuf) {
-        match write_file_atomically(&path, &self.graph.serialize()) {
+        match write_file_atomically(&path, &self.scene_text()) {
             Ok(()) => {
                 self.mark_saved();
                 self.status = format!("Saved {}", path.display());
@@ -11839,13 +12047,26 @@ impl ProceduralFxStudioApp {
 
     // The scene now matches what's on disk.
     fn mark_saved(&mut self) {
-        self.saved_fingerprint = scene_fingerprint(&self.graph.serialize());
+        self.saved_fingerprint = scene_fingerprint(&self.scene_text());
         self.unsaved = false;
         self.unsaved_checked = Some(Instant::now());
     }
 
     fn has_unsaved_changes(&self) -> bool {
-        scene_fingerprint(&self.graph.serialize()) != self.saved_fingerprint
+        scene_fingerprint(&self.scene_text()) != self.saved_fingerprint
+    }
+
+    // What a saved scene file holds: the graph, then the timeline.
+    fn scene_text(&self) -> String {
+        self.graph.serialize() + &timeline_line(self.playback_start, self.playback_end, self.playback_fps)
+    }
+
+    // Uses a scene file's timeline, if it saved one.
+    fn use_saved_timeline(&mut self, text: &str) {
+        if let Some((start, end, fps)) = parse_timeline(text) {
+            (self.playback_start, self.playback_end, self.playback_fps) = (start, end, fps);
+            self.time = self.time.clamp(start, end);
+        }
     }
 
     // Quitting with unsaved changes asks first: Save, Don't Save or Cancel.
@@ -13462,9 +13683,10 @@ impl ProceduralFxStudioApp {
         let in_solver = self
             .network()
             .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::SopSolver { .. })));
-        let in_vop = self
-            .network()
-            .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. })));
+        let in_vop = self.network().is_some_and(|id| {
+            matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. })) || matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::Pop(p)) if p.op == pop::VOP)
+        });
+        let in_popnet = self.network().is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::PopNet { .. })));
         let in_builder = self
             .network()
             .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::MaterialBuilder)));
@@ -13495,6 +13717,11 @@ impl ProceduralFxStudioApp {
                         // Inside an Attribute VOP only VOPs; VOPs nowhere else.
                         AppContext::Obj if in_vop => matches!(k, NodeKind::Vop(_)),
                         AppContext::Obj if matches!(k, NodeKind::Vop(_)) => false,
+                        // Inside a POP Network only POPs and Merge; POPs nowhere else.
+                        AppContext::Obj if in_popnet => matches!(k, NodeKind::Pop(_) | NodeKind::Merge),
+                        AppContext::Obj if matches!(k, NodeKind::Pop(_)) => false,
+                        // The POP Network replaces it; scenes that have one still work.
+                        AppContext::Obj if matches!(k, NodeKind::Particles { .. }) => false,
                         AppContext::Obj if top_obj => k.is_object(),
                         AppContext::Obj if matches!(k, NodeKind::SolverInput { .. }) => in_solver,
                         AppContext::Obj => {
@@ -14026,7 +14253,31 @@ impl ProceduralFxStudioApp {
         if self.graph.nodes.get(&id).is_some_and(|n| n.kind.is_lop()) && self.graph.display_of(STAGE_NETWORK).is_none() {
             self.graph.set_display(id);
         }
-        if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. })) {
+        if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::PopNet { .. })) {
+            // Like Houdini's: the source in the solver's post-solve input, so particles are
+            // born where the source is at the end of a step; gravity after the solver.
+            let mut add = |kind: NodeKind, x: f32, y: f32| {
+                let child = self.graph.add(kind, egui::pos2(x, y));
+                if let Some(n) = self.graph.nodes.get_mut(&child) {
+                    n.context = AppContext::Obj;
+                    n.parent = Some(id);
+                }
+                child
+            };
+            let object = add(NodeKind::Pop(pop::PopNode::new(pop::OBJECT)), 40.0, 20.0);
+            let source = add(NodeKind::Pop(pop::PopNode::new(pop::SOURCE)), 240.0, 20.0);
+            let solver = add(NodeKind::Pop(pop::PopNode::new(pop::SOLVER)), 40.0, 140.0);
+            let gravity = add(NodeKind::Pop(pop::PopNode::new(pop::GRAVITY)), 40.0, 260.0);
+            self.graph.connect(object, solver, 0);
+            self.graph.connect(source, solver, 2);
+            self.graph.connect(solver, gravity, 0);
+            self.graph.set_display(gravity);
+            self.status = "POP Network created: double-click it to add forces, colour and more (TAB inside lists the POPs)".into();
+            return;
+        }
+        if matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. }))
+            || matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::Pop(p)) if p.op == pop::VOP)
+        {
             // Like Houdini's: P read in and written back out, ready to be modified in between.
             let bind = self.graph.add(NodeKind::Vop(vop::VopNode::new(vop::BIND)), egui::pos2(40.0, 30.0));
             let export = self.graph.add(NodeKind::Vop(vop::VopNode::new(vop::EXPORT)), egui::pos2(40.0, 260.0));
@@ -14083,6 +14334,7 @@ impl ProceduralFxStudioApp {
                     kind,
                     NodeKind::Add { .. }
                         | NodeKind::Particles { .. }
+                        | NodeKind::PopNet { .. }
                                 | NodeKind::Flip { .. }
                         | NodeKind::WhitewaterSolver(_)
                         | NodeKind::Cache { .. }
@@ -14112,6 +14364,7 @@ impl ProceduralFxStudioApp {
                     kind,
                     NodeKind::Add { .. }
                         | NodeKind::Particles { .. }
+                        | NodeKind::PopNet { .. }
                                 | NodeKind::Flip { .. }
                         | NodeKind::WhitewaterSolver(_)
                         | NodeKind::Cache { .. }
@@ -14786,6 +15039,7 @@ impl ProceduralFxStudioApp {
         let geometry_objects = self.graph.geometry_ids();
         let picked_prim = self.stage_selected_prim.clone();
         let viewport_view = self.viewport_eye_target();
+        let pop_display_missing = matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::PopNet { .. })) && self.graph.display_of(id).is_none();
         let solver_display_is_input = self
             .graph
             .display_of(id)
@@ -14802,7 +15056,8 @@ impl ProceduralFxStudioApp {
             .collect();
         material_ids.sort_unstable();
         // An Attribute VOP's generated code and its Parameter VOPs' defaults.
-        let vop_code = matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. })).then(|| self.graph.vop_code(id));
+        let vop_code = matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. }) | Some(NodeKind::Pop(pop::PopNode { op: pop::VOP, .. })))
+            .then(|| self.graph.vop_code(id));
         let vop_parameters: Vec<(String, [f32; 3])> = self
             .graph
             .children(id)
@@ -15040,6 +15295,80 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::TopNetwork => {
                 ui.small("A task graph: double-click to build it from TOP nodes, then cook the last node to run its work items.");
+            }
+            NodeKind::PopNet { substeps } => {
+                ui.heading("POP Network");
+                if pop_display_missing {
+                    ui.colored_label(egui::Color32::from_rgb(230, 190, 90), "⚠ Nothing inside has the display flag, so there are no particles. Double-click to enter it and set the display flag on the last node.");
+                }
+                c |= pfield(ui, pslider(substeps, 1..=16).text("Substeps")).changed();
+                ui.small("A particle simulation built from POP nodes: double-click it to edit. A new one has a POP Source in the POP Solver's third input (post-solve, as in Houdini: particles are born at the source at the end of each step), with Gravity Force after it. Inputs 0-3 are geometry for POP Sources to birth from (input 0 by default), for POP Collide to collide with, and for POP Wrangles to read (point(1, ...) reads input 0).");
+                ui.small("The output is points with v, age, life and id, plus what the POPs add (Cd, groups...): ready for Copy to Points, Particle Fluid Surface, Loop Particles or a sprite sheet.");
+            }
+            NodeKind::Pop(pop_node) => {
+                ui.heading(pop_node.def().label);
+                ui.small(pop_node.def().help);
+                let op = pop_node.op;
+                if op == pop::WRANGLE {
+                    if let Some(code) = pop_node.texts.get_mut(0) {
+                        c |= vex_editor_ui(ui, code, 2, "particles", &mut node.channels, "v@force += set(0, 2, 0);");
+                    }
+                } else {
+                    let labels = pop_node.def().texts;
+                    let rule = pop_node.v("rule").round() as usize;
+                    for (i, ((label, _), text)) in labels.iter().zip(pop_node.texts.iter_mut()).enumerate() {
+                        // The expression only matters for the Expression rule.
+                        let is_expression = (op == pop::GROUP && i == 1) || op == pop::KILL;
+                        let expression_rule = (op == pop::GROUP && rule == 3) || (op == pop::KILL && rule == 0);
+                        if is_expression && !expression_rule {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(*label);
+                            let edit = egui::TextEdit::singleline(text).desired_width(220.0);
+                            c |= ui.add(if is_expression { edit.font(egui::TextStyle::Monospace) } else { edit }).changed();
+                        });
+                    }
+                }
+                for (param, slot) in pop_node.param_mut() {
+                    if let Some(choices) = pop::choices(op, param.key) {
+                        let mut value = (slot[0].round().max(0.0) as usize).min(choices.len() - 1);
+                        egui::ComboBox::from_label(param.label).selected_text(choices[value]).show_ui(ui, |ui| {
+                            for (i, label) in choices.iter().enumerate() {
+                                c |= ui.selectable_value(&mut value, i, *label).changed();
+                            }
+                        });
+                        slot[0] = value as f32;
+                        continue;
+                    }
+                    match param.key {
+                        "input" | "seed" => {
+                            let mut whole = slot[0].round().max(0.0) as usize;
+                            let top = if param.key == "input" { 3 } else { 10_000 };
+                            c |= pfield(ui, pslider(&mut whole, 0..=top).text(param.label)).changed();
+                            slot[0] = whole as f32;
+                        }
+                        _ => c |= shader_param_ui(ui, param, slot),
+                    }
+                }
+                if op == pop::VOP {
+                    ui.small("Double-click to edit its VOP network. Bind reads the particles' attributes (P, v, force, age, Cd...) and Export writes them back.");
+                    match &vop_code {
+                        Some(Ok(code)) => {
+                            for (name, default) in &vop_parameters {
+                                node.channels.entry(name.clone()).or_insert(*default);
+                            }
+                            c |= channel_params_ui(ui, code, &mut node.channels);
+                            egui::CollapsingHeader::new("Generated VEX").id_salt("vop_code").show(ui, |ui| {
+                                ui.label(egui::RichText::new(code.as_str()).monospace().small());
+                            });
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(egui::Color32::from_rgb(240, 110, 110), format!("✖ {e}"));
+                        }
+                        None => {}
+                    }
+                }
             }
             NodeKind::Cop(cop) => {
                 ui.small(cop.def().help);
@@ -21096,7 +21425,7 @@ mod scene_file_tests {
                 }
                 let (params, names, texts) = (kind.params(), kind.param_names(), kind.texts());
                 // Table-driven nodes share one saved name and store which operation they are first.
-                let table = matches!(kind, NodeKind::Vop(_) | NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::ShaderNode(_));
+                let table = matches!(kind, NodeKind::Vop(_) | NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::ShaderNode(_) | NodeKind::Pop(_));
                 let numbers = params
                     .iter()
                     .enumerate()
@@ -21747,6 +22076,36 @@ mod group_node_tests {
         let loaded = Graph::deserialize(&g.serialize());
         assert_eq!(loaded.nodes[&target].group, groups::NodeGroup { pattern: "right ^0-3".into(), kind: 1 });
         assert_eq!(format!("{:?}", loaded.nodes[&make].kind), format!("{:?}", g.nodes[&make].kind));
+    }
+
+    #[test]
+    fn the_timeline_is_saved_with_the_scene() {
+        let dir = std::env::temp_dir().join(format!("pfx_timeline_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("range.pfs");
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n");
+        (app.playback_start, app.playback_end, app.playback_fps) = (2.0, 2.958, 30.0);
+        app.write_scene(path.clone());
+        assert!(!app.has_unsaved_changes());
+        // Changing only the range is a change to save.
+        app.playback_end = 4.0;
+        assert!(app.has_unsaved_changes());
+
+        let mut other = ProceduralFxStudioApp::default();
+        other.open_scene(path.clone());
+        assert_eq!((other.playback_start, other.playback_end, other.playback_fps), (2.0, 2.958, 30.0));
+        assert!(other.time >= 2.0 && other.time <= 2.958);
+        assert!(!other.has_unsaved_changes(), "just opened: nothing to save");
+        assert_eq!(other.graph.nodes.len(), 2, "the graph still loads around the timeline line");
+
+        // A scene saved before the timeline was saved keeps whatever range is set.
+        std::fs::write(&path, "pfs 2\nnode 0 40 20 0 obj geometry -1\nnext 1\n").unwrap();
+        other.open_scene(path.clone());
+        assert_eq!((other.playback_start, other.playback_end), (2.0, 2.958));
+        assert_eq!(parse_timeline("timeline 5 1 999\n"), Some((5.0, 5.0, 120.0)), "end before start, and too high a rate, are fixed");
+        assert_eq!(parse_timeline("timeline nan 1 24\n"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -23051,7 +23410,7 @@ mod param_name_tests {
                 // Fixed-size nodes name every parameter (variable lists and table nodes may leave some unnamed).
                 let variable = matches!(kind, NodeKind::Add { .. } | NodeKind::Blast { .. } | NodeKind::AttributePaint { .. } | NodeKind::ObjectMerge { .. } | NodeKind::MaterialAssign { .. } | NodeKind::Cache { .. } | NodeKind::Wrangle { .. } | NodeKind::MoonRayRender { .. } | NodeKind::Vop(_) | NodeKind::CompileEnd { .. } | NodeKind::Geometry { .. } | NodeKind::LopSopImport { .. } | NodeKind::LopMaterial { .. } | NodeKind::Light { .. } | NodeKind::Camera { .. } | NodeKind::EnvironmentLight { .. } | NodeKind::RigPose(_) | NodeKind::SolverInput { .. } | NodeKind::AttributeVop { .. });
                 // Table nodes always store their operation first; only the rest needs names.
-                let table_only_op = matches!(kind, NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::ShaderNode(_));
+                let table_only_op = matches!(kind, NodeKind::Cop(_) | NodeKind::Top(_) | NodeKind::ShaderNode(_) | NodeKind::Pop(_));
                 if !variable && !table_only_op && !params.is_empty() {
                     assert!(!kind.animatable().is_empty(), "{} has parameters but none named", kind.name());
                 }
@@ -24350,5 +24709,293 @@ mod sheet_column_tests {
         let columns = headers(&sphere);
         assert_eq!(&columns[4..5], ["age"]);
         assert_eq!(&columns[columns.len() - 3..], ["N.x", "N.y", "N.z"]);
+    }
+}
+
+#[cfg(test)]
+mod pop_network_tests {
+    use super::*;
+
+    // A Geometry object holding a new POP Network, made from the menus as a user would;
+    // returns the app (inside the object) and the network.
+    fn new_network() -> (ProceduralFxStudioApp, NodeId) {
+        sims::clear_all();
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        app.context = AppContext::Obj;
+        app.apply(Action::Add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0)));
+        let geo = app.selected.unwrap();
+        app.apply(Action::Enter(geo));
+        // Particles is hidden in favour of the POP Network; POPs only appear inside one.
+        let menu: Vec<NodeKind> = app.templates_for_view().into_iter().flat_map(|(_, k)| k).collect();
+        assert!(menu.iter().any(|k| matches!(k, NodeKind::PopNet { .. })));
+        assert!(!menu.iter().any(|k| matches!(k, NodeKind::Particles { .. } | NodeKind::Pop(_))));
+        app.apply(Action::Add(NodeKind::PopNet { substeps: 1 }, egui::pos2(0.0, 0.0)));
+        let net = app.selected.unwrap();
+        (app, net)
+    }
+
+    fn pop_child(app: &mut ProceduralFxStudioApp, net: NodeId, op: usize) -> NodeId {
+        let id = app.graph.add(NodeKind::Pop(pop::PopNode::new(op)), egui::pos2(0.0, 0.0));
+        let n = app.graph.nodes.get_mut(&id).unwrap();
+        n.context = AppContext::Obj;
+        n.parent = Some(net);
+        id
+    }
+
+    fn child(app: &ProceduralFxStudioApp, net: NodeId, op: usize) -> NodeId {
+        app.graph.children(net).into_iter().find(|c| matches!(&app.graph.nodes[c].kind, NodeKind::Pop(p) if p.op == op)).unwrap()
+    }
+
+    fn set(app: &mut ProceduralFxStudioApp, id: NodeId, key: &str, values: &[f32]) {
+        let Some(NodeKind::Pop(p)) = app.graph.nodes.get_mut(&id).map(|n| &mut n.kind) else { panic!() };
+        for (param, slot) in p.param_mut() {
+            if param.key == key {
+                slot.copy_from_slice(values);
+            }
+        }
+    }
+
+    fn cook(app: &ProceduralFxStudioApp, id: NodeId, time: f32) -> Mesh {
+        app.graph.cook(id, time, &mut HashMap::new())
+    }
+
+    #[test]
+    fn a_new_pop_network_births_and_falls() {
+        let (mut app, net) = new_network();
+        // Source, object, solver and gravity, with gravity displayed.
+        assert_eq!(app.graph.children(net).len(), 4);
+        let gravity = child(&app, net, pop::GRAVITY);
+        assert_eq!(app.graph.display_of(net), Some(gravity));
+        app.apply(Action::Enter(net));
+        let menu: Vec<NodeKind> = app.templates_for_view().into_iter().flat_map(|(_, k)| k).collect();
+        assert_eq!(menu.iter().filter(|k| matches!(k, NodeKind::Pop(_))).count(), pop::OPS.len());
+        assert!(menu.iter().all(|k| matches!(k, NodeKind::Pop(_) | NodeKind::Merge)));
+
+        // 200 a second for a second from the origin, living 1.5-2.5 s: all 200 alive.
+        let out = cook(&app, net, 1.0);
+        assert_eq!(out.vertices.len(), 200);
+        for name in ["v", "age", "life", "id"] {
+            assert!(out.point_attributes.contains_key(name), "{name}");
+        }
+        assert!(!out.point_attributes.contains_key("detail:pop_next_id"));
+        // Launched up at about 1, pulled down by gravity: the oldest are falling now.
+        let oldest = (0..200).max_by(|&a, &b| out.point_attributes["age"][a].total_cmp(&out.point_attributes["age"][b])).unwrap();
+        assert!(out.point_attributes["v"][oldest * 3 + 1] < -5.0);
+        // Viewing a POP inside shows the network's particles.
+        assert_eq!(cook(&app, gravity, 1.0).vertices.len(), 200);
+        // Scrubbing back gives the same frame.
+        let again = cook(&app, net, 0.5);
+        let _later = cook(&app, net, 1.5);
+        assert_eq!(cook(&app, net, 0.5).vertices, again.vertices);
+        // By 3 s the first ones are past their life.
+        assert!(cook(&app, net, 3.0).point_attributes["age"].iter().all(|a| *a <= 2.5 + 1e-3));
+    }
+
+    #[test]
+    fn forces_vex_groups_and_kills_in_the_network() {
+        let (mut app, net) = new_network();
+        let (solver, gravity) = (child(&app, net, pop::SOLVER), child(&app, net, pop::GRAVITY));
+        // A source from a grid on input 0, a wind and a wrangle merged into the pre-solve.
+        let grid = app.graph.add(NodeKind::Grid { size: 2.0, res: 4 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&grid).unwrap().parent = app.graph.nodes[&net].parent;
+        app.graph.connect(grid, net, 0);
+        let source = child(&app, net, pop::SOURCE);
+        set(&mut app, source, "velocity", &[0.0, 0.0, 0.0]);
+        set(&mut app, source, "variance", &[0.0, 0.0, 0.0]);
+        let wind = pop_child(&mut app, net, pop::WIND);
+        set(&mut app, wind, "wind", &[3.0, 0.0, 0.0]);
+        set(&mut app, wind, "air_resistance", &[50.0]);
+        let wrangle = pop_child(&mut app, net, pop::WRANGLE);
+        if let Some(NodeKind::Pop(p)) = app.graph.nodes.get_mut(&wrangle).map(|n| &mut n.kind) {
+            p.texts[0] = "@Cd = set(1, 0, 0);".into();
+        }
+        let merge = app.graph.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&merge).unwrap().parent = Some(net);
+        app.graph.links.retain(|l| !(l.to == solver && l.from == source));
+        app.graph.connect(source, merge, 0);
+        app.graph.connect(wind, merge, 1);
+        app.graph.connect(wrangle, merge, 2);
+        app.graph.connect(merge, solver, 1);
+        // After gravity: a group of the left half, and a kill of everything below y = -0.5.
+        let group = pop_child(&mut app, net, pop::GROUP);
+        set(&mut app, group, "rule", &[3.0]);
+        set(&mut app, group, "births_only", &[0.0]);
+        if let Some(NodeKind::Pop(p)) = app.graph.nodes.get_mut(&group).map(|n| &mut n.kind) {
+            p.texts = vec!["left".into(), "@P.x < 0".into()];
+        }
+        let kill = pop_child(&mut app, net, pop::KILL);
+        if let Some(NodeKind::Pop(p)) = app.graph.nodes.get_mut(&kill).map(|n| &mut n.kind) {
+            p.texts[0] = "@P.y < -0.5".into();
+        }
+        app.graph.connect(gravity, group, 0);
+        app.graph.connect(group, kill, 0);
+        app.graph.set_display(kill);
+
+        let out = cook(&app, net, 0.5);
+        let n = out.vertices.len();
+        assert!(n > 50, "{n} particles");
+        // Born on the grid (y = 0, |x| <= 1), blown along +x toward 3, red, none below -0.5.
+        assert!(out.vertices.iter().all(|p| p.y >= -0.5 && p.z.abs() <= 1.0 + 1e-4));
+        assert!(out.point_attributes["v"].chunks(3).all(|v| v[0] > 2.0), "the wind sets the pace");
+        assert!(out.point_attributes["Cd"].chunks(3).all(|c| c == [1.0, 0.0, 0.0]));
+        let left = &out.point_attributes["group:left"];
+        assert!((0..n).all(|i| (left[i] > 0.5) == (out.vertices[i].x < 0.0)));
+        // Gravity after the solver acts on the next step: they fall, as fast as the wind's
+        // air resistance lets them (about -9.8 / 50).
+        // Those a step old or more; the newest haven't had a step of gravity yet.
+        let age = &out.point_attributes["age"];
+        let vy: Vec<f32> = (0..n).filter(|&i| age[i] > 0.1).map(|i| out.point_attributes["v"][i * 3 + 1]).collect();
+        assert!(!vy.is_empty() && vy.iter().all(|v| (v + 9.8 / 50.0).abs() < 0.02), "{vy:?}");
+    }
+
+    #[test]
+    fn static_objects_and_ground_planes_catch_particles() {
+        let (mut app, net) = new_network();
+        let (object, solver) = (child(&app, net, pop::OBJECT), child(&app, net, pop::SOLVER));
+        let outside = app.graph.nodes[&net].parent;
+        // Particles from a small grid at y = 2 fall onto a box (top at y = 1) on input 1.
+        let grid = app.graph.add(NodeKind::Grid { size: 0.5, res: 2 }, egui::pos2(0.0, 0.0));
+        let lift = app.graph.add(NodeKind::Wrangle { code: "@P.y += 2;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        let block = app.graph.add(NodeKind::Box { size: 2.0, div: 1 }, egui::pos2(0.0, 0.0));
+        for id in [grid, lift, block] {
+            app.graph.nodes.get_mut(&id).unwrap().parent = outside;
+        }
+        app.graph.connect(grid, lift, 0);
+        app.graph.connect(lift, net, 0);
+        app.graph.connect(block, net, 1);
+        let source = child(&app, net, pop::SOURCE);
+        set(&mut app, source, "velocity", &[0.0, 0.0, 0.0]);
+        set(&mut app, source, "variance", &[0.0, 0.0, 0.0]);
+        set(&mut app, source, "life", &[10.0]);
+        // Merged with the POP Object into the solver, as in Houdini.
+        let still = pop_child(&mut app, net, pop::STATIC_OBJECT);
+        let merge = app.graph.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&merge).unwrap().parent = Some(net);
+        app.graph.links.retain(|l| !(l.to == solver && l.slot == 0));
+        app.graph.connect(object, merge, 0);
+        app.graph.connect(still, merge, 1);
+        app.graph.connect(merge, solver, 0);
+        let out = cook(&app, net, 2.0);
+        assert!(out.vertices.len() > 100);
+        assert!(out.vertices.iter().all(|p| p.y > 0.95 && p.y < 2.0 + 1e-4), "they rest on the box");
+        assert!(out.point_attributes["hit"].iter().any(|h| *h > 0.5));
+
+        // Without it they fall through, until a Ground Plane at y = -1 catches them.
+        app.graph.nodes.get_mut(&still).unwrap().bypass = true;
+        let ground = pop_child(&mut app, net, pop::GROUND_PLANE);
+        set(&mut app, ground, "height", &[-1.0]);
+        app.graph.connect(ground, merge, 2);
+        let out = cook(&app, net, 2.0);
+        assert!(out.vertices.iter().any(|p| p.y < 0.0));
+        assert!(out.vertices.iter().all(|p| p.y > -1.0));
+    }
+
+    #[test]
+    fn viewing_inside_a_network_plays_its_simulation() {
+        let (mut app, net) = new_network();
+        let (source, solver, gravity) = (child(&app, net, pop::SOURCE), child(&app, net, pop::SOLVER), child(&app, net, pop::GRAVITY));
+        // Inside, the viewport shows the network's display node: it must recook as time moves.
+        for id in app.graph.children(net) {
+            assert!(app.graph.time_dependent(id), "{}", app.graph.nodes[&id].kind.menu_name());
+        }
+        // The source works before or after the solver, and moved back.
+        for slot in [2, 1] {
+            app.graph.links.retain(|l| !(l.to == solver && l.from == source));
+            app.graph.connect(source, solver, slot);
+            let (early, late) = (cook(&app, gravity, 0.5), cook(&app, gravity, 1.0));
+            let lowest = |m: &Mesh| m.vertices.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+            assert!(late.vertices.len() > early.vertices.len() && lowest(&late) < lowest(&early) - 1.0, "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn pop_vops_and_wrangles_read_the_networks_inputs() {
+        let (mut app, net) = new_network();
+        let gravity = child(&app, net, pop::GRAVITY);
+        // Input 0 of the POP Network: a red grid. Particles are born on it.
+        let grid = app.graph.add(NodeKind::Grid { size: 1.0, res: 20 }, egui::pos2(0.0, 0.0));
+        let red = app.graph.add(NodeKind::Wrangle { code: "@Cd = set(1, 0, 0);".into(), domain: 2 }, egui::pos2(0.0, 0.0));
+        for id in [grid, red] {
+            app.graph.nodes.get_mut(&id).unwrap().parent = app.graph.nodes[&net].parent;
+        }
+        app.graph.connect(grid, red, 0);
+        app.graph.connect(red, net, 0);
+        // A POP VOP whose Bind reads Cd from VOP input 1 (the network's input 0), exported as tint.
+        app.apply(Action::Enter(net));
+        app.apply(Action::Add(NodeKind::Pop(pop::PopNode::new(pop::VOP)), egui::pos2(0.0, 0.0)));
+        let vop_net = app.selected.unwrap();
+        for child in app.graph.children(vop_net) {
+            if let Some(NodeKind::Vop(v)) = app.graph.nodes.get_mut(&child).map(|n| &mut n.kind) {
+                if v.op == vop::BIND {
+                    v.input = 1;
+                }
+                v.name = if v.op == vop::BIND { "Cd".into() } else { "tint".into() };
+            }
+        }
+        app.graph.connect(gravity, vop_net, 0);
+        app.graph.set_display(vop_net);
+        let out = cook(&app, net, 0.25);
+        assert!(!out.vertices.is_empty());
+        assert!(out.point_attributes["tint"].chunks(3).all(|c| c == [1.0, 0.0, 0.0]), "read from the network's input");
+        // The same from a POP Wrangle.
+        let wrangle = pop_child(&mut app, net, pop::WRANGLE);
+        if let Some(NodeKind::Pop(p)) = app.graph.nodes.get_mut(&wrangle).map(|n| &mut n.kind) {
+            p.texts[0] = "v@tint2 = point(1, \"Cd\", 0); f@count = npoints(1);".into();
+        }
+        app.graph.connect(vop_net, wrangle, 0);
+        app.graph.set_display(wrangle);
+        let out = cook(&app, net, 0.25);
+        assert!(out.point_attributes["tint2"].chunks(3).all(|c| c == [1.0, 0.0, 0.0]));
+        assert!(out.point_attributes["count"].iter().all(|n| *n == 400.0));
+    }
+
+    #[test]
+    fn every_pop_panel_draws() {
+        let (mut app, net) = new_network();
+        let ids: Vec<NodeId> = std::iter::once(net).chain((0..pop::OPS.len()).map(|op| pop_child(&mut app, net, op))).collect();
+        let ctx = egui::Context::default();
+        for id in ids {
+            app.selected = Some(id);
+            let before = app.graph.nodes[&id].kind.clone();
+            let mut changed = false;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| changed = app.params_ui(ui));
+            });
+            assert!(!changed, "drawing {} changed it", app.graph.nodes[&id].kind.menu_name());
+            assert_eq!(format!("{:?}", app.graph.nodes[&id].kind), format!("{before:?}"));
+        }
+    }
+
+    #[test]
+    fn pop_vops_run_and_networks_survive_save_and_load() {
+        let (mut app, net) = new_network();
+        let (solver, gravity) = (child(&app, net, pop::SOLVER), child(&app, net, pop::GRAVITY));
+        // A POP VOP made from the menu has Bind P -> Export P inside, and runs.
+        app.apply(Action::Enter(net));
+        app.apply(Action::Add(NodeKind::Pop(pop::PopNode::new(pop::VOP)), egui::pos2(0.0, 0.0)));
+        let vop = app.selected.unwrap();
+        assert!(app.graph.nodes[&vop].kind.is_container());
+        assert_eq!(app.graph.children(vop).len(), 2);
+        assert!(app.graph.vop_code(vop).is_ok());
+        app.graph.connect(gravity, vop, 0);
+        app.graph.set_display(vop);
+        // Collisions after the source, in the post-solve input.
+        let source = child(&app, net, pop::SOURCE);
+        let collide = pop_child(&mut app, net, pop::COLLIDE);
+        app.graph.connect(source, collide, 0);
+        app.graph.connect(collide, solver, 2);
+        let before = cook(&app, net, 2.0);
+        assert!(!before.vertices.is_empty());
+        // The ground at y = 0 holds them up.
+        assert!(before.vertices.iter().all(|p| p.y >= 0.0));
+        assert!(before.point_attributes["hit"].iter().any(|h| *h > 0.5));
+
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        sims::clear_all();
+        let after = loaded.cook(net, 2.0, &mut HashMap::new());
+        assert_eq!(after.vertices, before.vertices);
+        let Some(NodeKind::Pop(p)) = loaded.nodes.get(&collide).map(|n| &n.kind) else { panic!() };
+        assert_eq!(p.op, pop::COLLIDE);
     }
 }

@@ -44,6 +44,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("rbd_solver", "Rigid bodies (rapier, Bullet-style): each connected piece, or each value of `piece`, falls and collides. Input 2: static collider."),
     ("cloth_solver", "XPBD cloth, hair, softbody or grains with a collider, a ground plane, self-collision and pinning (f@pin, a pin group or animated pins)."),
     ("sop_solver", "Runs its network once per step on the previous step's result (Prev_Frame), for custom simulations."),
+    ("popnet", "A particle simulation built from POP nodes inside it, as in Houdini: double-click to edit. A POP Source births particles into a POP Solver, with forces (Gravity, Force, Wind, Drag, Attract), colour, groups, kills, collisions and VEX (POP Wrangle, POP VOP) wired before or after the solver. Inputs 0-3 are geometry to birth from, collide with or read in VEX. Outputs points with v, age, life and id."),
     ("solver_input", "Inside a SOP Solver: Prev_Frame (the last step) or Input_1 (the solver's input)."),
     // Import / export
     ("file", "Reads geometry: OBJ, FBX, Alembic (animated .abc is read at the current time), STL, USD (usd/usda/usdc/usdz) or VDB. $F in the name reads one file per frame."),
@@ -280,10 +281,11 @@ pub fn html(version: &str) -> String {
     }
 
     // Network-internal operations.
-    let groups: [(&str, &str, Vec<(String, String, String)>); 4] = [
+    let groups: [(&str, &str, Vec<(String, String, String)>); 5] = [
         ("vop", "VOP nodes (inside an Attribute VOP)", crate::vop::OPS.iter().map(|o| (o.label.to_owned(), o.category.to_owned(), o.help.to_owned())).collect()),
         ("shader-nodes", "Shader nodes (inside a Material Builder)", crate::shading::SHADER_OPS.iter().map(|o| (o.label.to_owned(), format!("{} inputs", o.inputs.len()), o.help.to_owned())).collect()),
         ("cop", "COP nodes (inside a COP Network)", crate::cops::OPS.iter().map(|o| (o.label.to_owned(), o.category.to_owned(), o.help.to_owned())).collect()),
+        ("pop", "POP nodes (inside a POP Network)", crate::pop::OPS.iter().map(|o| (o.label.to_owned(), format!("{} input{}", o.inputs, if o.inputs == 1 { "" } else { "s" }), o.help.to_owned())).collect()),
         ("top", "TOP nodes (inside a TOP Network)", crate::tops::OPS.iter().map(|o| (o.label.to_owned(), format!("{} input{}", o.inputs, if o.inputs == 1 { "" } else { "s" }), o.help.to_owned())).collect()),
     ];
     for (id, title, ops) in groups {

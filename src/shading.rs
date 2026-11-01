@@ -18,6 +18,8 @@ pub enum Kind {
     Float(f32, f32),
     Color,
     Toggle,
+    // Three numbers (a direction or velocity), each within the range.
+    Vector(f32, f32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -35,13 +37,16 @@ pub(crate) const fn f(key: &'static str, label: &'static str, group: &'static st
 pub(crate) const fn c(key: &'static str, label: &'static str, group: &'static str, value: [f32; 3]) -> Param {
     Param { key, label, group, kind: Kind::Color, default: value }
 }
+pub(crate) const fn vector(key: &'static str, label: &'static str, group: &'static str, min: f32, max: f32, value: [f32; 3]) -> Param {
+    Param { key, label, group, kind: Kind::Vector(min, max), default: value }
+}
 pub(crate) const fn t(key: &'static str, label: &'static str, group: &'static str, on: bool) -> Param {
     Param { key, label, group, kind: Kind::Toggle, default: [on as u8 as f32, 0.0, 0.0] }
 }
 
 impl Param {
     pub fn width(&self) -> usize {
-        if self.kind == Kind::Color { 3 } else { 1 }
+        if matches!(self.kind, Kind::Color | Kind::Vector(..)) { 3 } else { 1 }
     }
 }
 

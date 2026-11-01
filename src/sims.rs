@@ -178,6 +178,28 @@ pub fn sop_solver(
 }
 
 // ============================================================================
+// POP Network
+// ============================================================================
+
+// Step 0 has no particles; each later step cooks the network on the previous step's
+// particles. `step` gets them, the step's end time, its length, its number and whether it
+// starts a frame.
+pub fn pop_network(key: u64, time: f32, substeps: usize, mut step: impl FnMut(&Mesh, f32, f32, usize, bool) -> Mesh) -> Mesh {
+    let substeps = substeps.clamp(1, 16);
+    let dt = 1.0 / (SIM_FPS * substeps as f32);
+    run(
+        key,
+        step_count(time, substeps),
+        12,
+        Mesh::default,
+        |mesh: &Mesh| mesh.clone(),
+        |mesh: &Mesh| mesh.clone(),
+        |state, at| *state = step(state, at as f32 * dt, dt, at, (at - 1) % substeps == 0),
+        crate::pop::output,
+    )
+}
+
+// ============================================================================
 // Voxel helpers shared by Pyro
 // ============================================================================
 

@@ -62,6 +62,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
+| popnet | `popnet` | substeps=1 |
 | particles | `particles` | max_particles=2000, birth_rate=400, lifetime=4, speed=2, spread=0.35, gravity=-1.5, seed=1, drag=0, bounce=0.4, friction=0.1, radius=0.02, substeps=2, along_normals=0 |
 | flip | `flip` | particles=20000, grid_resolution=64, flip_blend=0.95, viscosity=0.1, gravity=-9.8, max_timestep=0.02, substeps=2, seed=11, domain_center.x=0, domain_center.y=0, domain_center.z=0, domain_size.x=0, domain_size.y=0, domain_size.z=0 |
 | whitewater_solver | `whitewater_solver` | max_particles=200000, emission_rate=400, trapped_air=1, wave_crests=1, min_speed=1, full_emission_speed=6, foam_lifespan=2, spray_drag=0.3, bubble_buoyancy=2, bubble_drag=0.5, spray_neighbours=6, bubble_neighbours=20, gravity=-9.8, particle_size=0.01, substeps=1, seed=1 |
@@ -434,6 +435,29 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | File Pattern | `top` | 1 text field(s); operation=4 |
 | Wait for All | `top` | operation=5 |
 | FFmpeg Encode | `top` | 1 text field(s); operation=6, fps=24 |
+
+## POP
+
+| Node | Saved as | Parameters |
+| --- | --- | --- |
+| POP Object | `pop` | operation=0 |
+| POP Solver | `pop` | operation=1 |
+| POP Source | `pop` | operation=2, input=0, emission=0, birth_rate=200, impulse=0, life=2, life_variance=0.5, inherit=1, velocity.x=0, velocity.y=1, velocity.z=0, variance.x=0.3, variance.y=0.3, variance.z=0.3, along_normal=0, seed=1 |
+| Gravity Force | `pop` | operation=3, force.x=0, force.y=-9.8, force.z=0 |
+| POP Force | `pop` | operation=4, force.x=0, force.y=0, force.z=0, noise=0, frequency=1, speed=0.5 |
+| POP Wind | `pop` | operation=5, wind.x=1, wind.y=0, wind.z=0, air_resistance=1, noise=0, frequency=1, speed=0.5 |
+| POP Drag | `pop` | operation=6, air_resistance=1, wind.x=0, wind.y=0, wind.z=0 |
+| POP Color | `pop` | operation=7, mode=0, color.r=1, color.g=0.55, color.b=0.1, color2.r=0.25, color2.g=0.25, color2.b=0.25, seed=1 |
+| POP Wrangle | `pop` | 1 text field(s); operation=8 |
+| POP VOP | `pop` | operation=9 |
+| POP Group | `pop` | 2 text field(s); operation=10, rule=1, ratio=0.5, center.x=0, center.y=0, center.z=0, size.x=1, size.y=1, size.z=1, births_only=1, seed=1 |
+| POP Kill | `pop` | 1 text field(s); operation=11, rule=0, center.x=0, center.y=0, center.z=0, size.x=1, size.y=1, size.z=1, inside=0, chance=0.5, seed=1 |
+| POP Speed Limit | `pop` | operation=12, min=0, max=10 |
+| POP Attract | `pop` | operation=13, goal.x=0, goal.y=1, goal.z=0, strength=5, mode=0 |
+| POP Collide | `pop` | operation=14, ground=1, height=0, use_input=0, input=1, bounce=0.4, friction=0.1, radius=0.02 |
+| POP Replicate | `pop` | operation=15, rate=10, life=0.5, life_variance=0.1, inherit=0.5, variance.x=0.5, variance.y=0.5, variance.z=0.5, seed=1 |
+| Static Object | `pop` | operation=16, input=1, bounce=0.4, friction=0.1, radius=0.02 |
+| Ground Plane | `pop` | operation=17, height=0, bounce=0.4, friction=0.1, radius=0.02 |
 
 ## Shader Nodes
 

@@ -42,7 +42,7 @@ fn is_sop(kind: &NodeKind) -> bool {
         && !kind.is_material()
         && !kind.is_render()
         && !kind.is_lop()
-        && !matches!(kind, NodeKind::ShaderNode(_) | NodeKind::CopNetwork | NodeKind::Cop(_) | NodeKind::TopNetwork | NodeKind::Top(_) | NodeKind::Vop(_) | NodeKind::SolverInput { .. })
+        && !matches!(kind, NodeKind::ShaderNode(_) | NodeKind::CopNetwork | NodeKind::Cop(_) | NodeKind::TopNetwork | NodeKind::Top(_) | NodeKind::Vop(_) | NodeKind::SolverInput { .. } | NodeKind::Pop(_) | NodeKind::PopNet { .. })
 }
 
 // The first menu template of each geometry node type: its defaults.
