@@ -2,6 +2,10 @@
 
 Play sprite-sheet effects exported from [ProceduralFX Studio](https://github.com/loksangho/proceduralfx-studio) in [Bevy](https://bevy.org).
 
+![An effect re-exported from ProceduralFX Studio updating live in a running Bevy game](https://raw.githubusercontent.com/loksangho/proceduralfx-studio/main/bevy_procedural_fx/docs/live.gif)
+
+*Live: change the effect in ProceduralFX Studio and the running game picks up each export.*
+
 Build an effect in ProceduralFX Studio, choose **Render → Export Sprite Sheet…**, and drop the
 two files it writes into your game's `assets` folder:
 

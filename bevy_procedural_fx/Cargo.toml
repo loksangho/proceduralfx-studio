@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/loksangho/proceduralfx-studio"
 keywords = ["bevy", "vfx", "sprite-sheet", "2d", "gamedev"]
 categories = ["game-development"]
+# The README's GIF is linked from GitHub, so the crate doesn't carry it.
+exclude = ["docs/"]
 
 [dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["bevy_asset", "bevy_image", "bevy_sprite", "png"] }
