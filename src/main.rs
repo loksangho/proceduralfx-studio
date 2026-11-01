@@ -11796,7 +11796,8 @@ impl ProceduralFxStudioApp {
                 self.status = match spritesheet::save(&done.frames, &output) {
                     Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}{cut_off}", png.display()),
                     Ok((png, sheet)) => {
-                        self.viewer.add(png.clone(), true);
+                        // With Live on, the game shows the effect: don't open a window over it.
+                        self.viewer.add(png.clone(), !self.sprite_sheet.live);
                         let (w, h) = sheet.image.dimensions();
                         format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}{cut_off}", done.frames.len().saturating_sub(output.blend), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
                     }
@@ -24081,6 +24082,7 @@ mod realtime_render_tests {
         let dir = std::env::temp_dir().join(format!("pfx_live_sheet_{}", std::process::id()));
         app.start_sprite_sheet(dir.join("ball.png"), false);
         run_recording(&mut app);
+        assert!(!app.viewer.open, "the Render Viewer stays shut, so it doesn't cover the game");
         let width = |dir: &std::path::Path| {
             let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.pfx.json")).unwrap()).unwrap();
             meta["frame_size"][0].as_u64().unwrap()
@@ -24132,6 +24134,7 @@ mod realtime_render_tests {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_app_{}", std::process::id()));
         app.start_sprite_sheet(dir.join("ball.png"), false);
         run_recording(&mut app);
+        assert!(app.viewer.open, "without Live, the sheet opens in the Render Viewer");
         let sheet = image::open(dir.join("ball.png")).expect("the sheet was saved").to_rgba8();
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("ball.pfx.json")).unwrap()).unwrap();
         assert_eq!(meta["frame_count"], 4);

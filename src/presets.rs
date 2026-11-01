@@ -27,7 +27,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "Toon fire",
-        description: "A looping cartoon flame: the Fire simulation meshed into a solid shape, coloured in flat yellow, orange and red bands with a grey smoky tip, cel-shaded and outlined by the Toon FX shader.",
+        description: "A looping cartoon campfire: the Fire simulation meshed into solid tongues of flame (one simulation, shown three times a beat apart), coloured in flat yellow, orange and red bands with smoky tips, cel-shaded and outlined by the Toon FX shader.",
         scene: include_str!("../assets/presets/toon_fire.pfs"),
         range: (2.0, 3.0 - 1.0 / 24.0),
         frame: [192, 256],
