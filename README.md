@@ -14,6 +14,12 @@ from networks of nodes, and the app includes:
 - keyframe animation with a graph editor;
 - rendering with [MoonRay](https://openmoonray.org).
 
+Effects export as sprite sheets for [Bevy](https://bevy.org) games, and with **Keep updating**
+ticked a running game picks up every change as you make it (with the free
+[bevy_procedural_fx](https://crates.io/crates/bevy_procedural_fx) plugin):
+
+![A cartoon flame changing colour in ProceduralFX Studio and in a running Bevy game at the same time](bevy_procedural_fx/docs/live.gif)
+
 Downloads are on the [Releases page](https://github.com/loksangho/proceduralfx-studio/releases/latest).
 
 | Platform | Download | Requirements |
