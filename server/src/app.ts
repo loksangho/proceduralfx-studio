@@ -9,7 +9,7 @@ import { chargeMicros, messageCostMicros, ALLOWED_MODELS, money, symbol } from "
 import { prepare, relayError, type Send } from "./relay.js";
 import { balanceMicros, type Store, type User } from "./store.js";
 import { hash, Limiter, normalizeEmail, normalizeUserCode, secret, userCode } from "./auth.js";
-import { checkEmailPage, confirmPage, messagePage, signInPage } from "./pages.js";
+import { checkEmailPage, confirmPage, escape as escapeHtml, messagePage, signInPage } from "./pages.js";
 
 export interface Deps {
   config: Config;
@@ -59,6 +59,10 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       return;
     }
     if (event.kind === "ignored") return;
+    if (event.kind === "founder") {
+      await recordFounder(event);
+      return;
+    }
     const user = await store.userByCustomer(event.customerId);
     if (!user) return;
     if (event.kind === "renewed") {
@@ -72,6 +76,55 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       // A new plan's name now; its credit comes with its next paid invoice.
       if (plan && plan.id !== user.plan) await store.setPlan(event.id, user.id, plan.id, null);
     }
+  }
+
+  // A paid Founder's license: the next seat, the AI credit on the account for that email
+  // (made if need be, so signing in with it finds the credit), and the license by email.
+  async function recordFounder(event: { id: string; email: string; licensee: string; paidMicros: number }) {
+    const email = normalizeEmail(event.email) ?? event.email.trim().toLowerCase();
+    const user = (await store.userByEmail(email)) ?? (await store.createUser(email, config.freeCreditMicros));
+    const founder = await store.addFounder(event.id, user.id, email, event.licensee, event.paidMicros, config.founderCreditMicros);
+    if (!founder) return;
+    const mail_ = founderEmail(founder.seat, email, event.licensee);
+    try {
+      await mail(email, mail_.subject, mail_.text, mail_.html);
+    } catch (e) {
+      // The license is recorded either way; the email can be sent again by hand.
+      console.error(`Couldn't email Founder's license #${founder.seat} to ${email}:`, e);
+    }
+  }
+
+  function founderEmail(seat: number, email: string, licensee: string) {
+    const who = licensee || email;
+    const credit = money(config.founderCreditMicros);
+    const sym = symbol(config.currency);
+    const terms = `${config.siteUrl}/founder`;
+    const lines = [
+      `Thank you for backing ProceduralFX Studio early.`,
+      ``,
+      `This email is your Founder's license:`,
+      ``,
+      `  Founder's license #${seat} of ${config.founderSeats}`,
+      `  Licensed to: ${who}`,
+      `  Email: ${email}`,
+      ``,
+      `It lets you use ProceduralFX Studio commercially, including effects for games you sell, for every version, forever. The full terms: ${terms}`,
+      ``,
+      ...(config.founderCreditMicros > 0
+        ? [`We've also added ${sym}${credit} of AI credit to the account for ${email}. Sign in with this email in the AI assistant's settings to use it.`, ``]
+        : []),
+      `As a founder, your feedback shapes what comes next. Email support@build3dstudio.com any time with what works, what doesn't, and what you'd like.`,
+      ``,
+      `Keep this email: it's your proof of license.`,
+      ``,
+      `Lok Sang Ho, ProceduralFX Studio`,
+    ];
+    const text = lines.join("\n");
+    const html = lines
+      .map((l) => escapeHtml(l))
+      .join("<br>")
+      .replace(escapeHtml(terms), `<a href="${terms}">${escapeHtml(terms)}</a>`);
+    return { subject: `Your ProceduralFX Studio Founder's license (#${seat})`, text, html };
   }
 
   app.use(express.json({ limit: "25mb" }));
@@ -167,6 +220,44 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
   app.get("/paid", (_req, res) => {
     res.send(messagePage("Thank you!", "Your credit will show in ProceduralFX Studio within a minute. You can close this page."));
   });
+  // --- The Founder's license (from the website, no sign-in) -----------------------------
+
+  // How many are left, for the website's pricing section.
+  app.get(
+    "/v1/founders",
+    wrap(async (_req, res) => {
+      const sold = config.founderSeats > 0 ? await store.founderCount() : 0;
+      res.set("access-control-allow-origin", "*");
+      res.set("cache-control", "public, max-age=60");
+      res.json({
+        open: config.founderSeats > 0 && billing !== null && sold < config.founderSeats,
+        seats: config.founderSeats,
+        sold,
+        left: Math.max(0, config.founderSeats - sold),
+        price: config.founderPrice,
+        currency: config.currency,
+        symbol: symbol(config.currency),
+      });
+    }),
+  );
+
+  // The website's Buy button: checks a seat is left, then opens Stripe Checkout.
+  app.get(
+    "/founder",
+    wrap(async (req, res) => {
+      if (!perIp.allow(`founder:${ip(req)}`)) return res.status(429).send(messagePage("Too many tries", "Please wait a minute and try again."));
+      if (!billing || config.founderSeats <= 0) return res.status(404).send(messagePage("Not on sale", "Founder's licenses aren't on sale right now."));
+      if ((await store.founderCount()) >= config.founderSeats) {
+        return res.status(410).send(messagePage("Sold out", `All ${config.founderSeats} Founder's licenses have been sold. Thank you to everyone who took one!`));
+      }
+      res.redirect(303, await billing.checkoutFounder(config.founderPrice, config.currency, config.publicUrl, `${config.siteUrl}/#pricing`));
+    }),
+  );
+
+  app.get("/founder/thanks", (_req, res) => {
+    res.send(messagePage("Thank you, founder!", "Your Founder's license is on its way by email (check spam if it hasn't arrived in a few minutes). You can close this page."));
+  });
+
   app.get("/cancelled", (_req, res) => {
     res.send(messagePage("Payment cancelled", "Nothing was charged. You can close this page."));
   });
@@ -333,6 +424,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
         charged: money(s.chargedMicros),
         margin: money(s.chargedMicros - s.costMicros * config.usdRate),
         topups_paid: money(s.paidMicros),
+        founders: s.founders,
       });
     }),
   );

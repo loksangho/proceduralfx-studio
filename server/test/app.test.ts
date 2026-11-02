@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import type Anthropic from "@anthropic-ai/sdk";
 import { createApp } from "../src/app.js";
 import type { Billing, BillingEvent } from "../src/billing.js";
-import { interpret } from "../src/billing.js";
+import { interpret, taxBehavior, taxParams } from "../src/billing.js";
 import { loadConfig, parsePlans } from "../src/config.js";
 import { chargeMicros, messageCostMicros } from "../src/pricing.js";
 import { prepare } from "../src/relay.js";
@@ -67,6 +67,9 @@ class FakeBilling implements Billing {
     this.check(c);
     return `https://stripe.test/topup/${amount}${currency}`;
   }
+  async checkoutFounder(amount: number, currency: string) {
+    return `https://stripe.test/founder/${amount}${currency}`;
+  }
   async portal() {
     return "https://stripe.test/portal";
   }
@@ -82,8 +85,8 @@ class FakeBilling implements Billing {
   }
 }
 
-async function setup(makeStore: () => Promise<Store>) {
-  const config = loadConfig({ PLANS: "basic=price_basic=8", TOPUPS: "5,10", FREE_CREDIT: "0.05", MARGIN: "0.25", CURRENCY: "aud", USD_RATE: "1.6", ADMIN_TOKEN: "admin" });
+async function setup(makeStore: () => Promise<Store>, env: Record<string, string> = {}) {
+  const config = loadConfig({ PLANS: "basic=price_basic=8", TOPUPS: "5,10", FREE_CREDIT: "0.05", MARGIN: "0.25", CURRENCY: "aud", USD_RATE: "1.6", ADMIN_TOKEN: "admin", ...env });
   const store = await makeStore();
   const billing = new FakeBilling();
   const mails: string[] = [];
@@ -195,7 +198,7 @@ for (const [name, makeStore] of stores) test(`sign in, spend free credit, top up
     assert.equal(u.topupMicros, 10_000_000 - 70_000 + 2 * 8_000_000 - 120_000);
 
     const stats = await (await fetch(`${t.base}/admin/stats`, { headers: { authorization: "Bearer admin" } })).json();
-    assert.deepEqual(stats, { currency: "aud", users: 1, requests: 2, anthropic_cost_usd: 0.12, anthropic_cost: 0.19, charged: 0.24, margin: 0.05, topups_paid: 10 });
+    assert.deepEqual(stats, { currency: "aud", users: 1, requests: 2, anthropic_cost_usd: 0.12, anthropic_cost: 0.19, charged: 0.24, margin: 0.05, topups_paid: 10, founders: 0 });
     assert.equal((await fetch(`${t.base}/admin/stats`)).status, 404);
 
     // A customer Stripe no longer knows (made with test keys) is replaced.
@@ -222,6 +225,58 @@ for (const [name, makeStore] of stores) test(`requests are checked before they c
     assert.equal(t.sent.length, 0);
     assert.equal((await t.post("/v1/messages", request)).status, 401);
     assert.equal((await t.post("/v1/messages", request, "pfx_wrong")).status, 401);
+  } finally {
+    t.server.close();
+  }
+});
+
+for (const [name, makeStore] of stores) test(`Founder's licenses: checkout, seats, credit and the license email (${name})`, async () => {
+  const t = await setup(makeStore, { FOUNDER_SEATS: "2", FOUNDER_PRICE: "49", FOUNDER_CREDIT: "10" });
+  try {
+    const seats = async () => (await fetch(`${t.base}/v1/founders`)).json();
+    const first = await fetch(`${t.base}/v1/founders`);
+    assert.equal(first.headers.get("access-control-allow-origin"), "*");
+    assert.deepEqual(await first.json(), { open: true, seats: 2, sold: 0, left: 2, price: 49, currency: "aud", symbol: "A$" });
+    // The website's button goes straight to Stripe.
+    const buy = await fetch(`${t.base}/founder`, { redirect: "manual" });
+    assert.equal(buy.status, 303);
+    assert.equal(buy.headers.get("location"), "https://stripe.test/founder/49aud");
+
+    // A buyer who has used the assistant already, under the same email.
+    await signIn(t);
+    const hook = () => fetch(`${t.base}/stripe/webhook`, { method: "POST", headers: { "content-type": "application/json", "stripe-signature": "good" }, body: "{}" });
+    t.billing.next = { kind: "founder", id: "cs_f1", email: "Artist@Example.com", licensee: "Tiny Studio", paidMicros: 49_000_000 };
+    await hook();
+    await hook();
+    const early = (await t.store.userByEmail("artist@example.com"))!;
+    assert.equal(early.topupMicros, 50_000 + 10_000_000, "the free credit plus the founder's A$10, once");
+    const letter = t.mails.at(-1)!;
+    assert.match(letter, /Founder's license #1 of 2/);
+    assert.match(letter, /Licensed to: Tiny Studio/);
+    assert.match(letter, /A\$10 of AI credit/);
+    assert.equal(t.mails.filter((m) => m.includes("Founder's license #")).length, 1, "one email per payment");
+
+    // A buyer with no account yet gets one, holding the credit for when they sign in.
+    t.billing.next = { kind: "founder", id: "cs_f2", email: "new@example.com", licensee: "", paidMicros: 49_000_000 };
+    await hook();
+    assert.equal((await t.store.userByEmail("new@example.com"))!.topupMicros, 50_000 + 10_000_000);
+    assert.match(t.mails.at(-1)!, /#2 of 2[\s\S]*Licensed to: new@example.com/);
+
+    // Sold out: the counter says so and the button stops selling.
+    assert.deepEqual(await seats(), { open: false, seats: 2, sold: 2, left: 0, price: 49, currency: "aud", symbol: "A$" });
+    assert.equal((await fetch(`${t.base}/founder`, { redirect: "manual" })).status, 410);
+    const stats = await (await fetch(`${t.base}/admin/stats`, { headers: { authorization: "Bearer admin" } })).json();
+    assert.equal(stats.founders, 2);
+  } finally {
+    t.server.close();
+  }
+});
+
+for (const [name, makeStore] of stores) test(`Founder's licenses are off unless FOUNDER_SEATS is set (${name})`, async () => {
+  const t = await setup(makeStore);
+  try {
+    assert.equal((await (await fetch(`${t.base}/v1/founders`)).json()).open, false);
+    assert.equal((await fetch(`${t.base}/founder`, { redirect: "manual" })).status, 404);
   } finally {
     t.server.close();
   }
@@ -256,8 +311,24 @@ test("stripe events", () => {
   const ev = (type: string, object: unknown) => ({ id: "evt_1", type, data: { object } }) as never;
   assert.deepEqual(interpret(ev("checkout.session.completed", { id: "cs_1", mode: "payment", payment_status: "paid", metadata: { user_id: "7", credit_micros: "5000000" } })), { kind: "topup", id: "cs_1", userId: "7", micros: 5_000_000 });
   assert.deepEqual(interpret(ev("checkout.session.completed", { id: "cs_2", mode: "payment", payment_status: "unpaid", metadata: {} })), { kind: "ignored" });
+  const founder = { id: "cs_f", mode: "payment", payment_status: "paid", amount_total: 4900, metadata: { kind: "founder" }, customer_details: { email: "a@b.co" }, custom_fields: [{ key: "licensee", text: { value: " Tiny Studio " } }] };
+  assert.deepEqual(interpret(ev("checkout.session.completed", founder)), { kind: "founder", id: "cs_f", email: "a@b.co", licensee: "Tiny Studio", paidMicros: 49_000_000 });
+  assert.deepEqual(interpret(ev("checkout.session.completed", { ...founder, custom_fields: [] })), { kind: "founder", id: "cs_f", email: "a@b.co", licensee: "", paidMicros: 49_000_000 });
   assert.deepEqual(interpret(ev("checkout.session.completed", { id: "cs_3", mode: "subscription", payment_status: "paid" })), { kind: "ignored" });
   assert.deepEqual(interpret(ev("invoice.paid", { id: "in_1", billing_reason: "subscription_cycle", customer: "cus_1" })), { kind: "renewed", id: "in_1", customerId: "cus_1" });
   assert.deepEqual(interpret(ev("invoice.paid", { id: "in_2", billing_reason: "manual", customer: "cus_1" })), { kind: "ignored" });
   assert.deepEqual(interpret(ev("customer.subscription.deleted", { customer: { id: "cus_1" }, status: "canceled", items: { data: [{ price: { id: "price_1" } }] } })), { kind: "changed", id: "evt_1", customerId: "cus_1", priceId: "price_1", active: false });
+});
+
+test("Stripe Tax stays off until it's turned on", () => {
+  assert.equal(loadConfig({}).stripeTax, "off");
+  assert.equal(loadConfig({ STRIPE_TAX: " Inclusive " }).stripeTax, "inclusive");
+  assert.throws(() => loadConfig({ STRIPE_TAX: "maybe" }), /STRIPE_TAX/);
+  // Off: checkouts are exactly as before.
+  assert.deepEqual(taxParams("off", true), {});
+  assert.deepEqual(taxBehavior("off"), {});
+  // On: tax from the buyer's address, tax IDs for businesses, saved customers keep their address.
+  assert.deepEqual(taxParams("inclusive", true), { automatic_tax: { enabled: true }, tax_id_collection: { enabled: true }, customer_update: { address: "auto", name: "auto" } });
+  assert.deepEqual(taxParams("exclusive", false), { automatic_tax: { enabled: true }, tax_id_collection: { enabled: true } });
+  assert.deepEqual(taxBehavior("inclusive"), { tax_behavior: "inclusive" });
 });

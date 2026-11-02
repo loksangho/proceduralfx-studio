@@ -39,12 +39,20 @@ export interface UsageRow {
   chargedMicros: number;
 }
 
+// A Founder's license: seat 1 is the first one sold.
+export interface Founder {
+  seat: number;
+  email: string;
+  licensee: string;
+}
+
 export interface Stats {
   users: number;
   requests: number;
   costMicros: number;
   chargedMicros: number;
   paidMicros: number;
+  founders: number;
 }
 
 export interface Store {
@@ -76,6 +84,11 @@ export interface Store {
   // Ending the plan (null) moves its credit to top-ups.
   setPlan(eventId: string, userId: string, plan: string | null, micros: number | null): Promise<boolean>;
 
+  // Records a paid Founder's license once per payment id, with the next seat number, and
+  // adds its AI credit to the user's top-ups. Null if that payment was already counted.
+  addFounder(paymentId: string, userId: string, email: string, licensee: string, paidMicros: number, creditMicros: number): Promise<Founder | null>;
+  founderCount(): Promise<number>;
+
   stats(): Promise<Stats>;
 }
 
@@ -96,6 +109,7 @@ export class MemoryStore implements Store {
   sessions = new Map<string, string>();
   processed = new Set<string>();
   usage: UsageRow[] = [];
+  founders: Founder[] = [];
   paid = 0;
   private next = 1;
 
@@ -190,6 +204,19 @@ export class MemoryStore implements Store {
     return true;
   }
 
+  async addFounder(paymentId: string, userId: string, email: string, licensee: string, _paidMicros: number, creditMicros: number) {
+    const u = this.users.get(userId);
+    if (!u || this.processed.has(paymentId)) return null;
+    this.processed.add(paymentId);
+    u.topupMicros += creditMicros;
+    const f = { seat: this.founders.length + 1, email, licensee };
+    this.founders.push(f);
+    return f;
+  }
+  async founderCount() {
+    return this.founders.length;
+  }
+
   async stats() {
     return {
       users: this.users.size,
@@ -197,6 +224,7 @@ export class MemoryStore implements Store {
       costMicros: this.usage.reduce((s, r) => s + r.costMicros, 0),
       chargedMicros: this.usage.reduce((s, r) => s + r.chargedMicros, 0),
       paidMicros: this.paid,
+      founders: this.founders.length,
     };
   }
 }

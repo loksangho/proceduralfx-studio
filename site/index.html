@@ -140,8 +140,21 @@
 <section id="pricing">
   <div class="wrap">
     <p class="eyebrow">Pricing</p>
-    <h2>Free for noncommercial use. Pay only for AI.</h2>
-    <p class="intro">Everything in the app is free for learning, hobby projects and other noncommercial use. Commercial use, such as effects for a game you sell, needs a commercial license. ProceduralFX credits are optional and only pay for the AI assistant. Prices are in Australian dollars.</p>
+    <h2>Free for noncommercial use. A$49 once for commercial.</h2>
+    <p class="intro">Everything in the app is free for learning, hobby projects and other noncommercial use. Commercial use, such as effects for a game you sell, needs a commercial license: right now, that's the Founder's license. ProceduralFX credits are optional and only pay for the AI assistant. Prices are in Australian dollars and include any applicable tax.</p>
+    <div class="card price featured founder">
+      <div>
+        <h3>Founder's license</h3>
+        <div class="amount">A$49 <small>once</small></div>
+        <p>Commercial use for one person, every version, forever. For the first 100 people who use it for real work.</p>
+        <ul><li>Effects for games you sell, with no revenue limit</li><li>Every future version included</li><li>A$10 of AI credit included</li><li>Full refund within 14 days</li></ul>
+      </div>
+      <div class="founder-buy">
+        <p class="seats" id="founder-seats">Limited to 100</p>
+        <a class="btn btn-primary" id="founder-buy" href="https://ai.build3dstudio.com/founder">Buy a Founder's license</a>
+        <p class="small muted"><a href="/founder">Read the license</a>. Later licenses will cost more, and their prices will be published here first.</p>
+      </div>
+    </div>
     <div class="grid grid-3">
       <div class="card price">
         <h3>App</h3>
@@ -149,7 +162,7 @@
         <p>Every node, simulation and renderer, for noncommercial use.</p>
         <ul><li>macOS, Windows and Linux</li><li>Automatic updates</li><li>Use the AI assistant with your own key or a local model</li></ul>
       </div>
-      <div class="card price featured">
+      <div class="card price">
         <h3>Basic plan</h3>
         <div class="amount">A$12 <small>/ month</small></div>
         <p>A$12 of AI credit added every month.</p>
@@ -165,6 +178,24 @@
     <p class="fineprint small muted">Each request costs Anthropic's list price for the model, converted to Australian dollars at A$1.60 per US dollar, plus 25%. The margin pays for card fees and running the service, and the exchange rate sits a little above the market rate as a buffer against currency swings. A typical build of a small setup costs about A$0.20–0.60 with Claude Opus, about half that with Sonnet, and a cent or two with Haiku. The app shows an estimate before you build, and what each request cost when it finishes. See <a href="/promise">our promise</a>, the <a href="/refunds">refund policy</a> and the <a href="/terms">terms</a>.</p>
   </div>
 </section>
+<script>
+// Seats left, from the credits server. Without it the card still works: it says "Limited to 100".
+fetch("https://ai.build3dstudio.com/v1/founders")
+  .then(function (r) { return r.json(); })
+  .then(function (f) {
+    if (!f.seats) return;
+    var seats = document.getElementById("founder-seats"), buy = document.getElementById("founder-buy");
+    if (f.left > 0) {
+      seats.textContent = f.left + " of " + f.seats + " left";
+    } else {
+      seats.textContent = "All " + f.seats + " sold. Thank you, founders!";
+      buy.removeAttribute("href");
+      buy.classList.add("disabled");
+      buy.textContent = "Sold out";
+    }
+  })
+  .catch(function () {});
+</script>
 
 <section id="download" class="alt">
   <div class="wrap">

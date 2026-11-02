@@ -173,7 +173,9 @@ are all free. You can read, build, modify and share the code for those purposes.
 
 **Commercial use needs a commercial license.** If you use ProceduralFX Studio
 to make something you sell or earn money from (for example, effects for a
-commercial game), please get a commercial license: email [support@build3dstudio.com](mailto:support@build3dstudio.com).
+commercial game), please get a commercial license. Right now that's the
+[Founder's license](https://www.build3dstudio.com/founder): A$49 once, for every
+version, for the first 100 people. Questions: [support@build3dstudio.com](mailto:support@build3dstudio.com).
 
 **If the project ends, it becomes open source.** The code is also licensed under
 Apache-2.0 from the day the project is announced as discontinued, or after 18 months

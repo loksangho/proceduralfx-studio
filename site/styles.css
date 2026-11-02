@@ -145,3 +145,11 @@ footer .legal-note { flex-basis: 100%; margin: 4px 0 0; font-size: 13px; opacity
 .legal table { width: 100%; border-collapse: collapse; font-size: 15px; margin: 12px 0; }
 .legal th, .legal td { text-align: left; border-top: 1px solid var(--border); padding: 10px 8px; vertical-align: top; }
 .legal th { border-top: 0; color: var(--muted); font-weight: 600; }
+
+/* The Founder's licence: one wide card above the others. */
+.price.founder { display: grid; grid-template-columns: 1.4fr 1fr; gap: 28px; align-items: center; margin-bottom: 20px; }
+.founder-buy { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.founder-buy .seats { margin: 0; font-size: 20px; font-weight: 700; color: var(--text); }
+.founder-buy p { margin: 0; }
+.btn.disabled { opacity: 0.5; pointer-events: none; }
+@media (max-width: 760px) { .price.founder { grid-template-columns: 1fr; } }

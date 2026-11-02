@@ -19,7 +19,7 @@ if (config.databaseUrl) {
   store = new MemoryStore();
 }
 
-const billing = config.stripeKey ? new StripeBilling(config.stripeKey, config.stripeWebhookSecret) : null;
+const billing = config.stripeKey ? new StripeBilling(config.stripeKey, config.stripeWebhookSecret, config.stripeTax) : null;
 if (!billing) console.warn("STRIPE_SECRET_KEY is not set: payments are off.");
 if (billing && !config.stripeWebhookSecret) throw new Error("STRIPE_WEBHOOK_SECRET is not set");
 if (!config.resendKey) console.warn("RESEND_API_KEY is not set: sign-in links are printed to this log.");

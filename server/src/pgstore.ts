@@ -1,7 +1,7 @@
 // The Store on Postgres. The schema is created on start (CREATE ... IF NOT EXISTS).
 
 import pg from "pg";
-import type { Device, Login, Stats, Store, UsageRow, User } from "./store.js";
+import type { Device, Founder, Login, Stats, Store, UsageRow, User } from "./store.js";
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS usage (
   at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS usage_user_at ON usage (user_id, at);
+CREATE TABLE IF NOT EXISTS founders (
+  seat INTEGER PRIMARY KEY,
+  payment_id TEXT NOT NULL UNIQUE,
+  user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  email TEXT NOT NULL,
+  licensee TEXT NOT NULL DEFAULT '',
+  paid_micros BIGINT NOT NULL,
+  at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 type Row = Record<string, unknown>;
@@ -205,15 +214,35 @@ export class PgStore implements Store {
     return this.once(eventId, userId, plan === null ? "plan_end" : "plan", micros ?? 0, (c) => c.query(sql, args));
   }
 
+  async addFounder(paymentId: string, userId: string, email: string, licensee: string, paidMicros: number, creditMicros: number): Promise<Founder | null> {
+    let founder: Founder | null = null;
+    await this.once(paymentId, userId, "founder", creditMicros, async (c) => {
+      await c.query("UPDATE users SET topup_micros = topup_micros + $2 WHERE id = $1", [userId, creditMicros]);
+      // One sale at a time, so seat numbers follow the order of payment with no gaps.
+      await c.query("LOCK TABLE founders IN EXCLUSIVE MODE");
+      const { rows } = await c.query(
+        "INSERT INTO founders (seat, payment_id, user_id, email, licensee, paid_micros) SELECT coalesce(max(seat), 0) + 1, $1, $2, $3, $4, $5 FROM founders RETURNING seat",
+        [paymentId, userId, email, licensee, paidMicros],
+      );
+      founder = { seat: Number(rows[0].seat), email, licensee };
+    });
+    return founder;
+  }
+  async founderCount() {
+    const { rows } = await this.pool.query("SELECT count(*) AS n FROM founders");
+    return Number(rows[0].n);
+  }
+
   async stats(): Promise<Stats> {
     const { rows } = await this.pool.query(
       `SELECT (SELECT count(*) FROM users) AS users,
               (SELECT count(*) FROM usage) AS requests,
               (SELECT coalesce(sum(cost_micros), 0) FROM usage) AS cost,
               (SELECT coalesce(sum(charged_micros), 0) FROM usage) AS charged,
-              (SELECT coalesce(sum(credit_micros), 0) FROM processed_events WHERE kind = 'topup') AS paid`,
+              (SELECT coalesce(sum(credit_micros), 0) FROM processed_events WHERE kind = 'topup') AS paid,
+              (SELECT count(*) FROM founders) AS founders`,
     );
     const r = rows[0];
-    return { users: Number(r.users), requests: Number(r.requests), costMicros: Number(r.cost), chargedMicros: Number(r.charged), paidMicros: Number(r.paid) };
+    return { users: Number(r.users), requests: Number(r.requests), costMicros: Number(r.cost), chargedMicros: Number(r.charged), paidMicros: Number(r.paid), founders: Number(r.founders) };
   }
 }
