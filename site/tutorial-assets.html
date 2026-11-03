@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assets Tutorial · ProceduralFX Studio</title>
+<meta name="description" content="Use ProceduralFX Studio's built-in assets (Sparks, Spark Burst, Smoke Puff and Debris), then package your own network as a reusable node with sliders, save it and share it.">
+<link rel="icon" href="/img/logo.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a class="brand" href="/"><img src="/img/logo.png" alt=""><span>ProceduralFX Studio</span></a><nav><a href="/tutorials">Tutorials</a><a class="keep" href="/#download">Download</a></nav></div></header>
+<main class="legal">
+<p><a href="/tutorials">← Tutorials</a></p>
+<h1>Assets: ready-made, and your own</h1>
+<p class="updated">Tutorial 3 · about 10 minutes</p>
+
+<div class="summary">
+<p>An <b>asset</b> is a whole network packaged as one node, with a few sliders for what matters, like Houdini's digital assets. The app comes with four. You can make your own and reuse them in any scene, or share them with someone else.</p>
+</div>
+
+<div class="gallery">
+<figure><img src="/img/tutorials/sparks.gif" alt="Sparks" width="320" height="320" loading="lazy"><figcaption>Sparks</figcaption></figure>
+<figure><img src="/img/tutorials/spark_burst.gif" alt="Spark Burst" width="320" height="320" loading="lazy"><figcaption>Spark Burst</figcaption></figure>
+<figure><img src="/img/tutorials/smoke_puff.gif" alt="Smoke Puff" width="256" height="256" loading="lazy"><figcaption>Smoke Puff</figcaption></figure>
+<figure><img src="/img/tutorials/debris.gif" alt="Debris" width="320" height="320" loading="lazy"><figcaption>Debris</figcaption></figure>
+</div>
+
+<h2>1. Use a built-in asset</h2>
+<ol>
+<li>Go inside a geometry object (double-click it) and add a <code>sphere</code>.</li>
+<li>Press <b>Tab</b> and look under <b>Assets</b>. You'll find <b>Sparks</b>, <b>Spark Burst</b>, <b>Smoke Puff</b> and <b>Debris</b>. Add <b>Sparks</b>.</li>
+<li>Wire the sphere into it, and click <b>Set Display</b> at the bottom of its parameters to show it. Double-clicking an asset goes inside it instead.</li>
+<li>Press <b>Space</b>. The asset's sliders (<b>Birth rate</b>, <b>Speed</b>, <b>Spread</b>, <b>Life</b>, <b>Gravity</b>, <b>Drag</b>) are its parameters, and you can key them like any other.</li>
+</ol>
+<p>Sparks, Spark Burst and Smoke Puff work from a sphere or even a single point. Debris scatters boxes over a surface, so give it a shape like a grid or a sphere.</p>
+<p>Double-click an asset to see how it's built. Inside Sparks is a POP Network like the one in <a href="/tutorial-particles">tutorial 2</a>.</p>
+
+<h2>2. Package your own network</h2>
+<ol>
+<li>In a geometry object, add a <code>subnet</code> (Tab, then type it). Double-click it to go inside. It starts with <code>Input_1</code> wired to <code>OUT</code>.</li>
+<li>Build your network between them. For example, add a <code>xform</code> (Transform) between <code>Input_1</code> and <code>OUT</code>. <code>Input_1</code> is whatever is wired into the Subnet's first input. The Subnet's output is <code>OUT</code>.</li>
+<li>Press <b>U</b> to go back up, wire something into the Subnet, and click <b>Set Display</b>.</li>
+</ol>
+
+<h2>3. Give it sliders</h2>
+<p>With the Subnet selected, find <b>Promoted parameters</b> in its parameters:</p>
+<ol>
+<li>In the first menu, choose a node inside, such as your Transform.</li>
+<li>In the second, choose one of its parameters, such as <code>ty</code> (move up and down).</li>
+<li>Type a label, such as <code>Height</code>, and click <b>Promote</b>.</li>
+</ol>
+<p>The Subnet now has a <b>Height</b> slider, and it drives the Transform inside. Promote as many as you like. The <b>✕</b> beside each one removes it.</p>
+
+<h2>4. Save it as an asset</h2>
+<ol>
+<li>Under <b>Asset</b>, give it a <b>Name</b> and a short description.</li>
+<li>Click <b>Save as Asset</b>. It's saved to your assets folder, and <b>Show the assets folder</b> opens it.</li>
+<li>Press <b>Tab</b> in any geometry network: your asset is under <b>Assets</b>, ready to place.</li>
+</ol>
+
+<h2>5. Improve it later</h2>
+<p>Change the network inside a copy, then click <b>Save as version 2</b>. Copies in your scenes that are still on the old version say <b>"The library has version 2"</b>, with an <b>Update</b> button. Updating keeps the values their sliders were set to. Copies you don't update stay as they were.</p>
+<p>You can also save a built-in asset again to make your own version of it. Yours then appears in its place.</p>
+
+<h2>Sharing assets</h2>
+<p>An asset is one <code>.pfxasset</code> file in your assets folder. Send it to someone, and they put it in their assets folder. It's in their Tab menu the next time they start the app, or straight away if they click <b>⟳</b> under Asset in any Subnet's parameters. Scenes that use an asset store a copy of it, so they open fine on computers that don't have it.</p>
+
+<p><b>Back to:</b> <a href="/tutorials">all tutorials</a></p>
+</main>
+<footer><div class="wrap"><span>© 2026 ProceduralFX Studio</span><nav><a href="/tutorials">Tutorials</a><a href="/promise">Our promise</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/refunds">Refunds</a><a href="mailto:support@build3dstudio.com">Contact</a></nav><p class="legal-note">Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></div></footer>
+</body>
+</html>

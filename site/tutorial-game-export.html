@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your First Effect in a Game · ProceduralFX Studio</title>
+<meta name="description" content="Start from a ready-made fire in ProceduralFX Studio, change it, and play it as a sprite sheet in Bevy, Godot or Unity, including particle systems and live updates.">
+<link rel="icon" href="/img/logo.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a class="brand" href="/"><img src="/img/logo.png" alt=""><span>ProceduralFX Studio</span></a><nav><a href="/tutorials">Tutorials</a><a class="keep" href="/#download">Download</a></nav></div></header>
+<main class="legal">
+<p><a href="/tutorials">← Tutorials</a></p>
+<h1>Your first effect in a game</h1>
+<p class="updated">Tutorial 1 · about 10 minutes</p>
+
+<div class="summary">
+<p>You'll start from a ready-made looping fire, change how it moves, and export it as a <b>sprite sheet</b>: one PNG holding every frame in a grid. Then you'll play it in Bevy, Godot or Unity.</p>
+</div>
+
+<h2>1. Start from a preset</h2>
+<ol>
+<li>Choose <b>File → New from Preset → Fire (loop)</b>. A campfire flame appears, framed by its own camera.</li>
+<li>Press <b>Space</b> to play it. The first time, the fire simulates for a few seconds before it plays smoothly.</li>
+</ol>
+<p>There are five presets. Fire and Smoke loop. Impact, Magic burst and Slash play once. Each is already set up to export.</p>
+
+<h2>2. Change it</h2>
+<ol>
+<li>In the network editor, double-click the <b>fire</b> node to go inside it. You'll see <code>source</code> (a small sphere the fire burns from), <code>fire_sim</code> (the Pyro simulation) and <code>fire_loop</code> (which makes it loop).</li>
+<li>Click <code>fire_sim</code>. Its settings appear in the Parameters panel.</li>
+<li>Raise <b>Turbulence</b> for a wilder flame, or <b>Buoyancy</b> to make it rise faster. Lower <b>Burn rate</b> for a smaller fire. The simulation restarts after each change.</li>
+<li>Press <b>U</b> to come back up.</li>
+</ol>
+
+<h2>3. Export the sprite sheet</h2>
+<ol>
+<li>Choose <b>Render → Export Sprite Sheet…</b>.</li>
+<li>Leave <b>Frame size</b> at 192 × 256 for now. <b>Trim</b> crops away the empty space around the flame, and <b>Seamless</b> makes the end of the loop lead into the start.</li>
+<li>Click <b>Preview</b> to play the frames exactly as they'll export. If the flame is cut off at an edge, the app says so. Make the frame bigger or move the camera back.</li>
+<li>Under <b>Also for</b>, tick <b>Godot</b> or <b>Unity</b> if that's your engine. Bevy needs nothing extra.</li>
+<li>Click <b>Export…</b> and save it as <code>fire.png</code> inside your game's project. Beside it you get <code>fire.pfx.json</code>, which describes the grid and frame rate.</li>
+</ol>
+
+<h2>4a. Play it in Bevy</h2>
+<p>Add the free <a href="https://crates.io/crates/bevy_procedural_fx">bevy_procedural_fx</a> plugin (<code>cargo add bevy_procedural_fx</code>), put <code>fire.png</code> and <code>fire.pfx.json</code> in <code>assets/fx/</code>, and spawn it:</p>
+<pre><code>use bevy::prelude::*;
+use bevy_procedural_fx::{FxSprite, ProceduralFxPlugin};
+
+fn main() {
+    App::new()
+        .add_plugins((DefaultPlugins, ProceduralFxPlugin))
+        .add_systems(Startup, setup)
+        .run();
+}
+
+fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
+    commands.spawn(Camera2d);
+    commands.spawn(FxSprite::looping(assets.load("fx/fire.pfx.json")));
+}</code></pre>
+
+<h2>4b. Play it in Godot 4</h2>
+<ol>
+<li>Export into your Godot project's folder, with <b>Godot</b> ticked. Beside the PNG you get <code>fire.tres</code>, a <code>SpriteFrames</code> resource.</li>
+<li>Add an <b>AnimatedSprite2D</b> node. In the Inspector, drag <code>fire.tres</code> onto <b>Sprite Frames</b>.</li>
+<li>Turn on <b>Autoplay on Load</b> for the <code>default</code> animation, using the button in the SpriteFrames panel at the bottom, or call <code>$AnimatedSprite2D.play()</code>. It loops at the sheet's frame rate.</li>
+</ol>
+
+<h2>4c. Play it in Unity</h2>
+<ol>
+<li>Export into your Unity project's <code>Assets</code> folder, with <b>Unity</b> ticked. Unity imports the PNG already sliced into one sprite per frame (<code>fire_0</code>, <code>fire_1</code>…), full size and uncompressed.</li>
+<li>In the Project window, open <code>fire.png</code>'s arrow, select all the sprites, and drag them into the scene. Unity asks where to save a new animation, then plays it.</li>
+<li>Unity picks the new clip's frame rate itself. To play at the sheet's own rate (24 for this fire), set the clip's sample rate in the Animation window.</li>
+</ol>
+
+<h2>5. For particle systems</h2>
+<p>Particle systems play every cell of the grid, so tick <b>Fill the grid</b> under <b>Particles</b>. The sheet then gets a layout with no empty cells: 24 frames make 6 × 4, not 5 × 5 with one blank.</p>
+<ul>
+<li><b>Godot:</b> with Godot ticked too, you also get <code>fire_particles.tres</code>. Set it as a <b>GPUParticles2D</b>'s material, and the PNG as its texture. The process material's <b>Animation → Speed</b> sets how fast the frames go: 1 plays them once over each particle's life.</li>
+<li><b>Unity:</b> in the Particle System, turn on <b>Texture Sheet Animation</b>. Use <b>Grid</b> mode with the columns and rows from the export (they're in <code>fire.pfx.json</code>), or <b>Sprites</b> mode with the sliced sprites.</li>
+</ul>
+
+<h2>6. Keep it updating while your game runs</h2>
+<p>Tick <b>Keep updating</b> under <b>Live</b> before you export. From then on, the app exports again a moment after every change. A Bevy game run with Bevy's <code>file_watcher</code> feature shows the change while it runs. Godot and Unity pick up the new files when you switch back to their window.</p>
+
+<h2>Share it</h2>
+<p>To post an effect, click <b>Flipbook</b> under the timeline. When it's recorded, the flipbook viewer's <b>Save GIF…</b> saves a looping GIF. From a terminal, <code>proceduralfx_studio animation fire.pfs fire.gif</code> does the same in one step.</p>
+
+<p><b>Next:</b> <a href="/tutorial-particles">Particles with a POP Network →</a></p>
+</main>
+<footer><div class="wrap"><span>© 2026 ProceduralFX Studio</span><nav><a href="/tutorials">Tutorials</a><a href="/promise">Our promise</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/refunds">Refunds</a><a href="mailto:support@build3dstudio.com">Contact</a></nav><p class="legal-note">Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></div></footer>
+</body>
+</html>

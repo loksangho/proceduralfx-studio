@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Particles with a POP Network · ProceduralFX Studio</title>
+<meta name="description" content="Build a spark fountain in ProceduralFX Studio with a POP Network: a source, gravity, wind and colour, the way Houdini builds particles.">
+<link rel="icon" href="/img/logo.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a class="brand" href="/"><img src="/img/logo.png" alt=""><span>ProceduralFX Studio</span></a><nav><a href="/tutorials">Tutorials</a><a class="keep" href="/#download">Download</a></nav></div></header>
+<main class="legal">
+<p><a href="/tutorials">← Tutorials</a></p>
+<h1>Particles with a POP Network</h1>
+<p class="updated">Tutorial 2 · about 10 minutes</p>
+
+<div class="summary">
+<p>A <b>POP Network</b> is a particle simulation built from nodes, as in Houdini. Inside it, a <b>POP Source</b> gives birth to particles, a <b>POP Solver</b> moves them each frame, and forces such as gravity and wind push them. You'll build a spark fountain like this one:</p>
+</div>
+
+<figure><img src="/img/tutorials/sparks.gif" alt="Sparks spraying up and falling, fading from yellow to red" width="320" height="320"><figcaption>The finished sparks. The built-in Sparks asset is built the same way.</figcaption></figure>
+
+<h2>1. Something to emit from</h2>
+<ol>
+<li>At the top of the network editor (the <b>OBJ</b> level), press <b>Tab</b>, type <code>geometry</code> and press Enter. A new geometry object appears.</li>
+<li>Double-click it to go inside, then press <b>Tab</b> and add a <code>sphere</code>. Particles will come from its surface.</li>
+<li>In the sphere's parameters, make <b>Radius</b> small, say 0.2.</li>
+</ol>
+
+<h2>2. Add the POP Network</h2>
+<ol>
+<li>Press <b>Tab</b>, type <code>popnet</code> and add the <b>POP Network</b>.</li>
+<li>Drag from the sphere's output to the POP Network's first input. The network shows its particles straight away.</li>
+<li>Press <b>Space</b>. Particles pour out of the sphere and fall under gravity.</li>
+</ol>
+
+<h2>3. Look inside</h2>
+<p>Double-click the POP Network. A new one comes with four nodes:</p>
+<ul>
+<li><b>POP Object:</b> the particles from the last frame, going into the solver's first input.</li>
+<li><b>POP Source:</b> births new particles, in the solver's third input (post-solve), so they first move on the next frame.</li>
+<li><b>POP Solver:</b> moves the particles, ages them, and removes those past their life.</li>
+<li><b>Gravity Force:</b> after the solver, with the display flag, so it's what you see.</li>
+</ul>
+<p>Click <b>POP Source</b> and try its settings:</p>
+<ul>
+<li><b>Birth rate (per second):</b> how many particles are born.</li>
+<li><b>Life expectancy</b> and <b>Life variance:</b> how long they live, in seconds.</li>
+<li><b>Initial velocity</b> and <b>Velocity variance:</b> set the y of Initial velocity to 4 to throw them upwards, and raise the variance to spread them out.</li>
+</ul>
+
+<h2>4. Add wind and colour</h2>
+<ol>
+<li>Press <b>Tab</b> and add a <b>POP Wind</b>. Wire Gravity Force's output into it, then double-click POP Wind to make it the display node. Set <b>Wind velocity</b> x to 2 to blow the sparks sideways. <b>Air resistance</b> sets how quickly they catch the wind.</li>
+<li>Add a <b>POP Color</b> after POP Wind and double-click it. Set <b>Color</b> to <b>Ramp over life</b>. Choose yellow for <b>Color (at birth)</b> and dark red for <b>Color at the end of life</b>.</li>
+</ol>
+<p>Forces and colours can go before the solver too, in its second input (pre-solve). Every POP after the solver runs each frame on what it outputs.</p>
+
+<h2>5. More to try</h2>
+<ul>
+<li><b>POP Drag</b> slows particles down. <b>POP Speed Limit</b> caps their speed.</li>
+<li><b>POP Kill</b> removes particles by an expression, such as <code>@P.y &lt; -1</code>, or inside a box.</li>
+<li><b>Ground Plane</b> makes particles bounce off the floor. Merge it with the POP Object into the solver's first input.</li>
+<li><b>POP Wrangle</b> runs your own VEX on every particle, for example <code>v@force += set(0, 2, 0);</code>.</li>
+</ul>
+
+<h2>6. Use the particles</h2>
+<p>Press <b>U</b> to go back up. The POP Network outputs points carrying <code>v</code>, <code>age</code>, <code>life</code>, <code>id</code> and their colour. Export them as a sprite sheet straight away (see <a href="/tutorial-game-export">tutorial 1</a>), or feed them into <b>Copy to Points</b> to put a shape on every particle, or into <b>Particle Fluid Surface</b> to turn them into a liquid.</p>
+
+<p><b>Next:</b> <a href="/tutorial-assets">Assets: ready-made, and your own →</a></p>
+</main>
+<footer><div class="wrap"><span>© 2026 ProceduralFX Studio</span><nav><a href="/tutorials">Tutorials</a><a href="/promise">Our promise</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/refunds">Refunds</a><a href="mailto:support@build3dstudio.com">Contact</a></nav><p class="legal-note">Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></div></footer>
+</body>
+</html>

@@ -200,6 +200,11 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
         notes.push(format!("{unread} node{} couldn't be read and were left out", if unread == 1 { "" } else { "s" }));
     }
 
+    if let Some((start, end, _)) = job.frames {
+        app.playback_start = (start - 1.0) / sims::SIM_FPS;
+        app.playback_end = (end - 1.0) / sims::SIM_FPS;
+        app.time = app.playback_start;
+    }
     // The camera: the one named, the scene's first, or a view framing everything.
     let cameras: Vec<(NodeId, String)> = {
         let mut ids: Vec<NodeId> = app.graph.nodes.iter().filter(|(_, n)| matches!(n.kind, NodeKind::Camera { .. })).map(|(id, _)| *id).collect();
@@ -215,20 +220,25 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
         None => match cameras.first() {
             Some((id, _)) => RenderCamera::Node(*id),
             None => {
+                // Framed halfway through, so a simulation has something to frame.
+                let first = app.time;
+                app.time = (app.playback_start + app.playback_end) / 2.0;
+                app.dirty = true;
                 app.rebuild_graph();
+                while app.simulation_rx.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    app.rebuild_graph();
+                }
                 app.dirty = false;
                 app.frame_all();
+                app.time = first;
+                app.dirty = true;
                 notes.push("the scene has no camera, so it's rendered from a view of everything".into());
                 RenderCamera::Viewport
             }
         },
     };
 
-    if let Some((start, end, _)) = job.frames {
-        app.playback_start = (start - 1.0) / sims::SIM_FPS;
-        app.playback_end = (end - 1.0) / sims::SIM_FPS;
-        app.time = app.playback_start;
-    }
     let started = std::time::SystemTime::now();
     let written = match &job.output {
         Output::Frames { dir } => {

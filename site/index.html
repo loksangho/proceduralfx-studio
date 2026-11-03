@@ -21,6 +21,7 @@
       <a href="#ai">AI assistant</a>
       <a href="#games">For games</a>
       <a href="#pricing">Pricing</a>
+      <a href="/tutorials">Tutorials</a>
       <a class="keep" href="#download">Download</a>
     </nav>
   </div>
@@ -123,15 +124,15 @@
 <section id="games" class="alt">
   <div class="wrap">
     <p class="eyebrow">For game makers</p>
-    <h2>Effects for your Bevy game, updated live.</h2>
-    <p class="intro">Export any effect as a sprite sheet and play it in <a href="https://bevy.org">Bevy</a> with the free <a href="https://crates.io/crates/bevy_procedural_fx">bevy_procedural_fx</a> plugin. Tick <b>Keep updating</b> and the app exports again whenever you change the effect, so your game follows along while it runs.</p>
+    <h2>Effects for your game, updated live.</h2>
+    <p class="intro">Export any effect as a sprite sheet and play it in <a href="https://bevy.org">Bevy</a> with the free <a href="https://crates.io/crates/bevy_procedural_fx">bevy_procedural_fx</a> plugin, or in Godot and Unity, which get the files they need to play it straight away. Tick <b>Keep updating</b> and the app exports again whenever you change the effect, so your game follows along while it runs. <a href="/tutorial-game-export">See how →</a></p>
     <figure class="demo">
       <video src="/img/live-export.mp4" poster="/img/live-export.jpg" autoplay muted loop playsinline preload="metadata" aria-label="Building a cartoon flame in ProceduralFX Studio and changing its colours, with the same flame updating in a running Bevy game beside it."></video>
       <figcaption class="small muted">Left, BeaverBoy Online, a game made in Bevy. Right, ProceduralFX Studio. The game picks up each change as it's made. One minute, sped up in places.</figcaption>
     </figure>
     <div class="grid grid-3">
       <div class="card"><h3>One PNG, one JSON</h3><p>Frames are packed into a grid with empty space cropped away. A small JSON file beside it gives the grid and frame rate, so any engine can read it.</p></div>
-      <div class="card"><h3>Three lines in Bevy</h3><p>Add the plugin and spawn an <code>FxSprite</code>: looping for fires and auras, or one-shot for hits and explosions.</p></div>
+      <div class="card"><h3>Bevy, Godot or Unity</h3><p>In Bevy, add the plugin and spawn an <code>FxSprite</code>. Godot gets a SpriteFrames resource for an AnimatedSprite2D, and Unity gets the PNG sliced into sprites. Both work with particle systems too.</p></div>
       <div class="card"><h3>The effects are yours</h3><p>We claim no rights over the effects you make. The plugin is MIT or Apache-2.0, like Bevy. Making effects for a game you sell needs a commercial license for the app.</p></div>
     </div>
   </div>
@@ -219,6 +220,7 @@ fetch("https://ai.build3dstudio.com/v1/founders")
   <div class="wrap">
     <span>© 2026 ProceduralFX Studio</span>
     <nav>
+      <a href="/tutorials">Tutorials</a>
       <a href="/promise">Our promise</a>
       <a href="/terms">Terms</a>
       <a href="/privacy">Privacy</a>
