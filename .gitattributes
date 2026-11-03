@@ -1,0 +1,5 @@
+# Docs and scenes are compared byte for byte by the tests (generated docs, examples,
+# starter scenes built into the app), so they keep Unix line endings on every platform.
+*.md text eol=lf
+*.pfs text eol=lf
+*.mhip text eol=lf

@@ -1136,8 +1136,8 @@ fn texture_bind_group(state: &egui_wgpu::RenderState, layout: &wgpu::BindGroupLa
     })
 }
 
-// A GPU viewport without a window, for tests; None where there's no GPU (as on some CI machines).
-#[cfg(test)]
+// A GPU viewport without a window, for command-line renders and tests; None where
+// there's no GPU (as on some CI machines).
 pub fn headless() -> Option<GpuViewport> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;

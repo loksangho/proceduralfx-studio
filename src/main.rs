@@ -27,6 +27,7 @@ mod attrib;
 mod assistant;
 mod boolean;
 mod bullet;
+mod cli;
 mod color;
 mod cops;
 mod crowd;
@@ -3258,6 +3259,41 @@ fn recent_scenes_file() -> Option<PathBuf> {
         return None;
     }
     Some(app_config_dir()?.join("recent_scenes.txt"))
+}
+
+// Runs the app without a window until its flipbook, render or sprite sheet recording is
+// done (or for at most `steps` frames): each frame cooks (simulations in the background)
+// and the GPU viewport renders the frame to capture. Reports frames done and the total;
+// returns what the recording said when it finished (what it saved, or why it couldn't).
+fn drive_recording(app: &mut ProceduralFxStudioApp, steps: Option<usize>, progress: &mut dyn FnMut(usize, usize)) -> Option<String> {
+    let ctx = egui::Context::default();
+    let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))), ..Default::default() };
+    let mut step = 0;
+    let mut finished = None;
+    while steps.is_none_or(|limit| step < limit) {
+        step += 1;
+        if app.simulation_rx.is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = ctx.run(screen.clone(), |ctx| {
+            app.flipbook_step(ctx);
+            // Cooking again afterwards (back at the resume time) replaces the status.
+            if app.flipbook_recording.is_none() && finished.is_none() {
+                finished = Some(app.status.clone());
+            }
+            if app.dirty || app.simulation_rx.is_some() {
+                app.rebuild_graph();
+                app.dirty = false;
+            }
+            app.flipbook_request_capture(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.viewport(ui, ctx));
+        });
+        match &app.flipbook_recording {
+            Some(recording) => progress(recording.next, recording.times.len()),
+            None => break,
+        }
+    }
+    finished
 }
 
 // Where autosaves and crash reports go. Tests mustn't touch the user's.
@@ -20751,6 +20787,10 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    // `render` and `sprite-sheet` render a scene without a window, then exit.
+    if let Some(code) = cli::main(&args) {
+        std::process::exit(code);
+    }
     recovery::install_panic_hook();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -20848,7 +20888,8 @@ mod tests {
     fn frame_ranges_and_output_names() {
         assert_eq!(frame_times(0.0, 1.0, 0.25), vec![0.0, 0.25, 0.5, 0.75, 1.0]);
         assert_eq!(frame_times(2.0, 1.0, 0.5).len(), 1);
-        assert_eq!(frame_output("/out/render.exr", 7), "/out/render.0007.exr");
+        // The system's own separator before the new file name ("\\" on Windows).
+        assert_eq!(frame_output("/out/render.exr", 7), std::path::Path::new("/out/render.exr").with_file_name("render.0007.exr").to_string_lossy());
         assert_eq!(frame_output("/out/shot_####.png", 12), "/out/shot_0012.png");
         assert_eq!(frame_output("beauty", 3), "beauty.0003");
     }
@@ -24561,25 +24602,7 @@ mod realtime_render_tests {
 
     // `steps` frames of the app, or until the recording is done (simulations cook in the background).
     pub(super) fn run_recording_for(app: &mut ProceduralFxStudioApp, steps: usize) {
-        let ctx = egui::Context::default();
-        let screen = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0))), ..Default::default() };
-        for _ in 0..steps {
-            if app.simulation_rx.is_some() {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            let _ = ctx.run(screen.clone(), |ctx| {
-                app.flipbook_step(ctx);
-                if app.dirty || app.simulation_rx.is_some() {
-                    app.rebuild_graph();
-                    app.dirty = false;
-                }
-                app.flipbook_request_capture(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| app.viewport(ui, ctx));
-            });
-            if app.flipbook_recording.is_none() {
-                break;
-            }
-        }
+        let _ = drive_recording(app, Some(steps), &mut |_, _| {});
         assert!(app.flipbook_recording.is_none(), "the recording finished: {}", app.status);
     }
 
