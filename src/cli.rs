@@ -28,6 +28,7 @@ Renders a scene without opening a window.
       --fill-grid                  no empty cells, for particle systems (and with --godot,
                                    also sheet_particles.tres, a GPUParticles2D material)
       --motion-vectors             also sheet_motion.png, for smooth playback between frames
+      --normal-map                 also sheet_normal.png, so 2D lights can light the effect
 
   proceduralfx_studio animation <scene.pfs> <fire.gif | fire.mp4> [options]
       A looping GIF, or an MP4 movie (needs FFmpeg), over a dark background:
@@ -62,7 +63,7 @@ pub enum Output {
     Animation { file: PathBuf },
     // Vertex animation textures: name.obj, name_offsets.exr... beside `stem`.
     Vat { stem: PathBuf, object: Option<String>, mode: Option<vat::Mode>, godot: bool, unity: bool },
-    SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool, fill_grid: bool, motion_vectors: bool },
+    SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool, fill_grid: bool, motion_vectors: bool, normal_map: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +90,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     let (mut out, mut frames, mut size, mut camera, mut object) = (None, None, None, None, None);
     let mut mode = None;
     let (mut every, mut columns, mut trim, mut seamless, mut blend) = (1, 0, true, false, 8);
-    let (mut godot, mut unity, mut fill_grid, mut motion_vectors) = (false, false, false, false);
+    let (mut godot, mut unity, mut fill_grid, mut motion_vectors, mut normal_map) = (false, false, false, false, false);
     let mut i = 0;
     let value = |i: usize, flag: &str| args.get(i + 1).cloned().ok_or_else(|| format!("{flag} needs a value"));
     let number = |text: &str, flag: &str| text.parse::<f32>().ok().filter(|n| n.is_finite()).ok_or_else(|| format!("{flag}: \"{text}\" isn't a number"));
@@ -163,6 +164,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
             "--unity" => unity = true,
             "--fill-grid" => fill_grid = true,
             "--motion-vectors" => motion_vectors = true,
+            "--normal-map" => normal_map = true,
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
             _ => positional.push(PathBuf::from(arg)),
         }
@@ -183,7 +185,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     if animation && !positional[1].extension().is_some_and(|e| e.eq_ignore_ascii_case("gif") || e.eq_ignore_ascii_case("mp4")) {
         return Err("animation writes a .gif or an .mp4: end the file name with one of them".into());
     }
-    let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless), ("--godot", godot), ("--unity", unity), ("--fill-grid", fill_grid), ("--motion-vectors", motion_vectors)];
+    let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless), ("--godot", godot), ("--unity", unity), ("--fill-grid", fill_grid), ("--motion-vectors", motion_vectors), ("--normal-map", normal_map)];
     // --godot and --unity also go with vat.
     let sheet_only: Vec<(&str, bool)> = sheet_only.into_iter().filter(|(flag, _)| !(vat && matches!(*flag, "--godot" | "--unity"))).collect();
     if !sheet {
@@ -206,7 +208,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     } else if animation {
         Output::Animation { file: positional.remove(0) }
     } else if sheet {
-        Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend, godot, unity, fill_grid, motion_vectors }
+        Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend, godot, unity, fill_grid, motion_vectors, normal_map }
     } else {
         Output::Frames { dir: out }
     };
@@ -310,9 +312,9 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
             file.clone()
         }
         Output::Vat { .. } => unreachable!("baked before the renderer starts"),
-        Output::SpriteSheet { png, every, columns, trim, seamless, blend, godot, unity, fill_grid, motion_vectors } => {
+        Output::SpriteSheet { png, every, columns, trim, seamless, blend, godot, unity, fill_grid, motion_vectors, normal_map } => {
             let [width, height] = job.size.unwrap_or([256, 256]);
-            app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend, godot: *godot, unity: *unity, fill_grid: *fill_grid, motion_vectors: *motion_vectors };
+            app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend, godot: *godot, unity: *unity, fill_grid: *fill_grid, motion_vectors: *motion_vectors, normal_map: *normal_map };
             app.start_sprite_sheet(png.clone(), false);
             png.clone()
         }
@@ -435,7 +437,7 @@ mod tests {
         assert_eq!(job.output, Output::Frames { dir: Some("frames".into()) });
 
         let job = parse(&args("sprite-sheet fire.pfs out/fire --every 2 --columns 4 --no-trim --seamless --blend 3 --frame 5")).unwrap().unwrap();
-        assert_eq!(job.output, Output::SpriteSheet { png: "out/fire.png".into(), every: 2, columns: 4, trim: false, seamless: true, blend: 3, godot: false, unity: false, fill_grid: false, motion_vectors: false });
+        assert_eq!(job.output, Output::SpriteSheet { png: "out/fire.png".into(), every: 2, columns: 4, trim: false, seamless: true, blend: 3, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false });
         let engines = parse(&args("sprite-sheet fire.pfs fire.png --godot --unity")).unwrap().unwrap();
         assert!(matches!(engines.output, Output::SpriteSheet { godot: true, unity: true, .. }));
         assert!(parse(&args("render fire.pfs --godot")).unwrap().unwrap_err().contains("for sprite sheets"));

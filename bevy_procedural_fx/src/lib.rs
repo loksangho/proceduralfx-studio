@@ -43,7 +43,7 @@ use serde::Deserialize;
 #[cfg(feature = "flipbook")]
 mod flipbook;
 #[cfg(feature = "flipbook")]
-pub use flipbook::{Blend, FlipbookMaterial, FlipbookSettings, FxFlipbook};
+pub use flipbook::{Blend, FlipbookMaterial, FlipbookSettings, FxAmbient2d, FxFlipbook, FxLight2d, MAX_LIGHTS};
 #[cfg(feature = "vat")]
 mod vat;
 #[cfg(feature = "vat")]
@@ -88,6 +88,9 @@ pub struct FxSheet {
     /// How each pixel moves to the next frame, if the sheet was exported with motion
     /// vectors. [`FxFlipbook`] uses them.
     pub motion: Option<FxMotion>,
+    /// Each frame's shape, if the sheet was exported with a normal map (loaded as data):
+    /// [`FxFlipbook`] lights it with [`FxLight2d`]s.
+    pub normal_map: Option<Handle<Image>>,
 }
 
 /// A sheet's motion vectors (`name_motion.png`), laid out like the sheet.
@@ -224,6 +227,13 @@ struct SheetFile {
     offset: [u32; 2],
     #[serde(default)]
     motion_vectors: Option<MotionFile>,
+    #[serde(default)]
+    normal_map: Option<NormalFile>,
+}
+
+#[derive(Deserialize)]
+struct NormalFile {
+    image: String,
 }
 
 #[derive(Deserialize)]
@@ -295,6 +305,13 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
         }
         None => None,
     };
+    let normal_map = match &file.normal_map {
+        Some(n) => {
+            let path = load_context.path().resolve_embed_str(&n.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
+            Some(load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.is_srgb = false).load(path))
+        }
+        None => None,
+    };
     Ok(FxSheet {
         image: load_context.load(image_path),
         layout: load_context.add_labeled_asset("layout", layout),
@@ -306,6 +323,7 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
         columns,
         rows,
         motion,
+        normal_map,
     })
 }
 
@@ -325,6 +343,7 @@ mod tests {
             columns: 2,
             rows: 2,
             motion: None,
+            normal_map: None,
         }
     }
 

@@ -91,7 +91,16 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 </ul>
 <p>It works best for smoke, explosions and anything that moves smoothly. Fast, scattered sparks jump further between frames than the gaps between them, so for those, keep more frames.</p>
 
-<h2>7. Keep it updating while your game runs</h2>
+<h2>7. Light it</h2>
+<p class="soon">Coming in the next update: normal maps aren't in version 0.21 yet.</p>
+<p>Tick <b>Normal map</b> under <b>Lighting</b>, and the export also writes <code>fire_normal.png</code>: each frame's shape, read from how opaque it is. Your game's 2D lights then light the effect from their side, so smoke looks like a soft puff rather than a flat picture. It suits smoke, dust and clouds; leave glowing effects such as fire unlit.</p>
+<ul>
+<li><b>Bevy:</b> spawn <code>FxLight2d</code> lights. Every <code>FxFlipbook</code> whose sheet has a normal map is lit by them (bevy_procedural_fx 0.3).</li>
+<li><b>Godot:</b> with Godot ticked, put <code>fire_lit.tres</code> on the AnimatedSprite2D as its material, and add a <b>PointLight2D</b>. The flipbook scene is lit too. Raise the light's <b>Height</b> to light the front more.</li>
+<li><b>Unity:</b> with Unity ticked, the sliced sprites already carry the normal map. With URP's 2D Renderer, use the <b>Sprite-Lit-Default</b> material and add a <b>Light 2D</b>.</li>
+</ul>
+
+<h2>8. Keep it updating while your game runs</h2>
 <p>Tick <b>Keep updating</b> under <b>Live</b> before you export. From then on, the app exports again a moment after every change. A Bevy game run with Bevy's <code>file_watcher</code> feature shows the change while it runs. Godot and Unity pick up the new files when you switch back to their window.</p>
 
 <h2>Share it</h2>

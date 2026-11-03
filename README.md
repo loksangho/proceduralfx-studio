@@ -131,6 +131,21 @@ scattered sparks need more frames.
 - **Unity** (with Unity ticked): `name_flipbook.mat` and its shader, for a Quad, in URP or
   the built-in pipeline.
 
+## Lit 2D effects
+
+Tick **Normal map** under *Lighting* in **Export Sprite Sheet…** (or pass `--normal-map`) and
+the export also writes `name_normal.png`: each frame's shape, read from how opaque it is, so
+a game's 2D lights light the effect from their side. It suits smoke, dust and clouds; leave
+glowing effects such as fire unlit.
+
+- **Bevy**: `FxFlipbook` from [bevy_procedural_fx](bevy_procedural_fx) 0.3 is lit by
+  `FxLight2d` lights.
+- **Godot 4** (with Godot ticked): put `name_lit.tres` on the AnimatedSprite2D playing
+  `name.tres`; `name_flipbook.tscn` (with motion vectors) is lit too. Light2D does the rest.
+  Raise a light's height to light the effect's front more.
+- **Unity** (with Unity ticked): the sliced sprites carry the normal map as their `_NormalMap`,
+  so URP's 2D lights use it with the Sprite-Lit-Default material.
+
 ## Vertex animation (VAT) for 3D games
 
 **Render → Export Vertex Animation…** bakes an object's motion over the playback range into

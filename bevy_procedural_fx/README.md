@@ -1,7 +1,7 @@
 # bevy_procedural_fx
 
 Play effects exported from [ProceduralFX Studio](https://github.com/loksangho/proceduralfx-studio) in [Bevy](https://bevy.org):
-sprite sheets for 2D (played smoothly with motion vectors), and [vertex animation](#vertex-animation-for-3d) for 3D cloth,
+sprite sheets for 2D (played smoothly with motion vectors, and lit by 2D lights), and [vertex animation](#vertex-animation-for-3d) for 3D cloth,
 destruction and liquids.
 
 ![An effect re-exported from ProceduralFX Studio updating live in a running Bevy game](https://raw.githubusercontent.com/loksangho/proceduralfx-studio/main/bevy_procedural_fx/docs/live.gif)
@@ -97,6 +97,30 @@ how it goes from frame to frame with `.with_blend(...)`:
 that moves smoothly. Fast, scattered sparks need more frames. This needs the `flipbook`
 feature, which is on by default.
 
+## Lit 2D effects
+
+Tick **Normal map** when you export, and ProceduralFX Studio also writes `smoke_normal.png`:
+each frame's shape, read from how opaque it is. An `FxFlipbook` whose sheet has one is lit
+by any `FxLight2d`s, from the side each light is on:
+
+```rust
+commands.spawn((
+    FxLight2d { color: Color::srgb(1.0, 0.8, 0.55), intensity: 2.0, radius: 500.0, height: 80.0 },
+    Transform::from_xyz(-200.0, 50.0, 0.0),
+));
+```
+
+| `FxLight2d` | |
+| --- | --- |
+| `color`, `intensity` | The light's colour and strength (1 lights a surface facing it fully) |
+| `radius` | How far it reaches, in world units; it fades to nothing there |
+| `height` | How far in front of the scene it is: higher lights the front more, lower lights the edges from the side |
+
+The eight nearest lights light each flipbook, on top of the `FxAmbient2d` resource (a dim
+grey unless you set it). Without any lights, flipbooks are drawn unlit. For effects that
+glow, such as fire, use `.unlit()`. Rotating a lit flipbook doesn't turn its normals yet, so
+light it unrotated.
+
 ## Vertex animation for 3D
 
 Simulations are too slow to run in a game, so you bake them. In ProceduralFX Studio,
@@ -155,6 +179,7 @@ bevy_procedural_fx = { version = "0.3", default-features = false, features = ["f
 ```sh
 cargo run --example fire
 cargo run --example flipbook
+cargo run --example lit
 cargo run --example vat
 ```
 
@@ -163,6 +188,8 @@ one-shot bursts.
 
 `flipbook` shows the same smoke, a 12-frame sheet slowed to a quarter speed, three ways:
 whole frames, cross-faded, and following its motion vectors.
+
+`lit` lights the smoke with a warm light that follows the mouse, and a cool one.
 
 `vat` shows a rippling sheet (soft) beside a box that has broken apart (rigid). Press
 Space to break another one.
@@ -180,6 +207,7 @@ Space to break another one.
 | `frame_count`, `fps` | How many frames there are, and how fast they play |
 | `frames` | Each frame's `[x, y, width, height]` in the PNG |
 | `source_size`, `offset` | The size each frame was rendered at, and where the cropped frame's top-left corner was in it |
+| `normal_map` | If exported with one: `image`, laid out like the sheet, in tangent space with red right, green up and blue towards the viewer, each `(n + 1) / 2` |
 | `motion_vectors` | If exported with them: `image` (laid out like the sheet), `strength` and `looping`. Red and green hold each pixel's shift to the next frame, across and down, in fractions of a frame: `(value - 0.5) * 2 * strength` |
 
 ## Bevy versions

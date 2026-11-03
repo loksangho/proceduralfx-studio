@@ -22,6 +22,11 @@ struct FlipbookSettings {
     blend: u32,
     // Whether the last frame's motion leads into the first.
     motion_loops: u32,
+    light_count: u32,
+    ambient: vec4<f32>,
+    // World position (z: height) and radius; colour times intensity.
+    light_positions: array<vec4<f32>, 8>,
+    light_colors: array<vec4<f32>, 8>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> settings: FlipbookSettings;
@@ -29,6 +34,21 @@ struct FlipbookSettings {
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var sheet_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var motion: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var motion_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var normal_map: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var normal_sampler: sampler;
+
+// The light reaching a surface facing `n` (red right, green up, blue out of the screen)
+// at `at`, from the ambient and each light.
+fn lighting(n: vec3<f32>, at: vec3<f32>) -> vec3<f32> {
+    var total = settings.ambient.rgb;
+    for (var i = 0u; i < settings.light_count; i++) {
+        let light = settings.light_positions[i];
+        let to_light = vec3<f32>(light.xy - at.xy, light.z);
+        let fade = clamp(1.0 - length(to_light.xy) / light.w, 0.0, 1.0);
+        total += settings.light_colors[i].rgb * max(dot(n, normalize(to_light)), 0.0) * fade * fade;
+    }
+    return total;
+}
 
 // Where `local` (0 to 1 across a frame, from its top left) is in the sheet for frame `f`,
 // kept half a texel inside the cell so it never picks up the next one.
@@ -58,21 +78,25 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     var t = at - floor(at);
     let local = in.uv;
-    var color: vec4<f32>;
     if settings.blend == 0u {
-        color = premultiplied(textureSample(sheet, sheet_sampler, in_sheet(f0, local)));
-    } else {
-        var shift = vec2<f32>(0.0);
-        // The last frame's motion only leads into the first if the sheet loops.
-        let wraps = f1 < f0;
-        if settings.blend == 2u && (!wraps || settings.motion_loops != 0u) {
-            shift = (textureSample(motion, motion_sampler, in_sheet(f0, local)).rg - vec2<f32>(0.5)) * 2.0 * settings.strength;
-        }
-        let a = premultiplied(textureSample(sheet, sheet_sampler, in_sheet(f0, local - shift * t)));
-        let b = premultiplied(textureSample(sheet, sheet_sampler, in_sheet(f1, local + shift * (1.0 - t))));
-        color = mix(a, b, t);
+        t = 0.0;
     }
+    var shift = vec2<f32>(0.0);
+    // The last frame's motion only leads into the first if the sheet loops.
+    let wraps = f1 < f0;
+    if settings.blend == 2u && (!wraps || settings.motion_loops != 0u) {
+        shift = (textureSample(motion, motion_sampler, in_sheet(f0, local)).rg - vec2<f32>(0.5)) * 2.0 * settings.strength;
+    }
+    // Where this pixel comes from in this frame and the next.
+    let ua = in_sheet(f0, local - shift * t);
+    let ub = in_sheet(f1, local + shift * (1.0 - t));
+    let color = mix(premultiplied(textureSample(sheet, sheet_sampler, ua)), premultiplied(textureSample(sheet, sheet_sampler, ub)), t);
     var out = vec4<f32>(color.rgb / max(color.a, 1e-5), color.a) * settings.color;
+    if settings.light_count > 0u {
+        let encoded = mix(textureSample(normal_map, normal_sampler, ua).rgb, textureSample(normal_map, normal_sampler, ub).rgb, t);
+        let n = normalize(encoded * 2.0 - vec3<f32>(1.0));
+        out = vec4<f32>(out.rgb * lighting(n, in.world_position.xyz), out.a);
+    }
 @if(TONEMAP_IN_SHADER)
     out = tonemapping::tone_mapping(out, view.color_grading);
 @if(SRGB_OUTPUT)

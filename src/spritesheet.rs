@@ -40,11 +40,13 @@ pub struct Settings {
     // Also write name_motion.png: how each pixel moves to the next frame, so games can
     // slide between frames rather than cross-fade (see `motion`).
     pub motion_vectors: bool,
+    // Also write name_normal.png: each frame's shape, for engines' 2D lights (see `normals`).
+    pub normal_map: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false }
     }
 }
 
@@ -70,6 +72,7 @@ pub struct Output {
     pub unity: bool,
     pub fill_grid: bool,
     pub motion_vectors: bool,
+    pub normal_map: bool,
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -170,7 +173,7 @@ pub fn pack_in(frames: &[egui::ColorImage], requested: u32, crop: [u32; 4]) -> R
 }
 
 // The JSON written beside the sheet.
-pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, source_size: [u32; 2], motion: Option<&Motion>) -> serde_json::Value {
+pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, source_size: [u32; 2], motion: Option<&Motion>, normal_map: Option<&str>) -> serde_json::Value {
     let [w, h] = sheet.cell;
     let frames: Vec<[u32; 4]> = (0..frame_count as u32).map(|i| [(i % sheet.columns) * w, (i / sheet.columns) * h, w, h]).collect();
     let mut json = serde_json::json!({
@@ -186,6 +189,12 @@ pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, s
         "offset": sheet.offset,
         "frames": frames,
     });
+    if let Some(name) = normal_map {
+        json["normal_map"] = serde_json::json!({
+            "image": name,
+            "convention": "tangent space, laid out like the sheet: red right, green up, blue towards the viewer, each (n + 1) / 2",
+        });
+    }
     if let Some(m) = motion {
         json["motion_vectors"] = serde_json::json!({
             "image": m.image_name,
@@ -206,6 +215,12 @@ pub struct Motion {
     pub strength: f32,
     // Whether the last frame's vectors lead into the first.
     pub looping: bool,
+}
+
+// name_normal.png beside name.png.
+pub fn normal_path(png: &Path) -> PathBuf {
+    let stem = png.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    png.with_file_name(format!("{stem}_normal.png"))
 }
 
 // name_motion.png beside name.png.
@@ -282,14 +297,29 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
     } else {
         None
     };
+    let normal = if output.normal_map {
+        let path = normal_path(&png);
+        let maps = crate::normals::normal_maps(frames);
+        let packed = pack_in(&maps, sheet.columns, [sheet.offset[0], sheet.offset[1], sheet.cell[0], sheet.cell[1]])?;
+        save_png(&packed.image, &path)?;
+        Some(file_name(&path))
+    } else {
+        None
+    };
     let size = frames.first().map_or([0, 0], |f| [f.size[0] as u32, f.size[1] as u32]);
-    let json = serde_json::to_string_pretty(&metadata(&sheet, &name, frames.len(), output.fps, size, motion.as_ref())).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&metadata(&sheet, &name, frames.len(), output.fps, size, motion.as_ref(), normal.as_deref())).map_err(|e| e.to_string())?;
     let partial = png.with_extension("pfx.json.partial");
     std::fs::write(&partial, json + "\n").map_err(|e| e.to_string())?;
     std::fs::rename(&partial, json_path(&png)).map_err(|e| e.to_string())?;
     let count = frames.len();
     if output.godot {
         write_beside(&godot_path(&png), &godot_sprite_frames(&sheet, &name, count, output.fps))?;
+        if let Some(normal_name) = &normal {
+            write_beside(&with_suffix(&normal_path(&png), ".import"), &crate::vat::godot_texture_import())?;
+            let [shader, material] = godot_lit_paths(&png);
+            write_beside(&shader, GODOT_LIT_SHADER)?;
+            write_beside(&material, &godot_lit_material(&stem_of(&png), normal_name))?;
+        }
         if output.fill_grid {
             write_beside(&godot_particles_path(&png), &godot_particle_material(&sheet))?;
         }
@@ -298,10 +328,19 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
         let meta = unity_meta_path(&png);
         // Re-exports keep the same guid, so Unity keeps what uses the sprites.
         let guid = std::fs::read_to_string(&meta).ok().and_then(|text| meta_guid(&text)).unwrap_or_else(|| new_guid(&png));
-        write_beside(&meta, &unity_meta(&sheet, &name, count, &guid))?;
+        let normal_guid = match &normal {
+            Some(_) => {
+                let path = normal_path(&png);
+                let g = crate::vat::unity_guid(&unity_meta_path(&path), &stem_of(&png));
+                write_beside(&unity_meta_path(&path), &unity_normal_meta(&g, sheet.image.width().max(sheet.image.height())))?;
+                Some(g)
+            }
+            None => None,
+        };
+        write_beside(&meta, &unity_meta(&sheet, &name, count, &guid, normal_guid.as_deref()))?;
     }
     if let Some(motion) = &motion {
-        write_flipbook_engines(output, &png, &sheet, count, size, motion)?;
+        write_flipbook_engines(output, &png, &sheet, count, size, motion, normal.as_deref())?;
     }
     Ok((png, sheet))
 }
@@ -382,7 +421,7 @@ fn meta_guid(text: &str) -> Option<String> {
 // Unity's import settings for the sheet: a sprite texture sliced into one sprite per frame
 // (name_0, name_1...), uncompressed, without mipmaps, and not shrunk below its size. In
 // Unity, select the sprites and drag them into the scene to make an animation.
-pub fn unity_meta(sheet: &Sheet, image_name: &str, count: usize, guid: &str) -> String {
+pub fn unity_meta(sheet: &Sheet, image_name: &str, count: usize, guid: &str, normal_guid: Option<&str>) -> String {
     let stem = image_name.strip_suffix(".png").unwrap_or(image_name);
     let height = sheet.image.height();
     let size = sheet.image.width().max(height).next_power_of_two().clamp(32, MAX_SIDE);
@@ -522,8 +561,13 @@ TextureImporter:
     indices: 
     edges: []
     weights: []
-    secondaryTextures: []
-    spriteCustomMetadata:
+";
+    // The normal map, for URP's 2D lights (Sprite-Lit-Default reads _NormalMap).
+    out += &match normal_guid {
+        Some(g) => format!("    secondaryTextures:\n    - name: _NormalMap\n      texture: {{fileID: 2800000, guid: {g}, type: 3}}\n"),
+        None => "    secondaryTextures: []\n".to_owned(),
+    };
+    out += "    spriteCustomMetadata:
       entries: []
     nameFileIdTable:
 ";
@@ -550,6 +594,39 @@ fn stem_of(png: &Path) -> String {
     png.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned())
 }
 
+// name_lit.gdshader and name_lit.tres beside name.png: a material for the AnimatedSprite2D
+// playing name.tres, so Light2D lights it with the normal map. (The normal sheet is laid
+// out like the sheet, and an AtlasTexture's UV covers the whole sheet, so the same UV
+// finds a pixel's normal. A CanvasTexture can't be used: AtlasTextures drop its normals.)
+pub fn godot_lit_paths(png: &Path) -> [PathBuf; 2] {
+    let stem = stem_of(png);
+    [png.with_file_name(format!("{stem}_lit.gdshader")), png.with_file_name(format!("{stem}_lit.tres"))]
+}
+
+pub const GODOT_LIT_SHADER: &str = "// ProceduralFX Studio: lights a sprite sheet with its normal map (name_normal.png).
+shader_type canvas_item;
+
+uniform sampler2D normal_map : hint_normal, filter_linear, repeat_disable;
+
+void fragment() {
+	NORMAL_MAP = texture(normal_map, UV).rgb;
+}
+";
+
+pub fn godot_lit_material(stem: &str, normal_name: &str) -> String {
+    format!(
+        "[gd_resource type=\"ShaderMaterial\" load_steps=3 format=3]
+
+[ext_resource type=\"Shader\" path=\"{stem}_lit.gdshader\" id=\"1_shader\"]
+[ext_resource type=\"Texture2D\" path=\"{normal_name}\" id=\"2_normal\"]
+
+[resource]
+shader = ExtResource(\"1_shader\")
+shader_parameter/normal_map = ExtResource(\"2_normal\")
+"
+    )
+}
+
 // name_flipbook.gdshader and name_flipbook.tscn beside name.png.
 pub fn godot_flipbook_paths(png: &Path) -> [PathBuf; 2] {
     let stem = stem_of(png);
@@ -559,7 +636,7 @@ pub fn godot_flipbook_paths(png: &Path) -> [PathBuf; 2] {
 // A canvas_item shader for a Sprite2D showing the sheet with `hframes` and `vframes` set to
 // its grid (so its UV covers the first cell); it picks the frame itself, from TIME or from
 // `frame`.
-pub fn godot_flipbook_shader(sheet: &Sheet, count: usize, fps: f32, motion: &Motion) -> String {
+pub fn godot_flipbook_shader(sheet: &Sheet, count: usize, fps: f32, motion: &Motion, normal_map: bool) -> String {
     format!(
         "// ProceduralFX Studio flipbook with motion vectors: slides between frames.
 shader_type canvas_item;
@@ -578,7 +655,7 @@ uniform bool looping = true;
 // The frame to show when use_time is off (from 0; fractions are part of the way to the next).
 uniform float frame = 0.0;
 uniform int blending : hint_enum(\"Whole frames\", \"Cross-fade\", \"Motion vectors\") = 2;
-
+{normal_uniform}
 // Where `local` (0 to 1 across a frame, from its top left) is in the sheet for frame f,
 // kept half a texel inside the cell.
 vec2 in_sheet(int f, vec2 local, vec2 texel) {{
@@ -599,32 +676,30 @@ void fragment() {{
 	at = looping ? mod(at, count) : clamp(at, 0.0, count - 1.0);
 	int f0 = min(int(floor(at)), frame_count - 1);
 	int f1 = looping ? (f0 + 1) % frame_count : min(f0 + 1, frame_count - 1);
-	float t = fract(at);
-	vec4 c;
-	if (blending == 0) {{
-		c = premultiplied(texture(TEXTURE, in_sheet(f0, local, TEXTURE_PIXEL_SIZE)));
-	}} else {{
-		vec2 shift = vec2(0.0);
-		if (blending == 2 && (f1 > f0 || motion_loops)) {{
-			shift = (texture(motion_vectors, in_sheet(f0, local, TEXTURE_PIXEL_SIZE)).rg - 0.5) * 2.0 * strength;
-		}}
-		vec4 a = premultiplied(texture(TEXTURE, in_sheet(f0, local - shift * t, TEXTURE_PIXEL_SIZE)));
-		vec4 b = premultiplied(texture(TEXTURE, in_sheet(f1, local + shift * (1.0 - t), TEXTURE_PIXEL_SIZE)));
-		c = mix(a, b, t);
+	float t = blending == 0 ? 0.0 : fract(at);
+	vec2 shift = vec2(0.0);
+	if (blending == 2 && (f1 > f0 || motion_loops)) {{
+		shift = (texture(motion_vectors, in_sheet(f0, local, TEXTURE_PIXEL_SIZE)).rg - 0.5) * 2.0 * strength;
 	}}
-	COLOR = vec4(c.rgb / max(c.a, 1e-5), c.a);
+	// Where this pixel comes from in this frame and the next.
+	vec2 ua = in_sheet(f0, local - shift * t, TEXTURE_PIXEL_SIZE);
+	vec2 ub = in_sheet(f1, local + shift * (1.0 - t), TEXTURE_PIXEL_SIZE);
+	vec4 c = mix(premultiplied(texture(TEXTURE, ua)), premultiplied(texture(TEXTURE, ub)), t);
+{normal_line}	COLOR = vec4(c.rgb / max(c.a, 1e-5), c.a);
 }}
 ",
         columns = sheet.columns,
         rows = sheet.rows,
         strength = (motion.strength as f64 * 1000.0).round() / 1000.0,
         loops = motion.looping,
+        normal_uniform = if normal_map { "// Each frame's shape, for Light2D: name_normal.png.\nuniform sampler2D normal_map : hint_normal, filter_linear, repeat_disable;\n" } else { "" },
+        normal_line = if normal_map { "\tNORMAL_MAP = mix(texture(normal_map, ua).rgb, texture(normal_map, ub).rgb, t);\n" } else { "" },
     )
 }
 
 // A ready scene: a Sprite2D showing the sheet through the shader, placed so the full
 // rendered frame's centre is at the node, as the other exports do.
-pub fn godot_flipbook_scene(sheet: &Sheet, png: &Path, source_size: [u32; 2], motion: &Motion) -> String {
+pub fn godot_flipbook_scene(sheet: &Sheet, png: &Path, source_size: [u32; 2], motion: &Motion, normal_map: Option<&str>) -> String {
     let stem = stem_of(png);
     let image = png.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let [cw, ch] = sheet.cell;
@@ -632,16 +707,16 @@ pub fn godot_flipbook_scene(sheet: &Sheet, png: &Path, source_size: [u32; 2], mo
     let dx = sheet.offset[0] as f32 + cw as f32 / 2.0 - source_size[0] as f32 / 2.0;
     let dy = sheet.offset[1] as f32 + ch as f32 / 2.0 - source_size[1] as f32 / 2.0;
     format!(
-        "[gd_scene load_steps=5 format=3]
+        "[gd_scene load_steps={steps} format=3]
 
 [ext_resource type=\"Texture2D\" path=\"{image}\" id=\"1_sheet\"]
 [ext_resource type=\"Texture2D\" path=\"{motion_image}\" id=\"2_motion\"]
 [ext_resource type=\"Shader\" path=\"{stem}_flipbook.gdshader\" id=\"3_shader\"]
-
+{normal_resource}
 [sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_flipbook\"]
 shader = ExtResource(\"3_shader\")
 shader_parameter/motion_vectors = ExtResource(\"2_motion\")
-
+{normal_parameter}
 [node name=\"{node}\" type=\"Sprite2D\"]
 material = SubResource(\"ShaderMaterial_flipbook\")
 texture = ExtResource(\"1_sheet\")
@@ -650,6 +725,9 @@ hframes = {columns}
 vframes = {rows}
 ",
         motion_image = motion.image_name,
+        steps = if normal_map.is_some() { 6 } else { 5 },
+        normal_resource = normal_map.map_or_else(String::new, |n| format!("[ext_resource type=\"Texture2D\" path=\"{n}\" id=\"4_normal\"]\n")),
+        normal_parameter = if normal_map.is_some() { "shader_parameter/normal_map = ExtResource(\"4_normal\")\n" } else { "" },
         node = stem.replace(['.', ':', '@', '/', '"', '%'], "_"),
         columns = sheet.columns,
         rows = sheet.rows,
@@ -829,7 +907,17 @@ Material:
 // Import settings for name_motion.png: numbers, not colour (no sRGB), uncompressed, no
 // mipmaps (they'd blend neighbouring cells' motion), filtered, clamped, never shrunk.
 pub fn unity_motion_meta(guid: &str, largest: u32) -> String {
+    unity_data_meta(guid, largest, false)
+}
+
+// The same for name_normal.png, imported as a normal map.
+pub fn unity_normal_meta(guid: &str, largest: u32) -> String {
+    unity_data_meta(guid, largest, true)
+}
+
+fn unity_data_meta(guid: &str, largest: u32, normal_map: bool) -> String {
     let size = largest.next_power_of_two().clamp(32, MAX_SIDE);
+    let texture_type = if normal_map { 1 } else { 0 };
     format!(
         "fileFormatVersion: 2
 guid: {guid}
@@ -887,7 +975,7 @@ TextureImporter:
   alphaUsage: 0
   alphaIsTransparency: 0
   spriteTessellationDetail: -1
-  textureType: 0
+  textureType: {texture_type}
   textureShape: 1
   singleChannelComponent: 0
   flipbookRows: 1
@@ -937,14 +1025,14 @@ TextureImporter:
 }
 
 // Writes the engines' smooth-playback files for a sheet saved at `png` with `motion`.
-fn write_flipbook_engines(output: &Output, png: &Path, sheet: &Sheet, count: usize, source_size: [u32; 2], motion: &Motion) -> Result<(), String> {
+fn write_flipbook_engines(output: &Output, png: &Path, sheet: &Sheet, count: usize, source_size: [u32; 2], motion: &Motion, normal_map: Option<&str>) -> Result<(), String> {
     let stem = stem_of(png);
     let motion_png = motion_path(png);
     if output.godot {
         let [shader, scene] = godot_flipbook_paths(png);
-        write_beside(&shader, &godot_flipbook_shader(sheet, count, output.fps, motion))?;
+        write_beside(&shader, &godot_flipbook_shader(sheet, count, output.fps, motion, normal_map.is_some()))?;
         write_beside(&with_suffix(&motion_png, ".import"), &crate::vat::godot_texture_import())?;
-        write_beside(&scene, &godot_flipbook_scene(sheet, png, source_size, motion))?;
+        write_beside(&scene, &godot_flipbook_scene(sheet, png, source_size, motion, normal_map))?;
     }
     if output.unity {
         let [shader, material] = unity_flipbook_paths(png);
@@ -998,7 +1086,7 @@ mod tests {
 
     #[test]
     fn unity_meta_slices_from_the_bottom_left_at_full_size() {
-        let text = unity_meta(&sheet(), "fire.png", 5, "0123456789abcdef0123456789abcdef");
+        let text = unity_meta(&sheet(), "fire.png", 5, "0123456789abcdef0123456789abcdef", None);
         assert!(text.starts_with("fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n"));
         assert!(text.contains("spriteMode: 2") && text.contains("textureType: 8"));
         // The first frame is at the top: y = 40 - 20.
@@ -1044,7 +1132,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let frames = vec![egui::ColorImage::filled([8, 8], egui::Color32::WHITE); 3];
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true, motion_vectors: false };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true, motion_vectors: false, normal_map: false };
         let (png, _) = save(&frames, &output).unwrap();
         let guid = |p: &Path| meta_guid(&std::fs::read_to_string(unity_meta_path(p)).unwrap()).unwrap();
         let first = guid(&png);
@@ -1095,7 +1183,7 @@ mod tests {
         // Frame 3 (index 2) is in row 1, column 0; its pixel was at x 7 → 7 - 4 = 3 in the cell.
         assert_eq!(sheet.image.get_pixel(3, 3 + 1).0, [255, 128, 0, 255]);
         assert_eq!(sheet.image.get_pixel(2, 3 + 1).0[3], 0);
-        let meta = metadata(&sheet, "fx.png", 5, 24.0, [20, 10], None);
+        let meta = metadata(&sheet, "fx.png", 5, 24.0, [20, 10], None, None);
         assert_eq!(meta["frames"][4], serde_json::json!([0, 6, 7, 3]));
         assert_eq!(meta["frame_size"], serde_json::json!([7, 3]));
         assert_eq!(pack(&frames, 2, false).unwrap().image.dimensions(), (40, 30));
@@ -1147,7 +1235,7 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: false };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();
@@ -1173,7 +1261,7 @@ mod tests {
             egui::ColorImage { size: [64, 32], source_size: egui::vec2(64.0, 32.0), pixels }
         };
         let frames: Vec<_> = (0..5).map(|i| dot(20.0 + 3.0 * i as f32)).collect();
-        let output = Output { path: dir.join("dot.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: true };
+        let output = Output { path: dir.join("dot.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: true, normal_map: false };
         let (png, sheet) = save(&frames, &output).unwrap();
         let motion = image::open(motion_path(&png)).unwrap().to_rgba8();
         assert_eq!(motion.dimensions(), sheet.image.dimensions(), "the same grid of the same cells");
@@ -1205,7 +1293,7 @@ mod tests {
             image
         };
         let frames: Vec<_> = (0..4).map(|i| dot(4 + 5 * i)).collect();
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: false };
         let (png, sheet) = save(&frames, &output).unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
         let [gd_shader, gd_scene] = godot_flipbook_paths(&png);
@@ -1231,6 +1319,44 @@ mod tests {
         let plain = Output { path: dir.join("plain.png"), motion_vectors: false, ..output };
         let (plain_png, _) = save(&frames, &plain).unwrap();
         assert!(!motion_path(&plain_png).exists() && !godot_flipbook_paths(&plain_png)[0].exists() && !unity_flipbook_paths(&plain_png)[0].exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normal_maps_come_with_what_each_engine_needs_to_light_them() {
+        let dir = std::env::temp_dir().join(format!("pfx_normals_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = |cx: usize| {
+            let mut image = egui::ColorImage::new([40, 24], vec![egui::Color32::TRANSPARENT; 40 * 24]);
+            for y in 6..18 {
+                for x in cx..cx + 12 {
+                    image.pixels[y * 40 + x] = egui::Color32::WHITE;
+                }
+            }
+            image
+        };
+        let frames: Vec<_> = (0..3).map(|i| blob(6 + 4 * i)).collect();
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: true };
+        let (png, sheet) = save(&frames, &output).unwrap();
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        let normals = image::open(normal_path(&png)).unwrap().to_rgba8();
+        assert_eq!(normals.dimensions(), sheet.image.dimensions(), "laid out like the sheet");
+        let meta: serde_json::Value = serde_json::from_str(&read(&json_path(&png))).unwrap();
+        assert_eq!(meta["normal_map"]["image"], "puff_normal.png");
+        // Godot: a material for the AnimatedSprite2D, and the flipbook passes the normals on.
+        let [lit_shader, lit_material] = godot_lit_paths(&png);
+        assert!(read(&lit_shader).contains("NORMAL_MAP = texture(normal_map, UV).rgb;"));
+        assert!(read(&lit_material).contains("path=\"puff_normal.png\"") && read(&lit_material).contains("path=\"puff_lit.gdshader\""));
+        assert!(read(&dir.join("puff_normal.png.import")).contains("compress/mode=0"));
+        let [flip_shader, flip_scene] = godot_flipbook_paths(&png);
+        assert!(read(&flip_shader).contains("NORMAL_MAP = mix(") && read(&flip_scene).contains("shader_parameter/normal_map = ExtResource(\"4_normal\")"));
+        // Unity: the sprites carry it as _NormalMap, imported as a normal map.
+        let normal_meta = read(&unity_meta_path(&normal_path(&png)));
+        let normal_guid = meta_guid(&normal_meta).unwrap();
+        assert!(normal_meta.contains("textureType: 1") && normal_meta.contains("sRGBTexture: 0"));
+        assert!(read(&unity_meta_path(&png)).contains(&format!("    - name: _NormalMap\n      texture: {{fileID: 2800000, guid: {normal_guid}, type: 3}}")));
+        save(&frames, &output).unwrap();
+        assert_eq!(meta_guid(&read(&unity_meta_path(&normal_path(&png)))).unwrap(), normal_guid, "re-exports keep the link");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

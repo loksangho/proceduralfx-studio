@@ -7,12 +7,12 @@ use bevy::image::{CompressedImageFormats, ImageLoader};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::time::TimeUpdateStrategy;
-use bevy_procedural_fx::{Blend, FlipbookMaterial, FxFlipbook, FxSheet, ProceduralFxPlugin};
+use bevy_procedural_fx::{Blend, FlipbookMaterial, FxFlipbook, FxLight2d, FxSheet, ProceduralFxPlugin};
 use std::time::Duration;
 
 fn app() -> App {
     let mut app = App::new();
-    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ImagePlugin::default(), ProceduralFxPlugin))
+    app.add_plugins((MinimalPlugins, TransformPlugin, AssetPlugin::default(), ImagePlugin::default(), ProceduralFxPlugin))
         .register_asset_loader(ImageLoader::new(CompressedImageFormats::empty()))
         .init_asset::<Mesh>()
         .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(1.0 / 24.0)));
@@ -80,4 +80,29 @@ fn fades_and_one_shots() {
         app.update();
     }
     assert!(app.world().get_entity(fx).is_err(), "despawned after the last frame");
+}
+
+#[test]
+fn normal_maps_load_as_data_and_lights_light_flipbooks() {
+    let mut app = app();
+    let handle = load(&mut app);
+    let sheet = app.world().resource::<Assets<FxSheet>>().get(&handle).unwrap().clone();
+    let normals = sheet.normal_map.clone().expect("exported with a normal map");
+    let image = app.world().resource::<Assets<Image>>().get(&normals).unwrap();
+    assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba8Unorm, "numbers, not sRGB colour");
+    let settings = |app: &App, e: Entity| {
+        let material = app.world().get::<MeshMaterial2d<FlipbookMaterial>>(e).unwrap().0.clone();
+        app.world().resource::<Assets<FlipbookMaterial>>().get(&material).unwrap().settings
+    };
+    let lit = app.world_mut().spawn((FxFlipbook::looping(handle.clone()), Transform::from_xyz(100.0, 0.0, 0.0))).id();
+    let unlit = app.world_mut().spawn(FxFlipbook::looping(handle.clone()).unlit()).id();
+    app.update();
+    assert_eq!(settings(&app, lit).light_count, 0, "with no lights, drawn unlit");
+    app.world_mut().spawn((FxLight2d { radius: 300.0, height: 50.0, ..Default::default() }, Transform::from_xyz(-20.0, 30.0, 0.0)));
+    app.update();
+    app.update();
+    let s = settings(&app, lit);
+    assert_eq!(s.light_count, 1);
+    assert_eq!(s.light_positions[0], Vec4::new(-20.0, 30.0, 50.0, 300.0), "where it is, its height and reach");
+    assert_eq!(settings(&app, unlit).light_count, 0, "unlit stays unlit");
 }
