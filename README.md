@@ -117,6 +117,24 @@ empty cells, since particle systems play every cell. With Godot ticked it also w
 Texture Sheet Animation in Grid mode with the sheet's columns and rows, or in Sprites mode
 with the sliced sprites.
 
+## Vertex animation (VAT) for 3D games
+
+**Render → Export Vertex Animation…** bakes a deforming object over the playback range into
+vertex animation textures, so a 3D game plays the motion on the GPU for the cost of a texture
+read per vertex. It works for shapes whose points stay the same: cloth, deformers, wobbling or
+twisting shapes. (From the command line: `proceduralfx_studio vat scene.pfs out/name --godot --unity`.)
+
+You get `name.obj` (the first frame), `name_offsets.exr` and `name_normals.exr` (every frame,
+one texel per point), and `name.vat.json` describing the layout. Tick an engine for what it needs:
+
+- **Godot 4**: `name_vat.gdshader` and `name_vat_material.tres`, with import settings that keep
+  the textures exact. Put `name.obj` on a `MeshInstance3D` and set the material on it. It plays
+  by itself; turn off `use_time` and set `frame` to drive it from a script.
+- **Unity (URP)**: `name_vat.shader` and `name_vat.mat`, with import settings that keep the
+  textures exact. Export into your `Assets` folder, put `name.obj` in the scene and give it the
+  material. The project must use the Linear colour space (URP's default); in Gamma, the
+  mesh shows magenta.
+
 ## GIFs and movies
 
 The flipbook viewer's **Save GIF…** saves a looping GIF over a dark background, ready to post.

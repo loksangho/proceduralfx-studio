@@ -32,6 +32,13 @@ Renders a scene without opening a window.
       A looping GIF, or an MP4 movie (needs FFmpeg), over a dark background:
       for posting an effect online
 
+  proceduralfx_studio vat <scene.pfs> <out/name> [options]
+      Vertex animation textures for game engines: name.obj (the first frame),
+      name_offsets.exr and name_normals.exr (every frame), name.vat.json
+      --object <name>              the geometry object to bake (default: the first)
+      --godot                      also a Godot 4 shader and material
+      --unity                      also a Unity (URP) shader, material and import settings
+
   All of them:
       --frames <start> <end> [<step>]   a range of frames (default: the scene's timeline)
       --frame <n>                  one frame
@@ -49,6 +56,8 @@ pub enum Output {
     Frames { dir: Option<PathBuf> },
     // A GIF or MP4, by the file's extension.
     Animation { file: PathBuf },
+    // Vertex animation textures: name.obj, name_offsets.exr... beside `stem`.
+    Vat { stem: PathBuf, object: Option<String>, godot: bool, unity: bool },
     SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool, fill_grid: bool },
 }
 
@@ -65,7 +74,7 @@ pub struct Job {
 // A render command, if the arguments are one (None: start the app as usual).
 pub fn parse(args: &[String]) -> Option<Result<Job, String>> {
     let command = args.get(1)?.as_str();
-    if !matches!(command, "render" | "sprite-sheet" | "animation") {
+    if !matches!(command, "render" | "sprite-sheet" | "animation" | "vat") {
         return None;
     }
     Some(parse_job(command, &args[2..]))
@@ -73,7 +82,7 @@ pub fn parse(args: &[String]) -> Option<Result<Job, String>> {
 
 fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     let mut positional = Vec::new();
-    let (mut out, mut frames, mut size, mut camera) = (None, None, None, None);
+    let (mut out, mut frames, mut size, mut camera, mut object) = (None, None, None, None, None);
     let (mut every, mut columns, mut trim, mut seamless, mut blend) = (1, 0, true, false, 8);
     let (mut godot, mut unity, mut fill_grid) = (false, false, false);
     let mut i = 0;
@@ -119,6 +128,10 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
                 camera = Some(value(i, arg)?);
                 i += 1;
             }
+            "--object" => {
+                object = Some(value(i, arg)?);
+                i += 1;
+            }
             "--every" => {
                 every = count(&value(i, arg)?, arg)?;
                 i += 1;
@@ -143,11 +156,13 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     }
     let sheet = command == "sprite-sheet";
     let animation = command == "animation";
-    let wanted = if sheet || animation { 2 } else { 1 };
+    let vat = command == "vat";
+    let wanted = if sheet || animation || vat { 2 } else { 1 };
     if positional.len() != wanted {
         return Err(match command {
             "sprite-sheet" => "sprite-sheet needs a scene and the sheet to write: sprite-sheet <scene.pfs> <sheet.png>".into(),
             "animation" => "animation needs a scene and the file to write: animation <scene.pfs> <fire.gif>".into(),
+            "vat" => "vat needs a scene and the name to write: vat <scene.pfs> <out/name>".into(),
             _ => "render needs one scene: render <scene.pfs>".into(),
         });
     }
@@ -155,16 +170,26 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
         return Err("animation writes a .gif or an .mp4: end the file name with one of them".into());
     }
     let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless), ("--godot", godot), ("--unity", unity), ("--fill-grid", fill_grid)];
+    // --godot and --unity also go with vat.
+    let sheet_only: Vec<(&str, bool)> = sheet_only.into_iter().filter(|(flag, _)| !(vat && matches!(*flag, "--godot" | "--unity"))).collect();
     if !sheet {
         if let Some((flag, _)) = sheet_only.iter().find(|(_, set)| *set) {
             return Err(format!("{flag} is for sprite sheets"));
         }
     }
-    if (sheet || animation) && out.is_some() {
+    if object.is_some() && !vat {
+        return Err("--object is for vat".into());
+    }
+    if vat && (camera.is_some() || size.is_some()) {
+        return Err("vat bakes geometry, so it takes no --camera or --size".into());
+    }
+    if (sheet || animation || vat) && out.is_some() {
         return Err(format!("--out is for render; {} goes where its second argument says", if sheet { "a sprite sheet" } else { "an animation" }));
     }
     let scene = positional.remove(0);
-    let output = if animation {
+    let output = if vat {
+        Output::Vat { stem: positional.remove(0), object, godot, unity }
+    } else if animation {
         Output::Animation { file: positional.remove(0) }
     } else if sheet {
         Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend, godot, unity, fill_grid }
@@ -187,6 +212,9 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
     let text = std::fs::read_to_string(&job.scene).map_err(|e| format!("couldn't read {}: {e}", job.scene.display()))?;
     if let Some(problem) = scene_problem(&text) {
         return Err(format!("can't open {}: {problem}", job.scene.display()));
+    }
+    if let Output::Vat { stem, object, godot, unity } = &job.output {
+        return run_vat(job, text, stem, object.as_deref(), *godot, *unity, progress);
     }
     let gpu = gpu_viewport::headless().ok_or("no GPU was found for the real-time renderer")?;
     let mut app = ProceduralFxStudioApp::default();
@@ -267,6 +295,7 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
             app.flipbook_recording = Some(flipbook::Recording::new(times, app.time, Some(capture)));
             file.clone()
         }
+        Output::Vat { .. } => unreachable!("baked before the renderer starts"),
         Output::SpriteSheet { png, every, columns, trim, seamless, blend, godot, unity, fill_grid } => {
             let [width, height] = job.size.unwrap_or([256, 256]);
             app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend, godot: *godot, unity: *unity, fill_grid: *fill_grid };
@@ -292,6 +321,43 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
     }
     notes.insert(0, finished);
     Ok(notes.join("\n"))
+}
+
+// Bakes a geometry object's animation into vertex animation textures.
+fn run_vat(job: &Job, text: String, stem: &std::path::Path, object: Option<&str>, godot: bool, unity: bool, progress: &mut dyn FnMut(usize, usize)) -> Result<String, String> {
+    let mut app = ProceduralFxStudioApp::default();
+    app.use_saved_timeline(&text);
+    app.load_state(text);
+    if let Some((start, end, _)) = job.frames {
+        app.playback_start = (start - 1.0) / sims::SIM_FPS;
+        app.playback_end = (end - 1.0) / sims::SIM_FPS;
+    }
+    let objects: Vec<(NodeId, String)> = app.graph.geometry_ids().into_iter().map(|id| (id, app.graph.nodes[&id].title(id))).collect();
+    let id = match object {
+        Some(name) => objects.iter().find(|(_, t)| t == name).map(|(id, _)| *id).ok_or_else(|| {
+            format!("there's no geometry object called \"{name}\"; the scene's are {}", objects.iter().map(|(_, t)| format!("\"{t}\"")).collect::<Vec<_>>().join(", "))
+        })?,
+        None => objects.first().map(|(id, _)| *id).ok_or("the scene has no geometry objects to bake")?,
+    };
+    let step = job.frames.map_or(1.0, |f| f.2) / sims::SIM_FPS;
+    let times = frame_times(app.playback_start, app.playback_end, step);
+    let bake = vat::bake_object(&app.graph, id, &times, progress)?;
+    let fps = sims::SIM_FPS / job.frames.map_or(1.0, |f| f.2);
+    let (files, layout) = vat::write(&bake, stem, fps)?;
+    if godot {
+        vat::write_godot(&files, &layout, fps)?;
+    }
+    if unity {
+        vat::write_unity(&files, &layout, fps)?;
+    }
+    Ok(format!(
+        "Baked {} points over {} frames ({}×{} textures) to {}",
+        layout.points,
+        layout.frames,
+        layout.width,
+        layout.height(),
+        files.obj.with_file_name(format!("{}.*", files.name())).display()
+    ))
 }
 
 // The command-line entry point: Some(exit code) if the arguments were a render command.
@@ -373,6 +439,13 @@ mod tests {
         assert!(error("animation fire.pfs fire.png").contains(".gif or an .mp4"));
         assert!(error("animation fire.pfs fire.gif --out x").contains("an animation"));
         assert!(error("animation fire.pfs fire.gif --godot").contains("for sprite sheets"));
+        assert!(error("vat wave.pfs").contains("the name to write"));
+        assert!(error("vat wave.pfs out/wave --camera c").contains("no --camera"));
+        assert!(error("render wave.pfs --object wave").contains("--object is for vat"));
+        assert!(error("vat wave.pfs out/wave --fill-grid").contains("for sprite sheets"));
+        let job = parse(&args("vat wave.pfs out/wave --object wave --frames 1 48 2 --godot --unity")).unwrap().unwrap();
+        assert_eq!(job.output, Output::Vat { stem: "out/wave".into(), object: Some("wave".into()), godot: true, unity: true });
+        assert_eq!(job.frames, Some((1.0, 48.0, 2.0)));
         assert!(error("render fire.pfs --frame").contains("needs a value"));
         assert_eq!(main(&args("render")), Some(2));
         assert_eq!(main(&args("--help")), Some(0));

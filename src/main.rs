@@ -77,6 +77,7 @@ mod pop;
 mod promote;
 mod fluidsurface;
 mod updater;
+mod vat;
 mod vellum;
 mod usd;
 mod vex;
@@ -8820,6 +8821,27 @@ struct LiveSheet {
 }
 
 // How long the scene has to stay unchanged before a live sheet is exported again.
+// Whether the bake window has an object to bake.
+fn chosen_ok(objects: &[(NodeId, String)], default: Option<NodeId>, chosen: Option<NodeId>) -> bool {
+    chosen.filter(|o| objects.iter().any(|(id, _)| id == o)).or(default).is_some()
+}
+
+// The Export Vertex Animation window's choices.
+#[derive(Default)]
+struct VatWindow {
+    open: bool,
+    // The geometry object to bake (None: the one being viewed, or the first).
+    object: Option<NodeId>,
+    every: u32,
+    godot: bool,
+    unity: bool,
+}
+
+enum VatMessage {
+    Progress(usize, usize),
+    Done(Result<String, String>),
+}
+
 const LIVE_SHEET_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 // A scene's content regardless of line order (some parts are written from hash maps).
@@ -9957,6 +9979,9 @@ struct ProceduralFxStudioApp {
     moonray_default_samples: usize,
     show_moonray_settings: bool,
     sprite_sheet: spritesheet::Settings,
+    // The Export Vertex Animation window, and a bake running in the background.
+    vat_window: VatWindow,
+    vat_job: Option<mpsc::Receiver<VatMessage>>,
     // Exporting again as the scene changes (Export Sprite Sheet's "Keep updating").
     live_sheet: Option<LiveSheet>,
     // Render Settings dialog: used by toolbar renders; a selected render node overrides them.
@@ -10214,6 +10239,8 @@ impl Default for ProceduralFxStudioApp {
             moonray_default_samples: default_mr_s,
             show_moonray_settings: false,
             sprite_sheet: spritesheet::Settings::default(),
+            vat_window: VatWindow::default(),
+            vat_job: None,
             live_sheet: None,
             moonray_default_opts: RenderOpts::default(),
             render_to_temp: true,
@@ -11623,6 +11650,14 @@ impl ProceduralFxStudioApp {
             self.sprite_sheet.open = true;
             ui.close();
         }
+        if ui
+            .button("Export Vertex Animation…")
+            .on_hover_text("Bakes a deforming object (cloth, deformers, wobbling shapes) over the playback range into vertex animation textures, with shaders for Godot and Unity: the mesh moves on the GPU in the game")
+            .clicked()
+        {
+            self.vat_window.open = true;
+            ui.close();
+        }
         if ui.button("✨ AI").on_hover_text("Describe a setup and Claude builds it as nodes").clicked() {
             self.assistant.open = !self.assistant.open;
         }
@@ -12049,6 +12084,130 @@ impl ProceduralFxStudioApp {
     // The playback range's times for a sprite sheet: every Nth frame.
     fn sprite_sheet_times(&self) -> Vec<f32> {
         frame_times(self.playback_start, self.playback_end, self.sprite_sheet.every.max(1) as f32 / sims::SIM_FPS)
+    }
+
+    // The geometry object a bake uses by default: the one being viewed, else the first.
+    fn vat_default_object(&self) -> Option<NodeId> {
+        let objects = self.graph.geometry_ids();
+        // Up from the network being viewed to its object.
+        let mut at = self.current_network;
+        for _ in 0..64 {
+            match at.and_then(|n| self.graph.nodes.get(&n)).and_then(|n| n.parent) {
+                Some(parent) => at = Some(parent),
+                None => break,
+            }
+        }
+        at.filter(|o| objects.contains(o)).or_else(|| objects.first().copied())
+    }
+
+    fn vat_window(&mut self, ctx: &egui::Context) {
+        // A bake in the background: progress, then what it wrote.
+        if let Some(rx) = &self.vat_job {
+            loop {
+                match rx.try_recv() {
+                    Ok(VatMessage::Progress(done, total)) => self.status = format!("Baking vertex animation: frame {done} of {total}"),
+                    Ok(VatMessage::Done(result)) => {
+                        self.status = match result {
+                            Ok(summary) => summary,
+                            Err(e) => format!("Couldn't bake the vertex animation: {e}"),
+                        };
+                        self.vat_job = None;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.vat_job = None;
+                        break;
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if !self.vat_window.open {
+            return;
+        }
+        let objects: Vec<(NodeId, String)> = self.graph.geometry_ids().into_iter().map(|id| (id, self.graph.nodes[&id].title(id))).collect();
+        let default_object = self.vat_default_object();
+        let mut open = true;
+        let mut export = false;
+        let busy = self.vat_job.is_some();
+        let every = self.vat_window.every.max(1);
+        let count = frame_times(self.playback_start, self.playback_end, every as f32 / sims::SIM_FPS).len();
+        own_window(ctx, "export_vat", "Export Vertex Animation", [480.0, 360.0], [380.0, 260.0], &mut open, true, |ui| {
+            let w = &mut self.vat_window;
+            w.every = w.every.max(1);
+            ui.label("Bakes an object's motion over the playback range into vertex animation textures: the first frame as a mesh (OBJ), and every frame's point offsets and normals as textures (EXR). A shader in the game moves the mesh's points on the GPU.");
+            ui.small("For shapes whose points stay the same: cloth, deformers, wobbling or twisting shapes. Particles and fluids change their points, so they can't be baked this way.");
+            ui.add_space(4.0);
+            egui::Grid::new("vat_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("Object");
+                let chosen = w.object.filter(|o| objects.iter().any(|(id, _)| id == o)).or(default_object);
+                let title = objects.iter().find(|(id, _)| Some(*id) == chosen).map_or("(none)", |(_, t)| t.as_str());
+                egui::ComboBox::from_id_salt("vat_object").selected_text(title).show_ui(ui, |ui| {
+                    for (id, t) in &objects {
+                        if ui.selectable_label(chosen == Some(*id), t.as_str()).clicked() {
+                            w.object = Some(*id);
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Frames");
+                ui.horizontal(|ui| {
+                    ui.label("every");
+                    ui.add(egui::DragValue::new(&mut w.every).range(1..=100));
+                    ui.label(format!("frame{} of the playback range: {count} frame{}", if w.every == 1 { "" } else { "s" }, if count == 1 { "" } else { "s" }));
+                });
+                ui.end_row();
+                ui.label("Also for");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut w.godot, "Godot").on_hover_text("A spatial shader and a ShaderMaterial (name_vat_material.tres), with import settings that keep the textures exact. Put name.obj on a MeshInstance3D and the material on it.");
+                    ui.checkbox(&mut w.unity, "Unity").on_hover_text("A URP shader and material (name_vat.mat), with import settings that keep the textures exact. Put name.obj in the scene and the material on it. Needs the Linear colour space (URP's default).");
+                });
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy && chosen_ok(&objects, default_object, w.object) && count > 0, egui::Button::new("Export…")).clicked() {
+                    export = true;
+                }
+                if busy {
+                    ui.spinner();
+                    ui.weak("Baking…");
+                }
+            });
+        });
+        self.vat_window.open = open;
+        if !export {
+            return;
+        }
+        let Some(object) = self.vat_window.object.filter(|o| objects.iter().any(|(id, _)| id == o)).or(default_object) else { return };
+        let name = self.graph.nodes.get(&object).map_or_else(|| "vat".to_owned(), |n| n.title(object));
+        let Some(path) = FileDialog::new().set_title("Save the vertex animation").set_file_name(&format!("{name}.obj")).add_filter("OBJ mesh (with its textures beside it)", &["obj"]).save_file() else { return };
+        let stem = path.with_extension("");
+        let times = frame_times(self.playback_start, self.playback_end, every as f32 / sims::SIM_FPS);
+        let fps = sims::SIM_FPS / every as f32;
+        let (godot, unity) = (self.vat_window.godot, self.vat_window.unity);
+        let graph = self.graph.clone();
+        let (tx, rx) = mpsc::channel();
+        self.vat_job = Some(rx);
+        self.vat_window.open = false;
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let result = vat::bake_object(&graph, object, &times, &mut |done, total| {
+                let _ = progress_tx.send(VatMessage::Progress(done, total));
+            })
+            .and_then(|bake| vat::write(&bake, &stem, fps))
+            .and_then(|(files, layout)| {
+                if godot {
+                    vat::write_godot(&files, &layout, fps)?;
+                }
+                if unity {
+                    vat::write_unity(&files, &layout, fps)?;
+                }
+                Ok(format!("Baked {} points over {} frames to {} and its textures", layout.points, layout.frames, files.obj.display()))
+            });
+            let _ = tx.send(VatMessage::Done(result));
+        });
     }
 
     fn sprite_sheet_window(&mut self, ctx: &egui::Context) {
@@ -21166,6 +21325,7 @@ impl eframe::App for ProceduralFxStudioApp {
 
         self.render_settings_window(ctx);
         self.sprite_sheet_window(ctx);
+        self.vat_window(ctx);
         self.viewer.ui(ctx);
 
 
@@ -26243,3 +26403,23 @@ mod starter_assets {
     }
 }
 
+
+#[cfg(test)]
+mod vat_window_tests {
+    use super::*;
+
+    #[test]
+    fn the_export_vertex_animation_window_draws_and_picks_the_viewed_object() {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 8\nnode 2 240 20 0 obj geometry -1\nnode 3 40 20 0 obj sphere 0.5 8 12\nparent 1 0\nparent 3 2\ndisplay 0 1\ndisplay 2 3\nnext 4\n");
+        assert_eq!(app.vat_default_object(), Some(0), "the first object at the top");
+        app.current_network = Some(2);
+        assert_eq!(app.vat_default_object(), Some(2), "the one being viewed");
+        app.vat_window.open = true;
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.vat_window(ctx));
+        }
+        assert!(app.vat_window.open && app.vat_job.is_none());
+    }
+}
