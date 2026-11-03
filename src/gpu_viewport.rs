@@ -589,6 +589,8 @@ struct BlendTargets {
     accum: wgpu::TextureView,
     reveal: wgpu::TextureView,
     glow: wgpu::TextureView,
+    // The glow itself, for reading back (glow sheets).
+    glow_texture: wgpu::Texture,
     group: wgpu::BindGroup,
 }
 
@@ -940,6 +942,24 @@ impl GpuViewport {
         self.render_with(size, camera, false)
     }
 
+    // A finished frame, and its glow before the roll-off towards white (see the composite):
+    // what a glow sheet stores, in display encoding, one RGB per pixel. The frame holds
+    // 1 - exp(-glow) of it. None when nothing glows (no splats).
+    pub fn render_final_glow(&self, size: [u32; 2], camera: &Camera) -> (Vec<[u8; 4]>, Option<Vec<[f32; 3]>>) {
+        let size = [size[0].clamp(1, 16384), size[1].clamp(1, 16384)];
+        let target = Target::new(&self.render_state, size);
+        let blended = self.points.as_ref().is_some_and(|p| p.splats.is_some()).then(|| BlendTargets::new(&self.render_state, &self.composite_layout, size));
+        self.encode(camera, &target, blended.as_ref(), false);
+        let image = read_texture(&self.render_state, &target.texture, size);
+        let lost = blended.map(|b| {
+            read_halves(&self.render_state, &b.glow_texture, size)
+                .into_iter()
+                .map(|g| std::array::from_fn(|c| g[c].max(0.0)))
+                .collect()
+        });
+        (image, lost)
+    }
+
     fn render_with(&self, size: [u32; 2], camera: &Camera, edges: bool) -> Vec<[u8; 4]> {
         let size = [size[0].clamp(1, 16384), size[1].clamp(1, 16384)];
         let target = Target::new(&self.render_state, size);
@@ -1086,15 +1106,17 @@ impl BlendTargets {
     fn new(state: &egui_wgpu::RenderState, layout: &wgpu::BindGroupLayout, size: [u32; 2]) -> Self {
         let device = &state.device;
         let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
-        let view = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
-            device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: extent, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] }).create_view(&Default::default())
+        let texture = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: extent, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
         };
+        let view = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| texture(label, format, usage).create_view(&Default::default());
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         let depth = view("viewport splat depth", DEPTH, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let (accum, reveal, glow) = (view("viewport accum", ACCUM, usage), view("viewport reveal", REVEAL, usage), view("viewport glow", ACCUM, usage));
+        let glow_texture = texture("viewport glow", ACCUM, usage | wgpu::TextureUsages::COPY_SRC);
+        let (accum, reveal, glow) = (view("viewport accum", ACCUM, usage), view("viewport reveal", REVEAL, usage), glow_texture.create_view(&Default::default()));
         let entry = |binding, view| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) };
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("viewport composite"), layout, entries: &[entry(0, &accum), entry(1, &reveal), entry(2, &glow)] });
-        BlendTargets { size, depth, accum, reveal, glow, group }
+        BlendTargets { size, depth, accum, reveal, glow, glow_texture, group }
     }
 }
 
@@ -1117,6 +1139,28 @@ fn read_texture(state: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [
     let data = buffer.slice(..).get_mapped_range();
     let (row, w) = (row as usize, w as usize);
     (0..h as usize).flat_map(|y| (0..w).map(move |x| (y, x))).map(|(y, x)| std::array::from_fn(|c| data[y * row + x * 4 + c])).collect()
+}
+
+// An Rgba16Float texture's pixels as floats, row by row.
+fn read_halves(state: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2]) -> Vec<[f32; 4]> {
+    let [w, h] = size;
+    let row = (w * 8).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = state.device.create_buffer(&wgpu::BufferDescriptor { label: Some("viewport glow readback"), size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut encoder = state.device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    state.queue.submit([encoder.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    if state.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return vec![[0.0; 4]; (w * h) as usize];
+    }
+    let data = buffer.slice(..).get_mapped_range();
+    let (row, w) = (row as usize, w as usize);
+    let half = |i: usize| exr::prelude::f16::from_bits(u16::from_le_bytes([data[i], data[i + 1]])).to_f32();
+    (0..h as usize).flat_map(|y| (0..w).map(move |x| (y, x))).map(|(y, x)| std::array::from_fn(|c| half(y * row + x * 8 + c * 2))).collect()
 }
 
 fn texture_bind_group(state: &egui_wgpu::RenderState, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, source: &raster::Texture) -> wgpu::BindGroup {
@@ -1346,6 +1390,35 @@ mod tests {
         gpu.set_points(2, &[Point::new([0.0, 0.0, 2.0], 3.0, red, [0.0; 3])], &[], &[]);
         gpu.draw([20, 20], &straight_on());
         assert_eq!(read(&gpu)[10 * 20 + 10], [255, 255, 255, 255], "a point behind the surface is hidden");
+    }
+
+    #[test]
+    fn glow_sheets_read_back_the_glow_the_frame_rolls_off() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let smoke = |emission: [f32; 3]| Point::new([0.0, 0.0, 0.0], 2.0, [0.0, 0.0, 0.0, 0.5], emission);
+        gpu.set_scene(1, &[], &[], &[], &[], None);
+        // Not glowing: no glow anywhere.
+        gpu.set_points(1, &[], &[smoke([0.0; 3])], &[]);
+        let (_, glow) = gpu.render_final_glow([20, 20], &straight_on());
+        assert!(glow.expect("splats glow").iter().all(|g| g.iter().all(|c| *c == 0.0)));
+        // Glowing orange: the frame holds 1 - exp(-g) of the glow, the read-back has g itself,
+        // brighter than the frame can show.
+        gpu.set_points(2, &[], &[smoke([30.0, 12.0, 0.0])], &[]);
+        let (frame, glow) = gpu.render_final_glow([20, 20], &straight_on());
+        let g = glow.unwrap()[10 * 20 + 10];
+        let shown = frame[10 * 20 + 10];
+        assert!(g[0] > g[1] && g[1] > g[2] && g[2] == 0.0, "orange: {g:?}");
+        assert!(g[0] > 1.0, "brighter than white: {g:?}");
+        for c in 0..2 {
+            let rolled = ((1.0 - (-g[c]).exp()) * 255.0).round() as i32;
+            assert!((shown[c] as i32 - rolled).abs() <= 2, "the frame holds the rolled-off part: {shown:?} for {g:?}");
+        }
+        // Surfaces alone: nothing to read.
+        gpu.set_points(3, &[], &[], &[]);
+        assert!(gpu.render_final_glow([20, 20], &straight_on()).1.is_none());
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub struct Recording {
     pub times: Vec<f32>,
     pub next: usize,
     pub frames: Vec<egui::ColorImage>,
+    // Glow sheets: each frame's lost glow, encoded (see spritesheet::encode_glow).
+    pub glows: Vec<egui::ColorImage>,
     // A screenshot has been asked for and hasn't arrived yet.
     pub waiting: bool,
     // The time to go back to when done.
@@ -41,7 +43,7 @@ pub struct Capture {
 
 impl Recording {
     pub fn new(times: Vec<f32>, resume_time: f32, capture: Option<Capture>) -> Self {
-        Recording { times, next: 0, frames: Vec::new(), waiting: false, resume_time, capture }
+        Recording { times, next: 0, frames: Vec::new(), glows: Vec::new(), waiting: false, resume_time, capture }
     }
 }
 

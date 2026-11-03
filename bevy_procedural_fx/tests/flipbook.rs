@@ -106,3 +106,30 @@ fn normal_maps_load_as_data_and_lights_light_flipbooks() {
     assert_eq!(s.light_positions[0], Vec4::new(-20.0, 30.0, 50.0, 300.0), "where it is, its height and reach");
     assert_eq!(settings(&app, unlit).light_count, 0, "unlit stays unlit");
 }
+
+#[test]
+fn glow_sheets_load_and_set_their_strength() {
+    let mut app = app();
+    let handle: Handle<FxSheet> = app.world().resource::<AssetServer>().load("fx/campfire.pfx.json");
+    for _ in 0..500 {
+        app.update();
+        if app.world().resource::<AssetServer>().is_loaded_with_dependencies(&handle) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let sheet = app.world().resource::<Assets<FxSheet>>().get(&handle).expect("loaded").clone();
+    let glow = sheet.glow.clone().expect("exported as a glow sheet");
+    assert_eq!(app.world().resource::<Assets<Image>>().get(&glow).unwrap().texture_descriptor.format, TextureFormat::Rgba8Unorm, "numbers, not sRGB colour");
+    let fx = app.world_mut().spawn(FxFlipbook::looping(handle).with_glow(3.0)).id();
+    app.update();
+    let material = app.world().get::<MeshMaterial2d<FlipbookMaterial>>(fx).unwrap().0.clone();
+    let settings = app.world().resource::<Assets<FlipbookMaterial>>().get(&material).unwrap().settings;
+    assert_eq!((settings.glow, settings.has_glow), (3.0, 1));
+    // The smoke has no glow sheet.
+    let smoke = load(&mut app);
+    let plain = app.world_mut().spawn(FxFlipbook::looping(smoke)).id();
+    app.update();
+    let material = app.world().get::<MeshMaterial2d<FlipbookMaterial>>(plain).unwrap().0.clone();
+    assert_eq!(app.world().resource::<Assets<FlipbookMaterial>>().get(&material).unwrap().settings.has_glow, 0);
+}

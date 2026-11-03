@@ -91,6 +91,9 @@ pub struct FxSheet {
     /// Each frame's shape, if the sheet was exported with a normal map (loaded as data):
     /// [`FxFlipbook`] lights it with [`FxLight2d`]s.
     pub normal_map: Option<Handle<Image>>,
+    /// Glow too bright for the sheet's colour, if exported as a glow sheet (loaded as data):
+    /// [`FxFlipbook`] adds it back, for bloom.
+    pub glow: Option<Handle<Image>>,
 }
 
 /// A sheet's motion vectors (`name_motion.png`), laid out like the sheet.
@@ -229,6 +232,8 @@ struct SheetFile {
     motion_vectors: Option<MotionFile>,
     #[serde(default)]
     normal_map: Option<NormalFile>,
+    #[serde(default)]
+    glow: Option<NormalFile>,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +317,13 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
         }
         None => None,
     };
+    let glow = match &file.glow {
+        Some(g) => {
+            let path = load_context.path().resolve_embed_str(&g.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
+            Some(load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.is_srgb = false).load(path))
+        }
+        None => None,
+    };
     Ok(FxSheet {
         image: load_context.load(image_path),
         layout: load_context.add_labeled_asset("layout", layout),
@@ -324,6 +336,7 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
         rows,
         motion,
         normal_map,
+        glow,
     })
 }
 
@@ -344,6 +357,7 @@ mod tests {
             rows: 2,
             motion: None,
             normal_map: None,
+            glow: None,
         }
     }
 

@@ -18,9 +18,10 @@ use crate::{FxSheet, Playback};
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::render::render_resource::{AsBindGroup, BlendState, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError};
 use bevy::shader::ShaderRef;
-use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dPlugin};
+use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPipeline, Material2dPlugin};
 
 const SHADER: &str = "embedded://bevy_procedural_fx/flipbook.wesl";
 
@@ -65,11 +66,15 @@ pub struct FxFlipbook {
     /// Lit by [`FxLight2d`]s, when the sheet has a normal map and there are any lights.
     /// Turn it off for effects that glow, such as fire, which light shouldn't darken.
     pub lit: bool,
+    /// How strongly a glow sheet's glow shows: 1 at full brightness (more than the sheet's
+    /// colour alone holds), more for stronger bloom, 0 for none at all. Bloom needs `Hdr`
+    /// and `Bloom` on the camera.
+    pub glow: f32,
 }
 
 impl FxFlipbook {
     pub fn new(sheet: Handle<FxSheet>, playback: Playback) -> Self {
-        FxFlipbook { sheet, playback, blend: Blend::Motion, speed: 1.0, elapsed: 0.0, paused: false, color: Color::WHITE, lit: true }
+        FxFlipbook { sheet, playback, blend: Blend::Motion, speed: 1.0, elapsed: 0.0, paused: false, color: Color::WHITE, lit: true, glow: 1.0 }
     }
 
     pub fn looping(sheet: Handle<FxSheet>) -> Self {
@@ -97,6 +102,12 @@ impl FxFlipbook {
 
     pub fn with_color(mut self, color: Color) -> Self {
         self.color = color;
+        self
+    }
+
+    /// How strongly a glow sheet glows (1: as rendered).
+    pub fn with_glow(mut self, glow: f32) -> Self {
+        self.glow = glow;
         self
     }
 
@@ -159,6 +170,10 @@ pub struct FlipbookMaterial {
     #[texture(5)]
     #[sampler(6)]
     pub normal_map: Handle<Image>,
+    /// The glow sheet; the sheet itself when there's none (it's then unused).
+    #[texture(7)]
+    #[sampler(8)]
+    pub glow: Handle<Image>,
 }
 
 /// What the shader needs to know, and the frame to show.
@@ -181,6 +196,9 @@ pub struct FlipbookSettings {
     pub light_positions: [Vec4; MAX_LIGHTS],
     /// Each light's colour times its intensity.
     pub light_colors: [Vec4; MAX_LIGHTS],
+    /// The glow sheet's strength (1: as rendered), and whether there is one.
+    pub glow: f32,
+    pub has_glow: u32,
 }
 
 impl Material2d for FlipbookMaterial {
@@ -190,6 +208,15 @@ impl Material2d for FlipbookMaterial {
 
     fn alpha_mode(&self) -> AlphaMode2d {
         AlphaMode2d::Blend
+    }
+
+    // The shader returns premultiplied colour, so glow can add light where the effect is
+    // faint.
+    fn specialize(_: &Material2dPipeline, descriptor: &mut RenderPipelineDescriptor, _: &MeshVertexBufferLayoutRef, _: Material2dKey<Self>) -> Result<(), SpecializedMeshPipelineError> {
+        if let Some(target) = descriptor.fragment.as_mut().and_then(|f| f.targets.first_mut()).and_then(|t| t.as_mut()) {
+            target.blend = Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        }
+        Ok(())
     }
 }
 
@@ -216,10 +243,13 @@ impl FlipbookMaterial {
                 ambient: Vec4::ONE,
                 light_positions: [Vec4::ZERO; MAX_LIGHTS],
                 light_colors: [Vec4::ZERO; MAX_LIGHTS],
+                glow: fx.glow.max(0.0),
+                has_glow: sheet.glow.is_some() as u32,
             },
             sheet: sheet.image.clone(),
             motion: motion.map_or_else(|| sheet.image.clone(), |m| m.image.clone()),
             normal_map: sheet.normal_map.clone().unwrap_or_else(|| sheet.image.clone()),
+            glow: sheet.glow.clone().unwrap_or_else(|| sheet.image.clone()),
         }
     }
 }
@@ -286,10 +316,11 @@ fn play(
             Some(handle) => {
                 let mut material = materials.get_mut(&handle).expect("checked above");
                 material.settings = settings.settings;
-                if material.sheet != settings.sheet || material.motion != settings.motion || material.normal_map != settings.normal_map {
+                if material.sheet != settings.sheet || material.motion != settings.motion || material.normal_map != settings.normal_map || material.glow != settings.glow {
                     material.sheet = settings.sheet;
                     material.motion = settings.motion;
                     material.normal_map = settings.normal_map;
+                    material.glow = settings.glow;
                 }
             }
             None => {

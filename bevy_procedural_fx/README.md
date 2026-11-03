@@ -1,7 +1,7 @@
 # bevy_procedural_fx
 
 Play effects exported from [ProceduralFX Studio](https://github.com/loksangho/proceduralfx-studio) in [Bevy](https://bevy.org):
-sprite sheets for 2D (played smoothly with motion vectors, and lit by 2D lights), and [vertex animation](#vertex-animation-for-3d) for 3D cloth,
+sprite sheets for 2D (played smoothly with motion vectors, lit by 2D lights, and glowing under bloom), and [vertex animation](#vertex-animation-for-3d) for 3D cloth,
 destruction and liquids.
 
 ![An effect re-exported from ProceduralFX Studio updating live in a running Bevy game](https://raw.githubusercontent.com/loksangho/proceduralfx-studio/main/bevy_procedural_fx/docs/live.gif)
@@ -121,6 +121,21 @@ grey unless you set it). Without any lights, flipbooks are drawn unlit. For effe
 glow, such as fire, use `.unlit()`. Rotating a lit flipbook doesn't turn its normals yet, so
 light it unrotated.
 
+## Glow for bloom
+
+Fire, sparks and spells glow brighter than a PNG can hold, so the sheet rolls their glow off
+towards white. Tick **Glow sheet** when you export, and ProceduralFX Studio also writes
+`campfire_glow.png`: the glow itself, at any brightness. An `FxFlipbook` puts it back, so
+with bloom on the camera the hot parts glow:
+
+```rust
+commands.spawn((Camera2d, Hdr, Bloom::default()));
+commands.spawn(FxFlipbook::looping(assets.load("fx/campfire.pfx.json")).with_glow(2.0));
+```
+
+`with_glow(1.0)` (the default) shows the glow as it was rendered, more makes it stronger,
+and `0.0` takes it away.
+
 ## Vertex animation for 3D
 
 Simulations are too slow to run in a game, so you bake them. In ProceduralFX Studio,
@@ -180,6 +195,7 @@ bevy_procedural_fx = { version = "0.3", default-features = false, features = ["f
 cargo run --example fire
 cargo run --example flipbook
 cargo run --example lit
+cargo run --example glow
 cargo run --example vat
 ```
 
@@ -190,6 +206,8 @@ one-shot bursts.
 whole frames, cross-faded, and following its motion vectors.
 
 `lit` lights the smoke with a warm light that follows the mouse, and a cool one.
+
+`glow` shows a campfire under bloom with no glow, as rendered, and three times as strong.
 
 `vat` shows a rippling sheet (soft) beside a box that has broken apart (rigid). Press
 Space to break another one.
@@ -208,6 +226,7 @@ Space to break another one.
 | `frames` | Each frame's `[x, y, width, height]` in the PNG |
 | `source_size`, `offset` | The size each frame was rendered at, and where the cropped frame's top-left corner was in it |
 | `normal_map` | If exported with one: `image`, laid out like the sheet, in tangent space with red right, green up and blue towards the viewer, each `(n + 1) / 2` |
+| `glow` | If exported as a glow sheet: `image`, laid out like the sheet. Each channel holds the glow `g` as `g / (1 + g)`; the sheet's colour already holds `1 - exp(-g)` of it, so add `g * strength - (1 - exp(-g))` |
 | `motion_vectors` | If exported with them: `image` (laid out like the sheet), `strength` and `looping`. Red and green hold each pixel's shift to the next frame, across and down, in fractions of a frame: `(value - 0.5) * 2 * strength` |
 
 ## Bevy versions

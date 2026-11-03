@@ -140,11 +140,27 @@ glowing effects such as fire unlit.
 
 - **Bevy**: `FxFlipbook` from [bevy_procedural_fx](bevy_procedural_fx) 0.3 is lit by
   `FxLight2d` lights.
-- **Godot 4** (with Godot ticked): put `name_lit.tres` on the AnimatedSprite2D playing
+- **Godot 4** (with Godot ticked): put `name_sprite.tres` on the AnimatedSprite2D playing
   `name.tres`; `name_flipbook.tscn` (with motion vectors) is lit too. Light2D does the rest.
   Raise a light's height to light the effect's front more.
 - **Unity** (with Unity ticked): the sliced sprites carry the normal map as their `_NormalMap`,
   so URP's 2D lights use it with the Sprite-Lit-Default material.
+
+## Glow for bloom
+
+Fire, sparks and spells glow brighter than a PNG can hold, so the sheet rolls their glow
+off towards white. Tick **Glow sheet** in **Export Sprite Sheet…** (or pass `--glow`) and the
+export also writes `name_glow.png`: the glow itself, at any brightness. A game puts it back
+at full brightness, or stronger, so its bloom makes the hot parts glow. The sheet's own
+colour is unchanged, so it still works without it.
+
+- **Bevy**: `FxFlipbook` from [bevy_procedural_fx](bevy_procedural_fx) 0.3 adds it;
+  `.with_glow(3.0)` for more. Put `Hdr` and `Bloom` on the camera.
+- **Godot 4** (with Godot ticked): `name_sprite.tres` for the AnimatedSprite2D, and the
+  flipbook scene with motion vectors, both with a `glow_strength`. Turn on HDR 2D (Project
+  Settings → Rendering → Viewport) and glow in a WorldEnvironment.
+- **Unity** (with Unity and Motion vectors ticked): the flipbook material's *Glow strength*.
+  Turn on HDR and Bloom.
 
 ## Vertex animation (VAT) for 3D games
 

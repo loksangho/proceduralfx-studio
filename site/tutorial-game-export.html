@@ -96,11 +96,20 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 <p>Tick <b>Normal map</b> under <b>Lighting</b>, and the export also writes <code>fire_normal.png</code>: each frame's shape, read from how opaque it is. Your game's 2D lights then light the effect from their side, so smoke looks like a soft puff rather than a flat picture. It suits smoke, dust and clouds; leave glowing effects such as fire unlit.</p>
 <ul>
 <li><b>Bevy:</b> spawn <code>FxLight2d</code> lights. Every <code>FxFlipbook</code> whose sheet has a normal map is lit by them (bevy_procedural_fx 0.3).</li>
-<li><b>Godot:</b> with Godot ticked, put <code>fire_lit.tres</code> on the AnimatedSprite2D as its material, and add a <b>PointLight2D</b>. The flipbook scene is lit too. Raise the light's <b>Height</b> to light the front more.</li>
+<li><b>Godot:</b> with Godot ticked, put <code>fire_sprite.tres</code> on the AnimatedSprite2D as its material, and add a <b>PointLight2D</b>. The flipbook scene is lit too. Raise the light's <b>Height</b> to light the front more.</li>
 <li><b>Unity:</b> with Unity ticked, the sliced sprites already carry the normal map. With URP's 2D Renderer, use the <b>Sprite-Lit-Default</b> material and add a <b>Light 2D</b>.</li>
 </ul>
 
-<h2>8. Keep it updating while your game runs</h2>
+<h2>8. Make it glow</h2>
+<p class="soon">Coming in the next update: glow sheets aren't in version 0.21 yet.</p>
+<p>A flame's core is brighter than a PNG can hold, so the sheet rolls it off to white, and a game's bloom can't tell it from white smoke. Tick <b>Glow sheet</b> under <b>Glow</b>, and the export also writes <code>fire_glow.png</code>: the glow itself, at any brightness. Your game puts it back, at full strength or stronger, and its bloom makes the hot parts glow. The sheet itself is unchanged, so it still works without it.</p>
+<ul>
+<li><b>Bevy:</b> <code>FxFlipbook</code> adds it (<code>.with_glow(2.0)</code> for more). Put <code>Hdr</code> and <code>Bloom</code> on the camera.</li>
+<li><b>Godot:</b> with Godot ticked, <code>fire_sprite.tres</code> (for the AnimatedSprite2D) and the flipbook scene add it, with a <b>glow_strength</b>. Turn on <b>HDR 2D</b> in Project Settings → Rendering → Viewport, and glow in a WorldEnvironment.</li>
+<li><b>Unity:</b> with Unity and Motion vectors ticked, set the flipbook material's <b>Glow strength</b>. Turn on HDR and Bloom.</li>
+</ul>
+
+<h2>9. Keep it updating while your game runs</h2>
 <p>Tick <b>Keep updating</b> under <b>Live</b> before you export. From then on, the app exports again a moment after every change. A Bevy game run with Bevy's <code>file_watcher</code> feature shows the change while it runs. Godot and Unity pick up the new files when you switch back to their window.</p>
 
 <h2>Share it</h2>

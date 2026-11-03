@@ -12339,8 +12339,15 @@ impl ProceduralFxStudioApp {
                 ui.label("Lighting");
                 ui.checkbox(&mut s.normal_map, "Normal map").on_hover_text(
                     "Also writes name_normal.png: each frame's shape, read from how opaque it is, so a game's 2D lights light the effect from their side. \
-                     Suits smoke, dust and clouds. With Godot ticked, the sheet comes wrapped with it for Light2D; with Unity ticked, the sliced sprites get it as their \
+                     Suits smoke, dust and clouds. With Godot ticked, name_sprite.tres (for the AnimatedSprite2D) gives it to Light2D; with Unity ticked, the sliced sprites get it as their \
                      _NormalMap, for URP's 2D lights. bevy_procedural_fx lights an FxFlipbook with FxLight2d lights.",
+                );
+                ui.end_row();
+                ui.label("Glow");
+                ui.checkbox(&mut s.glow, "Glow sheet").on_hover_text(
+                    "Also writes name_glow.png: the light of glowing parts (fire, sparks, spells), which the sheet itself rolls off towards white. \
+                     Games put it back at full brightness, or stronger, so their bloom makes the hot parts glow. bevy_procedural_fx's FxFlipbook adds it (turn on HDR and Bloom on the camera); \
+                     with Godot or Unity ticked as well as Motion vectors, their flipbook shaders do too.",
                 );
                 ui.end_row();
                 ui.label("Trim");
@@ -12449,7 +12456,7 @@ impl ProceduralFxStudioApp {
             self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
         }
         let s = &self.sprite_sheet;
-        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity, fill_grid: s.fill_grid, motion_vectors: s.motion_vectors, normal_map: s.normal_map };
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity, fill_grid: s.fill_grid, motion_vectors: s.motion_vectors, normal_map: s.normal_map, glow: s.glow };
         let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output), preview: None };
         self.render_camera_in_use();
         self.animate = false;
@@ -12468,7 +12475,7 @@ impl ProceduralFxStudioApp {
             self.playback_start, self.playback_end, s.width, s.height, s.every, s.columns
         )
         .hash(&mut hasher);
-        (s.trim, s.seamless, s.blend, s.godot, s.unity, s.fill_grid, s.motion_vectors, s.normal_map).hash(&mut hasher);
+        (s.trim, s.seamless, s.blend, s.godot, s.unity, s.fill_grid, s.motion_vectors, s.normal_map, s.glow).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -12587,7 +12594,8 @@ impl ProceduralFxStudioApp {
                 self.flipbook_viewer = Some(flipbook::Viewer::new(frames, times, sims::SIM_FPS / self.sprite_sheet.every.max(1) as f32));
             } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
                 let cut_off = cut_off();
-                self.status = match spritesheet::save(&done.frames, &output) {
+                let glows = (output.glow && done.glows.len() == done.frames.len()).then_some(&done.glows[..]);
+                self.status = match spritesheet::save_with_glow(&done.frames, glows, &output) {
                     Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}{cut_off}", png.display()),
                     Ok((png, sheet)) => {
                         // With Live on, the game shows the effect: don't open a window over it.
@@ -20527,7 +20535,14 @@ impl ProceduralFxStudioApp {
                     let frame = match render_camera {
                         // Transparent where empty (premultiplied, as egui images are).
                         Some((render, size)) => {
-                            let pixels = gpu.render_final(size, &render);
+                            let wants_glow = self.flipbook_recording.as_ref().and_then(|r| r.capture.as_ref()).and_then(|c| c.sheet.as_ref()).is_some_and(|o| o.glow);
+                            let (pixels, glow) = if wants_glow { gpu.render_final_glow(size, &render) } else { (gpu.render_final(size, &render), None) };
+                            if wants_glow {
+                                let glow = spritesheet::encode_glow([size[0] as usize, size[1] as usize], glow.as_deref());
+                                if let Some(recording) = self.flipbook_recording.as_mut() {
+                                    recording.glows.push(glow);
+                                }
+                            }
                             egui::ColorImage::new([size[0] as usize, size[1] as usize], pixels.into_iter().map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(r, g, b, a)).collect())
                         }
                         // The viewport's view, at most flipbook::MAX_WIDTH wide, over its background.

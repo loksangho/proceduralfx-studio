@@ -27,6 +27,9 @@ struct FlipbookSettings {
     // World position (z: height) and radius; colour times intensity.
     light_positions: array<vec4<f32>, 8>,
     light_colors: array<vec4<f32>, 8>,
+    // The glow sheet's strength (1: as rendered), and whether there is one.
+    glow: f32,
+    has_glow: u32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> settings: FlipbookSettings;
@@ -36,6 +39,16 @@ struct FlipbookSettings {
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var motion_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var normal_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(6) var normal_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(7) var glow_sheet: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(8) var glow_sampler: sampler;
+
+// The light a glow sheet adds at `strength`: its glow g (stored as g / (1 + g)) that many
+// times over, less the 1 - exp(-g) of it the sheet's colour already holds.
+fn glow_light(x: vec3<f32>, strength: f32) -> vec3<f32> {
+    let c = min(x, vec3<f32>(254.0 / 255.0));
+    let g = c / (vec3<f32>(1.0) - c);
+    return g * strength - (vec3<f32>(1.0) - exp(-g));
+}
 
 // The light reaching a surface facing `n` (red right, green up, blue out of the screen)
 // at `at`, from the ambient and each light.
@@ -97,6 +110,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let n = normalize(encoded * 2.0 - vec3<f32>(1.0));
         out = vec4<f32>(out.rgb * lighting(n, in.world_position.xyz), out.a);
     }
+    // Premultiplied (the pipeline blends it so), with the glow's light on top.
+    var light = vec3<f32>(0.0);
+    if settings.has_glow != 0u {
+        let encoded = mix(textureSample(glow_sheet, glow_sampler, ua).rgb, textureSample(glow_sheet, glow_sampler, ub).rgb, t);
+        light = glow_light(encoded, settings.glow) * settings.color.a;
+    }
+    out = vec4<f32>(max(out.rgb * out.a + light, vec3<f32>(0.0)), out.a);
 @if(TONEMAP_IN_SHADER)
     out = tonemapping::tone_mapping(out, view.color_grading);
 @if(SRGB_OUTPUT)
