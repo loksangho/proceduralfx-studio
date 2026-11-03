@@ -95,25 +95,52 @@ pub fn info_line(name: &str, version: u32, description: &str) -> String {
 
 pub const EXTENSION: &str = "pfxasset";
 
-// An asset in the library.
+// The assets that come with the app (made by `write_starter_assets`).
+pub const BUILT_IN: &[&str] = &[
+    include_str!("../assets/library/sparks.pfxasset"),
+    include_str!("../assets/library/spark_burst.pfxasset"),
+    include_str!("../assets/library/smoke_puff.pfxasset"),
+    include_str!("../assets/library/debris.pfxasset"),
+];
+
+// An asset in the library: a file in the assets folder, or one built into the app.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub name: String,
     pub version: u32,
     pub description: String,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
+    pub built_in: Option<&'static str>,
 }
 
-// The assets in a folder, by name. A name in two files keeps the higher version.
-pub fn library(dir: &Path) -> Vec<Entry> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+impl Entry {
+    pub fn text(&self) -> Result<String, String> {
+        match (&self.path, self.built_in) {
+            (Some(path), _) => std::fs::read_to_string(path).map_err(|e| e.to_string()),
+            (None, Some(text)) => Ok(text.to_owned()),
+            (None, None) => Err("it has no file".into()),
+        }
+    }
+}
+
+// The built-in assets and those in the assets folder, by name. A name found twice keeps
+// the higher version, so saving a built-in asset again replaces it with yours.
+pub fn library(dir: Option<&Path>) -> Vec<Entry> {
     let mut found: Vec<Entry> = Vec::new();
-    for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == EXTENSION)) {
-        let Some((name, version, description)) = std::fs::read_to_string(&path).ok().and_then(|t| info(&t)) else { continue };
-        match found.iter_mut().find(|e| e.name == name) {
-            Some(existing) if existing.version >= version => {}
-            Some(existing) => *existing = Entry { name, version, description, path },
-            None => found.push(Entry { name, version, description, path }),
+    let mut add = |entry: Entry| match found.iter_mut().find(|e| e.name == entry.name) {
+        Some(existing) if existing.version >= entry.version => {}
+        Some(existing) => *existing = entry,
+        None => found.push(entry),
+    };
+    for text in BUILT_IN {
+        if let Some((name, version, description)) = info(text) {
+            add(Entry { name, version, description, path: None, built_in: Some(text) });
+        }
+    }
+    if let Some(entries) = dir.and_then(|d| std::fs::read_dir(d).ok()) {
+        for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == EXTENSION)) {
+            let Some((name, version, description)) = std::fs::read_to_string(&path).ok().and_then(|t| info(&t)) else { continue };
+            add(Entry { name, version, description, path: Some(path), built_in: None });
         }
     }
     found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -156,9 +183,10 @@ mod tests {
         std::fs::write(dir.join("b.pfxasset"), format!("pfs 2\n{}", info_line("Rocks", 2, "new"))).unwrap();
         std::fs::write(dir.join("c.pfxasset"), format!("pfs 2\n{}", info_line("bush", 1, ""))).unwrap();
         std::fs::write(dir.join("d.pfs"), "pfs 2\n").unwrap();
-        let found = library(&dir);
+        let found: Vec<Entry> = library(Some(&dir)).into_iter().filter(|e| e.built_in.is_none()).collect();
         assert_eq!(found.iter().map(|e| (e.name.as_str(), e.version)).collect::<Vec<_>>(), vec![("bush", 1), ("Rocks", 2)]);
         assert_eq!(found[1].description, "new");
+        assert_eq!(found[1].text().unwrap(), format!("pfs 2\n{}", info_line("Rocks", 2, "new")));
         assert_eq!(file_name("Rock pile / v2"), "Rock_pile___v2.pfxasset");
         let _ = std::fs::remove_dir_all(&dir);
     }
