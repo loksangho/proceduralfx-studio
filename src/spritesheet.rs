@@ -32,11 +32,14 @@ pub struct Settings {
     // Cross-fade the end into the start over `blend` frames.
     pub seamless: bool,
     pub blend: u32,
+    // Also write what Godot and Unity need to play it (see `godot_sprite_frames`, `unity_meta`).
+    pub godot: bool,
+    pub unity: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8 }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false }
     }
 }
 
@@ -58,6 +61,8 @@ pub struct Output {
     pub live: bool,
     // The last `blend` frames were rendered past the end, to cross-fade into the start.
     pub blend: usize,
+    pub godot: bool,
+    pub unity: bool,
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -207,7 +212,233 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
     let partial = png.with_extension("pfx.json.partial");
     std::fs::write(&partial, json + "\n").map_err(|e| e.to_string())?;
     std::fs::rename(&partial, json_path(&png)).map_err(|e| e.to_string())?;
+    let count = frames.len();
+    if output.godot {
+        write_beside(&godot_path(&png), &godot_sprite_frames(&sheet, &name, count, output.fps))?;
+    }
+    if output.unity {
+        let meta = unity_meta_path(&png);
+        // Re-exports keep the same guid, so Unity keeps what uses the sprites.
+        let guid = std::fs::read_to_string(&meta).ok().and_then(|text| meta_guid(&text)).unwrap_or_else(|| new_guid(&png));
+        write_beside(&meta, &unity_meta(&sheet, &name, count, &guid))?;
+    }
     Ok((png, sheet))
+}
+
+fn write_beside(path: &Path, text: &str) -> Result<(), String> {
+    let partial = path.with_extension("partial");
+    std::fs::write(&partial, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, path).map_err(|e| e.to_string())
+}
+
+// name.tres beside name.png: a Godot 4 SpriteFrames resource.
+pub fn godot_path(png: &Path) -> PathBuf {
+    png.with_extension("tres")
+}
+
+// name.png.meta: Unity's import settings for name.png.
+pub fn unity_meta_path(png: &Path) -> PathBuf {
+    let mut name = png.as_os_str().to_owned();
+    name.push(".meta");
+    PathBuf::from(name)
+}
+
+// The frames' rectangles in the sheet, left to right, top to bottom: [x, y, width, height]
+// from the top-left corner.
+fn frame_rects(sheet: &Sheet, count: usize) -> Vec<[u32; 4]> {
+    let [w, h] = sheet.cell;
+    (0..count as u32).map(|i| [(i % sheet.columns) * w, (i / sheet.columns) * h, w, h]).collect()
+}
+
+// A Godot 4 SpriteFrames resource playing the sheet's frames, looping, at its frame rate:
+// put it on an AnimatedSprite2D (or AnimatedSprite3D). The sheet is found beside it.
+pub fn godot_sprite_frames(sheet: &Sheet, image_name: &str, count: usize, fps: f32) -> String {
+    let rects = frame_rects(sheet, count);
+    let mut out = format!("[gd_resource type=\"SpriteFrames\" load_steps={} format=3]\n\n", rects.len() + 2);
+    out += &format!("[ext_resource type=\"Texture2D\" path=\"{image_name}\" id=\"1_sheet\"]\n\n");
+    for (i, [x, y, w, h]) in rects.iter().enumerate() {
+        out += &format!("[sub_resource type=\"AtlasTexture\" id=\"AtlasTexture_{i}\"]\natlas = ExtResource(\"1_sheet\")\nregion = Rect2({x}, {y}, {w}, {h})\n\n");
+    }
+    let frames: Vec<String> = (0..rects.len()).map(|i| format!("{{\n\"duration\": 1.0,\n\"texture\": SubResource(\"AtlasTexture_{i}\")\n}}")).collect();
+    out += &format!("[resource]\nanimations = [{{\n\"frames\": [{}],\n\"loop\": true,\n\"name\": &\"default\",\n\"speed\": {fps:.1}\n}}]\n", frames.join(", "));
+    out
+}
+
+// A 32-hex-digit id Unity uses for assets and sprites, from a name (so the same name gives
+// the same id, and nothing random is needed).
+fn hex_id(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(seed.as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn new_guid(png: &Path) -> String {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    hex_id(&format!("{}:{stamp}", png.display()))
+}
+
+fn meta_guid(text: &str) -> Option<String> {
+    text.lines().find_map(|l| l.strip_prefix("guid: ")).map(|g| g.trim().to_owned()).filter(|g| g.len() == 32 && g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+// Unity's import settings for the sheet: a sprite texture sliced into one sprite per frame
+// (name_0, name_1...), uncompressed, without mipmaps, and not shrunk below its size. In
+// Unity, select the sprites and drag them into the scene to make an animation.
+pub fn unity_meta(sheet: &Sheet, image_name: &str, count: usize, guid: &str) -> String {
+    let stem = image_name.strip_suffix(".png").unwrap_or(image_name);
+    let height = sheet.image.height();
+    let size = sheet.image.width().max(height).next_power_of_two().clamp(32, MAX_SIDE);
+    let sprites: Vec<(String, [u32; 4], i64)> = frame_rects(sheet, count)
+        .into_iter()
+        .enumerate()
+        .map(|(i, [x, y, w, h])| {
+            let name = format!("{stem}_{i}");
+            // Unity's rectangles start at the bottom left.
+            let id = i64::from_str_radix(&hex_id(&name)[..15], 16).unwrap_or(i as i64 + 1);
+            (name, [x, height - y - h, w, h], id)
+        })
+        .collect();
+    let mut out = format!(
+        "fileFormatVersion: 2
+guid: {guid}
+TextureImporter:
+  internalIDToNameTable: []
+  externalObjects: {{}}
+  serializedVersion: 13
+  mipmaps:
+    mipMapMode: 0
+    enableMipMap: 0
+    sRGBTexture: 1
+    linearTexture: 0
+    fadeOut: 0
+    borderMipMap: 0
+    mipMapsPreserveCoverage: 0
+    alphaTestReferenceValue: 0.5
+    mipMapFadeDistanceStart: 1
+    mipMapFadeDistanceEnd: 3
+  bumpmap:
+    convertToNormalMap: 0
+    externalNormalMap: 0
+    heightScale: 0.25
+    normalMapFilter: 0
+    flipGreenChannel: 0
+  isReadable: 0
+  streamingMipmaps: 0
+  streamingMipmapsPriority: 0
+  vTOnly: 0
+  ignoreMipmapLimit: 0
+  grayScaleToAlpha: 0
+  generateCubemap: 6
+  cubemapConvolution: 0
+  seamlessCubemap: 0
+  textureFormat: 1
+  maxTextureSize: {size}
+  textureSettings:
+    serializedVersion: 2
+    filterMode: 1
+    aniso: 1
+    mipBias: 0
+    wrapU: 1
+    wrapV: 1
+    wrapW: 1
+  nPOTScale: 0
+  lightmap: 0
+  compressionQuality: 50
+  spriteMode: 2
+  spriteExtrude: 1
+  spriteMeshType: 0
+  alignment: 0
+  spritePivot: {{x: 0.5, y: 0.5}}
+  spritePixelsToUnits: 100
+  spriteBorder: {{x: 0, y: 0, z: 0, w: 0}}
+  spriteGenerateFallbackPhysicsShape: 0
+  alphaUsage: 1
+  alphaIsTransparency: 1
+  spriteTessellationDetail: -1
+  textureType: 8
+  textureShape: 1
+  singleChannelComponent: 0
+  flipbookRows: 1
+  flipbookColumns: 1
+  maxTextureSizeSet: 0
+  compressionQualitySet: 0
+  textureFormatSet: 0
+  ignorePngGamma: 0
+  applyGammaDecoding: 0
+  swizzle: 50462976
+  cookieLightType: 0
+  platformSettings:
+  - serializedVersion: 4
+    buildTarget: DefaultTexturePlatform
+    maxTextureSize: {size}
+    resizeAlgorithm: 0
+    textureFormat: -1
+    textureCompression: 0
+    compressionQuality: 50
+    crunchedCompression: 0
+    allowsAlphaSplitting: 0
+    overridden: 0
+    ignorePlatformSupport: 0
+    androidETC2FallbackOverride: 0
+    forceMaximumCompressionQuality_BC6H_BC7: 0
+  spriteSheet:
+    serializedVersion: 2
+    sprites:
+"
+    );
+    for (name, [x, y, w, h], id) in &sprites {
+        out += &format!(
+            "    - serializedVersion: 2
+      name: {name}
+      rect:
+        serializedVersion: 2
+        x: {x}
+        y: {y}
+        width: {w}
+        height: {h}
+      alignment: 0
+      pivot: {{x: 0.5, y: 0.5}}
+      border: {{x: 0, y: 0, z: 0, w: 0}}
+      customData: 
+      outline: []
+      physicsShape: []
+      tessellationDetail: -1
+      bones: []
+      spriteID: {}
+      internalID: {id}
+      vertices: []
+      indices: 
+      edges: []
+      weights: []
+",
+            hex_id(&format!("{guid}/{name}"))
+        );
+    }
+    out += "    outline: []
+    customData: 
+    physicsShape: []
+    bones: []
+    spriteID: 
+    internalID: 0
+    vertices: []
+    indices: 
+    edges: []
+    weights: []
+    secondaryTextures: []
+    spriteCustomMetadata:
+      entries: []
+    nameFileIdTable:
+";
+    for (name, _, id) in &sprites {
+        out += &format!("      {name}: {id}\n");
+    }
+    out += "  mipmapLimitGroupName: 
+  pSDRemoveMatte: 0
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+";
+    out
 }
 
 // name.pfx.json beside name.png: the extension bevy_procedural_fx loads.
@@ -218,6 +449,63 @@ pub fn json_path(png: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 5 frames of 10×20 in 3 columns: a 30×40 sheet.
+    fn sheet() -> Sheet {
+        Sheet { image: image::RgbaImage::new(30, 40), cell: [10, 20], columns: 3, rows: 2, offset: [0, 0] }
+    }
+
+    #[test]
+    fn godot_sprite_frames_list_every_frame_from_the_top_left() {
+        let text = godot_sprite_frames(&sheet(), "fire.png", 5, 12.0);
+        assert!(text.starts_with("[gd_resource type=\"SpriteFrames\" load_steps=7 format=3]"));
+        assert!(text.contains("path=\"fire.png\""));
+        assert!(text.contains("region = Rect2(0, 0, 10, 20)"));
+        assert!(text.contains("region = Rect2(20, 0, 10, 20)"));
+        assert!(text.contains("region = Rect2(10, 20, 10, 20)"), "the fifth frame is the second of row two");
+        assert!(!text.contains("AtlasTexture_5"), "only the frames there are");
+        assert!(text.contains("\"speed\": 12.0") && text.contains("\"loop\": true"));
+        assert_eq!(text.matches("SubResource(\"AtlasTexture_").count(), 5);
+    }
+
+    #[test]
+    fn unity_meta_slices_from_the_bottom_left_at_full_size() {
+        let text = unity_meta(&sheet(), "fire.png", 5, "0123456789abcdef0123456789abcdef");
+        assert!(text.starts_with("fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n"));
+        assert!(text.contains("spriteMode: 2") && text.contains("textureType: 8"));
+        // The first frame is at the top: y = 40 - 20.
+        let first = text.split("name: fire_0\n").nth(1).unwrap();
+        assert!(first.contains("x: 0\n        y: 20\n        width: 10\n        height: 20"));
+        let fifth = text.split("name: fire_4\n").nth(1).unwrap();
+        assert!(fifth.contains("x: 10\n        y: 0\n"));
+        assert!(!text.contains("fire_5"));
+        // Never shrunk: the size limit is at least the sheet's.
+        assert!(text.contains("maxTextureSize: 64"));
+        // Each sprite has its own ids, and the table names them all.
+        let ids: std::collections::HashSet<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("internalID: ")).filter(|id| *id != "0").collect();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(text.split("nameFileIdTable:").nth(1).unwrap().lines().filter(|l| l.trim().starts_with("fire_")).count(), 5);
+        assert_eq!(meta_guid(&text).as_deref(), Some("0123456789abcdef0123456789abcdef"));
+        // YAML: indentation in steps of two, no tabs.
+        assert!(text.lines().all(|l| !l.contains('\t') && (l.len() - l.trim_start().len()) % 2 == 0));
+    }
+
+    #[test]
+    fn exports_keep_their_unity_guid() {
+        let dir = std::env::temp_dir().join(format!("pfx_engines_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frames = vec![egui::ColorImage::filled([8, 8], egui::Color32::WHITE); 3];
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true };
+        let (png, _) = save(&frames, &output).unwrap();
+        let guid = |p: &Path| meta_guid(&std::fs::read_to_string(unity_meta_path(p)).unwrap()).unwrap();
+        let first = guid(&png);
+        save(&frames, &output).unwrap();
+        assert_eq!(guid(&png), first, "Unity keeps the sprites' links");
+        assert!(godot_path(&png).is_file());
+        assert_eq!(unity_meta_path(&png).file_name().unwrap(), "puff.png.meta");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // A w×h frame, transparent except for one opaque pixel at (x, y).
     fn frame(w: usize, h: usize, x: usize, y: usize) -> egui::ColorImage {
@@ -309,7 +597,7 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0 };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();

@@ -100,6 +100,17 @@ https://github.com/user-attachments/assets/2fdcdd85-ec14-45ca-922b-c3bdfacd9b34
 *Editing a fire in ProceduralFX Studio (left) while BeaverBoy Online, a Bevy game, picks
 up each change (right).*
 
+## Godot and Unity
+
+Tick **Godot** or **Unity** under *Also for* in **Export Sprite Sheet…**, or pass `--godot`
+or `--unity` to `proceduralfx_studio sprite-sheet`:
+
+- **Godot 4**: `name.tres` beside the PNG is a `SpriteFrames` resource. Put it on an
+  `AnimatedSprite2D` and it plays the sheet, looping, at its frame rate.
+- **Unity**: `name.png.meta` makes Unity import the PNG already sliced into one sprite per
+  frame (`name_0`, `name_1`…), uncompressed and at full size. Export into your project's
+  `Assets` folder, then select the sprites and drag them into the scene to make an animation.
+
 ## Support
 
 ProceduralFX Studio is free. If it's useful to you, you can support its

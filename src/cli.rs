@@ -22,6 +22,8 @@ Renders a scene without opening a window.
       --columns <n>                cells across (default: as square as possible)
       --no-trim                    keep the full frame, empty space included
       --seamless [--blend <n>]     fade the end into the start (default blend 8)
+      --godot                      also write sheet.tres, a Godot 4 SpriteFrames resource
+      --unity                      also write sheet.png.meta, slicing it into sprites in Unity
 
   Both:
       --frames <start> <end> [<step>]   a range of frames (default: the scene's timeline)
@@ -37,7 +39,7 @@ Renders a scene without opening a window.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Output {
     Frames { dir: Option<PathBuf> },
-    SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32 },
+    SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +65,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     let mut positional = Vec::new();
     let (mut out, mut frames, mut size, mut camera) = (None, None, None, None);
     let (mut every, mut columns, mut trim, mut seamless, mut blend) = (1, 0, true, false, 8);
+    let (mut godot, mut unity) = (false, false);
     let mut i = 0;
     let value = |i: usize, flag: &str| args.get(i + 1).cloned().ok_or_else(|| format!("{flag} needs a value"));
     let number = |text: &str, flag: &str| text.parse::<f32>().ok().filter(|n| n.is_finite()).ok_or_else(|| format!("{flag}: \"{text}\" isn't a number"));
@@ -120,6 +123,8 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
             }
             "--no-trim" => trim = false,
             "--seamless" => seamless = true,
+            "--godot" => godot = true,
+            "--unity" => unity = true,
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
             _ => positional.push(PathBuf::from(arg)),
         }
@@ -130,7 +135,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     if positional.len() != wanted {
         return Err(if sheet { "sprite-sheet needs a scene and the sheet to write: sprite-sheet <scene.pfs> <sheet.png>".into() } else { "render needs one scene: render <scene.pfs>".into() });
     }
-    let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless)];
+    let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless), ("--godot", godot), ("--unity", unity)];
     if !sheet {
         if let Some((flag, _)) = sheet_only.iter().find(|(_, set)| *set) {
             return Err(format!("{flag} is for sprite sheets"));
@@ -140,7 +145,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     }
     let scene = positional.remove(0);
     let output = if sheet {
-        Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend }
+        Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend, godot, unity }
     } else {
         Output::Frames { dir: out }
     };
@@ -218,9 +223,9 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
             app.flipbook_recording = Some(flipbook::Recording::new(times, app.time, Some(capture)));
             dir.join("render.0001.png")
         }
-        Output::SpriteSheet { png, every, columns, trim, seamless, blend } => {
+        Output::SpriteSheet { png, every, columns, trim, seamless, blend, godot, unity } => {
             let [width, height] = job.size.unwrap_or([256, 256]);
-            app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend };
+            app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend, godot: *godot, unity: *unity };
             app.start_sprite_sheet(png.clone(), false);
             png.clone()
         }
@@ -296,7 +301,10 @@ mod tests {
         assert_eq!(job.output, Output::Frames { dir: Some("frames".into()) });
 
         let job = parse(&args("sprite-sheet fire.pfs out/fire --every 2 --columns 4 --no-trim --seamless --blend 3 --frame 5")).unwrap().unwrap();
-        assert_eq!(job.output, Output::SpriteSheet { png: "out/fire.png".into(), every: 2, columns: 4, trim: false, seamless: true, blend: 3 });
+        assert_eq!(job.output, Output::SpriteSheet { png: "out/fire.png".into(), every: 2, columns: 4, trim: false, seamless: true, blend: 3, godot: false, unity: false });
+        let engines = parse(&args("sprite-sheet fire.pfs fire.png --godot --unity")).unwrap().unwrap();
+        assert!(matches!(engines.output, Output::SpriteSheet { godot: true, unity: true, .. }));
+        assert!(parse(&args("render fire.pfs --godot")).unwrap().unwrap_err().contains("for sprite sheets"));
         assert_eq!(job.frames, Some((5.0, 5.0, 1.0)));
     }
 
@@ -345,6 +353,11 @@ mod tests {
         let job = parse(&args(&format!("sprite-sheet {} {} --frames 1 4 --size 32x32", scene.display(), sheet.display()))).unwrap().unwrap();
         run(&job, &mut |_, _| {}).unwrap();
         assert!(sheet.is_file() && spritesheet::json_path(&sheet).is_file());
+        assert!(!spritesheet::godot_path(&sheet).exists() && !spritesheet::unity_meta_path(&sheet).exists(), "only when asked");
+        let job = parse(&args(&format!("sprite-sheet {} {} --frames 1 4 --size 32x32 --godot --unity", scene.display(), sheet.display()))).unwrap().unwrap();
+        run(&job, &mut |_, _| {}).unwrap();
+        assert!(std::fs::read_to_string(spritesheet::godot_path(&sheet)).unwrap().contains("AtlasTexture_3"));
+        assert!(std::fs::read_to_string(spritesheet::unity_meta_path(&sheet)).unwrap().contains("name: ball_sheet_3"));
 
         let missing = parse(&args(&format!("render {} --camera nope", scene.display()))).unwrap().unwrap();
         assert!(run(&missing, &mut |_, _| {}).unwrap_err().contains("no cameras"));

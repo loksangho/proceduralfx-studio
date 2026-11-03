@@ -12105,6 +12105,12 @@ impl ProceduralFxStudioApp {
                     }
                 });
                 ui.end_row();
+                ui.label("Also for");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut s.godot, "Godot").on_hover_text("Also write name.tres, a Godot 4 SpriteFrames resource: put it on an AnimatedSprite2D and it plays the sheet, looping, at its frame rate. Export into your Godot project, or copy the PNG and .tres together.");
+                    ui.checkbox(&mut s.unity, "Unity").on_hover_text("Also write name.png.meta, so Unity imports the PNG already sliced into one sprite per frame (name_0, name_1...), uncompressed and full size. Export into your project's Assets folder; select the sprites and drag them into the scene to make an animation.");
+                });
+                ui.end_row();
                 ui.label("Live");
                 ui.checkbox(&mut s.live, "Keep updating").on_hover_text(
                     "After exporting, export again to the same files whenever the scene, camera or these settings change. \
@@ -12188,7 +12194,7 @@ impl ProceduralFxStudioApp {
             self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
         }
         let s = &self.sprite_sheet;
-        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend };
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity };
         let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output), preview: None };
         self.render_camera_in_use();
         self.animate = false;
@@ -12207,7 +12213,7 @@ impl ProceduralFxStudioApp {
             self.playback_start, self.playback_end, s.width, s.height, s.every, s.columns
         )
         .hash(&mut hasher);
-        (s.trim, s.seamless, s.blend).hash(&mut hasher);
+        (s.trim, s.seamless, s.blend, s.godot, s.unity).hash(&mut hasher);
         hasher.finish()
     }
 
