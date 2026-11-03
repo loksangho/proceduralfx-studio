@@ -82,7 +82,6 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 </ul>
 
 <h2>6. Fewer frames, still smooth: motion vectors</h2>
-<p class="soon">Coming in the next update: motion vectors aren't in version 0.21 yet.</p>
 <p>A sheet with fewer frames is smaller and loads faster, but plays jerkily, especially slowed down. Tick <b>Motion vectors</b> under <b>Smooth playback</b> and the export also writes <code>fire_motion.png</code>: how each pixel moves on its way to the next frame. The game then slides each frame towards the next instead of jumping, so a sheet of every 4th frame (set <b>Frames</b> to every 4) can play about as smoothly as the full one.</p>
 <ul>
 <li><b>Bevy:</b> spawn <code>FxFlipbook::looping(assets.load("fx/fire.pfx.json"))</code> instead of <code>FxSprite</code> (bevy_procedural_fx 0.3).</li>
@@ -92,7 +91,6 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 <p>It works best for smoke, explosions and anything that moves smoothly. Fast, scattered sparks jump further between frames than the gaps between them, so for those, keep more frames.</p>
 
 <h2>7. Light it</h2>
-<p class="soon">Coming in the next update: normal maps aren't in version 0.21 yet.</p>
 <p>Tick <b>Normal map</b> under <b>Lighting</b>, and the export also writes <code>fire_normal.png</code>: each frame's shape, read from how opaque it is. Your game's 2D lights then light the effect from their side, so smoke looks like a soft puff rather than a flat picture. It suits smoke, dust and clouds; leave glowing effects such as fire unlit.</p>
 <ul>
 <li><b>Bevy:</b> spawn <code>FxLight2d</code> lights. Every <code>FxFlipbook</code> whose sheet has a normal map is lit by them (bevy_procedural_fx 0.3).</li>
@@ -101,7 +99,6 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 </ul>
 
 <h2>8. Make it glow</h2>
-<p class="soon">Coming in the next update: glow sheets aren't in version 0.21 yet.</p>
 <p>A flame's core is brighter than a PNG can hold, so the sheet rolls it off to white, and a game's bloom can't tell it from white smoke. Tick <b>Glow sheet</b> under <b>Glow</b>, and the export also writes <code>fire_glow.png</code>: the glow itself, at any brightness. Your game puts it back, at full strength or stronger, and its bloom makes the hot parts glow. The sheet itself is unchanged, so it still works without it.</p>
 <ul>
 <li><b>Bevy:</b> <code>FxFlipbook</code> adds it (<code>.with_glow(2.0)</code> for more). Put <code>Hdr</code> and <code>Bloom</code> on the camera.</li>
