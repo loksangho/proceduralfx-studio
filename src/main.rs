@@ -12088,6 +12088,13 @@ impl ProceduralFxStudioApp {
                     }
                 });
                 ui.end_row();
+                ui.label("Particles");
+                ui.checkbox(&mut s.fill_grid, "Fill the grid").on_hover_text(
+                    "For engines' particle systems, which play every cell of the grid: picks a column count that leaves no empty cells (24 frames: 6×4), \
+                     so particles never show a blank frame. With Godot ticked, also writes name_particles.tres, a material for GPUParticles2D. \
+                     In Unity, use Texture Sheet Animation in Grid mode with the columns and rows (or Sprites mode with the sliced sprites).",
+                );
+                ui.end_row();
                 ui.label("Trim");
                 ui.checkbox(&mut s.trim, "Crop empty space").on_hover_text("Crops every frame to the same box: what any frame shows, plus a 1-pixel transparent border. The JSON records where the box was in the full frame.");
                 ui.end_row();
@@ -12194,7 +12201,7 @@ impl ProceduralFxStudioApp {
             self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
         }
         let s = &self.sprite_sheet;
-        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity };
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity, fill_grid: s.fill_grid };
         let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output), preview: None };
         self.render_camera_in_use();
         self.animate = false;
@@ -12213,7 +12220,7 @@ impl ProceduralFxStudioApp {
             self.playback_start, self.playback_end, s.width, s.height, s.every, s.columns
         )
         .hash(&mut hasher);
-        (s.trim, s.seamless, s.blend, s.godot, s.unity).hash(&mut hasher);
+        (s.trim, s.seamless, s.blend, s.godot, s.unity, s.fill_grid).hash(&mut hasher);
         hasher.finish()
     }
 

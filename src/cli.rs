@@ -3,6 +3,7 @@
 //
 //   proceduralfx_studio render scene.pfs [--out DIR] [--frames START END [STEP]] ...
 //   proceduralfx_studio sprite-sheet scene.pfs sheet.png [--every N] [--columns N] ...
+//   proceduralfx_studio animation scene.pfs fire.gif (or fire.mp4) ...
 //
 // Frames are numbered as the timeline numbers them (frame 1 is time 0). Exit codes:
 // 0 done, 1 the render failed, 2 the command was wrong.
@@ -24,12 +25,19 @@ Renders a scene without opening a window.
       --seamless [--blend <n>]     fade the end into the start (default blend 8)
       --godot                      also write sheet.tres, a Godot 4 SpriteFrames resource
       --unity                      also write sheet.png.meta, slicing it into sprites in Unity
+      --fill-grid                  no empty cells, for particle systems (and with --godot,
+                                   also sheet_particles.tres, a GPUParticles2D material)
 
-  Both:
+  proceduralfx_studio animation <scene.pfs> <fire.gif | fire.mp4> [options]
+      A looping GIF, or an MP4 movie (needs FFmpeg), over a dark background:
+      for posting an effect online
+
+  All of them:
       --frames <start> <end> [<step>]   a range of frames (default: the scene's timeline)
       --frame <n>                  one frame
       --size <width>x<height>      the frame size in pixels (default: 1280x720 for
-                                   renders, 256x256 for sprite sheets)
+                                   renders, 256x256 for sprite sheets, 480x480
+                                   for animations)
       --camera <name>              the Camera node to render through (default: the
                                    scene's first camera, or a view of everything)
 
@@ -39,7 +47,9 @@ Renders a scene without opening a window.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Output {
     Frames { dir: Option<PathBuf> },
-    SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool },
+    // A GIF or MP4, by the file's extension.
+    Animation { file: PathBuf },
+    SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool, fill_grid: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,7 +65,7 @@ pub struct Job {
 // A render command, if the arguments are one (None: start the app as usual).
 pub fn parse(args: &[String]) -> Option<Result<Job, String>> {
     let command = args.get(1)?.as_str();
-    if !matches!(command, "render" | "sprite-sheet") {
+    if !matches!(command, "render" | "sprite-sheet" | "animation") {
         return None;
     }
     Some(parse_job(command, &args[2..]))
@@ -65,7 +75,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     let mut positional = Vec::new();
     let (mut out, mut frames, mut size, mut camera) = (None, None, None, None);
     let (mut every, mut columns, mut trim, mut seamless, mut blend) = (1, 0, true, false, 8);
-    let (mut godot, mut unity) = (false, false);
+    let (mut godot, mut unity, mut fill_grid) = (false, false, false);
     let mut i = 0;
     let value = |i: usize, flag: &str| args.get(i + 1).cloned().ok_or_else(|| format!("{flag} needs a value"));
     let number = |text: &str, flag: &str| text.parse::<f32>().ok().filter(|n| n.is_finite()).ok_or_else(|| format!("{flag}: \"{text}\" isn't a number"));
@@ -125,27 +135,39 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
             "--seamless" => seamless = true,
             "--godot" => godot = true,
             "--unity" => unity = true,
+            "--fill-grid" => fill_grid = true,
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
             _ => positional.push(PathBuf::from(arg)),
         }
         i += 1;
     }
     let sheet = command == "sprite-sheet";
-    let wanted = if sheet { 2 } else { 1 };
+    let animation = command == "animation";
+    let wanted = if sheet || animation { 2 } else { 1 };
     if positional.len() != wanted {
-        return Err(if sheet { "sprite-sheet needs a scene and the sheet to write: sprite-sheet <scene.pfs> <sheet.png>".into() } else { "render needs one scene: render <scene.pfs>".into() });
+        return Err(match command {
+            "sprite-sheet" => "sprite-sheet needs a scene and the sheet to write: sprite-sheet <scene.pfs> <sheet.png>".into(),
+            "animation" => "animation needs a scene and the file to write: animation <scene.pfs> <fire.gif>".into(),
+            _ => "render needs one scene: render <scene.pfs>".into(),
+        });
     }
-    let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless), ("--godot", godot), ("--unity", unity)];
+    if animation && !positional[1].extension().is_some_and(|e| e.eq_ignore_ascii_case("gif") || e.eq_ignore_ascii_case("mp4")) {
+        return Err("animation writes a .gif or an .mp4: end the file name with one of them".into());
+    }
+    let sheet_only = [("--every", every != 1), ("--columns", columns != 0), ("--no-trim", !trim), ("--seamless", seamless), ("--godot", godot), ("--unity", unity), ("--fill-grid", fill_grid)];
     if !sheet {
         if let Some((flag, _)) = sheet_only.iter().find(|(_, set)| *set) {
             return Err(format!("{flag} is for sprite sheets"));
         }
-    } else if out.is_some() {
-        return Err("--out is for render; a sprite sheet goes where its second argument says".into());
+    }
+    if (sheet || animation) && out.is_some() {
+        return Err(format!("--out is for render; {} goes where its second argument says", if sheet { "a sprite sheet" } else { "an animation" }));
     }
     let scene = positional.remove(0);
-    let output = if sheet {
-        Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend, godot, unity }
+    let output = if animation {
+        Output::Animation { file: positional.remove(0) }
+    } else if sheet {
+        Output::SpriteSheet { png: positional.remove(0).with_extension("png"), every, columns, trim, seamless, blend, godot, unity, fill_grid }
     } else {
         Output::Frames { dir: out }
     };
@@ -223,9 +245,21 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
             app.flipbook_recording = Some(flipbook::Recording::new(times, app.time, Some(capture)));
             dir.join("render.0001.png")
         }
-        Output::SpriteSheet { png, every, columns, trim, seamless, blend, godot, unity } => {
+        Output::Animation { file } => {
+            let step = job.frames.map_or(1.0, |f| f.2) / sims::SIM_FPS;
+            let times = frame_times(app.playback_start, app.playback_end, step);
+            if times.len() > 1000 {
+                return Err(format!("{} frames is too many for an animation; make one of at most 1000", times.len()));
+            }
+            app.render_camera_in_use();
+            app.animate = false;
+            let capture = flipbook::Capture { render: Some(job.size.unwrap_or([480, 480])), save_to: None, sheet: None, preview: None };
+            app.flipbook_recording = Some(flipbook::Recording::new(times, app.time, Some(capture)));
+            file.clone()
+        }
+        Output::SpriteSheet { png, every, columns, trim, seamless, blend, godot, unity, fill_grid } => {
             let [width, height] = job.size.unwrap_or([256, 256]);
-            app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend, godot: *godot, unity: *unity };
+            app.sprite_sheet = spritesheet::Settings { open: false, width, height, every: *every, columns: *columns, trim: *trim, live: false, seamless: *seamless, blend: *blend, godot: *godot, unity: *unity, fill_grid: *fill_grid };
             app.start_sprite_sheet(png.clone(), false);
             png.clone()
         }
@@ -233,7 +267,15 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
     if app.flipbook_recording.is_none() {
         return Err(app.status.clone());
     }
-    let finished = drive_recording(&mut app, None, progress).unwrap_or_else(|| app.status.clone());
+    let mut finished = drive_recording(&mut app, None, progress).unwrap_or_else(|| app.status.clone());
+    // An animation's frames end up in the flipbook viewer: save them.
+    if let Output::Animation { file } = &job.output {
+        let viewer = app.flipbook_viewer.take().ok_or(finished.clone())?;
+        let fps = sims::SIM_FPS / job.frames.map_or(1.0, |f| f.2);
+        let is_gif = file.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+        if is_gif { flipbook::save_gif(viewer.frames(), file, fps)? } else { flipbook::save_movie(viewer.frames(), file, fps)? }
+        finished = format!("Saved a {}-frame {} to {}", viewer.frames().len(), if is_gif { "GIF" } else { "movie" }, file.display());
+    }
     let fresh = std::fs::metadata(&written).and_then(|m| m.modified()).is_ok_and(|t| t >= started);
     if !fresh {
         return Err(finished);
@@ -301,7 +343,7 @@ mod tests {
         assert_eq!(job.output, Output::Frames { dir: Some("frames".into()) });
 
         let job = parse(&args("sprite-sheet fire.pfs out/fire --every 2 --columns 4 --no-trim --seamless --blend 3 --frame 5")).unwrap().unwrap();
-        assert_eq!(job.output, Output::SpriteSheet { png: "out/fire.png".into(), every: 2, columns: 4, trim: false, seamless: true, blend: 3, godot: false, unity: false });
+        assert_eq!(job.output, Output::SpriteSheet { png: "out/fire.png".into(), every: 2, columns: 4, trim: false, seamless: true, blend: 3, godot: false, unity: false, fill_grid: false });
         let engines = parse(&args("sprite-sheet fire.pfs fire.png --godot --unity")).unwrap().unwrap();
         assert!(matches!(engines.output, Output::SpriteSheet { godot: true, unity: true, .. }));
         assert!(parse(&args("render fire.pfs --godot")).unwrap().unwrap_err().contains("for sprite sheets"));
@@ -318,6 +360,9 @@ mod tests {
         assert!(error("render fire.pfs --every 2").contains("for sprite sheets"));
         assert!(error("sprite-sheet a.pfs b.png --out x").contains("--out is for render"));
         assert!(error("render fire.pfs --wat").contains("unknown option"));
+        assert!(error("animation fire.pfs fire.png").contains(".gif or an .mp4"));
+        assert!(error("animation fire.pfs fire.gif --out x").contains("an animation"));
+        assert!(error("animation fire.pfs fire.gif --godot").contains("for sprite sheets"));
         assert!(error("render fire.pfs --frame").contains("needs a value"));
         assert_eq!(main(&args("render")), Some(2));
         assert_eq!(main(&args("--help")), Some(0));
@@ -358,6 +403,11 @@ mod tests {
         run(&job, &mut |_, _| {}).unwrap();
         assert!(std::fs::read_to_string(spritesheet::godot_path(&sheet)).unwrap().contains("AtlasTexture_3"));
         assert!(std::fs::read_to_string(spritesheet::unity_meta_path(&sheet)).unwrap().contains("name: ball_sheet_3"));
+
+        let gif = dir.join("ball.gif");
+        let job = parse(&args(&format!("animation {} {} --frames 1 3 --size 32x24", scene.display(), gif.display()))).unwrap().unwrap();
+        assert!(run(&job, &mut |_, _| {}).unwrap().contains("3-frame GIF"));
+        assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
 
         let missing = parse(&args(&format!("render {} --camera nope", scene.display()))).unwrap().unwrap();
         assert!(run(&missing, &mut |_, _| {}).unwrap_err().contains("no cameras"));

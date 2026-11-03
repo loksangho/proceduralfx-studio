@@ -92,12 +92,55 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-// An H.264 movie of the frames at `fps`.
+// What animations (GIFs and movies) are drawn over: neither can show soft transparency,
+// and smoke fringes look ragged over anything but a plain dark background.
+pub const BACKGROUND: [u8; 3] = [30, 30, 34];
+
+// A frame over the animation background, opaque.
+fn over_background(frame: &egui::ColorImage) -> image::RgbaImage {
+    let [w, h] = frame.size;
+    let pixels = frame.pixels.iter().flat_map(|c| {
+        // The frame's colours are premultiplied: background × (1 - alpha) + colour.
+        let a = c.a() as f32 / 255.0;
+        let [r, g, b] = [c.r(), c.g(), c.b()].map(|v| v as f32);
+        let mix = |v: f32, bg: u8| (v + bg as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
+        [mix(r, BACKGROUND[0]), mix(g, BACKGROUND[1]), mix(b, BACKGROUND[2]), 255]
+    });
+    image::RgbaImage::from_raw(w as u32, h as u32, pixels.collect()).expect("sized from the frame")
+}
+
+// A looping GIF of the frames at `fps`, over the animation background. Needs nothing
+// installed, unlike movies.
+pub fn save_gif(frames: &[egui::ColorImage], path: &Path, fps: f32) -> Result<(), String> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    if frames.is_empty() {
+        return Err("there are no frames".into());
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let partial = path.with_extension("gif.partial");
+    let file = std::fs::File::create(&partial).map_err(|e| e.to_string())?;
+    // Speed 10 of 30: good colours without taking long.
+    let mut encoder = GifEncoder::new_with_speed(std::io::BufWriter::new(file), 10);
+    encoder.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
+    let delay = image::Delay::from_numer_denom_ms(1000, fps.clamp(1.0, 100.0).round() as u32);
+    for frame in frames {
+        encoder.encode_frame(image::Frame::from_parts(over_background(frame), 0, 0, delay)).map_err(|e| e.to_string())?;
+    }
+    drop(encoder);
+    std::fs::rename(&partial, path).map_err(|e| e.to_string())
+}
+
+// An H.264 movie of the frames at `fps`, over the animation background.
 pub fn save_movie(frames: &[egui::ColorImage], path: &Path, fps: f32) -> Result<(), String> {
     let ffmpeg = find_ffmpeg().ok_or("FFmpeg isn't installed (brew install ffmpeg), so only PNG frames can be saved")?;
     let dir = std::env::temp_dir().join(format!("pfx_flipbook_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    save_pngs(frames, &dir, "frame")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for (i, frame) in frames.iter().enumerate() {
+        over_background(frame).save(dir.join(format!("frame.{:04}.png", i + 1))).map_err(|e| e.to_string())?;
+    }
     let output = std::process::Command::new(ffmpeg)
         .args(["-y", "-loglevel", "error", "-framerate", &fps.to_string(), "-i"])
         .arg(dir.join("frame.%04d.png"))
@@ -133,7 +176,7 @@ impl Viewer {
         Viewer { frames, times, textures, current: 0, playing: true, looping: true, fps, last_step: None, open: true, status: String::new() }
     }
 
-    #[cfg(test)]
+    // The frames, for saving (the animation command) and tests.
     pub fn frames(&self) -> &[egui::ColorImage] {
         &self.frames
     }
@@ -234,6 +277,14 @@ impl Viewer {
                         };
                     }
                 }
+                if ui.button("Save GIF…").on_hover_text("A looping GIF over a dark background, for posting online").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().set_file_name("flipbook.gif").add_filter("GIF", &["gif"]).save_file() {
+                        self.status = match save_gif(&self.frames, &path, self.fps) {
+                            Ok(()) => format!("Saved {}", path.display()),
+                            Err(e) => format!("Couldn't save the GIF: {e}"),
+                        };
+                    }
+                }
                 let ffmpeg = find_ffmpeg().is_some();
                 let movie = ui.add_enabled(ffmpeg, egui::Button::new("Save movie…")).on_disabled_hover_text("Install FFmpeg (brew install ffmpeg) to save an .mp4");
                 if movie.clicked() {
@@ -253,6 +304,32 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gifs_loop_every_frame_over_the_background() {
+        use image::AnimationDecoder;
+        let dir = std::env::temp_dir().join(format!("pfx_gif_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Three frames: clear, half-covered by white, solid red.
+        let clear = egui::ColorImage::filled([8, 4], egui::Color32::TRANSPARENT);
+        let half = egui::ColorImage::filled([8, 4], egui::Color32::from_white_alpha(128));
+        let red = egui::ColorImage::filled([8, 4], egui::Color32::RED);
+        let path = dir.join("fx.gif");
+        save_gif(&[clear, half, red], &path, 24.0).unwrap();
+        let file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let frames = image::codecs::gif::GifDecoder::new(file).unwrap().into_frames().collect_frames().unwrap();
+        assert_eq!(frames.len(), 3);
+        let pixel = |f: usize| frames[f].buffer().get_pixel(3, 2).0;
+        let near = |a: [u8; 4], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| (*x as i32 - y as i32).abs() <= 8);
+        assert!(near(pixel(0), BACKGROUND), "clear shows the background: {:?}", pixel(0));
+        assert!(near(pixel(1), [142, 142, 144]), "half white over it: {:?}", pixel(1));
+        assert!(near(pixel(2), [255, 0, 0]), "{:?}", pixel(2));
+        let (numer, denom) = frames[0].delay().numer_denom_ms();
+        // GIFs count in hundredths of a second: 24 fps is 40 ms a frame.
+        assert!((numer as f32 / denom as f32 - 1000.0 / 24.0).abs() < 10.0);
+        assert!(!path.with_extension("gif.partial").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn crops_scales_and_saves() {

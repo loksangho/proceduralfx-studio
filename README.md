@@ -111,6 +111,19 @@ or `--unity` to `proceduralfx_studio sprite-sheet`:
   frame (`name_0`, `name_1`…), uncompressed and at full size. Export into your project's
   `Assets` folder, then select the sprites and drag them into the scene to make an animation.
 
+For particle systems, tick **Fill the grid** (`--fill-grid`): the sheet gets a grid with no
+empty cells, since particle systems play every cell. With Godot ticked it also writes
+`name_particles.tres`, a material for `GPUParticles2D`. In Unity, use the particle system's
+Texture Sheet Animation in Grid mode with the sheet's columns and rows, or in Sprites mode
+with the sliced sprites.
+
+## GIFs and movies
+
+The flipbook viewer's **Save GIF…** saves a looping GIF over a dark background, ready to post.
+**Save movie…** saves an MP4 (with [FFmpeg](https://ffmpeg.org) installed). From the command
+line, `proceduralfx_studio animation scene.pfs fire.gif` (or `fire.mp4`) renders and saves one
+in a single step.
+
 ## Support
 
 ProceduralFX Studio is free. If it's useful to you, you can support its

@@ -35,11 +35,13 @@ pub struct Settings {
     // Also write what Godot and Unity need to play it (see `godot_sprite_frames`, `unity_meta`).
     pub godot: bool,
     pub unity: bool,
+    // For particle systems: a grid with no empty cells (they'd show as blank frames).
+    pub fill_grid: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false }
     }
 }
 
@@ -63,6 +65,7 @@ pub struct Output {
     pub blend: usize,
     pub godot: bool,
     pub unity: bool,
+    pub fill_grid: bool,
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -73,6 +76,14 @@ pub fn columns(count: usize, size: [u32; 2], requested: u32) -> u32 {
     }
     let ideal = ((count as f32 * size[1] as f32 / size[0].max(1) as f32).sqrt()).round() as u32;
     ideal.clamp(1, count)
+}
+
+// Cells across that leave no empty cells (a divisor of the frame count), nearest the
+// layout `columns` would choose. Particle systems play every cell of the grid.
+pub fn filled_columns(count: usize, size: [u32; 2], requested: u32) -> u32 {
+    let count = count.max(1) as u32;
+    let want = columns(count as usize, size, requested) as f32;
+    (1..=count).filter(|c| count % c == 0).min_by(|a, b| ((*a as f32 / want).ln().abs()).total_cmp(&(*b as f32 / want).ln().abs())).unwrap_or(1)
 }
 
 // The box every frame is cropped to, as [x, y, width, height]: what any frame shows, plus a
@@ -196,7 +207,11 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
     } else {
         frames
     };
-    let sheet = pack(frames, output.columns, output.trim)?;
+    let requested = match frames.first() {
+        Some(f) if output.fill_grid => filled_columns(frames.len(), [f.size[0] as u32, f.size[1] as u32], output.columns),
+        _ => output.columns,
+    };
+    let sheet = pack(frames, requested, output.trim)?;
     let png = output.path.with_extension("png");
     if let Some(dir) = png.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -215,6 +230,9 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
     let count = frames.len();
     if output.godot {
         write_beside(&godot_path(&png), &godot_sprite_frames(&sheet, &name, count, output.fps))?;
+        if output.fill_grid {
+            write_beside(&godot_particles_path(&png), &godot_particle_material(&sheet))?;
+        }
     }
     if output.unity {
         let meta = unity_meta_path(&png);
@@ -234,6 +252,23 @@ fn write_beside(path: &Path, text: &str) -> Result<(), String> {
 // name.tres beside name.png: a Godot 4 SpriteFrames resource.
 pub fn godot_path(png: &Path) -> PathBuf {
     png.with_extension("tres")
+}
+
+// name_particles.tres beside name.png: a material for GPUParticles2D.
+pub fn godot_particles_path(png: &Path) -> PathBuf {
+    let stem = png.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    png.with_file_name(format!("{stem}_particles.tres"))
+}
+
+// A Godot 4 material that plays the sheet on each particle of a GPUParticles2D (or
+// CPUParticles2D), one cell after another: set it as the node's material, with the sheet
+// as its texture. How fast the frames go is the process material's Animation > Speed (1
+// plays them once over a particle's life).
+pub fn godot_particle_material(sheet: &Sheet) -> String {
+    format!(
+        "[gd_resource type=\"CanvasItemMaterial\" format=3]\n\n[resource]\nparticles_animation = true\nparticles_anim_h_frames = {}\nparticles_anim_v_frames = {}\nparticles_anim_loop = true\n",
+        sheet.columns, sheet.rows
+    )
 }
 
 // name.png.meta: Unity's import settings for name.png.
@@ -491,18 +526,40 @@ mod tests {
     }
 
     #[test]
+    fn filled_grids_have_no_empty_cells() {
+        // 24 square frames: 6×4 rather than 5×5 with one empty.
+        assert_eq!(filled_columns(24, [64, 64], 0), 6);
+        assert_eq!(filled_columns(16, [64, 64], 0), 4);
+        // Tall frames want more across.
+        assert_eq!(filled_columns(12, [32, 128], 0), 6);
+        // A prime count can only be one row.
+        assert_eq!(filled_columns(7, [64, 64], 0), 7);
+        // A column count asked for is the nearest divisor to it.
+        assert_eq!(filled_columns(24, [64, 64], 5), 6);
+        assert_eq!(filled_columns(24, [64, 64], 3), 3);
+        for count in 1..60 {
+            assert_eq!(count % filled_columns(count, [64, 48], 0) as usize, 0);
+        }
+        let material = godot_particle_material(&sheet());
+        assert!(material.contains("particles_animation = true") && material.contains("particles_anim_h_frames = 3") && material.contains("particles_anim_v_frames = 2"));
+        assert_eq!(godot_particles_path(Path::new("/fx/fire.png")), PathBuf::from("/fx/fire_particles.tres"));
+    }
+
+    #[test]
     fn exports_keep_their_unity_guid() {
         let dir = std::env::temp_dir().join(format!("pfx_engines_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let frames = vec![egui::ColorImage::filled([8, 8], egui::Color32::WHITE); 3];
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true };
         let (png, _) = save(&frames, &output).unwrap();
         let guid = |p: &Path| meta_guid(&std::fs::read_to_string(unity_meta_path(p)).unwrap()).unwrap();
         let first = guid(&png);
         save(&frames, &output).unwrap();
         assert_eq!(guid(&png), first, "Unity keeps the sprites' links");
-        assert!(godot_path(&png).is_file());
+        assert!(godot_path(&png).is_file() && godot_particles_path(&png).is_file());
+        // 3 frames fill a 3×1 grid.
+        assert!(std::fs::read_to_string(godot_particles_path(&png)).unwrap().contains("particles_anim_h_frames = 3"));
         assert_eq!(unity_meta_path(&png).file_name().unwrap(), "puff.png.meta");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -597,7 +654,7 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();
