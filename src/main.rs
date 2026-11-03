@@ -6610,6 +6610,33 @@ impl Graph {
         g.serialize() + &assets::info_line(name, version, description)
     }
 
+    // The Subnets placed from asset `name` at a version older than `version`.
+    fn asset_copies(&self, name: &str, version: u32) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(&n.kind, NodeKind::Subnet { spec: assets::Spec { asset: Some((a, v)), .. }, .. } if a == name && *v < version))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    // Updates every older copy of asset `name` from `text` (the library's version), each
+    // keeping its sliders' values. Copies inside copies go too, outer ones first.
+    fn update_asset_copies(&mut self, name: &str, version: u32, text: &str) -> Result<usize, String> {
+        let mut count = 0;
+        // Each update can remove nested copies, so look again after each.
+        while let Some(&id) = self.asset_copies(name, version).first() {
+            self.fill_from_asset(id, text)?;
+            count += 1;
+            if count > 10_000 {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
     // Fills a Subnet from an asset file: its network (replacing what was inside), its
     // promoted parameters and the asset's name and version. Sliders keep their values
     // where the new version has a slider of the same name. Err says why it couldn't.
@@ -12202,7 +12229,13 @@ impl ProceduralFxStudioApp {
         let Some(object) = self.vat_window.object.filter(|o| objects.iter().any(|(id, _)| id == o)).or(default_object) else { return };
         let name = self.graph.nodes.get(&object).map_or_else(|| "vat".to_owned(), |n| n.title(object));
         let Some(path) = FileDialog::new().set_title("Save the vertex animation").set_file_name(&format!("{name}.obj")).add_filter("OBJ mesh (with its textures beside it)", &["obj"]).save_file() else { return };
-        let stem = path.with_extension("");
+        self.start_vat_bake(object, path.with_extension(""));
+    }
+
+    // Bakes `object` with the window's settings to the files beside `stem`, in the
+    // background; vat_window reports progress and the result.
+    fn start_vat_bake(&mut self, object: NodeId, stem: PathBuf) {
+        let every = self.vat_window.every.max(1);
         let times = frame_times(self.playback_start, self.playback_end, every as f32 / sims::SIM_FPS);
         let fps = sims::SIM_FPS / every as f32;
         let (godot, unity, mode) = (self.vat_window.godot, self.vat_window.unity, self.vat_window.mode);
@@ -15769,12 +15802,20 @@ impl ProceduralFxStudioApp {
         ui.strong("Asset");
         let newer = spec.asset.as_ref().and_then(|(name, version)| self.asset_library.iter().find(|e| &e.name == name && e.version > *version).cloned());
         if let Some(entry) = &newer {
-            ui.horizontal(|ui| {
+            let older = self.graph.asset_copies(&entry.name, entry.version).len();
+            ui.horizontal_wrapped(|ui| {
                 ui.colored_label(egui::Color32::from_rgb(230, 190, 90), format!("The library has version {}", entry.version));
                 if ui.button("Update").on_hover_text("Replace the network inside with the library's version. Sliders keep their values where the new version has them.").clicked() {
                     let result = entry.text().and_then(|text| self.graph.fill_from_asset(id, &text));
                     self.status = match result {
                         Ok(()) => format!("Updated to {} version {}", entry.name, entry.version),
+                        Err(e) => format!("Couldn't update: {e}"),
+                    };
+                    changed = true;
+                }
+                if older > 1 && ui.button(format!("Update all {older} copies")).on_hover_text("Update every copy of this asset in the scene that's on an older version, each keeping its sliders' values").clicked() {
+                    self.status = match entry.text().and_then(|text| self.graph.update_asset_copies(&entry.name, entry.version, &text)) {
+                        Ok(count) => format!("Updated {count} cop{} of {} to version {}", if count == 1 { "y" } else { "ies" }, entry.name, entry.version),
                         Err(e) => format!("Couldn't update: {e}"),
                     };
                     changed = true;
@@ -26180,6 +26221,24 @@ mod asset_tests {
         let NodeKind::Subnet { spec, .. } = &app.graph.nodes[&placed].kind else { panic!() };
         assert_eq!(spec.asset, Some(("Shifter".into(), 2)));
 
+        // Every older copy at once: place two more of version 2, make them look like
+        // version 1, and update them together.
+        for x in [400.0, 600.0] {
+            app.apply(Action::Add(kind.clone(), egui::pos2(x, 100.0)));
+        }
+        let copies: Vec<NodeId> = app.graph.nodes.iter().filter(|(_, n)| matches!(&n.kind, NodeKind::Subnet { spec: assets::Spec { asset: Some((a, _)), .. }, .. } if a == "Shifter")).map(|(id, _)| *id).collect();
+        let v1 = app.graph.asset_text(subnet, "Shifter", 1, "Moves things");
+        for &c in &copies {
+            if c != subnet {
+                app.graph.fill_from_asset(c, &v1).unwrap();
+            }
+        }
+        // (The Subnet the asset was saved from isn't a placed copy.)
+        assert_eq!(copies.len(), 3);
+        assert_eq!(app.graph.asset_copies("Shifter", 2).len(), 3, "all three placed copies are on version 1");
+        assert_eq!(app.graph.update_asset_copies("Shifter", 2, &text).unwrap(), 3);
+        assert!(app.graph.asset_copies("Shifter", 2).is_empty());
+
         // A file that isn't an asset says so.
         assert!(app.graph.fill_from_asset(placed, "pfs 2\nnext 0\n").is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -26440,6 +26499,73 @@ mod vat_window_tests {
             let _ = ctx.run(egui::RawInput::default(), |ctx| app.vat_window(ctx));
         }
         assert!(app.vat_window.open && app.vat_job.is_none());
+    }
+
+    // The window's export, through to the files: bakes in the background while the window
+    // reports progress, then says what it wrote.
+    #[test]
+    fn exporting_vertex_animation_bakes_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("pfx_vat_window_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 8\nnode 2 40 100 0 obj noise 2.2 0.65\nparent 1 0\nparent 2 0\nlink 1 2 0\ndisplay 0 2\nnext 3\n");
+        (app.playback_start, app.playback_end) = (0.0, 11.0 / sims::SIM_FPS);
+        app.vat_window = VatWindow { open: true, every: 2, godot: true, unity: true, ..VatWindow::default() };
+        app.start_vat_bake(0, dir.join("wobble"));
+        assert!(app.vat_job.is_some());
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        let mut saw_progress = false;
+        while app.vat_job.is_some() && started.elapsed() < std::time::Duration::from_secs(60) {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.vat_window(ctx));
+            saw_progress |= app.status.starts_with("Baking vertex animation");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.status.starts_with("Baked as soft: 64 elements over 6 frames"), "{}", app.status);
+        let _ = saw_progress;
+        for file in ["wobble.obj", "wobble_offsets.exr", "wobble_normals.exr", "wobble.vat.json", "wobble_vat.tscn", "wobble_vat.gdshader", "wobble_vat.shader", "wobble_vat.mat", "wobble_offsets.exr.meta"] {
+            assert!(dir.join(file).is_file(), "{file}");
+        }
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("wobble.vat.json")).unwrap()).unwrap();
+        assert_eq!(json["fps"], 12.0, "every second frame plays at half the rate");
+        // A shape that can't be baked says why, in the status bar.
+        app.vat_window.mode = Some(vat::Mode::Rigid);
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 8\nnode 2 40 100 0 obj noise 2.2 0.65\nparent 1 0\nparent 2 0\nlink 1 2 0\ndisplay 0 2\nnext 3\n");
+        app.start_vat_bake(0, dir.join("bent"));
+        while app.vat_job.is_some() {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.vat_window(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.status.contains("bends or stretches"), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Export Sprite Sheet with every engine option, through to the files.
+    #[test]
+    fn exporting_a_sprite_sheet_writes_every_engines_files() {
+        let Some(gpu) = gpu_viewport::headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("pfx_sheet_window_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = ProceduralFxStudioApp::default();
+        app.gpu_viewport = Some(gpu);
+        app.graph = Graph::deserialize("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n");
+        app.selected = None;
+        app.render_camera = RenderCamera::Viewport;
+        (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+        (app.playback_start, app.playback_end) = (0.0, 5.0 / sims::SIM_FPS);
+        app.sprite_sheet = spritesheet::Settings { width: 32, height: 32, godot: true, unity: true, fill_grid: true, ..Default::default() };
+        app.dirty = true;
+        let png = dir.join("ball.png");
+        app.start_sprite_sheet(png.clone(), false);
+        realtime_render_tests::run_recording_for(&mut app, 400);
+        assert!(app.status.starts_with("Sprite sheet: 6 frames in 2×3 cells"), "a filled grid, no empty cells: {}", app.status);
+        for path in [png.clone(), spritesheet::json_path(&png), spritesheet::godot_path(&png), spritesheet::godot_particles_path(&png), spritesheet::unity_meta_path(&png)] {
+            assert!(path.is_file(), "{}", path.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
