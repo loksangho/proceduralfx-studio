@@ -75,7 +75,6 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 </ol>
 
 <h2>5. For particle systems</h2>
-<p class="soon">Coming in the next update: Fill the grid isn't in version 0.20.0 yet.</p>
 <p>Particle systems play every cell of the grid, so tick <b>Fill the grid</b> under <b>Particles</b>. The sheet then gets a layout with no empty cells: 24 frames make 6 × 4, not 5 × 5 with one blank.</p>
 <ul>
 <li><b>Godot:</b> with Godot ticked too, you also get <code>fire_particles.tres</code>. Set it as a <b>GPUParticles2D</b>'s material, and the PNG as its texture. The process material's <b>Animation → Speed</b> sets how fast the frames go: 1 plays them once over each particle's life.</li>
@@ -86,7 +85,6 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 <p>Tick <b>Keep updating</b> under <b>Live</b> before you export. From then on, the app exports again a moment after every change. A Bevy game run with Bevy's <code>file_watcher</code> feature shows the change while it runs. Godot and Unity pick up the new files when you switch back to their window.</p>
 
 <h2>Share it</h2>
-<p class="soon">Coming in the next update: Save GIF… and the <code>animation</code> command aren't in version 0.20.0 yet. Until then, the flipbook viewer's <b>Save movie…</b> saves an MP4 if FFmpeg is installed.</p>
 <p>To post an effect, click <b>Flipbook</b> under the timeline. When it's recorded, the flipbook viewer's <b>Save GIF…</b> saves a looping GIF. From a terminal, <code>proceduralfx_studio animation fire.pfs fire.gif</code> does the same in one step.</p>
 
 <p><b>Next:</b> <a href="/tutorial-particles">Particles with a POP Network →</a></p>
