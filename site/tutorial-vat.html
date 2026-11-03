@@ -65,7 +65,6 @@
 <p>The shader works with URP and with Unity's older built-in render pipeline. Your project must use the <b>Linear</b> colour space, which is URP's default. In Gamma, Unity changes the textures' numbers, and the shader shows the mesh in magenta rather than move it wrongly. Change it in <b>Project Settings → Player → Other Settings → Color Space</b>.</p>
 
 <h2>3c. Play it in Bevy</h2>
-<p class="soon">Coming soon: this needs bevy_procedural_fx 0.2.</p>
 <ol>
 <li>Export into your game's <code>assets</code> folder, for example <code>assets/fx/</code>. Leave Godot and Unity unticked: Bevy reads the files as they are.</li>
 <li>Add <code>bevy_procedural_fx = "0.2"</code> to <code>Cargo.toml</code>, and <code>ProceduralFxPlugin</code> to your app.</li>
