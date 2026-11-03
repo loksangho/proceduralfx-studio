@@ -1,0 +1,32 @@
+{
+  "bounds": [
+    [
+      -2.36666202545166,
+      -0.06633307039737701,
+      -2.2961111068725586
+    ],
+    [
+      2.033024311065674,
+      2.1794354915618896,
+      2.277003765106201
+    ]
+  ],
+  "element": "pieces",
+  "element_count": 20,
+  "format": "procedural-fx-vat",
+  "fps": 24.0,
+  "frame_count": 48,
+  "mesh": "rubble.obj",
+  "mode": "rigid",
+  "positions": "rubble_positions.exr",
+  "rotations": "rubble_rotations.exr",
+  "rows_per_frame": 1,
+  "space": "right-handed, y up (the OBJ's)",
+  "texture_size": [
+    20,
+    48
+  ],
+  "uv": "a vertex's UV picks its element e: ((e + 0.5) / element_count, 0.5); e's texel at frame f is (e % width, f * rows_per_frame + e / width), from the top left",
+  "version": 2,
+  "width": 20
+}

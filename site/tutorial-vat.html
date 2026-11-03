@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vertex Animation for 3D Games · ProceduralFX Studio</title>
-<meta name="description" content="Bake cloth, destruction and liquids from ProceduralFX Studio into vertex animation textures (VAT) that play on the GPU in Godot and Unity.">
+<meta name="description" content="Bake cloth, destruction and liquids from ProceduralFX Studio into vertex animation textures (VAT) that play on the GPU in Godot, Unity and Bevy.">
 <link rel="icon" href="/img/logo.png">
 <link rel="stylesheet" href="/styles.css">
 </head>
@@ -63,6 +63,15 @@
 <li>Press Play. Untick <b>Play by itself</b> on the material to set the frame yourself.</li>
 </ol>
 <p>The shader works with URP and with Unity's older built-in render pipeline. Your project must use the <b>Linear</b> colour space, which is URP's default. In Gamma, Unity changes the textures' numbers, and the shader shows the mesh in magenta rather than move it wrongly. Change it in <b>Project Settings → Player → Other Settings → Color Space</b>.</p>
+
+<h2>3c. Play it in Bevy</h2>
+<p class="soon">Coming soon: this needs bevy_procedural_fx 0.2.</p>
+<ol>
+<li>Export into your game's <code>assets</code> folder, for example <code>assets/fx/</code>. Leave Godot and Unity unticked: Bevy reads the files as they are.</li>
+<li>Add <code>bevy_procedural_fx = "0.2"</code> to <code>Cargo.toml</code>, and <code>ProceduralFxPlugin</code> to your app.</li>
+<li>Spawn it: <code>commands.spawn(FxMesh::looping(assets.load("fx/name.vat.json")));</code></li>
+</ol>
+<p>It plays in shadows too, and stays visible however far the pieces fly. Use <code>FxMesh::one_shot</code> for an effect that plays once and then removes itself, and <code>.with_material(StandardMaterial { .. })</code> to set its colour and roughness.</p>
 
 <h2>Tips</h2>
 <ul>

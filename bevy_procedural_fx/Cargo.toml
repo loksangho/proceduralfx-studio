@@ -1,14 +1,19 @@
 [package]
 name = "bevy_procedural_fx"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
-description = "Play sprite-sheet effects exported from ProceduralFX Studio in Bevy"
+description = "Play effects exported from ProceduralFX Studio in Bevy: sprite sheets, and vertex animation for 3D"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/loksangho/proceduralfx-studio"
-keywords = ["bevy", "vfx", "sprite-sheet", "2d", "gamedev"]
+keywords = ["bevy", "vfx", "sprite-sheet", "vertex-animation", "gamedev"]
 categories = ["game-development"]
 # The README's GIF is linked from GitHub, so the crate doesn't carry it.
 exclude = ["docs/"]
+
+[features]
+default = ["vat"]
+# Vertex animation textures (FxMesh): 3D meshes moved by a shader.
+vat = ["bevy/bevy_pbr", "bevy/exr"]
 
 [dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["bevy_asset", "bevy_image", "bevy_sprite", "png"] }

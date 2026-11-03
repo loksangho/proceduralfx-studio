@@ -1,0 +1,32 @@
+{
+  "bounds": [
+    [
+      -2.828172206878662,
+      -0.8890924453735352,
+      -2.8282570838928223
+    ],
+    [
+      2.7265844345092773,
+      1.160489797592163,
+      2.816310405731201
+    ]
+  ],
+  "element": "points",
+  "element_count": 400,
+  "format": "procedural-fx-vat",
+  "fps": 24.0,
+  "frame_count": 48,
+  "mesh": "wave.obj",
+  "mode": "soft",
+  "normals": "wave_normals.exr",
+  "offsets": "wave_offsets.exr",
+  "rows_per_frame": 1,
+  "space": "right-handed, y up (the OBJ's)",
+  "texture_size": [
+    400,
+    48
+  ],
+  "uv": "a vertex's UV picks its element e: ((e + 0.5) / element_count, 0.5); e's texel at frame f is (e % width, f * rows_per_frame + e / width), from the top left",
+  "version": 2,
+  "width": 400
+}

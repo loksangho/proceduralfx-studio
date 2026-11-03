@@ -1,5 +1,5 @@
-//! Play sprite-sheet effects exported from [ProceduralFX Studio](https://github.com/loksangho/proceduralfx-studio)
-//! in Bevy.
+//! Play effects exported from [ProceduralFX Studio](https://github.com/loksangho/proceduralfx-studio)
+//! in Bevy: sprite sheets for 2D, and vertex animation for 3D ([`FxMesh`]).
 //!
 //! In ProceduralFX Studio, **Render → Export Sprite Sheet…** writes `name.png` and
 //! `name.pfx.json`. Put both in your `assets` folder, add [`ProceduralFxPlugin`], and spawn
@@ -25,6 +25,10 @@
 //! The sprite plays at the frame rate it was exported at. Its transform sits where the
 //! centre of the full rendered frame was, even when the sheet's frames were cropped, so an
 //! effect lines up the same way however it was trimmed.
+//!
+//! For 3D, **Render → Export Vertex Animation…** bakes cloth, destruction or a liquid into
+//! textures that a shader plays: spawn an [`FxMesh`] with the `.vat.json` file. It needs the
+//! `vat` feature, which is on by default.
 
 use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext};
@@ -32,8 +36,13 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use serde::Deserialize;
 
+#[cfg(feature = "vat")]
+mod vat;
+#[cfg(feature = "vat")]
+pub use vat::{FxMesh, FxVat, FxVatError, FxVatLoader, VatExtension, VatMaterial, VatMode, VatSettings};
+
 /// Registers the [`FxSheet`] asset, its `.pfx.json` loader, and the system that plays
-/// [`FxSprite`]s.
+/// [`FxSprite`]s; with the `vat` feature, the same for [`FxVat`] and [`FxMesh`].
 pub struct ProceduralFxPlugin;
 
 impl Plugin for ProceduralFxPlugin {
@@ -43,6 +52,8 @@ impl Plugin for ProceduralFxPlugin {
             app.init_asset::<TextureAtlasLayout>();
         }
         app.init_asset::<FxSheet>().register_asset_loader(FxSheetLoader).add_systems(Update, play);
+        #[cfg(feature = "vat")]
+        vat::build(app);
     }
 }
 

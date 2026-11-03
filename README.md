@@ -136,6 +136,11 @@ There are three kinds, and **Automatic** picks the one that suits the motion:
 You get `name.obj`, two EXR textures and `name.vat.json` describing the layout. Tick an engine
 for what it needs:
 
+- **Bevy**: nothing to tick. Put the files in your `assets` folder and spawn an `FxMesh` from
+  [bevy_procedural_fx](bevy_procedural_fx) 0.2 with the `.vat.json` file. It plays in the main
+  pass and in shadows, with culling bounds covering the whole animation:
+  `commands.spawn(FxMesh::looping(assets.load("fx/wave.vat.json")));`
+
 - **Godot 4**: `name_vat.tscn`, a ready scene: drag it into yours and it plays. It's a
   `MeshInstance3D` with `name.obj`, the material (`name_vat_material.tres` with
   `name_vat.gdshader`) and culling bounds covering the whole animation. Import settings keep the
