@@ -136,17 +136,19 @@ There are three kinds, and **Automatic** picks the one that suits the motion:
 You get `name.obj`, two EXR textures and `name.vat.json` describing the layout. Tick an engine
 for what it needs:
 
-- **Godot 4**: `name_vat.gdshader` and `name_vat_material.tres`, with import settings that keep
-  the textures and mesh exact. Put `name.obj` on a `MeshInstance3D` and set the material on it.
-  It plays by itself; turn off `use_time` and set `frame` to drive it from a script.
-- **Unity (URP)**: `name_vat.shader` and `name_vat.mat`, with import settings that keep the
-  textures exact. Export into your `Assets` folder, put `name.obj` in the scene and give it the
-  material. The project must use the Linear colour space (URP's default); in Gamma, the
-  mesh shows magenta.
+- **Godot 4**: `name_vat.tscn`, a ready scene: drag it into yours and it plays. It's a
+  `MeshInstance3D` with `name.obj`, the material (`name_vat_material.tres` with
+  `name_vat.gdshader`) and culling bounds covering the whole animation. Import settings keep the
+  textures and mesh exact. Turn off the material's `use_time` and set `frame` to drive it
+  from a script.
+- **Unity (URP or the built-in pipeline)**: `name_vat.shader` and `name_vat.mat`, with import
+  settings that keep the textures exact. Export into your `Assets` folder, put `name.obj` in the
+  scene and give it the material. The project must use the Linear colour space (URP's
+  default); in Gamma, the mesh shows magenta.
 
-If pieces or splashes fly far from where the first frame was, an engine may stop drawing the
-mesh too early. The JSON's `bounds` give the whole animation's extent: set Godot's
-`extra_cull_margin` or `custom_aabb`, or Unity's `Renderer.localBounds`, to cover it.
+In Unity, if pieces or splashes fly far from where the first frame was, Unity may stop drawing
+the mesh too early. The JSON's `bounds` give the whole animation's extent: set the renderer's
+`Renderer.localBounds` to cover it.
 
 ## GIFs and movies
 

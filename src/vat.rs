@@ -505,6 +505,8 @@ pub struct Files {
     pub obj: PathBuf,
     pub textures: [PathBuf; 2],
     pub json: PathBuf,
+    // Everything the animation covers, in OBJ space (for engines' culling).
+    pub bounds: (Vec3, Vec3),
 }
 
 impl Files {
@@ -512,7 +514,7 @@ impl Files {
         let name = stem.file_name().map_or_else(|| "vat".into(), |n| n.to_string_lossy().into_owned());
         let with = |suffix: &str| stem.with_file_name(format!("{name}{suffix}"));
         let [a, b] = mode.textures();
-        Files { mode, obj: with(".obj"), textures: [with(&format!("_{a}.exr")), with(&format!("_{b}.exr"))], json: with(".vat.json") }
+        Files { mode, obj: with(".obj"), textures: [with(&format!("_{a}.exr")), with(&format!("_{b}.exr"))], json: with(".vat.json"), bounds: (Vec3::zero(), Vec3::zero()) }
     }
 
     pub fn name(&self) -> String {
@@ -527,7 +529,8 @@ fn file_name(p: &Path) -> String {
 // Writes the mesh, the two textures and the JSON describing them. Returns the layout.
 pub fn write(bake: &Bake, stem: &Path, fps: f32) -> Result<(Files, Layout), String> {
     let layout = Layout::new(bake.elements, bake.frames)?;
-    let files = Files::new(stem, bake.mode);
+    let mut files = Files::new(stem, bake.mode);
+    files.bounds = bake.bounds;
     if let Some(dir) = files.obj.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -739,7 +742,34 @@ force_disable_mesh_compression=true
     .to_owned()
 }
 
-pub fn godot_paths(files: &Files) -> [PathBuf; 5] {
+// A scene ready to drop in: the mesh with the material, and culling bounds covering the
+// whole animation (Godot would otherwise stop drawing it once it leaves the first frame's).
+pub fn godot_scene(files: &Files) -> String {
+    let name = files.name();
+    let (lo, hi) = files.bounds;
+    let size = hi.sub(lo);
+    format!(
+        "[gd_scene load_steps=3 format=3]
+
+[ext_resource type=\"ArrayMesh\" path=\"{name}.obj\" id=\"1_mesh\"]
+[ext_resource type=\"Material\" path=\"{name}_vat_material.tres\" id=\"2_material\"]
+
+[node name=\"{node}\" type=\"MeshInstance3D\"]
+custom_aabb = AABB({}, {}, {}, {}, {}, {})
+mesh = ExtResource(\"1_mesh\")
+material_override = ExtResource(\"2_material\")
+",
+        lo.x,
+        lo.y,
+        lo.z,
+        size.x.max(1e-3),
+        size.y.max(1e-3),
+        size.z.max(1e-3),
+        node = name.replace(['.', ':', '@', '/', '"', '%'], "_"),
+    )
+}
+
+pub fn godot_paths(files: &Files) -> [PathBuf; 6] {
     let name = files.name();
     let beside = |file: String| files.obj.with_file_name(file);
     [
@@ -748,17 +778,19 @@ pub fn godot_paths(files: &Files) -> [PathBuf; 5] {
         with_suffix(&files.textures[0], ".import"),
         with_suffix(&files.textures[1], ".import"),
         with_suffix(&files.obj, ".import"),
+        beside(format!("{name}_vat.tscn")),
     ]
 }
 
 pub fn write_godot(files: &Files, layout: &Layout, fps: f32) -> Result<(), String> {
-    let [shader, material, import_a, import_b, import_mesh] = godot_paths(files);
+    let [shader, material, import_a, import_b, import_mesh, scene] = godot_paths(files);
     for (path, text) in [
         (shader, godot_shader(files.mode, layout, fps)),
         (material, godot_material(files)),
         (import_a, godot_texture_import()),
         (import_b, godot_texture_import()),
         (import_mesh, godot_mesh_import()),
+        (scene, godot_scene(files)),
     ] {
         std::fs::write(&path, text).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
     }
@@ -842,6 +874,8 @@ Shader \"ProceduralFX/Vertex Animation/{name}\"
     }}
     SubShader
     {{
+        // Only where URP is installed: elsewhere its include files don't exist.
+        PackageRequirements {{ \"com.unity.render-pipelines.universal\" }}
         Tags {{ \"RenderType\" = \"Opaque\" \"RenderPipeline\" = \"UniversalPipeline\" \"Queue\" = \"Geometry\" }}
         Pass
         {{
@@ -907,6 +941,66 @@ Shader \"ProceduralFX/Vertex Animation/{name}\"
                 return half4(_BaseColor.rgb * lit, 1.0);
             }}
             ENDHLSL
+        }}
+    }}
+    // The built-in render pipeline (Unity picks this one in projects without URP).
+    SubShader
+    {{
+        Tags {{ \"RenderType\" = \"Opaque\" \"Queue\" = \"Geometry\" }}
+        Pass
+        {{
+            Tags {{ \"LightMode\" = \"ForwardBase\" }}
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+            #pragma target 3.5
+            #include \"UnityCG.cginc\"
+            #include \"Lighting.cginc\"
+
+            Texture2D _{a};
+            Texture2D _{b};
+            float4 _BaseColor;
+            float _Fps, _UseTime, _Loop, _Frame, _ElementCount, _FrameCount, _Width, _RowsPerFrame, _TextureHeight;
+
+            struct Attributes {{ float4 positionOS : POSITION; float3 normalOS : NORMAL; float2 uv : TEXCOORD0; }};
+            struct Varyings {{ float4 positionCS : SV_POSITION; float3 normalWS : TEXCOORD0; }};
+
+            #define Fetch(tex, e, f) tex.Load(int3((uint)(e) % (uint)_Width, (int)_TextureHeight - 1 - (int)((uint)(f) * (uint)_RowsPerFrame + (uint)(e) / (uint)_Width), 0))
+
+            float3 Turn(float4 q, float3 v)
+            {{
+                float3 t = 2.0 * cross(q.xyz, v);
+                return v + q.w * t + cross(q.xyz, t);
+            }}
+
+            Varyings vert(Attributes v)
+            {{
+                int count = (int)_FrameCount;
+                int column = clamp((int)(v.uv.x * _Width), 0, (int)_Width - 1);
+                int row = clamp((int)(v.uv.y * _RowsPerFrame), 0, (int)_RowsPerFrame - 1);
+                int e = min(row * (int)_Width + column, (int)_ElementCount - 1);
+                float at = _UseTime > 0.5 ? _Time.y * _Fps : _Frame;
+                at = _Loop > 0.5 ? fmod(at, _FrameCount) : clamp(at, 0.0, _FrameCount - 1.0);
+                int f0 = (int)floor(at);
+                int f1 = _Loop > 0.5 ? (int)((uint)(f0 + 1) % (uint)count) : min(f0 + 1, count - 1);
+                float blend = frac(at);
+{vertex}
+                Varyings o;
+                o.positionCS = UnityObjectToClipPos(float4(position, 1.0));
+                o.normalWS = UnityObjectToWorldNormal(normalize(normal));
+                return o;
+            }}
+
+            fixed4 frag(Varyings i) : SV_Target
+            {{
+            #ifdef UNITY_COLORSPACE_GAMMA
+                return fixed4(1.0, 0.0, 1.0, 1.0);
+            #endif
+                float3 n = normalize(i.normalWS);
+                float3 lit = _LightColor0.rgb * saturate(dot(n, _WorldSpaceLightPos0.xyz)) + ShadeSH9(float4(n, 1.0));
+                return fixed4(_BaseColor.rgb * lit, 1.0);
+            }}
+            ENDCG
         }}
     }}
 }}
@@ -1345,8 +1439,10 @@ mod tests {
             write_godot(&files, &layout, 12.0).unwrap();
             write_unity(&files, &layout, 12.0).unwrap();
             let read = |p: &Path| std::fs::read_to_string(p).unwrap();
-            let [shader, material, import_a, _, import_mesh] = godot_paths(&files);
+            let [shader, material, import_a, _, import_mesh, scene] = godot_paths(&files);
             assert!(read(&import_mesh).contains("force_disable_mesh_compression=true"));
+            let tscn = read(&scene);
+            assert!(tscn.contains("type=\"MeshInstance3D\"") && tscn.contains("custom_aabb = AABB(") && tscn.contains("path=\"wobble_vat_material.tres\""));
             let gd = read(&shader);
             assert!(gd.contains(&format!("uniform int element_count = {};", layout.points)) && gd.contains("uniform int frame_count = 5;") && gd.contains("uniform float fps = 12.000;"));
             let [a, b] = mode.textures();

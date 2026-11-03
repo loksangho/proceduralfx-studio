@@ -52,23 +52,22 @@
 
 <h2>3a. Play it in Godot 4</h2>
 <ol>
-<li>Add a <b>MeshInstance3D</b> and drag <code>name.obj</code> onto its <b>Mesh</b>.</li>
-<li>Drag <code>name_vat_material.tres</code> onto its <b>Material Override</b>.</li>
+<li>Drag <code>name_vat.tscn</code> into your scene. It's a <b>MeshInstance3D</b> with the mesh and material set up, sized so Godot keeps drawing it wherever the animation goes.</li>
 <li>Run the scene: it plays and loops by itself. To control it from a script, turn off the material's <code>use_time</code> and set <code>frame</code>.</li>
 </ol>
 <p>The export includes import settings that stop Godot compressing the textures and mesh, which would ruin the numbers. Keep the <code>.import</code> files with them.</p>
 
-<h2>3b. Play it in Unity (URP)</h2>
+<h2>3b. Play it in Unity</h2>
 <ol>
 <li>Export into your project's <code>Assets</code> folder. The <code>.meta</code> files beside the textures keep them exact.</li>
 <li>Drag <code>name.obj</code> into the scene, and drag <code>name_vat.mat</code> onto it.</li>
 <li>Press Play. Untick <b>Play by itself</b> on the material to set the frame yourself.</li>
 </ol>
-<p>Your project must use the <b>Linear</b> colour space, which is URP's default. In Gamma, Unity changes the textures' numbers, and the shader shows the mesh in magenta rather than move it wrongly. Change it in <b>Project Settings → Player → Other Settings → Color Space</b>.</p>
+<p>The shader works with URP and with Unity's older built-in render pipeline. Your project must use the <b>Linear</b> colour space, which is URP's default. In Gamma, Unity changes the textures' numbers, and the shader shows the mesh in magenta rather than move it wrongly. Change it in <b>Project Settings → Player → Other Settings → Color Space</b>.</p>
 
 <h2>Tips</h2>
 <ul>
-<li><b>If the mesh vanishes</b> when pieces or splashes fly far from where they started, the engine thinks it's off screen. The JSON's <code>bounds</code> give the whole animation's size. Set Godot's <b>Extra Cull Margin</b> (or <b>Custom AABB</b>), or Unity's <code>Renderer.localBounds</code>, to cover it.</li>
+<li><b>If the mesh vanishes in Unity</b> when pieces or splashes fly far from where they started, Unity thinks it's off screen. The JSON's <code>bounds</code> give the whole animation's size: set the renderer's <code>Renderer.localBounds</code> to cover it. Godot's ready scene already does this.</li>
 <li><b>If the bake says the geometry changes</b> part-way through, its points or polygons aren't the same every frame. Choose <b>Fluid</b>, which allows that.</li>
 <li><b>From a terminal:</b> <code>proceduralfx_studio vat scene.pfs out/name --godot --unity</code> bakes without opening the app. Add <code>--mode rigid</code> to choose the kind.</li>
 </ul>
