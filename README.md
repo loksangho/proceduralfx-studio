@@ -119,21 +119,34 @@ with the sliced sprites.
 
 ## Vertex animation (VAT) for 3D games
 
-**Render → Export Vertex Animation…** bakes a deforming object over the playback range into
-vertex animation textures, so a 3D game plays the motion on the GPU for the cost of a texture
-read per vertex. It works for shapes whose points stay the same: cloth, deformers, wobbling or
-twisting shapes. (From the command line: `proceduralfx_studio vat scene.pfs out/name --godot --unity`.)
+**Render → Export Vertex Animation…** bakes an object's motion over the playback range into
+vertex animation textures, so a 3D game plays it on the GPU for the cost of a texture read or
+two per vertex. (From the command line: `proceduralfx_studio vat scene.pfs out/name --godot --unity`.)
+There are three kinds, and **Automatic** picks the one that suits the motion:
 
-You get `name.obj` (the first frame), `name_offsets.exr` and `name_normals.exr` (every frame,
-one texel per point), and `name.vat.json` describing the layout. Tick an engine for what it needs:
+- **Soft**: points that stay the same and move freely: cloth, deformers, wobbling or twisting
+  shapes. The textures hold each point's offset and normal.
+- **Rigid**: pieces that move and turn without bending: destruction and RBD. The textures hold
+  each piece's centre and rotation, so pieces stay perfectly rigid. Pieces come from the
+  `piece` attribute (fracturing sets it) or from what's connected.
+- **Fluid**: a mesh whose points and polygons change: liquids from Particle Fluid Surface,
+  growing shapes. The textures hold every triangle corner's position and normal each frame.
+  They get big, so keep the mesh's resolution modest.
+
+You get `name.obj`, two EXR textures and `name.vat.json` describing the layout. Tick an engine
+for what it needs:
 
 - **Godot 4**: `name_vat.gdshader` and `name_vat_material.tres`, with import settings that keep
-  the textures exact. Put `name.obj` on a `MeshInstance3D` and set the material on it. It plays
-  by itself; turn off `use_time` and set `frame` to drive it from a script.
+  the textures and mesh exact. Put `name.obj` on a `MeshInstance3D` and set the material on it.
+  It plays by itself; turn off `use_time` and set `frame` to drive it from a script.
 - **Unity (URP)**: `name_vat.shader` and `name_vat.mat`, with import settings that keep the
   textures exact. Export into your `Assets` folder, put `name.obj` in the scene and give it the
   material. The project must use the Linear colour space (URP's default); in Gamma, the
   mesh shows magenta.
+
+If pieces or splashes fly far from where the first frame was, an engine may stop drawing the
+mesh too early. The JSON's `bounds` give the whole animation's extent: set Godot's
+`extra_cull_margin` or `custom_aabb`, or Unity's `Renderer.localBounds`, to cover it.
 
 ## GIFs and movies
 

@@ -8833,6 +8833,8 @@ struct VatWindow {
     // The geometry object to bake (None: the one being viewed, or the first).
     object: Option<NodeId>,
     every: u32,
+    // None: the kind that suits the motion.
+    mode: Option<vat::Mode>,
     godot: bool,
     unity: bool,
 }
@@ -12136,8 +12138,7 @@ impl ProceduralFxStudioApp {
         own_window(ctx, "export_vat", "Export Vertex Animation", [480.0, 360.0], [380.0, 260.0], &mut open, true, |ui| {
             let w = &mut self.vat_window;
             w.every = w.every.max(1);
-            ui.label("Bakes an object's motion over the playback range into vertex animation textures: the first frame as a mesh (OBJ), and every frame's point offsets and normals as textures (EXR). A shader in the game moves the mesh's points on the GPU.");
-            ui.small("For shapes whose points stay the same: cloth, deformers, wobbling or twisting shapes. Particles and fluids change their points, so they can't be baked this way.");
+            ui.label("Bakes an object's motion over the playback range into vertex animation textures: a mesh (OBJ) and two textures (EXR) of every frame's motion. A shader in the game moves the mesh on the GPU.");
             ui.add_space(4.0);
             egui::Grid::new("vat_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("Object");
@@ -12148,6 +12149,24 @@ impl ProceduralFxStudioApp {
                         if ui.selectable_label(chosen == Some(*id), t.as_str()).clicked() {
                             w.object = Some(*id);
                         }
+                    }
+                });
+                ui.end_row();
+                ui.label("Kind");
+                let label = |m: Option<vat::Mode>| match m {
+                    None => "Automatic",
+                    Some(vat::Mode::Soft) => "Soft: points that stay",
+                    Some(vat::Mode::Rigid) => "Rigid: pieces",
+                    Some(vat::Mode::Fluid) => "Fluid: a changing mesh",
+                };
+                egui::ComboBox::from_id_salt("vat_mode").selected_text(label(w.mode)).show_ui(ui, |ui| {
+                    for (m, hint) in [
+                        (None, "The kind that suits the motion: Fluid if the mesh changes, Rigid if it's pieces that keep their shape, else Soft"),
+                        (Some(vat::Mode::Soft), "Points that stay the same and move freely: cloth, deformers, wobbling or twisting shapes"),
+                        (Some(vat::Mode::Rigid), "Pieces that move and turn without bending: destruction and RBD simulations. Pieces come from the piece attribute, or what's connected"),
+                        (Some(vat::Mode::Fluid), "A mesh whose points and polygons change: liquids (Particle Fluid Surface), growing shapes. Bigger textures, and frames don't blend"),
+                    ] {
+                        ui.selectable_value(&mut w.mode, m, label(m)).on_hover_text(hint);
                     }
                 });
                 ui.end_row();
@@ -12186,25 +12205,25 @@ impl ProceduralFxStudioApp {
         let stem = path.with_extension("");
         let times = frame_times(self.playback_start, self.playback_end, every as f32 / sims::SIM_FPS);
         let fps = sims::SIM_FPS / every as f32;
-        let (godot, unity) = (self.vat_window.godot, self.vat_window.unity);
+        let (godot, unity, mode) = (self.vat_window.godot, self.vat_window.unity, self.vat_window.mode);
         let graph = self.graph.clone();
         let (tx, rx) = mpsc::channel();
         self.vat_job = Some(rx);
         self.vat_window.open = false;
         std::thread::spawn(move || {
             let progress_tx = tx.clone();
-            let result = vat::bake_object(&graph, object, &times, &mut |done, total| {
+            let result = vat::bake_object(&graph, object, &times, mode, &mut |done, total| {
                 let _ = progress_tx.send(VatMessage::Progress(done, total));
             })
-            .and_then(|bake| vat::write(&bake, &stem, fps))
-            .and_then(|(files, layout)| {
+            .and_then(|bake| vat::write(&bake, &stem, fps).map(|(files, layout)| (bake.mode, files, layout)))
+            .and_then(|(kind, files, layout)| {
                 if godot {
                     vat::write_godot(&files, &layout, fps)?;
                 }
                 if unity {
                     vat::write_unity(&files, &layout, fps)?;
                 }
-                Ok(format!("Baked {} points over {} frames to {} and its textures", layout.points, layout.frames, files.obj.display()))
+                Ok(format!("Baked as {}: {} elements over {} frames, to {} and its textures", kind.name(), layout.points, layout.frames, files.obj.display()))
             });
             let _ = tx.send(VatMessage::Done(result));
         });
@@ -26421,5 +26440,45 @@ mod vat_window_tests {
             let _ = ctx.run(egui::RawInput::default(), |ctx| app.vat_window(ctx));
         }
         assert!(app.vat_window.open && app.vat_job.is_none());
+    }
+}
+
+#[cfg(test)]
+mod vat_scene_writer {
+    use super::*;
+    // Writes two test scenes for VAT: PFX_VAT_SCENES=<dir> cargo test --release -- --ignored write_vat_scenes
+    #[test]
+    #[ignore]
+    fn write_vat_scenes() {
+        let Some(dir) = std::env::var_os("PFX_VAT_SCENES").map(PathBuf::from) else { return };
+        let kind = |name: &str| NodeKind::templates().into_iter().flat_map(|(_, k)| k).find(|k| k.name() == name).unwrap_or_else(|| panic!("{name}"));
+        // Rigid: a fractured box dropped onto the ground.
+        let mut g = Graph::default();
+        let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let b = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
+        let up = g.add(NodeKind::Transform { t: [0.0, 1.5, 0.0], r: [20.0, 30.0, 0.0], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        let frac = g.add(kind("material_fracture"), egui::pos2(0.0, 0.0));
+        let rbd = g.add(kind("rbd_solver"), egui::pos2(0.0, 0.0));
+        for n in [b, up, frac, rbd] { g.nodes.get_mut(&n).unwrap().parent = Some(geo); }
+        g.connect(b, up, 0); g.connect(up, frac, 0); g.connect(frac, rbd, 0);
+        g.displays.insert(geo, rbd);
+        g.nodes.get_mut(&geo).unwrap().name = "rubble".into();
+        std::fs::write(dir.join("rubble.pfs"), g.serialize()).unwrap();
+        // Fluid: a POP Network's particles meshed by Particle Fluid Surface.
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let s = app.graph.add(NodeKind::Sphere { radius: 0.3, rows: 8, cols: 12 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&s).unwrap().parent = Some(geo);
+        app.current_network = Some(geo);
+        app.apply(Action::Add(NodeKind::PopNet { substeps: 1 }, egui::pos2(0.0, 100.0)));
+        let net = app.selected.unwrap();
+        app.graph.connect(s, net, 0);
+        let surface = app.graph.add(kind("particle_surface"), egui::pos2(0.0, 200.0));
+        app.graph.nodes.get_mut(&surface).unwrap().parent = Some(geo);
+        app.graph.connect(net, surface, 0);
+        app.graph.displays.insert(geo, surface);
+        app.graph.nodes.get_mut(&geo).unwrap().name = "splash".into();
+        std::fs::write(dir.join("splash.pfs"), app.graph.serialize()).unwrap();
     }
 }

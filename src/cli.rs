@@ -36,6 +36,9 @@ Renders a scene without opening a window.
       Vertex animation textures for game engines: name.obj (the first frame),
       name_offsets.exr and name_normals.exr (every frame), name.vat.json
       --object <name>              the geometry object to bake (default: the first)
+      --mode <soft|rigid|fluid>    soft: points that stay (cloth, deformers); rigid: pieces
+                                   that keep their shape (destruction); fluid: a mesh that
+                                   changes (liquids). Default: the one that suits it
       --godot                      also a Godot 4 shader and material
       --unity                      also a Unity (URP) shader, material and import settings
 
@@ -57,7 +60,7 @@ pub enum Output {
     // A GIF or MP4, by the file's extension.
     Animation { file: PathBuf },
     // Vertex animation textures: name.obj, name_offsets.exr... beside `stem`.
-    Vat { stem: PathBuf, object: Option<String>, godot: bool, unity: bool },
+    Vat { stem: PathBuf, object: Option<String>, mode: Option<vat::Mode>, godot: bool, unity: bool },
     SpriteSheet { png: PathBuf, every: u32, columns: u32, trim: bool, seamless: bool, blend: u32, godot: bool, unity: bool, fill_grid: bool },
 }
 
@@ -83,6 +86,7 @@ pub fn parse(args: &[String]) -> Option<Result<Job, String>> {
 fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     let mut positional = Vec::new();
     let (mut out, mut frames, mut size, mut camera, mut object) = (None, None, None, None, None);
+    let mut mode = None;
     let (mut every, mut columns, mut trim, mut seamless, mut blend) = (1, 0, true, false, 8);
     let (mut godot, mut unity, mut fill_grid) = (false, false, false);
     let mut i = 0;
@@ -132,6 +136,14 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
                 object = Some(value(i, arg)?);
                 i += 1;
             }
+            "--mode" => {
+                let text = value(i, arg)?;
+                mode = match text.as_str() {
+                    "auto" => None,
+                    other => Some(vat::Mode::parse(other).ok_or_else(|| format!("--mode: \"{other}\" should be soft, rigid, fluid or auto"))?),
+                };
+                i += 1;
+            }
             "--every" => {
                 every = count(&value(i, arg)?, arg)?;
                 i += 1;
@@ -177,8 +189,8 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
             return Err(format!("{flag} is for sprite sheets"));
         }
     }
-    if object.is_some() && !vat {
-        return Err("--object is for vat".into());
+    if (object.is_some() || mode.is_some()) && !vat {
+        return Err(format!("{} is for vat", if object.is_some() { "--object" } else { "--mode" }));
     }
     if vat && (camera.is_some() || size.is_some()) {
         return Err("vat bakes geometry, so it takes no --camera or --size".into());
@@ -188,7 +200,7 @@ fn parse_job(command: &str, args: &[String]) -> Result<Job, String> {
     }
     let scene = positional.remove(0);
     let output = if vat {
-        Output::Vat { stem: positional.remove(0), object, godot, unity }
+        Output::Vat { stem: positional.remove(0), object, mode, godot, unity }
     } else if animation {
         Output::Animation { file: positional.remove(0) }
     } else if sheet {
@@ -213,8 +225,8 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
     if let Some(problem) = scene_problem(&text) {
         return Err(format!("can't open {}: {problem}", job.scene.display()));
     }
-    if let Output::Vat { stem, object, godot, unity } = &job.output {
-        return run_vat(job, text, stem, object.as_deref(), *godot, *unity, progress);
+    if let Output::Vat { stem, object, mode, godot, unity } = &job.output {
+        return run_vat(job, text, stem, object.as_deref(), *mode, *godot, *unity, progress);
     }
     let gpu = gpu_viewport::headless().ok_or("no GPU was found for the real-time renderer")?;
     let mut app = ProceduralFxStudioApp::default();
@@ -324,7 +336,8 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
 }
 
 // Bakes a geometry object's animation into vertex animation textures.
-fn run_vat(job: &Job, text: String, stem: &std::path::Path, object: Option<&str>, godot: bool, unity: bool, progress: &mut dyn FnMut(usize, usize)) -> Result<String, String> {
+#[allow(clippy::too_many_arguments)]
+fn run_vat(job: &Job, text: String, stem: &std::path::Path, object: Option<&str>, mode: Option<vat::Mode>, godot: bool, unity: bool, progress: &mut dyn FnMut(usize, usize)) -> Result<String, String> {
     let mut app = ProceduralFxStudioApp::default();
     app.use_saved_timeline(&text);
     app.load_state(text);
@@ -341,7 +354,7 @@ fn run_vat(job: &Job, text: String, stem: &std::path::Path, object: Option<&str>
     };
     let step = job.frames.map_or(1.0, |f| f.2) / sims::SIM_FPS;
     let times = frame_times(app.playback_start, app.playback_end, step);
-    let bake = vat::bake_object(&app.graph, id, &times, progress)?;
+    let bake = vat::bake_object(&app.graph, id, &times, mode, progress)?;
     let fps = sims::SIM_FPS / job.frames.map_or(1.0, |f| f.2);
     let (files, layout) = vat::write(&bake, stem, fps)?;
     if godot {
@@ -351,7 +364,8 @@ fn run_vat(job: &Job, text: String, stem: &std::path::Path, object: Option<&str>
         vat::write_unity(&files, &layout, fps)?;
     }
     Ok(format!(
-        "Baked {} points over {} frames ({}×{} textures) to {}",
+        "Baked as {}: {} elements over {} frames ({}×{} textures) to {}",
+        bake.mode.name(),
         layout.points,
         layout.frames,
         layout.width,
@@ -444,7 +458,11 @@ mod tests {
         assert!(error("render wave.pfs --object wave").contains("--object is for vat"));
         assert!(error("vat wave.pfs out/wave --fill-grid").contains("for sprite sheets"));
         let job = parse(&args("vat wave.pfs out/wave --object wave --frames 1 48 2 --godot --unity")).unwrap().unwrap();
-        assert_eq!(job.output, Output::Vat { stem: "out/wave".into(), object: Some("wave".into()), godot: true, unity: true });
+        assert_eq!(job.output, Output::Vat { stem: "out/wave".into(), object: Some("wave".into()), mode: None, godot: true, unity: true });
+        let rigid = parse(&args("vat wave.pfs out/wave --mode rigid")).unwrap().unwrap();
+        assert!(matches!(rigid.output, Output::Vat { mode: Some(vat::Mode::Rigid), .. }));
+        assert!(error("vat wave.pfs out/wave --mode wobbly").contains("soft, rigid, fluid or auto"));
+        assert!(error("render wave.pfs --mode soft").contains("--mode is for vat"));
         assert_eq!(job.frames, Some((1.0, 48.0, 2.0)));
         assert!(error("render fire.pfs --frame").contains("needs a value"));
         assert_eq!(main(&args("render")), Some(2));
