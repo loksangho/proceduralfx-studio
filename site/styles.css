@@ -168,3 +168,6 @@ footer .legal-note { flex-basis: 100%; margin: 4px 0 0; font-size: 13px; opacity
 .tutorial-list a { display: block; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 20px; text-decoration: none; }
 .tutorial-list a strong { display: block; font-size: 18px; margin-bottom: 4px; }
 .tutorial-list a span { color: var(--muted); }
+
+/* Features not released yet */
+.legal .soon { display: inline-block; font-size: 14px; color: #f3d08a; background: rgba(243, 208, 138, 0.1); border: 1px solid rgba(243, 208, 138, 0.35); border-radius: 6px; padding: 4px 10px; margin: 0 0 6px; }
