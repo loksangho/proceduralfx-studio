@@ -26,6 +26,7 @@ mod anim;
 mod attrib;
 mod assistant;
 mod boolean;
+mod assets;
 mod bullet;
 mod cli;
 mod color;
@@ -1020,6 +1021,7 @@ fn remap_node_ids(kind: &mut NodeKind, map: impl Fn(NodeId) -> NodeId) {
                 *id = map(*id);
             }
         }
+        NodeKind::Subnet { spec, .. } => spec.remap(map),
         _ => {}
     }
 }
@@ -3296,6 +3298,14 @@ fn drive_recording(app: &mut ProceduralFxStudioApp, steps: Option<usize>, progre
     finished
 }
 
+// The assets folder. Tests use their own.
+fn default_asset_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    Some(app_config_dir()?.join("assets"))
+}
+
 // Where autosaves and crash reports go. Tests mustn't touch the user's.
 fn recovery_dir() -> Option<PathBuf> {
     if cfg!(test) {
@@ -3951,6 +3961,11 @@ enum NodeKind {
     Pop(pop::PopNode),
     // Inside a SOP Solver network: 0 = Prev_Frame, 1 = Input_1 (the solver's input at the step time).
     SolverInput { index: usize },
+    // A network packaged as one node (an asset when saved to the library): its output is
+    // its display node inside; `values` are its promoted parameters' values.
+    Subnet { values: Vec<f32>, spec: assets::Spec },
+    // Inside a Subnet: one of the Subnet's inputs (0-3).
+    SubnetInput { index: usize },
     // STAGE (LOP) nodes: each builds on the USD stage from its first input.
     // Imports an OBJ geometry object (None: all of them) as Mesh prims under `path`.
     LopSopImport { geometry: Option<NodeId>, path: String },
@@ -4179,6 +4194,8 @@ impl NodeKind {
             NodeKind::Subdivide { .. } => names(&["levels"]),
             NodeKind::Remesh { .. } => names(&["target_triangles"]),
             NodeKind::SolverInput { .. } => names(&[""]),
+            NodeKind::Subnet { spec, .. } => spec.params.iter().map(|p| p.label.clone()).collect(),
+            NodeKind::SubnetInput { .. } => names(&["input"]),
             NodeKind::Add { .. } => names(&["point_count", "spacing", "layout", "delete_geometry"]),
             NodeKind::Transform { .. } => XFORM_NAMES.iter().map(|s| s.to_string()).collect(),
             NodeKind::RbdBullet(_) => names(&["density", "friction", "bounce", "gravity", "substeps", "ground", "ground_height", "glue_strength_scale", "velocity.x", "velocity.y", "velocity.z"]),
@@ -4285,6 +4302,7 @@ impl NodeKind {
             NodeKind::Top(n) => n.texts.clone(),
             NodeKind::RigPose(p) => p.joints.clone(),
             NodeKind::TwoBoneIk(k) => vec![k.root.clone(), k.mid.clone(), k.tip.clone()],
+            NodeKind::Subnet { spec, .. } => vec![spec.format()],
             _ => Vec::new(),
         }
     }
@@ -4363,6 +4381,12 @@ impl NodeKind {
                 next(&mut k.mid);
                 next(&mut k.tip);
             }
+            NodeKind::Subnet { values, spec } => {
+                let mut text = String::new();
+                next(&mut text);
+                *spec = assets::Spec::parse(&text);
+                values.resize(spec.params.len(), 0.0);
+            }
             _ => {}
         }
     }
@@ -4376,7 +4400,7 @@ impl NodeKind {
     fn is_container(&self) -> bool {
         matches!(
             self,
-            NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder | NodeKind::CopNetwork | NodeKind::TopNetwork | NodeKind::PopNet { .. }
+            NodeKind::Geometry { .. } | NodeKind::SopSolver { .. } | NodeKind::AttributeVop { .. } | NodeKind::MaterialBuilder | NodeKind::CopNetwork | NodeKind::TopNetwork | NodeKind::PopNet { .. } | NodeKind::Subnet { .. }
         ) || matches!(self, NodeKind::Pop(n) if n.op == pop::VOP)
     }
 
@@ -4410,6 +4434,7 @@ impl NodeKind {
             NodeKind::ForEachEnd(f) => f.menu_name(),
             NodeKind::CompileEnd { .. } => "Compile Block".into(),
             NodeKind::Jitter { .. } => "point_jitter".into(),
+            NodeKind::Subnet { spec: assets::Spec { asset: Some((name, _)), .. }, .. } => name.clone(),
             other => other.name().to_owned(),
         }
     }
@@ -4430,6 +4455,8 @@ impl NodeKind {
         match self {
             NodeKind::SolverInput { index: 0 } => format!("Prev_Frame{id}"),
             NodeKind::SolverInput { .. } => format!("Input_1·{id}"),
+            NodeKind::SubnetInput { index } => format!("Input_{}·{id}", index + 1),
+            NodeKind::Subnet { spec: assets::Spec { asset: Some((name, _)), .. }, .. } => format!("{}{id}", name.to_lowercase().replace(' ', "_")),
             NodeKind::Vop(v) => v.label(id),
             NodeKind::Shader(v) => format!("{}{id}", v.name().to_lowercase().replace(' ', "_")),
             NodeKind::ShaderNode(n) => n.label(id),
@@ -4652,6 +4679,7 @@ impl NodeKind {
                 (0..flow::MODES.len())
                     .map(|m| NodeKind::ForEachEnd(flow::ForEachSettings::new(m)))
                     .chain(std::iter::once(NodeKind::CompileEnd { begin: None }))
+                    .chain([NodeKind::Subnet { values: Vec::new(), spec: assets::Spec::default() }, NodeKind::SubnetInput { index: 0 }])
                     .collect(),
             ),
             (
@@ -4942,6 +4970,8 @@ impl NodeKind {
             NodeKind::GroupCreate(_) => "group_create",
             NodeKind::SopSolver { .. } => "sop_solver",
             NodeKind::SolverInput { .. } => "solver_input",
+            NodeKind::Subnet { .. } => "subnet",
+            NodeKind::SubnetInput { .. } => "subnet_input",
             NodeKind::Switch { .. } => "switch",
             NodeKind::Geometry { .. } => "geometry",
             NodeKind::Material { kind, .. } => MATERIAL_NAMES[(*kind).min(MATERIAL_NAMES.len() - 1)],
@@ -4983,6 +5013,7 @@ impl NodeKind {
             NodeKind::PopNet { .. } => (&["0: POP Source input 0 (VEX input 1)", "1: input 1 (VEX input 2)", "2: input 2 (VEX input 3)", "3: input 3"], &[]),
             NodeKind::Pop(n) if n.op == pop::SOLVER => (&["Objects (POP Object, Static Objects)", "Pre-solve: forces", "Post-solve: POP Sources"], &[]),
             NodeKind::Pop(_) => (&["Particles"], &[]),
+            NodeKind::Subnet { .. } => (&["Input 1 (Subnet Input 1 inside)", "Input 2", "Input 3", "Input 4"], &[]),
             _ => (&[], &[]),
         }
     }
@@ -5019,6 +5050,8 @@ impl NodeKind {
             NodeKind::HairGenerate(_) | NodeKind::HairDeform(_) => 2,
             NodeKind::SopSolver { .. } => 1,
             NodeKind::SolverInput { .. } => 0,
+            NodeKind::Subnet { .. } => 4,
+            NodeKind::SubnetInput { .. } => 0,
             NodeKind::LopMerge => 2,
             NodeKind::FileImport { .. } => 0,
             NodeKind::ParticleSurface { .. } => 1,
@@ -5061,7 +5094,7 @@ impl NodeKind {
         if self.is_lop() {
             return egui::Color32::from_rgb(70, 175, 190);
         }
-        if matches!(self, NodeKind::SolverInput { .. }) {
+        if matches!(self, NodeKind::SolverInput { .. } | NodeKind::SubnetInput { .. }) {
             return egui::Color32::from_rgb(150, 150, 110);
         }
         match self.num_inputs() {
@@ -5388,6 +5421,8 @@ impl NodeKind {
             NodeKind::LopPrune { hide, .. } => vec![*hide as u8 as f32],
             NodeKind::LopMerge | NodeKind::LopExport { .. } => vec![],
             NodeKind::SolverInput { index } => vec![*index as f32],
+            NodeKind::Subnet { values, .. } => values.clone(),
+            NodeKind::SubnetInput { index } => vec![*index as f32],
             NodeKind::Subdivide { levels } => vec![*levels as f32],
             NodeKind::Remesh { target } => vec![*target as f32],
             NodeKind::Merge | NodeKind::Null => vec![],
@@ -5863,6 +5898,8 @@ impl NodeKind {
             "usd_merge" => NodeKind::LopMerge,
             "usd_export" => NodeKind::LopExport { file: String::new() },
             "solver_input" => NodeKind::SolverInput { index: u(0).min(1) },
+            "subnet" => NodeKind::Subnet { values: p.to_vec(), spec: assets::Spec::default() },
+            "subnet_input" => NodeKind::SubnetInput { index: u(0).min(3) },
             "switch" => NodeKind::Switch { index: u(0) },
             "geometry" => NodeKind::Geometry {
                 material: p.first().filter(|v| **v >= 0.0).map(|v| *v as usize),
@@ -6152,6 +6189,20 @@ impl Graph {
                 }
             }
         }
+        // Parameters promoted to a Subnet it's inside take the Subnet's values (at this time).
+        for subnet in self.subnets_around(id) {
+            let NodeKind::Subnet { spec, .. } = &self.nodes[&subnet].kind else { continue };
+            if !spec.params.iter().any(|p| p.node == id) {
+                continue;
+            }
+            let values = self.kind_at(subnet, time).params();
+            for (p, value) in spec.params.iter().zip(values) {
+                if p.node == id && p.index < params.len() {
+                    params[p.index] = value;
+                    any = true;
+                }
+            }
+        }
         if !any {
             return std::borrow::Cow::Borrowed(&node.kind);
         }
@@ -6162,6 +6213,24 @@ impl Graph {
             }
             None => std::borrow::Cow::Borrowed(&node.kind),
         }
+    }
+
+    // The Subnets a node is inside, innermost first.
+    fn subnets_around(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut at = self.nodes.get(&id).and_then(|n| n.parent);
+        while let Some(parent) = at {
+            let Some(node) = self.nodes.get(&parent) else { break };
+            if matches!(node.kind, NodeKind::Subnet { .. }) {
+                out.push(parent);
+            }
+            // A loop in the parents would be a broken file: stop rather than spin.
+            if out.len() > 64 {
+                break;
+            }
+            at = node.parent;
+        }
+        out
     }
 
     fn xform_at(&self, id: NodeId, time: f32) -> ObjectXform {
@@ -6449,19 +6518,37 @@ impl Graph {
         self.channels.retain(|c, _| c.node != id);
     }
 
-    fn copy_children(&mut self, from: NodeId, to: NodeId) {
+    // Copies a container's network into another container: every node inside (and inside
+    // those, for networks within networks) with its channels, the wires between them and
+    // the display flags. References between the copied nodes, such as a Subnet's promoted
+    // parameters, follow the copies.
+    fn copy_children(&mut self, from: NodeId, to: NodeId) -> HashMap<NodeId, NodeId> {
         let mut map: HashMap<NodeId, NodeId> = HashMap::new();
-        for child in self.children(from) {
-            let Some(src) = self.nodes.get(&child).cloned() else {
-                continue;
-            };
-            let new = self.add(src.kind, src.pos);
-            if let Some(node) = self.nodes.get_mut(&new) {
-                node.bypass = src.bypass;
-                node.context = src.context;
-                node.parent = Some(to);
+        let mut queue = vec![(from, to)];
+        while let Some((source, target)) = queue.pop() {
+            for child in self.children(source) {
+                let Some(src) = self.nodes.get(&child).cloned() else {
+                    continue;
+                };
+                let container = src.kind.is_container();
+                let new = self.add(src.kind, src.pos);
+                if let Some(node) = self.nodes.get_mut(&new) {
+                    node.bypass = src.bypass;
+                    node.context = src.context;
+                    node.parent = Some(target);
+                    node.group = src.group.clone();
+                    node.xform = src.xform;
+                    node.name = src.name.clone();
+                }
+                let copied: Vec<(ChannelTarget, anim::Channel)> = self.node_channels(child).map(|(c, ch)| (c.target, ch.clone())).collect();
+                for (channel, keys) in copied {
+                    self.channels.insert(ChannelId { node: new, target: channel }, keys);
+                }
+                map.insert(child, new);
+                if container {
+                    queue.push((child, new));
+                }
             }
-            map.insert(child, new);
         }
         let links: Vec<Link> = self.links.clone();
         for l in links {
@@ -6469,9 +6556,119 @@ impl Graph {
                 self.links.push(Link { from: *a, to: *b, slot: l.slot, out: l.out });
             }
         }
-        if let Some(display) = self.displays.get(&from).and_then(|d| map.get(d)) {
-            self.displays.insert(to, *display);
+        let mut containers: Vec<(NodeId, NodeId)> = map.iter().map(|(&a, &b)| (a, b)).collect();
+        containers.push((from, to));
+        for (source, target) in containers {
+            if let Some(display) = self.displays.get(&source).and_then(|d| map.get(d)) {
+                self.displays.insert(target, *display);
+            }
         }
+        let follow = |id: NodeId| map.get(&id).copied().unwrap_or(id);
+        for id in map.values().copied().chain(std::iter::once(to)) {
+            if let Some(node) = self.nodes.get_mut(&id) {
+                remap_node_ids(&mut node.kind, follow);
+            }
+        }
+        map
+    }
+
+    // Every node inside a container, at any depth.
+    fn descendants(&self, container: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut queue = vec![container];
+        while let Some(at) = queue.pop() {
+            for child in self.children(at) {
+                out.push(child);
+                queue.push(child);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    // A Subnet as an asset file: a scene of just it and its network, with its name,
+    // version and description.
+    fn asset_text(&self, subnet: NodeId, name: &str, version: u32, description: &str) -> String {
+        let mut keep: HashSet<NodeId> = self.descendants(subnet).into_iter().collect();
+        keep.insert(subnet);
+        let mut g = Graph { next_id: self.next_id, ..Graph::default() };
+        for &id in &keep {
+            let mut node = self.nodes[&id].clone();
+            if id == subnet {
+                node.parent = None;
+                if let NodeKind::Subnet { spec, .. } = &mut node.kind {
+                    spec.asset = Some((name.to_owned(), version));
+                    spec.description = description.to_owned();
+                }
+            }
+            g.nodes.insert(id, node);
+        }
+        g.links = self.links.iter().filter(|l| keep.contains(&l.from) && keep.contains(&l.to)).cloned().collect();
+        g.displays = self.displays.iter().filter(|(c, d)| keep.contains(c) && keep.contains(d)).map(|(&c, &d)| (c, d)).collect();
+        g.channels = self.channels.iter().filter(|(c, _)| keep.contains(&c.node)).map(|(c, ch)| (*c, ch.clone())).collect();
+        g.serialize() + &assets::info_line(name, version, description)
+    }
+
+    // Fills a Subnet from an asset file: its network (replacing what was inside), its
+    // promoted parameters and the asset's name and version. Sliders keep their values
+    // where the new version has a slider of the same name. Err says why it couldn't.
+    fn fill_from_asset(&mut self, subnet: NodeId, text: &str) -> Result<(), String> {
+        if let Some(problem) = scene_problem(text) {
+            return Err(problem);
+        }
+        let asset = Graph::deserialize(text);
+        let root = asset
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.parent.is_none() && matches!(n.kind, NodeKind::Subnet { .. }))
+            .map(|(id, _)| *id)
+            .min()
+            .ok_or("the file has no Subnet in it")?;
+        let NodeKind::Subnet { values: new_values, spec: new_spec } = asset.nodes[&root].kind.clone() else { unreachable!() };
+        let Some(NodeKind::Subnet { values: old_values, spec: old_spec }) = self.nodes.get(&subnet).map(|n| n.kind.clone()) else {
+            return Err("that isn't a Subnet".into());
+        };
+        for child in self.children(subnet) {
+            self.remove(child);
+        }
+        let offset = self.next_id;
+        let map = |id: NodeId| id + offset;
+        for (&id, node) in &asset.nodes {
+            if id == root {
+                continue;
+            }
+            let mut node = node.clone();
+            node.parent = node.parent.map(|p| if p == root { subnet } else { map(p) });
+            remap_node_ids(&mut node.kind, map);
+            self.nodes.insert(map(id), node);
+        }
+        let inside = |id: NodeId| if id == root { None } else { Some(map(id)) };
+        self.links.extend(asset.links.iter().filter_map(|l| Some(Link { from: inside(l.from)?, to: inside(l.to)?, slot: l.slot, out: l.out })));
+        for (&container, &display) in &asset.displays {
+            let container = if container == root { subnet } else { map(container) };
+            self.displays.insert(container, map(display));
+        }
+        for (c, ch) in &asset.channels {
+            if c.node != root {
+                self.channels.insert(ChannelId { node: map(c.node), target: c.target }, ch.clone());
+            }
+        }
+        self.next_id = offset + asset.next_id;
+        let mut spec = new_spec;
+        spec.remap(map);
+        let values = spec
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let kept = old_spec.params.iter().position(|o| o.label == p.label).and_then(|k| old_values.get(k));
+                kept.copied().unwrap_or_else(|| new_values.get(i).copied().unwrap_or(0.0))
+            })
+            .collect();
+        if let Some(node) = self.nodes.get_mut(&subnet) {
+            node.kind = NodeKind::Subnet { values, spec };
+        }
+        Ok(())
     }
 
     fn duplicate(&mut self, id: NodeId) -> Option<NodeId> {
@@ -7322,13 +7519,20 @@ impl Graph {
         for (channel, keys) in self.node_channels(id) {
             format!("{:?} {:?}", channel.target, keys).hash(&mut h);
         }
+        // Inside a Subnet, its promoted values can change this node's parameters.
+        for subnet in self.subnets_around(id) {
+            format!("{:?}", self.nodes[&subnet].kind).hash(&mut h);
+            for (channel, keys) in self.node_channels(subnet) {
+                format!("{:?} {:?}", channel.target, keys).hash(&mut h);
+            }
+        }
         let kind = &node.kind;
         let reads_beyond_inputs = kind.is_container()
             || kind.is_lop()
             || matches!(
                 kind.name(),
                 "geometry" | "cop_network" | "cop" | "top" | "top_network" | "solver_input" | "foreach_begin" | "foreach_end" | "vdb" | "usd_export" | "object_merge"
-                    | "sop_solver" | "compile_begin" | "compile_end" | "attribute_vop" | "vop" | "file" | "cache" | "popnet" | "pop"
+                    | "sop_solver" | "compile_begin" | "compile_end" | "attribute_vop" | "vop" | "file" | "cache" | "popnet" | "pop" | "subnet_input"
             );
         if reads_beyond_inputs {
             scene.hash(&mut h);
@@ -7426,8 +7630,15 @@ impl Graph {
                 _ => false,
             }
             || (!n.bypass
-                && matches!(n.kind, NodeKind::Geometry { .. } | NodeKind::CopNetwork)
+                && matches!(n.kind, NodeKind::Geometry { .. } | NodeKind::CopNetwork | NodeKind::Subnet { .. })
                 && self.display_of(id).is_some_and(|d| self.time_dependent(d)))
+            // A Subnet Input changes when what feeds the Subnet does.
+            || (matches!(n.kind, NodeKind::SubnetInput { .. })
+                && n.parent.is_some_and(|subnet| self.links.iter().filter(|l| l.to == subnet).any(|l| self.time_dependent(l.from))))
+            // Animated promoted parameters animate the nodes they drive.
+            || self.subnets_around(id).into_iter().any(|subnet| {
+                self.is_animated(subnet) && matches!(&self.nodes[&subnet].kind, NodeKind::Subnet { spec, .. } if spec.params.iter().any(|p| p.node == id))
+            })
             // Nodes inside a POP Network show its simulation.
             || n.parent.is_some_and(|p| matches!(self.nodes.get(&p).map(|n| &n.kind), Some(NodeKind::PopNet { .. })))
             || self
@@ -7854,6 +8065,12 @@ impl Graph {
                 }
                 NodeKind::Geometry { .. } => match self.display_of(id) {
                     Some(display) => self.xform_at(id, time).apply(self.cook(display, time, cache)),
+                    None => Mesh::default(),
+                },
+                // A Subnet's output is its display node inside.
+                NodeKind::Subnet { .. } => self.display_of(id).map(|display| self.cook(display, time, cache)).unwrap_or_default(),
+                NodeKind::SubnetInput { index } => match node.parent.filter(|p| matches!(self.nodes.get(p).map(|n| &n.kind), Some(NodeKind::Subnet { .. }))) {
+                    Some(subnet) => self.input_link(subnet, *index).map(|(src, out)| self.cook_output(src, out, time, cache)).unwrap_or_default(),
                     None => Mesh::default(),
                 },
                 NodeKind::Reverse => node_reverse(input(0, cache)),
@@ -9710,6 +9927,14 @@ struct ProceduralFxStudioApp {
     recovery: Option<recovery::Session>,
     // Unsaved work, or a crash report, left by a session that didn't quit cleanly.
     recovery_offer: Option<recovery::Leftover>,
+    // The asset library (the assets folder), as last read.
+    asset_library: Vec<assets::Entry>,
+    // Where assets are saved: the app's assets folder (tests set their own).
+    asset_dir: Option<PathBuf>,
+    // The Subnet panel's choices: the node and parameter to promote, its label, and the
+    // name and description to save the asset with.
+    subnet_promote: (Option<NodeId>, usize, String),
+    asset_save: (Option<NodeId>, String, String),
     // Viewport drags paint the selected Attribute Paint node instead of orbiting.
     paint_active: bool,
     paint_fill: Option<NodeId>,
@@ -9968,6 +10193,10 @@ impl Default for ProceduralFxStudioApp {
             quitting: false,
             recovery: None,
             recovery_offer: None,
+            asset_library: default_asset_dir().map(|d| assets::library(&d)).unwrap_or_default(),
+            asset_dir: default_asset_dir(),
+            subnet_promote: (None, 0, String::new()),
+            asset_save: (None, String::new(), String::new()),
             paint_active: false,
             paint_fill: None,
             group_choices: None,
@@ -13873,6 +14102,7 @@ impl ProceduralFxStudioApp {
             matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::AttributeVop { .. })) || matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::Pop(p)) if p.op == pop::VOP)
         });
         let in_popnet = self.network().is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::PopNet { .. })));
+        let in_subnet = self.network().is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::Subnet { .. })));
         let in_builder = self
             .network()
             .is_some_and(|id| matches!(self.graph.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::MaterialBuilder)));
@@ -13910,6 +14140,7 @@ impl ProceduralFxStudioApp {
                         AppContext::Obj if matches!(k, NodeKind::Particles { .. }) => false,
                         AppContext::Obj if top_obj => k.is_object(),
                         AppContext::Obj if matches!(k, NodeKind::SolverInput { .. }) => in_solver,
+                        AppContext::Obj if matches!(k, NodeKind::SubnetInput { .. }) => in_subnet,
                         AppContext::Obj => {
                             !k.is_object()
                                 && !k.is_material()
@@ -13920,6 +14151,17 @@ impl ProceduralFxStudioApp {
                     .collect();
                 (!kinds.is_empty()).then_some((category, kinds))
             })
+            .chain(
+                // The asset library, wherever SOPs go.
+                (context == AppContext::Obj && !top_obj && !in_vop && !in_popnet && !self.asset_library.is_empty()).then(|| {
+                    let kinds = self
+                        .asset_library
+                        .iter()
+                        .map(|e| NodeKind::Subnet { values: Vec::new(), spec: assets::Spec { asset: Some((e.name.clone(), e.version)), description: e.description.clone(), params: Vec::new() } })
+                        .collect();
+                    ("Assets", kinds)
+                }),
+            )
             .collect()
     }
 
@@ -14409,6 +14651,38 @@ impl ProceduralFxStudioApp {
 
     // A new SOP Solver starts like Houdini's: Prev_Frame and Input_1 nodes, displaying Prev_Frame.
     fn populate_new_node(&mut self, id: NodeId) {
+        // A Subnet: an asset from the library fills itself; a new one gets an input wired
+        // to an output to build between.
+        if let Some(NodeKind::Subnet { spec, .. }) = self.graph.nodes.get(&id).map(|n| &n.kind) {
+            if self.graph.children(id).is_empty() {
+                match spec.asset.clone() {
+                    Some((name, _)) => {
+                        let file = self.asset_library.iter().find(|e| e.name == name).map(|e| e.path.clone());
+                        let result = file.ok_or_else(|| "it isn't in the assets folder any more".to_owned()).and_then(|f| std::fs::read_to_string(&f).map_err(|e| e.to_string())).and_then(|text| self.graph.fill_from_asset(id, &text));
+                        self.status = match result {
+                            Ok(()) => format!("Placed the {name} asset: double-click it to see inside"),
+                            Err(e) => format!("Couldn't place the {name} asset: {e}"),
+                        };
+                    }
+                    None => {
+                        let input = self.graph.add(NodeKind::SubnetInput { index: 0 }, egui::pos2(40.0, 40.0));
+                        let output = self.graph.add(NodeKind::Null, egui::pos2(40.0, 160.0));
+                        for n in [input, output] {
+                            if let Some(node) = self.graph.nodes.get_mut(&n) {
+                                node.parent = Some(id);
+                                node.context = AppContext::Obj;
+                            }
+                        }
+                        if let Some(node) = self.graph.nodes.get_mut(&output) {
+                            node.name = "OUT".into();
+                        }
+                        self.graph.connect(input, output, 0);
+                        self.graph.displays.insert(id, output);
+                        self.status = "Subnet: double-click it to build its network between Input_1 and OUT".into();
+                    }
+                }
+            }
+        }
         // Loops and compile blocks are Begin/End pairs: the Begin goes above the End, wired to it.
         let pair = match self.graph.nodes.get(&id).map(|n| &n.kind) {
             Some(NodeKind::ForEachEnd(s)) if s.begin.is_none() => Some(NodeKind::ForEachBegin),
@@ -15214,6 +15488,164 @@ impl ProceduralFxStudioApp {
             }
         }
         self.dirty = true;
+    }
+
+    // A Subnet's promoted parameters (adding and removing them) and its asset: saving it
+    // to the library, and updating to the library's newer version.
+    fn subnet_ui(&mut self, ui: &mut egui::Ui, id: NodeId) -> bool {
+        let Some(NodeKind::Subnet { spec, .. }) = self.graph.nodes.get(&id).map(|n| n.kind.clone()) else { return false };
+        let mut changed = false;
+        ui.separator();
+        ui.strong("Promoted parameters");
+        let mut remove = None;
+        for (k, p) in spec.params.iter().enumerate() {
+            let target = self.graph.nodes.get(&p.node).map_or_else(|| "(deleted node)".to_owned(), |n| format!("{} · {}", n.title(p.node), n.kind.param_names().get(p.index).cloned().unwrap_or_else(|| format!("#{}", p.index))));
+            ui.horizontal(|ui| {
+                ui.label(p.label.as_str());
+                ui.weak(format!("→ {target}"));
+                if ui.small_button("✕").on_hover_text("Stop promoting it (the node keeps its own value)").clicked() {
+                    remove = Some(k);
+                }
+            });
+        }
+        // Nodes inside with numeric parameters, and the chosen one's parameters.
+        let candidates: Vec<(NodeId, String, Vec<String>, Vec<f32>)> = self
+            .graph
+            .descendants(id)
+            .into_iter()
+            .filter_map(|n| {
+                let node = self.graph.nodes.get(&n)?;
+                let params = node.kind.params();
+                (!params.is_empty() && !node.kind.is_container()).then(|| {
+                    let names = node.kind.param_names();
+                    (n, node.title(n), (0..params.len()).map(|i| names.get(i).filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| format!("#{i}"))).collect(), params)
+                })
+            })
+            .collect();
+        if candidates.is_empty() {
+            ui.small("Nothing inside has parameters to promote yet.");
+        } else {
+            let (mut node, mut index, mut label) = self.subnet_promote.clone();
+            if !node.is_some_and(|n| candidates.iter().any(|c| c.0 == n)) {
+                (node, index) = (Some(candidates[0].0), 0);
+            }
+            let chosen = candidates.iter().find(|c| Some(c.0) == node).expect("chosen above");
+            index = index.min(chosen.2.len() - 1);
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt(("promote_node", id)).selected_text(chosen.1.as_str()).show_ui(ui, |ui| {
+                    for (n, title, ..) in &candidates {
+                        if ui.selectable_value(&mut node, Some(*n), title.as_str()).changed() {
+                            index = 0;
+                        }
+                    }
+                });
+                let chosen = candidates.iter().find(|c| Some(c.0) == node).expect("one of them");
+                index = index.min(chosen.2.len() - 1);
+                egui::ComboBox::from_id_salt(("promote_param", id)).selected_text(chosen.2[index].as_str()).show_ui(ui, |ui| {
+                    for (i, name) in chosen.2.iter().enumerate() {
+                        ui.selectable_value(&mut index, i, name.as_str());
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut label).hint_text(chosen.2[index].as_str()).desired_width(100.0));
+                if ui.button("Promote").on_hover_text("Show this parameter on the Subnet, as a slider that sets it").clicked() {
+                    let value = chosen.3[index];
+                    let label = if label.trim().is_empty() { chosen.2[index].clone() } else { label.trim().to_owned() };
+                    let (min, max) = if value >= 0.0 { (0.0, (value * 2.0).max(1.0)) } else { (value * 2.0, (-value * 2.0).max(1.0)) };
+                    if let Some(NodeKind::Subnet { values, spec }) = self.graph.nodes.get_mut(&id).map(|n| &mut n.kind) {
+                        spec.params.push(assets::Promoted { label, node: chosen.0, index, min, max });
+                        values.push(value);
+                    }
+                    self.subnet_promote.2.clear();
+                    changed = true;
+                    return;
+                }
+            });
+            if !changed {
+                self.subnet_promote = (node, index, label);
+            }
+        }
+        if let Some(k) = remove {
+            if let Some(NodeKind::Subnet { values, spec }) = self.graph.nodes.get_mut(&id).map(|n| &mut n.kind) {
+                spec.params.remove(k);
+                if k < values.len() {
+                    values.remove(k);
+                }
+            }
+            changed = true;
+        }
+
+        ui.separator();
+        ui.strong("Asset");
+        let newer = spec.asset.as_ref().and_then(|(name, version)| self.asset_library.iter().find(|e| &e.name == name && e.version > *version).cloned());
+        if let Some(entry) = &newer {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(230, 190, 90), format!("The library has version {}", entry.version));
+                if ui.button("Update").on_hover_text("Replace the network inside with the library's version. Sliders keep their values where the new version has them.").clicked() {
+                    let result = std::fs::read_to_string(&entry.path).map_err(|e| e.to_string()).and_then(|text| self.graph.fill_from_asset(id, &text));
+                    self.status = match result {
+                        Ok(()) => format!("Updated to {} version {}", entry.name, entry.version),
+                        Err(e) => format!("Couldn't update: {e}"),
+                    };
+                    changed = true;
+                }
+            });
+        }
+        let Some(dir) = self.asset_dir.clone() else {
+            ui.small("There's no assets folder on this computer.");
+            return changed;
+        };
+        let (mut name, mut description) = match &self.asset_save {
+            (Some(for_id), name, description) if *for_id == id => (name.clone(), description.clone()),
+            _ => (String::new(), String::new()),
+        };
+        if name.is_empty() {
+            name = spec.asset.as_ref().map_or_else(|| self.graph.nodes[&id].title(id), |(n, _)| n.clone());
+        }
+        if description.is_empty() {
+            description = spec.description.clone();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut name);
+        });
+        ui.add(egui::TextEdit::multiline(&mut description).hint_text("What it does (shown in the TAB menu)").desired_rows(2));
+        let in_library = self.asset_library.iter().find(|e| e.name == name.trim()).map(|e| e.version);
+        let label = match in_library {
+            Some(v) => format!("Save as version {}", v + 1),
+            None => "Save as Asset".to_owned(),
+        };
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!name.trim().is_empty(), egui::Button::new(label)).on_hover_text("Write it to the assets folder: it appears in the TAB menu under Assets, wherever geometry nodes can go").clicked() {
+                let name = name.trim().to_owned();
+                let version = in_library.map_or(1, |v| v + 1).max(spec.asset.as_ref().filter(|(n, _)| *n == name).map_or(1, |(_, v)| v + 1));
+                let path = self.asset_library.iter().find(|e| e.name == name).map_or_else(|| dir.join(assets::file_name(&name)), |e| e.path.clone());
+                let text = self.graph.asset_text(id, &name, version, description.trim());
+                let written = std::fs::create_dir_all(&dir).and_then(|_| write_file_atomically(&path, &text));
+                self.status = match written {
+                    Ok(()) => {
+                        if let Some(NodeKind::Subnet { spec, .. }) = self.graph.nodes.get_mut(&id).map(|n| &mut n.kind) {
+                            spec.asset = Some((name.clone(), version));
+                            spec.description = description.trim().to_owned();
+                        }
+                        self.asset_library = assets::library(&dir);
+                        changed = true;
+                        let others = self.graph.nodes.iter().filter(|(other, n)| **other != id && matches!(&n.kind, NodeKind::Subnet { spec: assets::Spec { asset: Some((n2, v)), .. }, .. } if *n2 == name && *v < version)).count();
+                        let note = if others > 0 { format!(". {others} other cop{} in this scene can be updated from {} panel", if others == 1 { "y" } else { "ies" }, if others == 1 { "its" } else { "their" }) } else { String::new() };
+                        format!("Saved {name} version {version} to {}{note}", path.display())
+                    }
+                    Err(e) => format!("Couldn't save the asset: {e}"),
+                };
+            }
+            if ui.button("Show the assets folder").clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = platform::open(&dir.to_string_lossy());
+            }
+            if ui.small_button("⟳").on_hover_text("Read the assets folder again (after copying assets into it)").clicked() {
+                self.asset_library = assets::library(&dir);
+            }
+        });
+        self.asset_save = (Some(id), name, description);
+        changed
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {
@@ -17853,6 +18285,28 @@ impl ProceduralFxStudioApp {
                 }
                 ui.small("At time 0 the output is the input. Example: Prev_Frame → Wrangle (@P.y += 0.02;) with the display flag on the wrangle.");
             }
+            NodeKind::Subnet { values, spec } => {
+                ui.heading(spec.asset.as_ref().map_or_else(|| "Subnet".to_owned(), |(name, version)| format!("{name} · asset version {version}")));
+                if !spec.description.is_empty() {
+                    ui.label(spec.description.as_str());
+                }
+                if spec.params.is_empty() {
+                    ui.small("A network packaged as one node: double-click it to build inside. Inputs 1-4 come in through Subnet Input nodes; the output is the display node inside. Promote parameters of the nodes inside, below, to set them here.");
+                }
+                for (p, value) in spec.params.iter().zip(values.iter_mut()) {
+                    let (lo, hi) = (p.min.min(p.max), p.max.max(p.min));
+                    c |= pfield(ui, pslider(value, lo..=hi).clamping(egui::SliderClamping::Never).text(p.label.as_str())).changed();
+                }
+            }
+            NodeKind::SubnetInput { index } => {
+                ui.heading(format!("Subnet Input {}", *index + 1));
+                ui.horizontal(|ui| {
+                    for i in 0..4 {
+                        c |= ui.selectable_value(index, i, format!("Input {}", i + 1)).changed();
+                    }
+                });
+                ui.small("Inside a Subnet: what's wired into that input of the Subnet.");
+            }
             NodeKind::SolverInput { index } => {
                 ui.heading(if *index == 0 { "Prev_Frame" } else { "Input_1" });
                 ui.horizontal(|ui| {
@@ -18188,6 +18642,9 @@ impl ProceduralFxStudioApp {
                     });
                     ui.small("Edits to animated parameters (panel or gizmo) key the current frame automatically. An expression replaces the keys.");
                 });
+        }
+        if self.graph.nodes.get(&id).is_some_and(|n| matches!(n.kind, NodeKind::Subnet { .. })) {
+            c |= self.subnet_ui(ui, id);
         }
         if self.graph.nodes.get(&id).is_some_and(|n| n.kind.is_lop()) {
             // Cook the stage first so its errors below are current.
@@ -25390,5 +25847,158 @@ mod pop_network_tests {
         assert_eq!(after.vertices, before.vertices);
         let Some(NodeKind::Pop(p)) = loaded.nodes.get(&collide).map(|n| &n.kind) else { panic!() };
         assert_eq!(p.op, pop::COLLIDE);
+    }
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+
+    // Geometry ⊃ sphere → Subnet (Subnet Input → Transform → OUT), the Subnet displayed,
+    // with the Transform's translate x promoted as "Offset". Returns (graph, geometry, subnet, transform).
+    fn subnet_scene() -> (ProceduralFxStudioApp, NodeId, NodeId, NodeId) {
+        let mut app = ProceduralFxStudioApp::default();
+        app.graph = Graph::default();
+        let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
+        let sphere = app.graph.add(NodeKind::Sphere { radius: 0.5, rows: 8, cols: 12 }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&sphere).unwrap().parent = Some(geo);
+        app.current_network = Some(geo);
+        app.apply(Action::Add(NodeKind::Subnet { values: Vec::new(), spec: assets::Spec::default() }, egui::pos2(0.0, 100.0)));
+        let subnet = app.selected.expect("added");
+        assert_eq!(app.graph.nodes[&subnet].parent, Some(geo));
+        app.graph.connect(sphere, subnet, 0);
+        app.graph.displays.insert(geo, subnet);
+        // Put a Transform between the Subnet's input and OUT.
+        let out = app.graph.display_of(subnet).expect("a new Subnet shows OUT");
+        let input = app.graph.input_of(out, 0).expect("OUT is fed by Input_1");
+        let xform = app.graph.add(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&xform).unwrap().parent = Some(subnet);
+        app.graph.connect(input, xform, 0);
+        app.graph.connect(xform, out, 0);
+        if let Some(NodeKind::Subnet { values, spec }) = app.graph.nodes.get_mut(&subnet).map(|n| &mut n.kind) {
+            spec.params.push(assets::Promoted { label: "Offset".into(), node: xform, index: 0, min: -5.0, max: 5.0 });
+            values.push(0.0);
+        }
+        (app, geo, subnet, xform)
+    }
+
+    fn centre_x(g: &Graph, id: NodeId, time: f32) -> f32 {
+        let (lo, hi) = g.cook(id, time, &mut HashMap::new()).bounds().expect("geometry");
+        (lo.x + hi.x) / 2.0
+    }
+
+    fn set_offset(g: &mut Graph, subnet: NodeId, value: f32) {
+        if let Some(NodeKind::Subnet { values, .. }) = g.nodes.get_mut(&subnet).map(|n| &mut n.kind) {
+            values[0] = value;
+        }
+    }
+
+    #[test]
+    fn a_subnet_cooks_its_network_with_its_promoted_parameters() {
+        let (mut app, geo, subnet, xform) = subnet_scene();
+        assert!(centre_x(&app.graph, subnet, 0.0).abs() < 1e-4, "the input comes through");
+        let before = app.graph.cook_fingerprints(0);
+        set_offset(&mut app.graph, subnet, 2.0);
+        assert!((centre_x(&app.graph, subnet, 0.0) - 2.0).abs() < 1e-4, "the slider moves it");
+        assert!((centre_x(&app.graph, geo, 0.0) - 2.0).abs() < 1e-4, "and the object shows it");
+        let after = app.graph.cook_fingerprints(0);
+        assert_ne!(before[&xform], after[&xform], "the node it drives cooks again");
+        // The Transform's own value is untouched; the Subnet's is what counts.
+        assert!(matches!(app.graph.nodes[&xform].kind, NodeKind::Transform { t: [0.0, _, _], .. }));
+        assert_eq!(app.graph.nodes[&subnet].kind.param_names(), vec!["Offset".to_owned()]);
+
+        // Keyed, the slider animates the network.
+        assert!(!app.graph.time_dependent(xform));
+        let channel = ChannelId { node: subnet, target: ChannelTarget::Param(0) };
+        let keys = app.graph.channels.entry(channel).or_default();
+        keys.set_key(0.0, 0.0);
+        keys.set_key(1.0, 4.0);
+        assert!(app.graph.time_dependent(xform) && app.graph.time_dependent(subnet));
+        assert!((centre_x(&app.graph, subnet, 0.5) - 2.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn subnets_save_and_duplicate_with_their_promoted_parameters() {
+        let (mut app, _, subnet, xform) = subnet_scene();
+        set_offset(&mut app.graph, subnet, 1.5);
+        let loaded = Graph::deserialize(&app.graph.serialize());
+        assert_eq!(format!("{:?}", loaded.nodes[&subnet].kind), format!("{:?}", app.graph.nodes[&subnet].kind), "saved and loaded");
+        assert!((centre_x(&loaded, subnet, 0.0) - 1.5).abs() < 1e-4);
+
+        let copy = app.graph.duplicate(subnet).unwrap();
+        let NodeKind::Subnet { spec, .. } = &app.graph.nodes[&copy].kind else { panic!() };
+        let target = spec.params[0].node;
+        assert_ne!(target, xform, "the copy's slider drives the copy's Transform");
+        assert_eq!(app.graph.nodes[&target].parent, Some(copy));
+        set_offset(&mut app.graph, copy, -3.0);
+        assert!((centre_x(&app.graph, subnet, 0.0) - 1.5).abs() < 1e-4, "the original is unchanged");
+        app.graph.connect(app.graph.input_of(subnet, 0).unwrap(), copy, 0);
+        assert!((centre_x(&app.graph, copy, 0.0) + 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn assets_are_saved_placed_from_the_tab_menu_and_updated() {
+        let (mut app, geo, subnet, _) = subnet_scene();
+        let dir = std::env::temp_dir().join(format!("pfx_asset_lib_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.asset_dir = Some(dir.clone());
+
+        // Version 1: offset 1.
+        set_offset(&mut app.graph, subnet, 1.0);
+        std::fs::write(dir.join("shifter.pfxasset"), app.graph.asset_text(subnet, "Shifter", 1, "Moves things")).unwrap();
+        app.asset_library = assets::library(&dir);
+        assert_eq!(app.asset_library.len(), 1);
+
+        // It's in the TAB menu inside a geometry network.
+        let menu = app.templates_for_view();
+        let (_, kinds) = menu.iter().find(|(category, _)| *category == "Assets").expect("an Assets menu");
+        let kind = kinds[0].clone();
+        assert_eq!(kind.menu_name(), "Shifter");
+
+        // Placed: a working copy, fed like any node.
+        app.apply(Action::Add(kind.clone(), egui::pos2(200.0, 100.0)));
+        let placed = app.selected.unwrap();
+        assert_ne!(placed, subnet);
+        assert_eq!(app.graph.nodes[&placed].parent, Some(geo));
+        app.graph.connect(app.graph.input_of(subnet, 0).unwrap(), placed, 0);
+        assert!((centre_x(&app.graph, placed, 0.0) - 1.0).abs() < 1e-4, "{}", app.status);
+        let NodeKind::Subnet { spec, .. } = &app.graph.nodes[&placed].kind else { panic!() };
+        assert_eq!(spec.asset, Some(("Shifter".into(), 1)));
+        assert_eq!(spec.description, "Moves things");
+        assert_eq!(app.graph.nodes[&spec.params[0].node].parent, Some(placed), "its slider drives its own nodes");
+        set_offset(&mut app.graph, placed, 4.0);
+
+        // Version 2 adds a node: copies update and keep their slider's value.
+        let inner = app.graph.display_of(subnet).unwrap();
+        let extra = app.graph.add(NodeKind::Transform { t: [0.0, 10.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+        app.graph.nodes.get_mut(&extra).unwrap().parent = Some(subnet);
+        app.graph.connect(inner, extra, 0);
+        app.graph.displays.insert(subnet, extra);
+        std::fs::write(dir.join("shifter.pfxasset"), app.graph.asset_text(subnet, "Shifter", 2, "Moves things up")).unwrap();
+        app.asset_library = assets::library(&dir);
+        let text = std::fs::read_to_string(dir.join("shifter.pfxasset")).unwrap();
+        let before = app.graph.descendants(placed).len();
+        app.graph.fill_from_asset(placed, &text).unwrap();
+        assert_eq!(app.graph.descendants(placed).len(), before + 1, "the old network was replaced, not added to");
+        let (lo, hi) = app.graph.cook(placed, 0.0, &mut HashMap::new()).bounds().unwrap();
+        assert!(((lo.x + hi.x) / 2.0 - 4.0).abs() < 1e-4, "the slider kept its value");
+        assert!(((lo.y + hi.y) / 2.0 - 10.0).abs() < 1e-4, "and the new node is there");
+        let NodeKind::Subnet { spec, .. } = &app.graph.nodes[&placed].kind else { panic!() };
+        assert_eq!(spec.asset, Some(("Shifter".into(), 2)));
+
+        // A file that isn't an asset says so.
+        assert!(app.graph.fill_from_asset(placed, "pfs 2\nnext 0\n").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subnet_inputs_are_only_offered_inside_subnets() {
+        let (mut app, geo, subnet, _) = subnet_scene();
+        let offers = |app: &ProceduralFxStudioApp| app.templates_for_view().iter().flat_map(|(_, k)| k.clone()).any(|k| matches!(k, NodeKind::SubnetInput { .. }));
+        app.current_network = Some(geo);
+        assert!(!offers(&app));
+        app.current_network = Some(subnet);
+        assert!(offers(&app));
     }
 }

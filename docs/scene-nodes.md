@@ -150,6 +150,8 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | For-Each Number | `foreach_end` | 1 text field(s); loop_over=4, iterations=10, start_value=0, increment=1, single_pass=-1, multithread=1, #6=-1 |
 | For Loop with Feedback | `foreach_end` | 1 text field(s); loop_over=5, iterations=10, start_value=0, increment=1, single_pass=-1, multithread=1, #6=-1 |
 | Compile Block | `compile_end` | #0=-1 |
+| subnet | `subnet` | 1 text field(s) |
+| subnet_input | `subnet_input` | input=0 |
 
 ## Shading
 
