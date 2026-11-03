@@ -33,7 +33,9 @@
 <p>You don't have to choose: <b>Automatic</b> picks the kind that suits the motion.</p>
 
 <h2>1. Make something that moves</h2>
-<p>Any animated geometry object works. Two quick ones:</p>
+<p>The quickest start: <b>File → New from Preset</b> has three made for this, under <b>For 3D games</b>. <b>Flag</b> loops (soft), <b>Breaking wall</b> plays once (rigid), and <b>Splash</b> lands as a puddle (fluid). Each comes with its playback range set.</p>
+<p class="soon">Coming in the next update: the 3D presets aren't in version 0.21 yet.</p>
+<p>Or build your own. Any animated geometry object works. Two quick ones:</p>
 <ul>
 <li><b>Wobble (soft):</b> the scene the app opens with already moves. Its <code>noise</code> node changes over time. Press <b>Space</b> to see it.</li>
 <li><b>Destruction (rigid):</b> in a geometry object, wire a <code>box</code> into a <code>xform</code> (Transform) to lift it up, then into a <code>material_fracture</code> to break it, then into an <code>rbd_solver</code> to drop it. Double-click the RBD solver to show it, and press <b>Space</b>.</li>

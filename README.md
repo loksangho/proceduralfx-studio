@@ -147,6 +147,10 @@ There are three kinds, and **Automatic** picks the one that suits the motion:
   growing shapes. The textures hold every triangle corner's position and normal each frame.
   They get big, so keep the mesh's resolution modest.
 
+To start from something, **File → New from Preset** has three made for it: **Flag** (a
+soft loop), **Breaking wall** (rigid) and **Splash** (fluid, coarse enough to keep its textures
+small).
+
 You get `name.obj`, two EXR textures and `name.vat.json` describing the layout. Tick an engine
 for what it needs:
 

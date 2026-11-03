@@ -209,15 +209,15 @@ pub fn system_prompt() -> String {
          For a game effect (fire, smoke, sparks, a hit, a spell, a slash and the like), start from the closest preset with load_preset and change it to match the request, rather than building from nothing. \
          If the scene already has the effect, change it instead of loading a preset. \
          To make a simulation loop, put make_loop after a pyro solver, or loop_particles after a particles solver, with start and length matching the playback range; the Fire preset already does. \
-         A preset's sheet_camera frames the export: it's orthographic, looking along -Z at its position, and the frame's shorter side spans zoom ÷ focal units (for example zoom 3.6 and focal 1.2 show 3 units). \
+         A 2D preset's sheet_camera frames the export: it's orthographic, looking along -Z at its position, and the frame's shorter side spans zoom ÷ focal units (for example zoom 3.6 and focal 1.2 show 3 units). \
          When you make an effect bigger or move it, check its bounds with inspect_node over its range, and set the camera's position and zoom so it fits with a little room; otherwise the sprite sheet cuts it off. \
-         Presets come with a side-on camera and the playback range they're made for; the user exports them with Render → Export Sprite Sheet. \
+         Presets come with a camera and the playback range they're made for; the user exports the 2D ones with Render → Export Sprite Sheet, and the 3D ones (Flag, Breaking wall, Splash: whole meshes, no splats) with Render → Export Vertex Animation. \
          The particle presets are one detail wrangle whose points carry Alpha, Cd, pscale and emission (they render as soft glowing splats); their main settings are the wrangle's user channels (listed under channels, read in VEX with ch(), and set with set_params by name), so adjust those first, then the VEX.\n\
          Presets: {}\n\n\
          When you are done, reply in one or two sentences saying what you built or changed. If the request is unclear, make a reasonable choice and say what you assumed. \
          Describe only what you checked with inspect_node or view_scene; if you couldn't confirm something (how a simulation ends up, how it looks), say so rather than describing what you expect.\n\n\
          # Geometry node catalog\n{}",
-        presets::PRESETS.iter().map(|p| format!("{} ({}): {}", p.name, if p.looping { "loops" } else { "plays once" }, p.description)).collect::<Vec<_>>().join(" "),
+        presets::PRESETS.iter().map(|p| format!("{} ({}{}): {}", p.name, if p.looping { "loops" } else { "plays once" }, if p.vertex_animation { ", 3D" } else { "" }, p.description)).collect::<Vec<_>>().join(" "),
         ai::catalog_text()
     )
 }
@@ -285,7 +285,7 @@ pub fn tools() -> Value {
         },
         {
             "name": "load_preset",
-            "description": "Add a starter effect for 2D games to the scene: its geometry object, ready to tweak, and a side-on camera that frames it for sprite-sheet export. Returns the new nodes and their settings. Use it as the starting point for game effects.",
+            "description": "Add a starter effect to the scene: its geometry object, ready to tweak, and a camera that frames it (side-on for the 2D presets' sprite sheets; for the 3D ones, a view to check the vertex animation by). Returns the new nodes and their settings. Use it as the starting point for game effects.",
             "input_schema": {
                 "type": "object",
                 "properties": {
