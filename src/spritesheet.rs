@@ -37,11 +37,14 @@ pub struct Settings {
     pub unity: bool,
     // For particle systems: a grid with no empty cells (they'd show as blank frames).
     pub fill_grid: bool,
+    // Also write name_motion.png: how each pixel moves to the next frame, so games can
+    // slide between frames rather than cross-fade (see `motion`).
+    pub motion_vectors: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false }
     }
 }
 
@@ -66,6 +69,7 @@ pub struct Output {
     pub godot: bool,
     pub unity: bool,
     pub fill_grid: bool,
+    pub motion_vectors: bool,
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -135,8 +139,15 @@ pub struct Sheet {
 // Packs the frames left to right, top to bottom, `requested` cells across (0: near square).
 pub fn pack(frames: &[egui::ColorImage], requested: u32, trim: bool) -> Result<Sheet, String> {
     let first = frames.first().ok_or("no frames were rendered")?;
+    let crop = if trim { trim_box(frames) } else { [0, 0, first.size[0] as u32, first.size[1] as u32] };
+    pack_in(frames, requested, crop)
+}
+
+// Packs the frames cropped to `crop` ([x, y, width, height] in the full frame).
+pub fn pack_in(frames: &[egui::ColorImage], requested: u32, crop: [u32; 4]) -> Result<Sheet, String> {
+    let first = frames.first().ok_or("no frames were rendered")?;
     let full = [first.size[0] as u32, first.size[1] as u32];
-    let [x, y, w, h] = if trim { trim_box(frames) } else { [0, 0, full[0], full[1]] };
+    let [x, y, w, h] = crop;
     let columns = columns(frames.len(), [w, h], requested);
     let rows = (frames.len() as u32).div_ceil(columns);
     let (sheet_w, sheet_h) = (w as u64 * columns as u64, h as u64 * rows as u64);
@@ -159,10 +170,10 @@ pub fn pack(frames: &[egui::ColorImage], requested: u32, trim: bool) -> Result<S
 }
 
 // The JSON written beside the sheet.
-pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, source_size: [u32; 2]) -> serde_json::Value {
+pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, source_size: [u32; 2], motion: Option<&Motion>) -> serde_json::Value {
     let [w, h] = sheet.cell;
     let frames: Vec<[u32; 4]> = (0..frame_count as u32).map(|i| [(i % sheet.columns) * w, (i / sheet.columns) * h, w, h]).collect();
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "format": "procedural-fx-sprite-sheet",
         "version": 1,
         "image": image_name,
@@ -174,7 +185,48 @@ pub fn metadata(sheet: &Sheet, image_name: &str, frame_count: usize, fps: f32, s
         "source_size": source_size,
         "offset": sheet.offset,
         "frames": frames,
-    })
+    });
+    if let Some(m) = motion {
+        json["motion_vectors"] = serde_json::json!({
+            "image": m.image_name,
+            "strength": (m.strength as f64 * 1000.0).round() / 1000.0,
+            "looping": m.looping,
+            "encoding": "red and green: each pixel's shift to the next frame, across and down, in fractions of a frame's size: (value - 0.5) * 2 * strength. Draw a frame t of the way to the next by sampling this frame at uv - shift * t and the next at uv + shift * (1 - t), and blending",
+        });
+    }
+    json
+}
+
+// A sheet's motion vectors (name_motion.png): laid out like the sheet.
+#[derive(Debug)]
+pub struct Motion {
+    pub sheet: Sheet,
+    pub image_name: String,
+    // The largest shift the colours can hold, in fractions of a frame.
+    pub strength: f32,
+    // Whether the last frame's vectors lead into the first.
+    pub looping: bool,
+}
+
+// name_motion.png beside name.png.
+pub fn motion_path(png: &Path) -> PathBuf {
+    let stem = png.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    png.with_file_name(format!("{stem}_motion.png"))
+}
+
+// The motion vectors of `frames`, packed like `sheet` (which they were packed into).
+pub fn motion_sheet(frames: &[egui::ColorImage], sheet: &Sheet, looping: bool, image_name: String) -> Result<Motion, String> {
+    let flows = crate::motion::flows(frames, looping);
+    let (images, strength) = crate::motion::encode(&flows, sheet.cell);
+    let crop = [sheet.offset[0], sheet.offset[1], sheet.cell[0], sheet.cell[1]];
+    let packed = pack_in(&images, sheet.columns, crop)?;
+    Ok(Motion { sheet: packed, image_name, strength, looping })
+}
+
+fn save_png(image: &image::RgbaImage, png: &Path) -> Result<(), String> {
+    let partial = png.with_extension("png.partial");
+    image.save_with_format(&partial, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, png).map_err(|e| e.to_string())
 }
 
 // Turns `frames`, whose last `blend` were rendered just past the end of the loop, into a
@@ -217,13 +269,21 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     // Written beside the file and renamed over it, so a game watching the files never
-    // reads half of one. The image goes first: the JSON's reload reloads it too.
-    let partial = png.with_extension("png.partial");
-    sheet.image.save_with_format(&partial, image::ImageFormat::Png).map_err(|e| e.to_string())?;
-    std::fs::rename(&partial, &png).map_err(|e| e.to_string())?;
-    let name = png.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    // reads half of one. The images go first: the JSON's reload reloads them too.
+    save_png(&sheet.image, &png)?;
+    let file_name = |p: &Path| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let name = file_name(&png);
+    let motion = if output.motion_vectors {
+        let path = motion_path(&png);
+        let looping = output.blend > 0 || crate::motion::looks_looped(frames);
+        let motion = motion_sheet(frames, &sheet, looping, file_name(&path))?;
+        save_png(&motion.sheet.image, &path)?;
+        Some(motion)
+    } else {
+        None
+    };
     let size = frames.first().map_or([0, 0], |f| [f.size[0] as u32, f.size[1] as u32]);
-    let json = serde_json::to_string_pretty(&metadata(&sheet, &name, frames.len(), output.fps, size)).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&metadata(&sheet, &name, frames.len(), output.fps, size, motion.as_ref())).map_err(|e| e.to_string())?;
     let partial = png.with_extension("pfx.json.partial");
     std::fs::write(&partial, json + "\n").map_err(|e| e.to_string())?;
     std::fs::rename(&partial, json_path(&png)).map_err(|e| e.to_string())?;
@@ -239,6 +299,9 @@ pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sh
         // Re-exports keep the same guid, so Unity keeps what uses the sprites.
         let guid = std::fs::read_to_string(&meta).ok().and_then(|text| meta_guid(&text)).unwrap_or_else(|| new_guid(&png));
         write_beside(&meta, &unity_meta(&sheet, &name, count, &guid))?;
+    }
+    if let Some(motion) = &motion {
+        write_flipbook_engines(output, &png, &sheet, count, size, motion)?;
     }
     Ok((png, sheet))
 }
@@ -476,6 +539,436 @@ TextureImporter:
     out
 }
 
+// ---------------------------------------------------------------------------
+// Smooth playback in Godot and Unity: a shader that, between two frames, slides the first
+// forward along the motion vectors and the next one back, and blends them (as
+// bevy_procedural_fx's FxFlipbook does). Without motion vectors the same shaders could
+// only cross-fade, so they're written only with them.
+// ---------------------------------------------------------------------------
+
+fn stem_of(png: &Path) -> String {
+    png.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+}
+
+// name_flipbook.gdshader and name_flipbook.tscn beside name.png.
+pub fn godot_flipbook_paths(png: &Path) -> [PathBuf; 2] {
+    let stem = stem_of(png);
+    [png.with_file_name(format!("{stem}_flipbook.gdshader")), png.with_file_name(format!("{stem}_flipbook.tscn"))]
+}
+
+// A canvas_item shader for a Sprite2D showing the sheet with `hframes` and `vframes` set to
+// its grid (so its UV covers the first cell); it picks the frame itself, from TIME or from
+// `frame`.
+pub fn godot_flipbook_shader(sheet: &Sheet, count: usize, fps: f32, motion: &Motion) -> String {
+    format!(
+        "// ProceduralFX Studio flipbook with motion vectors: slides between frames.
+shader_type canvas_item;
+
+uniform sampler2D motion_vectors : filter_linear, repeat_disable;
+uniform int columns = {columns};
+uniform int rows = {rows};
+uniform int frame_count = {count};
+uniform float fps = {fps:.3};
+// The largest shift the motion colours hold, in fractions of a frame.
+uniform float strength = {strength};
+// Whether the last frame's motion leads into the first.
+uniform bool motion_loops = {loops};
+uniform bool use_time = true;
+uniform bool looping = true;
+// The frame to show when use_time is off (from 0; fractions are part of the way to the next).
+uniform float frame = 0.0;
+uniform int blending : hint_enum(\"Whole frames\", \"Cross-fade\", \"Motion vectors\") = 2;
+
+// Where `local` (0 to 1 across a frame, from its top left) is in the sheet for frame f,
+// kept half a texel inside the cell.
+vec2 in_sheet(int f, vec2 local, vec2 texel) {{
+	vec2 grid = vec2(float(columns), float(rows));
+	vec2 cell = vec2(float(f % columns), float(f / columns));
+	vec2 half_texel = 0.5 * texel * grid;
+	return (cell + clamp(local, half_texel, vec2(1.0) - half_texel)) / grid;
+}}
+
+vec4 premultiplied(vec4 c) {{
+	return vec4(c.rgb * c.a, c.a);
+}}
+
+void fragment() {{
+	vec2 local = UV * vec2(float(columns), float(rows));
+	float count = float(frame_count);
+	float at = use_time ? TIME * fps : frame;
+	at = looping ? mod(at, count) : clamp(at, 0.0, count - 1.0);
+	int f0 = min(int(floor(at)), frame_count - 1);
+	int f1 = looping ? (f0 + 1) % frame_count : min(f0 + 1, frame_count - 1);
+	float t = fract(at);
+	vec4 c;
+	if (blending == 0) {{
+		c = premultiplied(texture(TEXTURE, in_sheet(f0, local, TEXTURE_PIXEL_SIZE)));
+	}} else {{
+		vec2 shift = vec2(0.0);
+		if (blending == 2 && (f1 > f0 || motion_loops)) {{
+			shift = (texture(motion_vectors, in_sheet(f0, local, TEXTURE_PIXEL_SIZE)).rg - 0.5) * 2.0 * strength;
+		}}
+		vec4 a = premultiplied(texture(TEXTURE, in_sheet(f0, local - shift * t, TEXTURE_PIXEL_SIZE)));
+		vec4 b = premultiplied(texture(TEXTURE, in_sheet(f1, local + shift * (1.0 - t), TEXTURE_PIXEL_SIZE)));
+		c = mix(a, b, t);
+	}}
+	COLOR = vec4(c.rgb / max(c.a, 1e-5), c.a);
+}}
+",
+        columns = sheet.columns,
+        rows = sheet.rows,
+        strength = (motion.strength as f64 * 1000.0).round() / 1000.0,
+        loops = motion.looping,
+    )
+}
+
+// A ready scene: a Sprite2D showing the sheet through the shader, placed so the full
+// rendered frame's centre is at the node, as the other exports do.
+pub fn godot_flipbook_scene(sheet: &Sheet, png: &Path, source_size: [u32; 2], motion: &Motion) -> String {
+    let stem = stem_of(png);
+    let image = png.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let [cw, ch] = sheet.cell;
+    // The cell's centre, from the full frame's centre (y down, as in Godot 2D).
+    let dx = sheet.offset[0] as f32 + cw as f32 / 2.0 - source_size[0] as f32 / 2.0;
+    let dy = sheet.offset[1] as f32 + ch as f32 / 2.0 - source_size[1] as f32 / 2.0;
+    format!(
+        "[gd_scene load_steps=5 format=3]
+
+[ext_resource type=\"Texture2D\" path=\"{image}\" id=\"1_sheet\"]
+[ext_resource type=\"Texture2D\" path=\"{motion_image}\" id=\"2_motion\"]
+[ext_resource type=\"Shader\" path=\"{stem}_flipbook.gdshader\" id=\"3_shader\"]
+
+[sub_resource type=\"ShaderMaterial\" id=\"ShaderMaterial_flipbook\"]
+shader = ExtResource(\"3_shader\")
+shader_parameter/motion_vectors = ExtResource(\"2_motion\")
+
+[node name=\"{node}\" type=\"Sprite2D\"]
+material = SubResource(\"ShaderMaterial_flipbook\")
+texture = ExtResource(\"1_sheet\")
+offset = Vector2({dx}, {dy})
+hframes = {columns}
+vframes = {rows}
+",
+        motion_image = motion.image_name,
+        node = stem.replace(['.', ':', '@', '/', '"', '%'], "_"),
+        columns = sheet.columns,
+        rows = sheet.rows,
+    )
+}
+
+// name_flipbook.shader and name_flipbook.mat beside name.png.
+pub fn unity_flipbook_paths(png: &Path) -> [PathBuf; 2] {
+    let stem = stem_of(png);
+    [png.with_file_name(format!("{stem}_flipbook.shader")), png.with_file_name(format!("{stem}_flipbook.mat"))]
+}
+
+// An unlit, transparent shader for a Quad (or any mesh with 0-1 UVs): it draws one frame
+// over the whole mesh and picks the frame itself. Its one pass has no LightMode, so it
+// runs in URP as well as the built-in pipeline.
+pub fn unity_flipbook_shader(stem: &str, sheet: &Sheet, count: usize, fps: f32, motion: &Motion) -> String {
+    format!(
+        "// ProceduralFX Studio flipbook with motion vectors: slides between frames.
+// Put the material on a Quad; scale the Quad to the frame's shape ({cw} by {ch} pixels).
+Shader \"ProceduralFX/Flipbook/{stem}\"
+{{
+    Properties
+    {{
+        [NoScaleOffset] _MainTex(\"Sheet\", 2D) = \"white\" {{}}
+        [NoScaleOffset] _Motion(\"Motion vectors\", 2D) = \"gray\" {{}}
+        _Color(\"Color\", Color) = (1, 1, 1, 1)
+        _Fps(\"Frames per second\", Float) = {fps:.3}
+        [Toggle] _UseTime(\"Play by itself\", Float) = 1
+        [Toggle] _Loop(\"Loop\", Float) = 1
+        _Frame(\"Frame (when not playing by itself)\", Float) = 0
+        [Enum(Whole frames, 0, Cross fade, 1, Motion vectors, 2)] _Blending(\"Blending\", Float) = 2
+        [HideInInspector] _Columns(\"Columns\", Float) = {columns}
+        [HideInInspector] _Rows(\"Rows\", Float) = {rows}
+        [HideInInspector] _FrameCount(\"Frame count\", Float) = {count}
+        [HideInInspector] _Strength(\"Strength\", Float) = {strength}
+        [HideInInspector] _MotionLoops(\"Motion loops\", Float) = {loops}
+    }}
+    SubShader
+    {{
+        Tags {{ \"Queue\" = \"Transparent\" \"RenderType\" = \"Transparent\" \"IgnoreProjector\" = \"True\" \"PreviewType\" = \"Plane\" }}
+        // The fragment returns premultiplied colour.
+        Blend One OneMinusSrcAlpha
+        ZWrite Off
+        Cull Off
+        Pass
+        {{
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
+            #include \"UnityCG.cginc\"
+
+            sampler2D _MainTex;
+            sampler2D _Motion;
+            float4 _MainTex_TexelSize;
+            float4 _Color;
+            float _Fps, _UseTime, _Loop, _Frame, _Blending, _Columns, _Rows, _FrameCount, _Strength, _MotionLoops;
+
+            struct Attributes {{ float4 positionOS : POSITION; float2 uv : TEXCOORD0; }};
+            struct Varyings {{ float4 positionCS : SV_POSITION; float2 uv : TEXCOORD0; }};
+
+            Varyings vert(Attributes v)
+            {{
+                Varyings o;
+                o.positionCS = UnityObjectToClipPos(v.positionOS);
+                o.uv = v.uv;
+                return o;
+            }}
+
+            // Where `local` (0 to 1 across a frame, from its top left) is in the sheet for
+            // frame f, half a texel inside the cell; Unity's textures start at the bottom.
+            float2 InSheet(float f, float2 local)
+            {{
+                float2 grid = float2(_Columns, _Rows);
+                float2 cell = float2(fmod(f, _Columns), floor(f / _Columns));
+                float2 halfTexel = 0.5 * _MainTex_TexelSize.xy * grid;
+                float2 p = (cell + clamp(local, halfTexel, 1.0 - halfTexel)) / grid;
+                return float2(p.x, 1.0 - p.y);
+            }}
+
+            float4 Premultiplied(float4 c) {{ return float4(c.rgb * c.a, c.a); }}
+
+            float4 frag(Varyings i) : SV_Target
+            {{
+                float2 local = float2(i.uv.x, 1.0 - i.uv.y);
+                float at = _UseTime > 0.5 ? _Time.y * _Fps : _Frame;
+                at = _Loop > 0.5 ? fmod(at, _FrameCount) : clamp(at, 0.0, _FrameCount - 1.0);
+                float f0 = min(floor(at), _FrameCount - 1.0);
+                float f1 = _Loop > 0.5 ? fmod(f0 + 1.0, _FrameCount) : min(f0 + 1.0, _FrameCount - 1.0);
+                float t = frac(at);
+                float4 c;
+                if (_Blending < 0.5)
+                {{
+                    c = Premultiplied(tex2D(_MainTex, InSheet(f0, local)));
+                }}
+                else
+                {{
+                    float2 shift = 0.0;
+                    if (_Blending > 1.5 && (f1 > f0 || _MotionLoops > 0.5))
+                    {{
+                        // Red is across, green down the frame, as stored.
+                        shift = (tex2D(_Motion, InSheet(f0, local)).rg - 0.5) * 2.0 * _Strength;
+                    }}
+                    float4 a = Premultiplied(tex2D(_MainTex, InSheet(f0, local - shift * t)));
+                    float4 b = Premultiplied(tex2D(_MainTex, InSheet(f1, local + shift * (1.0 - t))));
+                    c = lerp(a, b, t);
+                }}
+                return c * _Color * _Color.a;
+            }}
+            ENDCG
+        }}
+    }}
+}}
+",
+        cw = sheet.cell[0],
+        ch = sheet.cell[1],
+        columns = sheet.columns,
+        rows = sheet.rows,
+        strength = (motion.strength as f64 * 1000.0).round() / 1000.0,
+        loops = motion.looping as u8,
+    )
+}
+
+fn unity_flipbook_material(stem: &str, shader: &str, sheet_guid: &str, motion_guid: &str, sheet: &Sheet, count: usize, fps: f32, motion: &Motion) -> String {
+    let texture = |prop: &str, guid: &str| format!("    - {prop}:\n        m_Texture: {{fileID: 2800000, guid: {guid}, type: 3}}\n        m_Scale: {{x: 1, y: 1}}\n        m_Offset: {{x: 0, y: 0}}\n");
+    format!(
+        "%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {{fileID: 0}}
+  m_PrefabInstance: {{fileID: 0}}
+  m_PrefabAsset: {{fileID: 0}}
+  m_Name: {stem}_flipbook
+  m_Shader: {{fileID: 4800000, guid: {shader}, type: 3}}
+  m_Parent: {{fileID: 0}}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {{}}
+  disabledShaderPasses: []
+  m_LockedProperties:
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+{main}{motion_tex}    m_Ints: []
+    m_Floats:
+    - _Blending: 2
+    - _Columns: {columns}
+    - _Fps: {fps}
+    - _Frame: 0
+    - _FrameCount: {count}
+    - _Loop: 1
+    - _MotionLoops: {loops}
+    - _Rows: {rows}
+    - _Strength: {strength}
+    - _UseTime: 1
+    m_Colors:
+    - _Color: {{r: 1, g: 1, b: 1, a: 1}}
+  m_BuildTextureStacks: []
+  m_AllowLocking: 1
+",
+        main = texture("_MainTex", sheet_guid),
+        motion_tex = texture("_Motion", motion_guid),
+        columns = sheet.columns,
+        rows = sheet.rows,
+        strength = (motion.strength as f64 * 1000.0).round() / 1000.0,
+        loops = motion.looping as u8,
+    )
+}
+
+// Import settings for name_motion.png: numbers, not colour (no sRGB), uncompressed, no
+// mipmaps (they'd blend neighbouring cells' motion), filtered, clamped, never shrunk.
+pub fn unity_motion_meta(guid: &str, largest: u32) -> String {
+    let size = largest.next_power_of_two().clamp(32, MAX_SIDE);
+    format!(
+        "fileFormatVersion: 2
+guid: {guid}
+TextureImporter:
+  internalIDToNameTable: []
+  externalObjects: {{}}
+  serializedVersion: 13
+  mipmaps:
+    mipMapMode: 0
+    enableMipMap: 0
+    sRGBTexture: 0
+    linearTexture: 0
+    fadeOut: 0
+    borderMipMap: 0
+    mipMapsPreserveCoverage: 0
+    alphaTestReferenceValue: 0.5
+    mipMapFadeDistanceStart: 1
+    mipMapFadeDistanceEnd: 3
+  bumpmap:
+    convertToNormalMap: 0
+    externalNormalMap: 0
+    heightScale: 0.25
+    normalMapFilter: 0
+    flipGreenChannel: 0
+  isReadable: 0
+  streamingMipmaps: 0
+  streamingMipmapsPriority: 0
+  vTOnly: 0
+  ignoreMipmapLimit: 0
+  grayScaleToAlpha: 0
+  generateCubemap: 6
+  cubemapConvolution: 0
+  seamlessCubemap: 0
+  textureFormat: 1
+  maxTextureSize: {size}
+  textureSettings:
+    serializedVersion: 2
+    filterMode: 1
+    aniso: 1
+    mipBias: 0
+    wrapU: 1
+    wrapV: 1
+    wrapW: 1
+  nPOTScale: 0
+  lightmap: 0
+  compressionQuality: 50
+  spriteMode: 0
+  spriteExtrude: 1
+  spriteMeshType: 1
+  alignment: 0
+  spritePivot: {{x: 0.5, y: 0.5}}
+  spritePixelsToUnits: 100
+  spriteBorder: {{x: 0, y: 0, z: 0, w: 0}}
+  spriteGenerateFallbackPhysicsShape: 1
+  alphaUsage: 0
+  alphaIsTransparency: 0
+  spriteTessellationDetail: -1
+  textureType: 0
+  textureShape: 1
+  singleChannelComponent: 0
+  flipbookRows: 1
+  flipbookColumns: 1
+  maxTextureSizeSet: 0
+  compressionQualitySet: 0
+  textureFormatSet: 0
+  ignorePngGamma: 0
+  applyGammaDecoding: 0
+  swizzle: 50462976
+  cookieLightType: 0
+  platformSettings:
+  - serializedVersion: 4
+    buildTarget: DefaultTexturePlatform
+    maxTextureSize: {size}
+    resizeAlgorithm: 0
+    textureFormat: 4
+    textureCompression: 0
+    compressionQuality: 50
+    crunchedCompression: 0
+    allowsAlphaSplitting: 0
+    overridden: 1
+    ignorePlatformSupport: 0
+    androidETC2FallbackOverride: 0
+    forceMaximumCompressionQuality_BC6H_BC7: 0
+  spriteSheet:
+    serializedVersion: 2
+    sprites: []
+    outline: []
+    physicsShape: []
+    bones: []
+    spriteID: 
+    internalID: 0
+    vertices: []
+    indices: 
+    edges: []
+    weights: []
+    secondaryTextures: []
+    nameFileIdTable: {{}}
+  mipmapLimitGroupName: 
+  pSDRemoveMatte: 0
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+"
+    )
+}
+
+// Writes the engines' smooth-playback files for a sheet saved at `png` with `motion`.
+fn write_flipbook_engines(output: &Output, png: &Path, sheet: &Sheet, count: usize, source_size: [u32; 2], motion: &Motion) -> Result<(), String> {
+    let stem = stem_of(png);
+    let motion_png = motion_path(png);
+    if output.godot {
+        let [shader, scene] = godot_flipbook_paths(png);
+        write_beside(&shader, &godot_flipbook_shader(sheet, count, output.fps, motion))?;
+        write_beside(&with_suffix(&motion_png, ".import"), &crate::vat::godot_texture_import())?;
+        write_beside(&scene, &godot_flipbook_scene(sheet, png, source_size, motion))?;
+    }
+    if output.unity {
+        let [shader, material] = unity_flipbook_paths(png);
+        let guid = |p: &Path| crate::vat::unity_guid(&unity_meta_path(p), &stem);
+        let (shader_guid, material_guid, motion_guid) = (guid(&shader), guid(&material), guid(&motion_png));
+        let sheet_guid = std::fs::read_to_string(unity_meta_path(png)).ok().and_then(|t| meta_guid(&t)).ok_or("the sheet's Unity import settings are missing")?;
+        let shader_meta = format!("fileFormatVersion: 2\nguid: {shader_guid}\nShaderImporter:\n  externalObjects: {{}}\n  defaultTextures: []\n  nonModifiableTextures: []\n  preprocessorOverride: 0\n  userData: \n  assetBundleName: \n  assetBundleVariant: \n");
+        let material_meta = format!("fileFormatVersion: 2\nguid: {material_guid}\nNativeFormatImporter:\n  externalObjects: {{}}\n  mainObjectFileID: 2100000\n  userData: \n  assetBundleName: \n  assetBundleVariant: \n");
+        let largest = motion.sheet.image.width().max(motion.sheet.image.height());
+        write_beside(&unity_meta_path(&motion_png), &unity_motion_meta(&motion_guid, largest))?;
+        write_beside(&shader, &unity_flipbook_shader(&stem, sheet, count, output.fps, motion))?;
+        write_beside(&unity_meta_path(&shader), &shader_meta)?;
+        write_beside(&material, &unity_flipbook_material(&stem, &shader_guid, &sheet_guid, &motion_guid, sheet, count, output.fps, motion))?;
+        write_beside(&unity_meta_path(&material), &material_meta)?;
+    }
+    Ok(())
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 // name.pfx.json beside name.png: the extension bevy_procedural_fx loads.
 pub fn json_path(png: &Path) -> PathBuf {
     png.with_extension("pfx.json")
@@ -551,7 +1044,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let frames = vec![egui::ColorImage::filled([8, 8], egui::Color32::WHITE); 3];
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true, motion_vectors: false };
         let (png, _) = save(&frames, &output).unwrap();
         let guid = |p: &Path| meta_guid(&std::fs::read_to_string(unity_meta_path(p)).unwrap()).unwrap();
         let first = guid(&png);
@@ -602,7 +1095,7 @@ mod tests {
         // Frame 3 (index 2) is in row 1, column 0; its pixel was at x 7 → 7 - 4 = 3 in the cell.
         assert_eq!(sheet.image.get_pixel(3, 3 + 1).0, [255, 128, 0, 255]);
         assert_eq!(sheet.image.get_pixel(2, 3 + 1).0[3], 0);
-        let meta = metadata(&sheet, "fx.png", 5, 24.0, [20, 10]);
+        let meta = metadata(&sheet, "fx.png", 5, 24.0, [20, 10], None);
         assert_eq!(meta["frames"][4], serde_json::json!([0, 6, 7, 3]));
         assert_eq!(meta["frame_size"], serde_json::json!([7, 3]));
         assert_eq!(pack(&frames, 2, false).unwrap().image.dimensions(), (40, 30));
@@ -654,7 +1147,7 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: false };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();
@@ -662,5 +1155,82 @@ mod tests {
         // Only the two files are left: nothing half-written.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn motion_vectors_are_packed_like_the_sheet() {
+        let dir = std::env::temp_dir().join(format!("pfx_motion_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A soft dot moving right 3 pixels a frame, trimmed to what it covers.
+        let dot = |cx: f32| {
+            let pixels = (0..64 * 32)
+                .map(|i| {
+                    let (x, y) = ((i % 64) as f32 + 0.5, (i / 64) as f32 + 0.5);
+                    let a = ((-((x - cx).powi(2) + (y - 16.0).powi(2)) / 20.0).exp() * 255.0) as u8;
+                    egui::Color32::from_rgba_premultiplied(a, a, a, a)
+                })
+                .collect();
+            egui::ColorImage { size: [64, 32], source_size: egui::vec2(64.0, 32.0), pixels }
+        };
+        let frames: Vec<_> = (0..5).map(|i| dot(20.0 + 3.0 * i as f32)).collect();
+        let output = Output { path: dir.join("dot.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: true };
+        let (png, sheet) = save(&frames, &output).unwrap();
+        let motion = image::open(motion_path(&png)).unwrap().to_rgba8();
+        assert_eq!(motion.dimensions(), sheet.image.dimensions(), "the same grid of the same cells");
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(json_path(&png)).unwrap()).unwrap();
+        let mv = &meta["motion_vectors"];
+        assert_eq!(mv["image"], "dot_motion.png");
+        assert_eq!(mv["looping"], false, "a dot moving one way isn't a loop");
+        // At the dot's centre in the first cell, it moves about 3 pixels right and none down.
+        let strength = mv["strength"].as_f64().unwrap() as f32;
+        let [cx, cy] = [20 - sheet.offset[0], 16 - sheet.offset[1]];
+        let px = motion.get_pixel(cx, cy).0;
+        let shift = |byte: u8, size: u32| (byte as f32 / 255.0 - 0.5) * 2.0 * strength * size as f32;
+        let (u, v) = (shift(px[0], sheet.cell[0]), shift(px[1], sheet.cell[1]));
+        assert!((u - 3.0).abs() < 0.6 && v.abs() < 0.4, "({u}, {v})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engines_get_a_flipbook_that_uses_the_motion_vectors() {
+        let dir = std::env::temp_dir().join(format!("pfx_flipbook_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dot = |cx: usize| {
+            let mut image = egui::ColorImage::new([32, 16], vec![egui::Color32::TRANSPARENT; 32 * 16]);
+            for y in 6..10 {
+                for x in cx..cx + 4 {
+                    image.pixels[y * 32 + x] = egui::Color32::WHITE;
+                }
+            }
+            image
+        };
+        let frames: Vec<_> = (0..4).map(|i| dot(4 + 5 * i)).collect();
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true };
+        let (png, sheet) = save(&frames, &output).unwrap();
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        let [gd_shader, gd_scene] = godot_flipbook_paths(&png);
+        let (shader, scene) = (read(&gd_shader), read(&gd_scene));
+        assert!(shader.starts_with("// ProceduralFX Studio flipbook") && shader.contains("shader_type canvas_item;"));
+        assert!(shader.contains(&format!("uniform int columns = {};", sheet.columns)) && shader.contains("uniform int frame_count = 4;") && shader.contains("uniform float fps = 12.000;"));
+        assert!(scene.contains("path=\"puff.png\"") && scene.contains("path=\"puff_motion.png\"") && scene.contains("path=\"puff_flipbook.gdshader\""));
+        assert!(scene.contains(&format!("hframes = {}", sheet.columns)) && scene.contains(&format!("vframes = {}", sheet.rows)));
+        assert!(read(&dir.join("puff_motion.png.import")).contains("compress/mode=0"), "lossless, so the numbers survive");
+        let [u_shader, u_material] = unity_flipbook_paths(&png);
+        let guid = |p: &Path| meta_guid(&read(&unity_meta_path(p))).unwrap();
+        let material = read(&u_material);
+        assert!(material.contains(&format!("m_Shader: {{fileID: 4800000, guid: {}, type: 3}}", guid(&u_shader))));
+        assert!(material.contains(&format!("guid: {}, type: 3}}", guid(&png))), "the material uses the sheet");
+        assert!(material.contains(&format!("guid: {}, type: 3}}", guid(&motion_path(&png)))), "and its motion vectors");
+        let motion_meta = read(&unity_meta_path(&motion_path(&png)));
+        assert!(motion_meta.contains("sRGBTexture: 0") && motion_meta.contains("enableMipMap: 0") && motion_meta.contains("textureCompression: 0"));
+        // Exporting again keeps every Unity link.
+        let before = [guid(&u_shader), guid(&u_material), guid(&motion_path(&png))];
+        save(&frames, &output).unwrap();
+        assert_eq!([guid(&u_shader), guid(&u_material), guid(&motion_path(&png))], before);
+        // Without motion vectors, none of it is written.
+        let plain = Output { path: dir.join("plain.png"), motion_vectors: false, ..output };
+        let (plain_png, _) = save(&frames, &plain).unwrap();
+        assert!(!motion_path(&plain_png).exists() && !godot_flipbook_paths(&plain_png)[0].exists() && !unity_flipbook_paths(&plain_png)[0].exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

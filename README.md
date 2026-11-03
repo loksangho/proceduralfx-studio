@@ -117,6 +117,20 @@ empty cells, since particle systems play every cell. With Godot ticked it also w
 Texture Sheet Animation in Grid mode with the sheet's columns and rows, or in Sprites mode
 with the sliced sprites.
 
+## Smooth playback with motion vectors
+
+Tick **Motion vectors** in **Export Sprite Sheet…** (or pass `--motion-vectors`) and the
+export also writes `name_motion.png`: how each pixel moves on its way to the next frame,
+found from the rendered frames themselves. A game then slides each frame towards the next
+instead of jumping or cross-fading, so a sheet with a quarter of the frames still plays
+smoothly. It works best for smoke, explosions and anything that moves smoothly; fast,
+scattered sparks need more frames.
+
+- **Bevy**: `FxFlipbook` from [bevy_procedural_fx](bevy_procedural_fx) 0.3 plays it.
+- **Godot 4** (with Godot ticked): `name_flipbook.tscn`, a Sprite2D with the shader set up.
+- **Unity** (with Unity ticked): `name_flipbook.mat` and its shader, for a Quad, in URP or
+  the built-in pipeline.
+
 ## Vertex animation (VAT) for 3D games
 
 **Render → Export Vertex Animation…** bakes an object's motion over the playback range into

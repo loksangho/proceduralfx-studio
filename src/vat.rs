@@ -803,7 +803,7 @@ pub fn write_godot(files: &Files, layout: &Layout, fps: f32) -> Result<(), Strin
 
 // A 32-hex-digit Unity guid: the one already in `meta`'s file if there is one (so
 // re-exports keep materials linked), else a new one.
-fn unity_guid(meta: &Path, seed: &str) -> String {
+pub(crate) fn unity_guid(meta: &Path, seed: &str) -> String {
     use sha2::{Digest, Sha256};
     if let Some(guid) = std::fs::read_to_string(meta).ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("guid: ").map(|g| g.trim().to_owned()))) {
         if guid.len() == 32 && guid.chars().all(|c| c.is_ascii_hexdigit()) {

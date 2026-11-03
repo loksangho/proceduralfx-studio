@@ -1,6 +1,6 @@
 [package]
 name = "bevy_procedural_fx"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Play effects exported from ProceduralFX Studio in Bevy: sprite sheets, and vertex animation for 3D"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,9 @@ categories = ["game-development"]
 exclude = ["docs/"]
 
 [features]
-default = ["vat"]
+default = ["flipbook", "vat"]
+# Smooth sprite-sheet playback (FxFlipbook): a 2D mesh and a shader that blend frames.
+flipbook = ["bevy/bevy_sprite_render"]
 # Vertex animation textures (FxMesh): 3D meshes moved by a shader.
 vat = ["bevy/bevy_pbr", "bevy/exr"]
 

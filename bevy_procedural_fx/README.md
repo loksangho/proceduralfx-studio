@@ -1,7 +1,7 @@
 # bevy_procedural_fx
 
 Play effects exported from [ProceduralFX Studio](https://github.com/loksangho/proceduralfx-studio) in [Bevy](https://bevy.org):
-sprite sheets for 2D, and [vertex animation](#vertex-animation-for-3d) for 3D cloth,
+sprite sheets for 2D (played smoothly with motion vectors), and [vertex animation](#vertex-animation-for-3d) for 3D cloth,
 destruction and liquids.
 
 ![An effect re-exported from ProceduralFX Studio updating live in a running Bevy game](https://raw.githubusercontent.com/loksangho/proceduralfx-studio/main/bevy_procedural_fx/docs/live.gif)
@@ -72,6 +72,31 @@ embedded_asset!(app, "fx/fire.png");
 commands.spawn(FxSprite::looping(assets.load("embedded://my_game/fx/fire.pfx.json")));
 ```
 
+## Smooth playback with motion vectors
+
+Tick **Motion vectors** when you export, and ProceduralFX Studio also writes
+`fire_motion.png`: how each pixel moves on its way to the next frame. `FxFlipbook` uses it
+to slide each frame towards the next instead of jumping, so a sheet with a quarter of the
+frames still plays smoothly, even slowed down:
+
+```rust
+commands.spawn(FxFlipbook::looping(assets.load("fx/smoke.pfx.json")).with_speed(0.25));
+```
+
+`FxFlipbook` plays like `FxSprite` (`looping`, `once`, `one_shot`, `with_speed`, `paused`,
+`elapsed`), and draws a frame-sized 2D mesh with a shader instead of a `Sprite`. Choose
+how it goes from frame to frame with `.with_blend(...)`:
+
+| | |
+| --- | --- |
+| `Blend::Motion` | Slide along the motion vectors (the default). Sheets without them cross-fade. |
+| `Blend::Fade` | Cross-fade. |
+| `Blend::None` | Whole frames, as `FxSprite` shows them. |
+
+`.with_color(...)` tints it. Motion vectors work best for smoke, explosions and anything
+that moves smoothly. Fast, scattered sparks need more frames. This needs the `flipbook`
+feature, which is on by default.
+
 ## Vertex animation for 3D
 
 Simulations are too slow to run in a game, so you bake them. In ProceduralFX Studio,
@@ -119,21 +144,25 @@ The mesh is culled by the bounds of the whole animation, so pieces that fly far 
 visible. Exporting again to the same files updates it live, as with sprite sheets.
 
 Vertex animation needs the `vat` feature, which is on by default and brings in Bevy's
-`bevy_pbr` and `exr` features. For a 2D-only game, turn it off:
+`bevy_pbr` and `exr` features. For a 2D-only game, keep just the flipbook:
 
 ```toml
-bevy_procedural_fx = { version = "0.2", default-features = false }
+bevy_procedural_fx = { version = "0.3", default-features = false, features = ["flipbook"] }
 ```
 
 ## Examples
 
 ```sh
 cargo run --example fire
+cargo run --example flipbook
 cargo run --example vat
 ```
 
 `fire` shows three fires from one sheet, playing at different speeds. Click to set off
 one-shot bursts.
+
+`flipbook` shows the same smoke, a 12-frame sheet slowed to a quarter speed, three ways:
+whole frames, cross-faded, and following its motion vectors.
 
 `vat` shows a rippling sheet (soft) beside a box that has broken apart (rigid). Press
 Space to break another one.
@@ -151,12 +180,13 @@ Space to break another one.
 | `frame_count`, `fps` | How many frames there are, and how fast they play |
 | `frames` | Each frame's `[x, y, width, height]` in the PNG |
 | `source_size`, `offset` | The size each frame was rendered at, and where the cropped frame's top-left corner was in it |
+| `motion_vectors` | If exported with them: `image` (laid out like the sheet), `strength` and `looping`. Red and green hold each pixel's shift to the next frame, across and down, in fractions of a frame: `(value - 0.5) * 2 * strength` |
 
 ## Bevy versions
 
 | bevy_procedural_fx | Bevy |
 | --- | --- |
-| 0.1, 0.2 | 0.20 |
+| 0.1 to 0.3 | 0.20 |
 
 ## License
 

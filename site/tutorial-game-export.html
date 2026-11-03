@@ -81,7 +81,17 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 <li><b>Unity:</b> in the Particle System, turn on <b>Texture Sheet Animation</b>. Use <b>Grid</b> mode with the columns and rows from the export (they're in <code>fire.pfx.json</code>), or <b>Sprites</b> mode with the sliced sprites.</li>
 </ul>
 
-<h2>6. Keep it updating while your game runs</h2>
+<h2>6. Fewer frames, still smooth: motion vectors</h2>
+<p class="soon">Coming in the next update: motion vectors aren't in version 0.21 yet.</p>
+<p>A sheet with fewer frames is smaller and loads faster, but plays jerkily, especially slowed down. Tick <b>Motion vectors</b> under <b>Smooth playback</b> and the export also writes <code>fire_motion.png</code>: how each pixel moves on its way to the next frame. The game then slides each frame towards the next instead of jumping, so a sheet of every 4th frame (set <b>Frames</b> to every 4) can play about as smoothly as the full one.</p>
+<ul>
+<li><b>Bevy:</b> spawn <code>FxFlipbook::looping(assets.load("fx/fire.pfx.json"))</code> instead of <code>FxSprite</code> (bevy_procedural_fx 0.3).</li>
+<li><b>Godot:</b> with Godot ticked, drag <code>fire_flipbook.tscn</code> into your scene. It's a Sprite2D with a shader that does the sliding.</li>
+<li><b>Unity:</b> with Unity ticked, put <code>fire_flipbook.mat</code> on a <b>Quad</b>, and scale the Quad to the frame's shape. It works with URP and the built-in pipeline.</li>
+</ul>
+<p>It works best for smoke, explosions and anything that moves smoothly. Fast, scattered sparks jump further between frames than the gaps between them, so for those, keep more frames.</p>
+
+<h2>7. Keep it updating while your game runs</h2>
 <p>Tick <b>Keep updating</b> under <b>Live</b> before you export. From then on, the app exports again a moment after every change. A Bevy game run with Bevy's <code>file_watcher</code> feature shows the change while it runs. Godot and Unity pick up the new files when you switch back to their window.</p>
 
 <h2>Share it</h2>

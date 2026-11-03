@@ -26,16 +26,24 @@
 //! centre of the full rendered frame was, even when the sheet's frames were cropped, so an
 //! effect lines up the same way however it was trimmed.
 //!
+//! With **Motion vectors** ticked on export, an [`FxFlipbook`] plays the sheet smoothly,
+//! sliding each frame towards the next, so a sheet with few frames still looks fluid.
+//!
 //! For 3D, **Render → Export Vertex Animation…** bakes cloth, destruction or a liquid into
 //! textures that a shader plays: spawn an [`FxMesh`] with the `.vat.json` file. It needs the
 //! `vat` feature, which is on by default.
 
 use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext};
+use bevy::image::ImageLoaderSettings;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use serde::Deserialize;
 
+#[cfg(feature = "flipbook")]
+mod flipbook;
+#[cfg(feature = "flipbook")]
+pub use flipbook::{Blend, FlipbookMaterial, FlipbookSettings, FxFlipbook};
 #[cfg(feature = "vat")]
 mod vat;
 #[cfg(feature = "vat")]
@@ -52,6 +60,8 @@ impl Plugin for ProceduralFxPlugin {
             app.init_asset::<TextureAtlasLayout>();
         }
         app.init_asset::<FxSheet>().register_asset_loader(FxSheetLoader).add_systems(Update, play);
+        #[cfg(feature = "flipbook")]
+        flipbook::build(app);
         #[cfg(feature = "vat")]
         vat::build(app);
     }
@@ -72,6 +82,23 @@ pub struct FxSheet {
     pub source_size: UVec2,
     /// Where each cropped frame's top-left corner was in the full frame.
     pub offset: UVec2,
+    /// The grid: frames run left to right, top to bottom.
+    pub columns: u32,
+    pub rows: u32,
+    /// How each pixel moves to the next frame, if the sheet was exported with motion
+    /// vectors. [`FxFlipbook`] uses them.
+    pub motion: Option<FxMotion>,
+}
+
+/// A sheet's motion vectors (`name_motion.png`), laid out like the sheet.
+#[derive(Debug, Clone)]
+pub struct FxMotion {
+    /// Loaded as data, not colour.
+    pub image: Handle<Image>,
+    /// The largest shift the image's colours hold, in fractions of a frame.
+    pub strength: f32,
+    /// Whether the last frame's motion leads into the first.
+    pub looping: bool,
 }
 
 impl FxSheet {
@@ -195,6 +222,16 @@ struct SheetFile {
     source_size: Option<[u32; 2]>,
     #[serde(default)]
     offset: [u32; 2],
+    #[serde(default)]
+    motion_vectors: Option<MotionFile>,
+}
+
+#[derive(Deserialize)]
+struct MotionFile {
+    image: String,
+    strength: f32,
+    #[serde(default)]
+    looping: bool,
 }
 
 /// Why a `.pfx.json` file couldn't be loaded.
@@ -250,6 +287,14 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
     let mut layout = TextureAtlasLayout::from_grid(frame_size, columns, rows, None, None);
     layout.textures.truncate(file.frame_count.max(1));
     let image_path = load_context.path().resolve_embed_str(&file.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
+    let motion = match &file.motion_vectors {
+        Some(m) => {
+            let path = load_context.path().resolve_embed_str(&m.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
+            let image = load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.is_srgb = false).load(path);
+            Some(FxMotion { image, strength: m.strength.max(0.0), looping: m.looping })
+        }
+        None => None,
+    };
     Ok(FxSheet {
         image: load_context.load(image_path),
         layout: load_context.add_labeled_asset("layout", layout),
@@ -258,6 +303,9 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
         frame_size,
         source_size: file.source_size.map_or(frame_size, UVec2::from),
         offset: UVec2::from(file.offset),
+        columns,
+        rows,
+        motion,
     })
 }
 
@@ -274,6 +322,9 @@ mod tests {
             frame_size: UVec2::new(40, 20),
             source_size: UVec2::new(100, 100),
             offset: UVec2::new(30, 40),
+            columns: 2,
+            rows: 2,
+            motion: None,
         }
     }
 
