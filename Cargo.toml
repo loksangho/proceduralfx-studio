@@ -23,6 +23,8 @@ serde = { version = "1", features = ["derive"] }
 ron = "0.10"
 # Vertex data for the GPU viewport (already used by egui).
 bytemuck = { version = "1", features = ["derive"] }
+# Runs point wrangles and other per-point work on every core (already used by image).
+rayon = "1"
 # Runs wgpu's async set-up for the windowless GPU renderer (command-line renders, tests).
 pollster = "0.4"
 

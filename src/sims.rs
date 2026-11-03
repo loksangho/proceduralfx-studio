@@ -12,6 +12,7 @@
 use super::{flip_cancelled, hash01, Mesh, Vec3};
 use crate::vex::perlin3;
 use rapier3d::math::{Pose, Vector as RVec};
+use rayon::prelude::*;
 use rapier3d::prelude::{ColliderBuilder, PhysicsWorld, RigidBodyBuilder, RigidBodyHandle};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -546,30 +547,34 @@ fn pyro_step(s: &mut PyroState, set: &PyroSettings, dt: f32, time: f32, animated
     let wind = Vec3::from_arr(set.wind);
     let wind_blend = if wind.length() > 0.0 { 1.0 - (-0.5 * dt).exp() } else { 0.0 };
     let frequency = 2.5 / set.size.iter().cloned().fold(0.1, f32::max);
-    for z in 0..nz {
+    let slice = nx * ny;
+    let (temperature, density) = (&s.temperature, &s.density);
+    // Each z-slice on its own core: a cell's forces change only its own velocity.
+    s.u.par_chunks_mut(slice).zip(s.v.par_chunks_mut(slice)).zip(s.w.par_chunks_mut(slice)).enumerate().for_each(|(z, ((u, v), w))| {
         for y in 0..ny {
             for x in 0..nx {
                 let i = g.at(x, y, z);
+                let k = i - z * slice;
                 if solid[i] {
                     continue;
                 }
-                s.v[i] += dt * (set.buoyancy * 4.0 * s.temperature[i] - 0.4 * s.density[i]);
+                v[k] += dt * (set.buoyancy * 4.0 * temperature[i] - 0.4 * density[i]);
                 if wind_blend > 0.0 {
-                    s.u[i] += (wind.x - s.u[i]) * wind_blend;
-                    s.v[i] += (wind.y - s.v[i]) * wind_blend;
-                    s.w[i] += (wind.z - s.w[i]) * wind_blend;
+                    u[k] += (wind.x - u[k]) * wind_blend;
+                    v[k] += (wind.y - v[k]) * wind_blend;
+                    w[k] += (wind.z - w[k]) * wind_blend;
                 }
-                if set.turbulence > 0.0 && s.density[i] + s.temperature[i] > 0.01 {
+                if set.turbulence > 0.0 && density[i] + temperature[i] > 0.01 {
                     let p = g.center(x, y, z);
                     let q = [p.x * frequency + time * 0.3, p.y * frequency - time * 0.6, p.z * frequency + time * 0.2];
                     let push = set.turbulence * 6.0 * dt;
-                    s.u[i] += perlin3(q, 11) * push;
-                    s.v[i] += perlin3(q, 23) * push;
-                    s.w[i] += perlin3(q, 37) * push;
+                    u[k] += perlin3(q, 11) * push;
+                    v[k] += perlin3(q, 23) * push;
+                    w[k] += perlin3(q, 37) * push;
                 }
             }
         }
-    }
+    });
 
     if set.vorticity > 0.0 {
         vorticity_confinement(s, set.vorticity * 3.0, dt);
@@ -604,9 +609,14 @@ fn vorticity_confinement(s: &mut PyroState, epsilon: f32, dt: f32) {
     let g = s.grid;
     let [nx, ny, nz] = g.n;
     let inv = 1.0 / (2.0 * g.h);
-    let mut curl = vec![[0.0f32; 3]; g.len()];
-    let mut magnitude = vec![0.0f32; g.len()];
-    for z in 1..nz - 1 {
+    let slice = nx * ny;
+    // The curl and its size, then the force from them: each z-slice on its own core.
+    let mut curl = vec![([0.0f32; 3], 0.0f32); g.len()];
+    let (u, v, w) = (&s.u, &s.v, &s.w);
+    curl.par_chunks_mut(slice).enumerate().for_each(|(z, out)| {
+        if z == 0 || z == nz - 1 {
+            return;
+        }
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = g.at(x, y, z);
@@ -614,35 +624,40 @@ fn vorticity_confinement(s: &mut PyroState, epsilon: f32, dt: f32) {
                 let (yp, ym) = (g.at(x, y + 1, z), g.at(x, y - 1, z));
                 let (zp, zm) = (g.at(x, y, z + 1), g.at(x, y, z - 1));
                 let c = [
-                    (s.w[yp] - s.w[ym] - (s.v[zp] - s.v[zm])) * inv,
-                    (s.u[zp] - s.u[zm] - (s.w[xp] - s.w[xm])) * inv,
-                    (s.v[xp] - s.v[xm] - (s.u[yp] - s.u[ym])) * inv,
+                    (w[yp] - w[ym] - (v[zp] - v[zm])) * inv,
+                    (u[zp] - u[zm] - (w[xp] - w[xm])) * inv,
+                    (v[xp] - v[xm] - (u[yp] - u[ym])) * inv,
                 ];
-                curl[i] = c;
-                magnitude[i] = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+                out[i - z * slice] = (c, (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt());
             }
         }
-    }
-    for z in 1..nz - 1 {
+    });
+    let solid = &s.solid;
+    let magnitude = |i: usize| curl[i].1;
+    s.u.par_chunks_mut(slice).zip(s.v.par_chunks_mut(slice)).zip(s.w.par_chunks_mut(slice)).enumerate().for_each(|(z, ((u, v), w))| {
+        if z == 0 || z == nz - 1 {
+            return;
+        }
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
                 let i = g.at(x, y, z);
-                if s.solid[i] || magnitude[i] < 1e-6 {
+                if solid[i] || magnitude(i) < 1e-6 {
                     continue;
                 }
                 let gradient = Vec3::new(
-                    magnitude[g.at(x + 1, y, z)] - magnitude[g.at(x - 1, y, z)],
-                    magnitude[g.at(x, y + 1, z)] - magnitude[g.at(x, y - 1, z)],
-                    magnitude[g.at(x, y, z + 1)] - magnitude[g.at(x, y, z - 1)],
+                    magnitude(g.at(x + 1, y, z)) - magnitude(g.at(x - 1, y, z)),
+                    magnitude(g.at(x, y + 1, z)) - magnitude(g.at(x, y - 1, z)),
+                    magnitude(g.at(x, y, z + 1)) - magnitude(g.at(x, y, z - 1)),
                 );
                 let normal = gradient.normalize();
-                let force = normal.cross(Vec3::from_arr(curl[i])).scale(epsilon * g.h * dt);
-                s.u[i] += force.x;
-                s.v[i] += force.y;
-                s.w[i] += force.z;
+                let force = normal.cross(Vec3::from_arr(curl[i].0)).scale(epsilon * g.h * dt);
+                let k = i - z * slice;
+                u[k] += force.x;
+                v[k] += force.y;
+                w[k] += force.z;
             }
         }
-    }
+    });
 }
 
 // Makes the velocity divergence-free. Side walls and the floor are closed, the top is open.
@@ -674,8 +689,11 @@ fn project(s: &mut PyroState) {
         (c.iter().zip(g.n.iter()).all(|(v, n)| *v >= 0 && (*v as usize) < *n)).then(|| g.at(c[0] as usize, c[1] as usize, c[2] as usize))
     };
     let inv = 1.0 / (2.0 * g.h);
+    let slice = nx * ny;
     let mut divergence = vec![0.0f32; n];
-    for z in 0..nz {
+    // Each z-slice on its own core: every cell reads the fields and writes only itself.
+    let (u, v, w) = (&s.u, &s.v, &s.w);
+    divergence.par_chunks_mut(slice).enumerate().for_each(|(z, out)| {
         for y in 0..ny {
             for x in 0..nx {
                 let i = g.at(x, y, z);
@@ -683,7 +701,7 @@ fn project(s: &mut PyroState) {
                     continue;
                 }
                 let mut div = 0.0;
-                for (axis, field) in [(0, &s.u), (1, &s.v), (2, &s.w)] {
+                for (axis, field) in [(0, u), (1, v), (2, w)] {
                     let value = |forward: bool| match neighbour(x, y, z, axis, forward) {
                         Some(j) if !solid[j] => field[j],
                         Some(_) => 0.0,
@@ -693,15 +711,17 @@ fn project(s: &mut PyroState) {
                     };
                     div += value(true) - value(false);
                 }
-                divergence[i] = div * inv;
+                out[i - z * slice] = div * inv;
             }
         }
-    }
+    });
     let h2 = g.h * g.h;
     let mut pressure = vec![0.0f32; n];
     let mut next = vec![0.0f32; n];
+    // Jacobi iterations read the last pressure and write the next, so slices are independent.
     for _ in 0..PRESSURE_ITERATIONS {
-        for z in 0..nz {
+        let (last, divergence) = (&pressure, &divergence);
+        next.par_chunks_mut(slice).enumerate().for_each(|(z, out)| {
             for y in 0..ny {
                 for x in 0..nx {
                     let i = g.at(x, y, z);
@@ -712,17 +732,17 @@ fn project(s: &mut PyroState) {
                     for axis in 0..3 {
                         for forward in [true, false] {
                             sum += match neighbour(x, y, z, axis, forward) {
-                                Some(j) if !solid[j] => pressure[j],
-                                Some(_) => pressure[i],
+                                Some(j) if !solid[j] => last[j],
+                                Some(_) => last[i],
                                 None if axis == 1 && forward => 0.0,
-                                None => pressure[i],
+                                None => last[i],
                             };
                         }
                     }
-                    next[i] = (sum - divergence[i] * h2) / 6.0;
+                    out[i - z * slice] = (sum - divergence[i] * h2) / 6.0;
                 }
             }
-        }
+        });
         std::mem::swap(&mut pressure, &mut next);
     }
     for z in 0..nz {
@@ -751,30 +771,36 @@ fn advect(s: &mut PyroState, dt: f32) {
     let g = s.grid;
     let [nx, ny, nz] = g.n;
     let n = g.len();
-    let mut out: [Vec<f32>; 7] = std::array::from_fn(|_| vec![0.0; n]);
-    for z in 0..nz {
+    let slice = nx * ny;
+    // Each z-slice on its own core: cells read the old fields and write only themselves.
+    let mut cells = vec![[0.0f32; 7]; n];
+    let state = &*s;
+    cells.par_chunks_mut(slice).enumerate().for_each(|(z, out)| {
         for y in 0..ny {
             for x in 0..nx {
                 let i = g.at(x, y, z);
-                if s.solid[i] {
+                if state.solid[i] {
                     continue;
                 }
                 let p = g.center(x, y, z);
-                let velocity = Vec3::new(s.u[i], s.v[i], s.w[i]);
+                let velocity = Vec3::new(state.u[i], state.v[i], state.w[i]);
                 let mid = p.sub(velocity.scale(dt * 0.5));
-                let velocity = Vec3::new(g.sample(&s.u, mid, None), g.sample(&s.v, mid, None), g.sample(&s.w, mid, None));
+                let velocity = Vec3::new(g.sample(&state.u, mid, None), g.sample(&state.v, mid, None), g.sample(&state.w, mid, None));
                 let back = p.sub(velocity.scale(dt));
-                out[0][i] = g.sample(&s.u, back, None);
-                out[1][i] = g.sample(&s.v, back, None);
-                out[2][i] = g.sample(&s.w, back, None);
-                out[3][i] = g.sample(&s.density, back, Some(0.0));
-                out[4][i] = g.sample(&s.temperature, back, Some(0.0));
-                out[5][i] = g.sample(&s.fuel, back, Some(0.0));
-                out[6][i] = g.sample(&s.flame, back, Some(0.0));
+                out[i - z * slice] = [
+                    g.sample(&state.u, back, None),
+                    g.sample(&state.v, back, None),
+                    g.sample(&state.w, back, None),
+                    g.sample(&state.density, back, Some(0.0)),
+                    g.sample(&state.temperature, back, Some(0.0)),
+                    g.sample(&state.fuel, back, Some(0.0)),
+                    g.sample(&state.flame, back, Some(0.0)),
+                ];
             }
         }
-    }
-    let [u, v, w, density, temperature, fuel, flame] = out;
+    });
+    let field = |k: usize| cells.iter().map(|c| c[k]).collect::<Vec<f32>>();
+    let [u, v, w, density, temperature, fuel, flame] = std::array::from_fn(field);
     (s.u, s.v, s.w, s.density, s.temperature, s.fuel, s.flame) = (u, v, w, density, temperature, fuel, flame);
 }
 

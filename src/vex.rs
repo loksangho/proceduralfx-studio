@@ -4536,6 +4536,135 @@ fn run_masked(
     mask: Option<&[bool]>,
     channels: Option<&Channels>,
 ) -> (Mesh, VexReport) {
+    run_with(mesh, inputs, code, time, time_inc, domain_index, mask, channels, true)
+}
+
+// Point wrangles over this many points or more run on every core.
+const PARALLEL_POINTS: usize = 4096;
+// Calls that make one point's run depend on the others' order: numbers handed out by
+// addpoint/addprim, printf's output, and writes queued for the end in the order made.
+const SERIAL_CALLS: [&str; 8] = ["addpoint", "addprim", "printf", "setpointattrib", "setprimattrib", "setdetailattrib", "setpointgroup", "setprimgroup"];
+
+// Whether a program can run its points in parallel chunks. Over points, a point's run
+// reads the inputs and writes only that point, so chunks are independent, unless it
+// calls one of SERIAL_CALLS (checked on the code itself: a mention in a comment just
+// means it runs on one core).
+fn parallel_safe(code: &str, domain: Domain, count: usize) -> bool {
+    domain == Domain::Point && count >= PARALLEL_POINTS && rayon::current_num_threads() > 1 && !SERIAL_CALLS.iter().any(|name| code.contains(name))
+}
+
+// The inputs, normals and polygons every run reads, shared by the chunks.
+struct Shared<'a> {
+    input: &'a Mesh,
+    normals: &'a [Vec3],
+    others_geometry: Vec<&'a Mesh>,
+    others_normals: &'a [Vec<Vec3>],
+    others_polys: Vec<(Vec<std::ops::Range<usize>>, Vec<usize>)>,
+    polys: Vec<std::ops::Range<usize>>,
+    poly_of: Vec<usize>,
+    domain: Domain,
+    count: usize,
+    time: f32,
+    time_inc: f32,
+    channels: Option<&'a Channels>,
+}
+
+fn new_runtime<'a>(program: &'a Program, shared: &'a Shared<'a>, out: Mesh) -> Runtime<'a> {
+    let others = shared
+        .others_geometry
+        .iter()
+        .zip(shared.others_normals)
+        .zip(&shared.others_polys)
+        .map(|((m, normals), (polys, poly_of))| OtherInput {
+            input: m,
+            normals,
+            neighbours: None,
+            point_prims: None,
+            point_grid: None,
+            fields: Vec::new(),
+            polys: polys.clone(),
+            poly_of: poly_of.clone(),
+        })
+        .collect();
+    let domain = shared.domain;
+    Runtime {
+        prog: program,
+        input: shared.input,
+        others,
+        normals: shared.normals,
+        out,
+        domain,
+        count: shared.count,
+        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), a.name)).collect(),
+        elem: 0,
+        time: shared.time,
+        time_inc: shared.time_inc,
+        pending: Pending::default(),
+        steps: 0,
+        depth: 0,
+        log: Vec::new(),
+        partial_line: String::new(),
+        neighbours: None,
+        point_prims: None,
+        point_grid: None,
+        fields: Vec::new(),
+        channels: shared.channels,
+        pc_handles: Vec::new(),
+        pc_elem: usize::MAX,
+        polys: shared.polys.clone(),
+        poly_of: shared.poly_of.clone(),
+        prim: 0,
+        reading: 0,
+    }
+}
+
+// Runs the program on `elements` (numbered from `first`); the error, if one stops it.
+fn run_elements<'a>(rt: &mut Runtime<'a>, program: &'a Program, elements: &[usize], first: usize, mask: Option<&[bool]>) -> Option<String> {
+    let domain = rt.domain;
+    let element_name = match domain {
+        Domain::Detail => "detail",
+        Domain::Prim => "primitive",
+        Domain::Point => "point",
+        Domain::Vertex => "vertex",
+    };
+    let defaults: Vec<Value> = program.main.slot_types.iter().map(|t| t.map_or(Value::Int(0), Ty::default_value)).collect();
+    for (offset, &elem) in elements.iter().enumerate() {
+        let number = first + offset;
+        if mask.is_some_and(|m| !m.get(elem).copied().unwrap_or(true)) {
+            continue;
+        }
+        rt.elem = elem;
+        rt.prim = if domain == Domain::Prim { number } else { 0 };
+        let mut frame = Frame { vals: defaults.clone(), types: &program.main.slot_types };
+        if let Err(error) = rt.exec_block(&program.main.body, &mut frame) {
+            return Some(if domain == Domain::Detail { error } else { format!("{error} (at {element_name} {number})") });
+        }
+    }
+    None
+}
+
+// What a chunk run on another thread hands back (no Values: they aren't Send).
+struct Chunk {
+    out: Mesh,
+    log: Vec<String>,
+    failure: Option<String>,
+    remove_points: HashSet<usize>,
+    remove_prims: HashSet<usize>,
+    orphan_candidates: HashSet<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with(
+    mesh: Mesh,
+    inputs: &[Mesh],
+    code: &str,
+    time: f32,
+    time_inc: f32,
+    domain_index: usize,
+    mask: Option<&[bool]>,
+    channels: Option<&Channels>,
+    allow_parallel: bool,
+) -> (Mesh, VexReport) {
     let program = match compile(code) {
         Ok(program) => program,
         Err(error) => return (mesh, VexReport { error: Some(error.to_string()), ..Default::default() }),
@@ -4552,82 +4681,44 @@ fn run_masked(
     let empty = Mesh::default();
     let others_geometry: Vec<&Mesh> = (1..INPUTS).map(|n| inputs.get(n - 1).unwrap_or(&empty)).collect();
     let others_normals: Vec<Vec<Vec3>> = others_geometry.iter().map(|m| m.compute_normals()).collect();
-    let others = others_geometry
-        .iter()
-        .zip(&others_normals)
-        .map(|(m, normals)| OtherInput {
-            input: m,
-            normals,
-            neighbours: None,
-            point_prims: None,
-            point_grid: None,
-            fields: Vec::new(),
-            polys: crate::poly::runs(m),
-            poly_of: crate::poly::of_triangles(m),
-        })
-        .collect();
-    let mut rt = Runtime {
-        prog: &program,
+    let shared = Shared {
         input: &input,
-        others,
         normals: &normals,
-        out: mesh,
-        domain,
-        count,
-        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), a.name)).collect(),
-        elem: 0,
-        time,
-        time_inc,
-        pending: Pending::default(),
-        steps: 0,
-        depth: 0,
-        log: Vec::new(),
-        partial_line: String::new(),
-        neighbours: None,
-        point_prims: None,
-        point_grid: None,
-        fields: Vec::new(),
-        channels,
-        pc_handles: Vec::new(),
-        pc_elem: usize::MAX,
+        others_polys: others_geometry.iter().map(|m| (crate::poly::runs(m), crate::poly::of_triangles(m))).collect(),
+        others_geometry,
+        others_normals: &others_normals,
         polys: crate::poly::runs(&input),
         poly_of: crate::poly::of_triangles(&input),
-        prim: 0,
-        reading: 0,
+        domain,
+        count,
+        time,
+        time_inc,
+        channels,
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
-    let missing: Vec<String> = program
+    let keys: Vec<String> = program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), a.name)).collect();
+    let warnings: Vec<String> = program
         .attrs
         .iter()
-        .zip(&rt.keys)
+        .zip(&keys)
         .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key) && opinput(&attr.name).is_none())
         .map(|(attr, _)| format!("Warning: @{} does not exist on the input and is never set, so it reads as 0", attr.name))
         .collect();
-    for warning in missing {
+
+    if allow_parallel && parallel_safe(code, domain, count) {
+        if let Some(result) = run_parallel(mesh.clone(), code, &program, &keys, &shared, mask, warnings.clone()) {
+            return result;
+        }
+        // The chunks disagreed about an attribute's width: run it in order instead.
+    }
+
+    let mut rt = new_runtime(&program, &shared, mesh);
+    for warning in warnings {
         rt.push_log(warning);
     }
-    let defaults: Vec<Value> = program.main.slot_types.iter().map(|t| t.map_or(Value::Int(0), Ty::default_value)).collect();
-    let element_name = match domain {
-        Domain::Detail => "detail",
-        Domain::Prim => "primitive",
-        Domain::Point => "point",
-        Domain::Vertex => "vertex",
-    };
-    let mut failure = None;
     // Over primitives, each polygon runs once, on its first triangle.
     let elements: Vec<usize> = if domain == Domain::Prim { rt.polys.iter().map(|run| run.start).collect() } else { (0..count).collect() };
-    for (number, &elem) in elements.iter().enumerate() {
-        if mask.is_some_and(|m| !m.get(elem).copied().unwrap_or(true)) {
-            continue;
-        }
-        rt.elem = elem;
-        rt.prim = if domain == Domain::Prim { number } else { 0 };
-        let mut frame = Frame { vals: defaults.clone(), types: &program.main.slot_types };
-        if let Err(error) = rt.exec_block(&program.main.body, &mut frame) {
-            failure = Some(if domain == Domain::Detail { error } else { format!("{error} (at {element_name} {number})") });
-            break;
-        }
-    }
+    let mut failure = run_elements(&mut rt, &program, &elements, 0, mask);
     // What a polygon's run wrote to its first triangle applies to all of its triangles.
     if domain == Domain::Prim && failure.is_none() {
         let written: Vec<String> = program.attrs.iter().zip(&rt.keys).filter(|(a, k)| a.written && k.starts_with("prim:")).map(|(_, k)| k.clone()).collect();
@@ -4661,6 +4752,112 @@ fn run_masked(
         Some(error) => (input, VexReport { error: Some(error), output: log, elements: count, millis: 0.0 }),
         None => (out, VexReport { error: None, output: log, elements: count, millis: 0.0 }),
     }
+}
+
+// Runs a point wrangle in chunks on every core, each on its own copy of the geometry,
+// then takes each chunk's points from its copy. None if the chunks wrote an attribute
+// with different widths (which only running in order settles).
+fn run_parallel(
+    mesh: Mesh,
+    code: &str,
+    program: &Program,
+    keys: &[String],
+    shared: &Shared,
+    mask: Option<&[bool]>,
+    warnings: Vec<String>,
+) -> Option<(Mesh, VexReport)> {
+    use rayon::prelude::*;
+    let count = shared.count;
+    // One chunk a core: each works on its own copy of the geometry.
+    let chunks = rayon::current_num_threads().min(count / 1024).max(2);
+    let size = count.div_ceil(chunks);
+    let ranges: Vec<std::ops::Range<usize>> = (0..chunks).map(|c| c * size..((c + 1) * size).min(count)).filter(|r| !r.is_empty()).collect();
+    let results: Vec<Chunk> = ranges
+        .par_iter()
+        .map(|range| {
+            // Each thread compiles its own copy: compiled programs hold Rc values.
+            let program = compile(code).expect("it compiled once already");
+            let mut rt = new_runtime(&program, shared, mesh.clone());
+            let elements: Vec<usize> = range.clone().collect();
+            let failure = run_elements(&mut rt, &program, &elements, range.start, mask);
+            if !rt.partial_line.is_empty() {
+                let rest = std::mem::take(&mut rt.partial_line);
+                rt.push_log(rest);
+            }
+            let Runtime { out, pending, log, .. } = rt;
+            debug_assert!(pending.writes.is_empty() && pending.add_points.is_empty() && pending.add_prims.is_empty());
+            Chunk { out, log, failure, remove_points: pending.remove_points, remove_prims: pending.remove_prims, orphan_candidates: pending.orphan_candidates }
+        })
+        .collect();
+
+    let mut log = warnings;
+    for chunk in &results {
+        log.extend(chunk.log.iter().cloned());
+    }
+    log.truncate(MAX_LOG_LINES + 1);
+    // The first error stops everything, as it would in order.
+    if let Some(error) = results.iter().find_map(|c| c.failure.clone()) {
+        return Some((shared.input.clone(), VexReport { error: Some(error), output: log, elements: count, millis: 0.0 }));
+    }
+
+    // The attributes the program writes, besides P.
+    let mut written: Vec<String> = program
+        .attrs
+        .iter()
+        .zip(keys)
+        .filter(|(a, _)| a.written && a.kind != AttrKind::P)
+        .map(|(a, k)| if a.kind == AttrKind::N { "N".to_owned() } else { k.clone() })
+        .collect();
+    written.sort();
+    written.dedup();
+    let writes_p = program.attrs.iter().any(|a| a.written && a.kind == AttrKind::P);
+
+    let mut out = mesh;
+    if writes_p {
+        for (range, chunk) in ranges.iter().zip(&results) {
+            out.vertices[range.clone()].copy_from_slice(&chunk.out.vertices[range.clone()]);
+        }
+    }
+    for key in &written {
+        let before = shared.input.point_attributes.get(key);
+        // The chunks that changed it: its width, or their own points' values (a chunk
+        // with every point masked off leaves it as it was).
+        let changed: Vec<(&std::ops::Range<usize>, &Vec<f32>)> = ranges
+            .iter()
+            .zip(&results)
+            .filter_map(|(range, chunk)| {
+                let values = chunk.out.point_attributes.get(key)?;
+                let same = before.is_some_and(|b| {
+                    b.len() == values.len() && count > 0 && {
+                        let width = b.len() / count;
+                        b[range.start * width..range.end * width] == values[range.start * width..range.end * width]
+                    }
+                });
+                (!same).then_some((range, values))
+            })
+            .collect();
+        let Some(&(_, base)) = changed.first() else { continue };
+        if changed.iter().any(|(_, values)| values.len() != base.len()) || count == 0 || base.len() % count != 0 {
+            return None;
+        }
+        let width = base.len() / count;
+        let mut merged = base.clone();
+        for (range, values) in &changed {
+            merged[range.start * width..range.end * width].copy_from_slice(&values[range.start * width..range.end * width]);
+        }
+        out.point_attributes.insert(key.clone(), merged);
+    }
+
+    let mut pending = Pending::default();
+    for chunk in results {
+        pending.remove_points.extend(chunk.remove_points);
+        pending.remove_prims.extend(chunk.remove_prims);
+        pending.orphan_candidates.extend(chunk.orphan_candidates);
+    }
+    if let Err(error) = apply_pending(&mut out, pending, &mut log) {
+        return Some((shared.input.clone(), VexReport { error: Some(error), output: log, elements: count, millis: 0.0 }));
+    }
+    Some((out, VexReport { error: None, output: log, elements: count, millis: 0.0 }))
 }
 
 // ============================================================================
@@ -4755,6 +4952,85 @@ mod tests {
             }
         }
         mesh
+    }
+
+    // A big grid (n×n points), with a colour on every point.
+    fn big_grid(n: usize) -> Mesh {
+        let mut mesh = Mesh::default();
+        for z in 0..n {
+            for x in 0..n {
+                mesh.vertices.push(Vec3::new(x as f32 * 0.1, 0.0, z as f32 * 0.1));
+            }
+        }
+        for z in 0..n - 1 {
+            for x in 0..n - 1 {
+                let i = z * n + x;
+                mesh.indices.push([i, i + n, i + 1]);
+                mesh.indices.push([i + 1, i + n, i + n + 1]);
+            }
+        }
+        mesh.point_attributes.insert("Cd".into(), vec![0.5; n * n * 3]);
+        mesh
+    }
+
+    // Point wrangles big enough to run on every core give exactly what running the
+    // points in order gives.
+    #[test]
+    fn parallel_point_wrangles_match_running_in_order() {
+        let mesh = big_grid(100);
+        assert!(mesh.vertices.len() >= PARALLEL_POINTS);
+        let other = big_grid(20);
+        let mask: Vec<bool> = (0..mesh.vertices.len()).map(|i| i % 7 != 0).collect();
+        let programs = [
+            "@P.y += sin(@P.x * 3.0 + @Time) * 0.2;",
+            "@Cd = set(@P.x, @P.z, 0); f@height = @P.x * @P.z; i@band = int(@P.x * 10) % 3;",
+            "v@N = normalize(set(@P.x, 1, @P.z));",
+            "p@orient = {0, 0, 0, 1}; 4@xf = ident();",
+            "if (@P.x + @P.z > 9) removepoint(0, @ptnum);",
+            "int n[] = neighbours(0, @ptnum); vector sum = @P; foreach (int i; n) sum += point(0, \"P\", i); @P = sum / (len(n) + 1);",
+            "int near = nearpoint(1, @P); @P.y = point(1, \"P\", near).x;",
+            "if (@ptnum == 7000) @P = undefined_function(1);",
+            "if (@ptnum > 6000) error(\"stop at %d\", @ptnum);",
+            "f@w = @ptnum < 5000 ? 1 : 2;",
+        ];
+        for code in programs {
+            for masked in [false, true] {
+                let m = masked.then_some(&mask[..]);
+                let (serial, serial_report) = run_with(mesh.clone(), &[other.clone()], code, 0.5, 0.04, 2, m, None, false);
+                let (parallel, parallel_report) = run_with(mesh.clone(), &[other.clone()], code, 0.5, 0.04, 2, m, None, true);
+                assert_eq!(serial_report.error, parallel_report.error, "{code}");
+                assert_eq!(serial.vertices, parallel.vertices, "{code}");
+                assert_eq!(serial.indices, parallel.indices, "{code}");
+                let mut keys: Vec<_> = serial.point_attributes.keys().collect();
+                keys.sort();
+                let mut other_keys: Vec<_> = parallel.point_attributes.keys().collect();
+                other_keys.sort();
+                assert_eq!(keys, other_keys, "{code}");
+                for key in keys {
+                    assert_eq!(serial.point_attributes[key], parallel.point_attributes[key], "{code}: @{key}");
+                }
+            }
+        }
+        // Calls whose results depend on the order stay in order.
+        assert!(!parallel_safe("int p = addpoint(0, @P);", Domain::Point, 10_000));
+        assert!(!parallel_safe("printf(\"%d\\n\", @ptnum);", Domain::Point, 10_000));
+        assert!(!parallel_safe("@P.y = 1;", Domain::Prim, 10_000));
+        assert!(!parallel_safe("@P.y = 1;", Domain::Point, 100));
+    }
+
+    // cargo test --release -- --ignored point_wrangle_speed --nocapture
+    #[test]
+    #[ignore]
+    fn point_wrangle_speed() {
+        let mesh = big_grid(700);
+        // (No loops: tests stop runs after a few loop iterations.)
+        let code = "vector p = @P; p += noise(p * 2) * 0.1; p += noise(p * 3 + 1) * 0.1; p += noise(p * 5 + 2) * 0.1; p += noise(p * 7 + 3) * 0.1; @P = p; @Cd = noise(p); f@d = length(p - @P);";
+        for parallel in [false, true] {
+            let start = Instant::now();
+            let (_, report) = run_with(mesh.clone(), &[], code, 0.0, 0.04, 2, None, None, parallel);
+            assert!(report.error.is_none());
+            eprintln!("{} points, {}: {:.0} ms", mesh.vertices.len(), if parallel { "parallel" } else { "in order" }, start.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     fn single_point(p: [f32; 3]) -> Mesh {

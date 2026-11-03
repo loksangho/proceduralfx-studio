@@ -22314,6 +22314,75 @@ mod group_node_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A fingerprint of each starter effect's cooked geometry at a few frames, to check
+    // that a speed-up changes nothing. cargo test --release -- --ignored cooked_fingerprints --nocapture
+    #[test]
+    #[ignore]
+    fn cooked_fingerprints() {
+        use std::hash::{Hash, Hasher};
+        for preset in presets::PRESETS {
+            let mut app = ProceduralFxStudioApp::default();
+            app.load_state(preset.scene.to_owned());
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for frame in [0, 6, 12, 23] {
+                app.time = preset.range.0 + frame as f32 / sims::SIM_FPS;
+                app.dirty = true;
+                app.rebuild_graph();
+                while app.simulation_rx.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    app.rebuild_graph();
+                }
+                for v in &app.current_mesh.vertices {
+                    for c in [v.x, v.y, v.z] {
+                        c.to_bits().hash(&mut hasher);
+                    }
+                }
+                let mut keys: Vec<_> = app.current_mesh.point_attributes.keys().collect();
+                keys.sort();
+                for key in keys {
+                    key.hash(&mut hasher);
+                    for value in &app.current_mesh.point_attributes[key] {
+                        value.to_bits().hash(&mut hasher);
+                    }
+                }
+            }
+            eprintln!("fingerprint {:<20} {:016x}", preset.name, hasher.finish());
+        }
+    }
+
+    // Where cooking time goes in the starter effects, by node kind (own time, not inputs).
+    // cargo test --release -- --ignored where_cooking_time_goes --nocapture
+    #[test]
+    #[ignore]
+    fn where_cooking_time_goes() {
+        let mut by_kind: HashMap<String, f64> = HashMap::new();
+        for preset in presets::PRESETS {
+            perf::clear();
+            let mut app = ProceduralFxStudioApp::default();
+            app.load_state(preset.scene.to_owned());
+            let start = Instant::now();
+            for frame in 0..24 {
+                app.time = preset.range.0 + frame as f32 / sims::SIM_FPS;
+                app.dirty = true;
+                app.rebuild_graph();
+                while app.simulation_rx.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    app.rebuild_graph();
+                }
+            }
+            eprintln!("{:<28} {:>8.0} ms", preset.name, start.elapsed().as_secs_f64() * 1000.0);
+            for (id, stat) in perf::snapshot() {
+                let name = app.graph.nodes.get(&id).map_or_else(|| "?".to_owned(), |n| n.kind.menu_name().to_owned());
+                *by_kind.entry(name).or_default() += stat.total;
+            }
+        }
+        let mut kinds: Vec<_> = by_kind.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (name, seconds) in kinds.iter().take(15) {
+            eprintln!("  {name:<26} {:>8.0} ms", seconds * 1000.0);
+        }
+    }
+
     #[test]
     fn scenes_from_a_newer_format_are_refused_not_half_opened() {
         assert_eq!(scene_format(&Graph::default().serialize()), Some(SCENE_FORMAT));
@@ -24775,7 +24844,8 @@ mod realtime_render_tests {
         app.dirty = true;
         let ctx = egui::Context::default();
         let started = Instant::now();
-        while width(&dir) == small && started.elapsed() < std::time::Duration::from_secs(10) {
+        // CI machines without a GPU render in software, slowly: allow them a minute.
+        while width(&dir) == small && started.elapsed() < std::time::Duration::from_secs(60) {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 app.live_sheet_step(ctx);
                 app.flipbook_step(ctx);

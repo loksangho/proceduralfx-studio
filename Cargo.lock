@@ -3300,6 +3300,7 @@ dependencies = [
  "pkg-config",
  "pollster",
  "rapier3d",
+ "rayon",
  "regex",
  "rfd",
  "ron",
