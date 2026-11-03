@@ -122,23 +122,50 @@ struct DriveMount {
     std::string containerPath; // "/mnt/host/c"
 };
 
-// The local and removable drives (network drives aren't visible to the VM).
-static std::vector<DriveMount> Drives()
+// The drive letters a command's (mapped) arguments use: "/mnt/host/c/..." is C:.
+static std::string DrivesUsed(const std::vector<std::string>& command)
+{
+    std::string letters;
+    const std::string prefix = "/mnt/host/";
+    for (auto& part : command) {
+        for (size_t at = part.find(prefix); at != std::string::npos; at = part.find(prefix, at + 1)) {
+            char letter = part.size() > at + prefix.size() ? part[at + prefix.size()] : 0;
+            if (letter >= 'a' && letter <= 'z' && letters.find(letter) == std::string::npos)
+                letters += letter;
+        }
+    }
+    return letters;
+}
+
+// The local and removable drives (network drives aren't visible to the VM). A drive
+// with nothing in it, such as an empty card reader, or a locked one, can't be shared:
+// one of those makes the whole container fail to start ("A device which does not
+// exist was specified"), so only drives with a readable volume are shared.
+// `only`, if not empty, limits them to those lower-case letters.
+static std::vector<DriveMount> Drives(const std::string& only = "")
 {
     std::vector<DriveMount> out;
     DWORD mask = GetLogicalDrives();
+    // Asking an empty drive about its volume mustn't show "insert a disk".
+    DWORD oldMode = 0;
+    SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &oldMode);
     for (int i = 0; i < 26; i++) {
         if (!(mask & (1u << i)))
+            continue;
+        if (!only.empty() && only.find((char)('a' + i)) == std::string::npos)
             continue;
         wchar_t root[4] = { (wchar_t)(L'A' + i), L':', L'\\', 0 };
         UINT type = GetDriveTypeW(root);
         if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE)
+            continue;
+        if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0))
             continue;
         DriveMount m;
         m.windowsPath = root;
         m.containerPath = std::string("/mnt/host/") + (char)('a' + i);
         out.push_back(m);
     }
+    SetThreadErrorMode(oldMode, nullptr);
     return out;
 }
 
@@ -388,7 +415,7 @@ static void ExplainStopped(WslcContainer container, InitWatch* watch)
 // Creates and starts a container of `image` whose first process is `initArgv` (it
 // keeps the container running), sharing the local drives when `shareDrives`. Waits a
 // moment and checks it's still running; explains it if not.
-static HRESULT StartContainer(WslcSession session, const char* image, bool shareDrives, bool autoRemove, std::vector<PCSTR> initArgv, WslcContainer* container, InitWatch* watch)
+static HRESULT StartContainer(WslcSession session, const char* image, bool shareDrives, bool autoRemove, std::vector<PCSTR> initArgv, WslcContainer* container, InitWatch* watch, const std::string& onlyDrives = "")
 {
     PWSTR error = nullptr;
     WslcProcessSettings init;
@@ -400,7 +427,7 @@ static HRESULT StartContainer(WslcSession session, const char* image, bool share
     WslcSetContainerSettingsInitProcess(&settings, &init);
     if (autoRemove)
         WslcSetContainerSettingsFlags(&settings, WSLC_CONTAINER_FLAG_AUTO_REMOVE);
-    std::vector<DriveMount> drives = shareDrives ? Drives() : std::vector<DriveMount>();
+    std::vector<DriveMount> drives = shareDrives ? Drives(onlyDrives) : std::vector<DriveMount>();
     std::vector<WslcContainerVolume> volumes;
     for (auto& drive : drives) {
         WslcContainerVolume volume = {};
@@ -471,6 +498,24 @@ static int Run(const char* image, const std::vector<std::string>& command)
         goto cleanup;
     // The container's first process only keeps it running while the render runs.
     hr = StartContainer(session, image, true, true, { "/bin/sleep", "infinity" }, &container, &watch);
+    // A drive that can't be shared (one Windows lists but the VM can't use, like some
+    // phones and music players) stops the container: share only the drives the render
+    // reads and writes.
+    if (FAILED(hr)) {
+        if (container) {
+            WslcReleaseContainer(container);
+            container = nullptr;
+        }
+        std::string used = DrivesUsed(command);
+        fwprintf(stderr, L"[pfx-render] status retrying with only the drives the render uses (%hs)\n", used.empty() ? "none" : used.c_str());
+        {
+            std::lock_guard<std::mutex> guard(watch.lock);
+            watch.output.clear();
+            watch.code = -1;
+            watch.exited = false;
+        }
+        hr = StartContainer(session, image, true, true, { "/bin/sleep", "infinity" }, &container, &watch, used.empty() ? std::string("-") : used);
+    }
     if (FAILED(hr))
         goto cleanup;
 

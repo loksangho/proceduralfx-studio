@@ -55,6 +55,7 @@ mod paint;
 mod poly;
 mod presets;
 mod randomize;
+mod recovery;
 mod raster;
 mod sims;
 mod providers;
@@ -3257,6 +3258,14 @@ fn recent_scenes_file() -> Option<PathBuf> {
         return None;
     }
     Some(app_config_dir()?.join("recent_scenes.txt"))
+}
+
+// Where autosaves and crash reports go. Tests mustn't touch the user's.
+fn recovery_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    Some(app_config_dir()?.join("recovery"))
 }
 
 fn load_recent_scenes() -> Vec<PathBuf> {
@@ -8140,7 +8149,7 @@ impl Graph {
 
     // ---- scene file / undo snapshot format ----
     fn serialize(&self) -> String {
-        let mut s = String::from("pfs 2\n");
+        let mut s = format!("pfs {SCENE_FORMAT}\n");
         let mut ids: Vec<_> = self.nodes.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
@@ -8561,6 +8570,37 @@ struct LiveSheet {
 const LIVE_SHEET_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 // A scene's content regardless of line order (some parts are written from hash maps).
+// The scene file format this version writes, on the first line ("pfs 2"). Bump it when
+// a change means an older version would misread a file (not for new node kinds or
+// parameters added at the end, which older versions skip or default), so older
+// versions refuse such a file instead of opening part of it.
+const SCENE_FORMAT: u32 = 2;
+
+// A scene file's format number: "pfs N", or "mhip N" from before the rename.
+fn scene_format(text: &str) -> Option<u32> {
+    match text.lines().next()?.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["pfs" | "mhip", n] => n.parse().ok(),
+        _ => None,
+    }
+}
+
+// Why a scene can't be opened, if it can't.
+fn scene_problem(text: &str) -> Option<String> {
+    match scene_format(text) {
+        Some(n) if n > SCENE_FORMAT => Some(format!(
+            "it was saved by a newer version of ProceduralFX Studio (scene format {n}; this version reads up to {SCENE_FORMAT}). Update the app to open it."
+        )),
+        _ => None,
+    }
+}
+
+// How many of a scene's nodes didn't load: kinds this version doesn't know, say, from
+// a newer version, or lines damaged in the file.
+fn unread_nodes(text: &str, graph: &Graph) -> usize {
+    let written = text.lines().filter(|l| l.starts_with("node ") && l.split_whitespace().count() >= 5).count();
+    written.saturating_sub(graph.nodes.len())
+}
+
 fn scene_fingerprint(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut lines: Vec<&str> = text.lines().collect();
@@ -9630,6 +9670,10 @@ struct ProceduralFxStudioApp {
     quit_prompt: bool,
     // The user chose to quit; the next close request goes through.
     quitting: bool,
+    // Autosave and crash reports (only in the running app, not tests).
+    recovery: Option<recovery::Session>,
+    // Unsaved work, or a crash report, left by a session that didn't quit cleanly.
+    recovery_offer: Option<recovery::Leftover>,
     // Viewport drags paint the selected Attribute Paint node instead of orbiting.
     paint_active: bool,
     paint_fill: Option<NodeId>,
@@ -9886,6 +9930,8 @@ impl Default for ProceduralFxStudioApp {
             unsaved_checked: None,
             quit_prompt: false,
             quitting: false,
+            recovery: None,
+            recovery_offer: None,
             paint_active: false,
             paint_fill: None,
             group_choices: None,
@@ -11586,12 +11632,23 @@ impl ProceduralFxStudioApp {
 
     fn open_scene(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
+            Ok(s) if scene_problem(&s).is_some() => {
+                self.status = format!("Can't open {}: {}", path.display(), scene_problem(&s).unwrap_or_default());
+            }
             Ok(s) => {
                 self.undo.push(self.last_state.clone());
                 self.use_saved_timeline(&s);
+                let unread = unread_nodes(&s, &Graph::deserialize(&s));
                 self.load_state(s);
                 self.mark_saved();
-                self.status = format!("Loaded {}", path.display());
+                self.status = match unread {
+                    0 => format!("Loaded {}", path.display()),
+                    n => format!(
+                        "Loaded {}, but {n} node{} couldn't be read (made by a newer version, or damaged). Saving over the file would lose them.",
+                        path.display(),
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
                 push_recent_scene(&mut self.recent_scenes, path.clone());
                 save_recent_scenes(&self.recent_scenes);
                 self.scene_path = Some(path);
@@ -11668,6 +11725,9 @@ impl ProceduralFxStudioApp {
         match write_file_atomically(&path, &self.scene_text()) {
             Ok(()) => {
                 self.mark_saved();
+                if let Some(session) = &mut self.recovery {
+                    session.clear_autosave();
+                }
                 self.status = format!("Saved {}", path.display());
                 push_recent_scene(&mut self.recent_scenes, path.clone());
                 save_recent_scenes(&self.recent_scenes);
@@ -12067,6 +12127,96 @@ impl ProceduralFxStudioApp {
             (self.playback_start, self.playback_end, self.playback_fps) = (start, end, fps);
             self.time = self.time.clamp(start, end);
         }
+    }
+
+    // Writes unsaved changes to the session's autosave every so often.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        let Some(mut session) = self.recovery.take() else { return };
+        if session.due() {
+            let unsaved = self.has_unsaved_changes();
+            let scene_path = self.scene_path.clone();
+            session.tick(unsaved, scene_path.as_deref(), || self.scene_text());
+        }
+        self.recovery = Some(session);
+        // An idle window doesn't redraw: wake it for the next autosave.
+        ctx.request_repaint_after(recovery::AUTOSAVE_EVERY);
+    }
+
+    // After a crash or a forced quit: offers back the unsaved work, and the crash report.
+    fn recovery_prompt(&mut self, ctx: &egui::Context) {
+        let Some(offer) = self.recovery_offer.clone() else { return };
+        let Some(dir) = recovery_dir() else { return };
+        let name = offer.scene_path.as_ref().and_then(|p| p.file_name()).map_or_else(|| "an untitled scene".to_owned(), |n| format!("\"{}\"", n.to_string_lossy()));
+        let when = offer.when.map(|t| recovery::ago(t, std::time::SystemTime::now()));
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("recovery_prompt")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("ProceduralFX Studio didn't close properly last time");
+            ui.add_space(4.0);
+            if offer.autosave.is_some() {
+                ui.label(format!("Unsaved changes to {name} were kept{}.", when.map(|w| format!(" (autosaved {w})")).unwrap_or_default()));
+            }
+            if let Some(report) = &offer.crash_report {
+                ui.label("It crashed. A crash report was saved on this computer; nothing has been sent.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("To help fix it, email the report to");
+                    ui.hyperlink_to("support@build3dstudio.com", "mailto:support@build3dstudio.com?subject=Crash%20report");
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Copy the report").clicked() {
+                        if let Ok(text) = std::fs::read_to_string(report) {
+                            ui.ctx().copy_text(text);
+                            self.status = "Crash report copied".into();
+                        }
+                    }
+                    if ui.button("Show the file").clicked() {
+                        let _ = platform::reveal(report);
+                    }
+                });
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if offer.autosave.is_some() {
+                    if ui.button("Discard").on_hover_text("Delete the unsaved changes").clicked() {
+                        choice = Some(false);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Recover").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            choice = Some(true);
+                        }
+                    });
+                } else if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
+                    choice = Some(false);
+                }
+            });
+        });
+        let Some(recover) = choice else { return };
+        if recover {
+            if let Some(text) = offer.autosave.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+                self.recover_scene(text, offer.scene_path.clone());
+            }
+        }
+        recovery::forget(&dir, &offer.id);
+        self.recovery_offer = None;
+    }
+
+    // Opens recovered work as unsaved changes to the scene it came from.
+    fn recover_scene(&mut self, text: String, scene_path: Option<PathBuf>) {
+        if let Some(problem) = scene_problem(&text) {
+            self.status = format!("Couldn't recover the scene: {problem}");
+            return;
+        }
+        self.undo.push(self.last_state.clone());
+        self.use_saved_timeline(&text);
+        self.load_state(text);
+        // Unsaved against the file on disk (or against nothing, if it was untitled).
+        let on_disk = scene_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+        self.saved_fingerprint = on_disk.map_or(0, |t| scene_fingerprint(&t));
+        self.unsaved = true;
+        self.unsaved_checked = None;
+        // Saving writes back to the scene it came from.
+        self.scene_path = scene_path.filter(|p| p.extension().is_some_and(|e| e == SCENE_EXTENSION || e == "mhip"));
+        self.status = "Recovered your unsaved changes. Save to keep them.".into();
     }
 
     // Quitting with unsaved changes asks first: Save, Don't Save or Cancel.
@@ -20253,6 +20403,13 @@ impl ProceduralFxStudioApp {
 // ============================================================================
 
 impl eframe::App for ProceduralFxStudioApp {
+    // A clean quit (saved, or "Don't Save"): nothing to recover next time.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(session) = &mut self.recovery {
+            session.end();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // A dialog in its own window locks this one.
         lock_for_modal(ctx);
@@ -20407,6 +20564,8 @@ impl eframe::App for ProceduralFxStudioApp {
         }
         self.update_window_title(ctx);
         self.confirm_quit(ctx);
+        self.autosave(ctx);
+        self.recovery_prompt(ctx);
 
         self.poll_moonray_render();
         self.advance_sequence();
@@ -20592,6 +20751,7 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    recovery::install_panic_hook();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
@@ -20618,6 +20778,11 @@ fn main() -> eframe::Result<()> {
             Box::new(move |cc| {
                 opened.store(true, Ordering::SeqCst);
                 let mut app = ProceduralFxStudioApp::default();
+                if let Some(dir) = recovery_dir() {
+                    let (session, leftovers) = recovery::Session::start(dir);
+                    app.recovery = Some(session);
+                    app.recovery_offer = leftovers.into_iter().next();
+                }
                 // PFX_VIEWPORT=cpu keeps the viewport on raster.rs (to compare the two).
                 let cpu = std::env::var("PFX_VIEWPORT").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"));
                 app.gpu_viewport = cc.wgpu_render_state.clone().filter(|_| !cpu).map(gpu_viewport::GpuViewport::new);
@@ -22106,6 +22271,141 @@ mod group_node_tests {
         assert_eq!(parse_timeline("timeline 5 1 999\n"), Some((5.0, 5.0, 120.0)), "end before start, and too high a rate, are fixed");
         assert_eq!(parse_timeline("timeline nan 1 24\n"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scenes_from_a_newer_format_are_refused_not_half_opened() {
+        assert_eq!(scene_format(&Graph::default().serialize()), Some(SCENE_FORMAT));
+        assert_eq!(scene_format("mhip 1\n"), Some(1));
+        assert_eq!(scene_format("node 0 0 0 0 obj sphere\n"), None);
+        assert!(scene_problem(&Graph::default().serialize()).is_none());
+
+        let dir = std::env::temp_dir().join(format!("pfx_format_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("future.pfs");
+        let newer = format!("pfs {}\nnode 0 40 20 0 obj geometry -1\nnext 1\n", SCENE_FORMAT + 1);
+        std::fs::write(&path, newer).unwrap();
+        let mut app = ProceduralFxStudioApp::default();
+        let before = app.graph.serialize();
+        app.open_scene(path.clone());
+        assert!(app.status.contains("newer version"), "{}", app.status);
+        assert_eq!(app.graph.serialize(), before, "nothing was loaded");
+        assert_ne!(app.scene_path.as_deref(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nodes_that_cant_be_read_are_reported() {
+        // Every starter effect reads in full.
+        for preset in presets::PRESETS {
+            assert_eq!(unread_nodes(preset.scene, &Graph::deserialize(preset.scene)), 0, "{}", preset.name);
+        }
+        let dir = std::env::temp_dir().join(format!("pfx_unread_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unknown.pfs");
+        std::fs::write(&path, "pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj hyperdrive 1 2 3\nparent 1 0\nnext 2\n").unwrap();
+        let mut app = ProceduralFxStudioApp::default();
+        app.open_scene(path);
+        assert!(app.status.contains("1 node couldn't be read"), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_work_opens_as_unsaved_changes_to_its_scene() {
+        let dir = std::env::temp_dir().join(format!("pfx_recover_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fire.pfs");
+        let saved = "pfs 2\nnode 0 40 20 0 obj geometry -1\nnext 1\ntimeline 1 2 24\n";
+        std::fs::write(&path, saved).unwrap();
+        let autosaved = "pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nnext 2\ntimeline 1 3 24\n";
+
+        let mut app = ProceduralFxStudioApp::default();
+        app.recover_scene(autosaved.to_owned(), Some(path.clone()));
+        assert_eq!(app.graph.nodes.len(), 2);
+        assert_eq!(app.playback_end, 3.0);
+        assert_eq!(app.scene_path.as_deref(), Some(path.as_path()));
+        assert!(app.has_unsaved_changes());
+        // Undo goes back to what was open before.
+        app.do_undo();
+        assert_eq!(app.graph.nodes.len(), Graph::deserialize(&ProceduralFxStudioApp::default().last_state).nodes.len());
+        app.do_redo();
+        app.save_scene();
+        assert_eq!(Graph::deserialize(&std::fs::read_to_string(&path).unwrap()).nodes.len(), 2, "saving writes it back to its scene");
+
+        // An untitled scene stays untitled; a newer format isn't recovered.
+        let mut other = ProceduralFxStudioApp::default();
+        other.recover_scene(autosaved.to_owned(), None);
+        assert!(other.scene_path.is_none() && other.has_unsaved_changes());
+        let mut refused = ProceduralFxStudioApp::default();
+        refused.recover_scene(format!("pfs {}\n", SCENE_FORMAT + 1), None);
+        assert!(refused.status.contains("newer version"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Damaged scene files (cut short, lines lost or mangled) must load what they can,
+    // never crash the app.
+    #[test]
+    fn damaged_scene_files_never_crash_the_loader() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let junk = ["", "-1", "0", "nan", "inf", "-inf", "1e40", "18446744073709551616", "99999999", "@", "%%", "|||", "::", "é", "\u{0}"];
+        let mut failures = Vec::new();
+        for preset in presets::PRESETS {
+            let lines: Vec<&str> = preset.scene.lines().collect();
+            for round in 0..60 {
+                let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                match round % 4 {
+                    // Cut short, anywhere (on a character boundary).
+                    0 => {
+                        let text = out.join("\n");
+                        let mut at = (next() as usize) % text.len().max(1);
+                        while !text.is_char_boundary(at) {
+                            at -= 1;
+                        }
+                        out = vec![text[..at].to_owned()];
+                    }
+                    // Lines lost.
+                    1 => out.retain(|_| next() % 4 != 0),
+                    // Tokens replaced with junk.
+                    2 => {
+                        for line in &mut out {
+                            let mut tokens: Vec<String> = line.split(' ').map(str::to_owned).collect();
+                            for token in &mut tokens {
+                                if next() % 6 == 0 {
+                                    *token = junk[(next() as usize) % junk.len()].to_owned();
+                                }
+                            }
+                            *line = tokens.join(" ");
+                        }
+                    }
+                    // Tokens dropped from the ends of lines.
+                    _ => {
+                        for line in &mut out {
+                            let mut tokens: Vec<&str> = line.split(' ').collect();
+                            let keep = tokens.len().saturating_sub((next() as usize) % 4);
+                            tokens.truncate(keep.max(1));
+                            *line = tokens.join(" ");
+                        }
+                    }
+                }
+                let text = out.join("\n");
+                let result = std::panic::catch_unwind(|| {
+                    let graph = Graph::deserialize(&text);
+                    // What loads saves again, and loads the same way.
+                    let again = graph.serialize();
+                    assert_eq!(Graph::deserialize(&again).serialize(), again);
+                });
+                if result.is_err() {
+                    failures.push(format!("{} round {round}", preset.name));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "the loader panicked on: {failures:?}");
     }
 }
 
