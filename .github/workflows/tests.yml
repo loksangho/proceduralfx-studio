@@ -36,5 +36,7 @@ jobs:
       - name: Linux packages
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev
+      # On Windows, one test at a time: GitHub's Windows machines draw with a software
+      # GPU, and a crash there then names the test that caused it.
       - name: Test
-        run: cargo test --release
+        run: cargo test --release ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
