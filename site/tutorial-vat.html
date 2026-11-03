@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vertex Animation for 3D Games · ProceduralFX Studio</title>
+<meta name="description" content="Bake cloth, destruction and liquids from ProceduralFX Studio into vertex animation textures (VAT) that play on the GPU in Godot and Unity.">
+<link rel="icon" href="/img/logo.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a class="brand" href="/"><img src="/img/logo.png" alt=""><span>ProceduralFX Studio</span></a><nav><a href="/tutorials">Tutorials</a><a class="keep" href="/#download">Download</a></nav></div></header>
+<main class="legal">
+<p><a href="/tutorials">← Tutorials</a></p>
+<h1>Vertex animation for 3D games</h1>
+<p class="updated">Tutorial 4 · about 15 minutes</p>
+<p class="soon">Coming in the next update: Export Vertex Animation isn't in version 0.20.0 yet.</p>
+
+<div class="summary">
+<p>Simulations are too slow to run in a game, so you <b>bake</b> them. A <b>vertex animation texture</b> (VAT) stores every frame of an effect's motion in a texture. A small shader in the game reads it and moves the mesh on the GPU. It's how games use cloth, destruction and splashes from Houdini, and it costs about one texture read per vertex.</p>
+</div>
+
+<div class="gallery">
+<figure><img src="/img/tutorials/vat_soft.gif" alt="A grid twisting and rippling" width="320" height="320" loading="lazy"><figcaption>Soft: points that move freely</figcaption></figure>
+<figure><img src="/img/tutorials/vat_rigid.gif" alt="A fractured box falling apart" width="320" height="320" loading="lazy"><figcaption>Rigid: pieces that keep their shape</figcaption></figure>
+</div>
+
+<h2>The three kinds</h2>
+<ul>
+<li><b>Soft:</b> a mesh whose points stay the same and move freely, like cloth, deformers, or wobbling and twisting shapes.</li>
+<li><b>Rigid:</b> pieces that move and turn without bending, like destruction and RBD. Each piece's position and rotation is stored, so pieces never warp.</li>
+<li><b>Fluid:</b> a mesh whose points and polygons change every frame, like a liquid from <b>Particle Fluid Surface</b>. Every triangle corner is stored, so the textures get large. Keep the surface's resolution modest.</li>
+</ul>
+<p>You don't have to choose: <b>Automatic</b> picks the kind that suits the motion.</p>
+
+<h2>1. Make something that moves</h2>
+<p>Any animated geometry object works. Two quick ones:</p>
+<ul>
+<li><b>Wobble (soft):</b> the scene the app opens with already moves. Its <code>noise</code> node changes over time. Press <b>Space</b> to see it.</li>
+<li><b>Destruction (rigid):</b> in a geometry object, wire a <code>box</code> into a <code>xform</code> (Transform) to lift it up, then into a <code>material_fracture</code> to break it, then into an <code>rbd_solver</code> to drop it. Double-click the RBD solver to show it, and press <b>Space</b>.</li>
+</ul>
+<p>Set the timeline's <b>Start</b> and <b>End</b> to the frames you want to bake.</p>
+
+<h2>2. Bake it</h2>
+<ol>
+<li>Choose <b>Render → Export Vertex Animation…</b>.</li>
+<li>Pick the <b>Object</b>. It starts on the one you're looking at.</li>
+<li>Leave <b>Kind</b> on <b>Automatic</b>. Under <b>Frames</b>, baking every second frame halves the textures. The game blends between frames anyway, except for fluids.</li>
+<li>Tick <b>Godot</b> or <b>Unity</b> under <b>Also for</b>, click <b>Export…</b>, and save into your game's project. The status bar shows the bake's progress, and which kind it chose.</li>
+</ol>
+<p>You get <code>name.obj</code> (the mesh), two EXR textures (the motion), and <code>name.vat.json</code> describing them, plus the engine's shader and material.</p>
+
+<h2>3a. Play it in Godot 4</h2>
+<ol>
+<li>Add a <b>MeshInstance3D</b> and drag <code>name.obj</code> onto its <b>Mesh</b>.</li>
+<li>Drag <code>name_vat_material.tres</code> onto its <b>Material Override</b>.</li>
+<li>Run the scene: it plays and loops by itself. To control it from a script, turn off the material's <code>use_time</code> and set <code>frame</code>.</li>
+</ol>
+<p>The export includes import settings that stop Godot compressing the textures and mesh, which would ruin the numbers. Keep the <code>.import</code> files with them.</p>
+
+<h2>3b. Play it in Unity (URP)</h2>
+<ol>
+<li>Export into your project's <code>Assets</code> folder. The <code>.meta</code> files beside the textures keep them exact.</li>
+<li>Drag <code>name.obj</code> into the scene, and drag <code>name_vat.mat</code> onto it.</li>
+<li>Press Play. Untick <b>Play by itself</b> on the material to set the frame yourself.</li>
+</ol>
+<p>Your project must use the <b>Linear</b> colour space, which is URP's default. In Gamma, Unity changes the textures' numbers, and the shader shows the mesh in magenta rather than move it wrongly. Change it in <b>Project Settings → Player → Other Settings → Color Space</b>.</p>
+
+<h2>Tips</h2>
+<ul>
+<li><b>If the mesh vanishes</b> when pieces or splashes fly far from where they started, the engine thinks it's off screen. The JSON's <code>bounds</code> give the whole animation's size. Set Godot's <b>Extra Cull Margin</b> (or <b>Custom AABB</b>), or Unity's <code>Renderer.localBounds</code>, to cover it.</li>
+<li><b>If the bake says the geometry changes</b> part-way through, its points or polygons aren't the same every frame. Choose <b>Fluid</b>, which allows that.</li>
+<li><b>From a terminal:</b> <code>proceduralfx_studio vat scene.pfs out/name --godot --unity</code> bakes without opening the app. Add <code>--mode rigid</code> to choose the kind.</li>
+</ul>
+
+<p><b>Back to:</b> <a href="/tutorials">all tutorials</a></p>
+</main>
+<footer><div class="wrap"><span>© 2026 ProceduralFX Studio</span><nav><a href="/tutorials">Tutorials</a><a href="/promise">Our promise</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/refunds">Refunds</a><a href="mailto:support@build3dstudio.com">Contact</a></nav><p class="legal-note">Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></div></footer>
+</body>
+</html>
