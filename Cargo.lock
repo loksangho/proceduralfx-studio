@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "proceduralfx_studio"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "bytemuck",
  "cc",
