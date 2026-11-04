@@ -68,6 +68,20 @@ fn add_with_tab(h: &mut Harness<ProceduralFxStudioApp>, at: egui::Pos2, name: &s
 }
 
 // A point in the network canvas, as fractions of its width and height.
+// Steps until a background cook has finished (it can take a while on a busy CI machine),
+// for at most 30 seconds.
+fn settle(h: &mut Harness<ProceduralFxStudioApp>) {
+    h.run_steps(3);
+    for _ in 0..3000 {
+        if h.state().simulation_rx.is_none() && !h.state().status.ends_with("press Escape to cancel") {
+            break;
+        }
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.run_steps(2);
+}
+
 fn in_canvas(h: &Harness<ProceduralFxStudioApp>, x: f32, y: f32) -> egui::Pos2 {
     let c = h.state().network_canvas;
     egui::pos2(c.left() + c.width() * x, c.top() + c.height() * y)
@@ -121,7 +135,7 @@ fn a_network_is_built_from_the_tab_menu_and_wired_by_dragging() {
         press(&h, centre, pressed);
         h.step();
     }
-    h.run_steps(3);
+    settle(&mut h);
     assert_eq!(h.state().graph.display_of(0), Some(noise), "the display flag moved to the noise");
     assert!(!h.state().current_mesh.vertices.is_empty(), "and the viewport shows it");
 }
@@ -135,15 +149,8 @@ fn a_preset_opens_from_the_file_menu() {
     h.run_steps(2);
     h.get_by_label("Smoke (loop)").click_accesskit();
     h.run_steps(6);
-    // Its first frame cooks in the background (slowly on a busy CI machine); then the
-    // preset's message comes back.
-    for _ in 0..3000 {
-        if !h.state().status.ends_with("press Escape to cancel") {
-            break;
-        }
-        h.step();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // Its first frame cooks in the background; then the preset's message comes back.
+    settle(&mut h);
     let app = h.state();
     assert!(app.status.starts_with("New scene from the Smoke preset"), "{}", app.status);
     assert_eq!(app.graph.nodes.values().filter(|n| n.name == "sheet_camera").count(), 1, "the preset's scene, with its camera");
@@ -194,7 +201,7 @@ fn typing_a_parameter_changes_the_node_and_the_viewport() {
     h.event(egui::Event::Text("6.5".into()));
     h.run_steps(1);
     h.key_press(egui::Key::Enter);
-    h.run_steps(6);
+    settle(&mut h);
     let app = h.state();
     assert!(matches!(app.graph.nodes[&1].kind, NodeKind::Grid { size, .. } if (size - 6.5).abs() < 1e-4), "the grid's size is 6.5");
     assert!((width_of(&app.current_mesh) - 6.5).abs() < 1e-3, "and the viewport shows it 6.5 wide: {}", width_of(&app.current_mesh));
@@ -230,7 +237,7 @@ fn a_scene_saves_and_reopens_from_open_recent() {
     h.get_by_label_contains("Open Recent").click();
     h.run_steps(2);
     h.get_by_label("terrain.pfs").click_accesskit();
-    h.run_steps(4);
+    settle(&mut h);
     let app = h.state();
     assert_eq!(app.graph.nodes.len(), 2, "back to what was saved");
     assert!(app.status.starts_with("Loaded "), "{}", app.status);
