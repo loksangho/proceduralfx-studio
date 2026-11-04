@@ -353,3 +353,32 @@ fn real_time_renders_save_transparent_frames_through_the_render_camera() {
     assert!(middle[3] == 255 && middle[0] > 40, "the sphere fills the middle: {middle:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// When the GPU refuses the viewport's work, the app carries on with the CPU viewport and
+// says why, instead of crashing.
+#[test]
+fn a_gpu_failure_falls_back_to_the_cpu_viewport() {
+    let Some(gpu) = gpu_viewport::headless() else {
+        eprintln!("no GPU here; skipping");
+        return;
+    };
+    let mut app = ProceduralFxStudioApp::default();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj sphere 0.5 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n".into());
+    app.animate = false;
+    app.gpu_viewport = Some(gpu);
+    let ctx = egui::Context::default();
+    let frame = |app: &mut ProceduralFxStudioApp| {
+        let _ = ctx.run(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), ..Default::default() }, |ctx| app.frame(ctx));
+    };
+    frame(&mut app);
+    assert!(app.gpu_viewport.is_some());
+    app.gpu_viewport.as_ref().unwrap().fail("Validation Error\n\nCaused by:\n  In Device::create_render_pipeline, label = 'viewport volumes'");
+    frame(&mut app);
+    assert!(app.gpu_viewport.is_none(), "given up");
+    assert!(app.status.contains("drawn on the CPU now") && app.status.contains("Validation Error"), "{}", app.status);
+    assert!(app.gpu_failure.as_deref().is_some_and(|e| e.contains("viewport volumes")));
+    // And the app keeps drawing, the viewport with the CPU.
+    frame(&mut app);
+    frame(&mut app);
+    assert!(!app.current_mesh.vertices.is_empty());
+}

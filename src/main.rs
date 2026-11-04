@@ -184,7 +184,15 @@ fn main() -> eframe::Result<()> {
                 }
                 // PFX_VIEWPORT=cpu keeps the viewport on raster.rs (to compare the two).
                 let cpu = std::env::var("PFX_VIEWPORT").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"));
-                app.gpu_viewport = cc.wgpu_render_state.clone().filter(|_| !cpu).map(gpu_viewport::GpuViewport::new);
+                app.gpu_viewport = match cc.wgpu_render_state.clone().filter(|_| !cpu).map(gpu_viewport::GpuViewport::new) {
+                    Some(Ok(viewport)) => Some(viewport),
+                    // The GPU refused something: draw the viewport on the CPU instead.
+                    Some(Err(error)) => {
+                        app.gpu_fallback(error);
+                        None
+                    }
+                    None => None,
+                };
                 Ok(Box::new(app))
             }),
         )

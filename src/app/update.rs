@@ -19,6 +19,10 @@ impl ProceduralFxStudioApp {
     // One frame of the whole app. Separate from eframe's update so tests can drive the
     // real UI without a window (see app_tests::gui_flows).
     pub(crate) fn frame(&mut self, ctx: &egui::Context) {
+        // The GPU refused the viewport's work (or ran out of memory): carry on with the CPU.
+        if let Some(error) = self.gpu_viewport.as_ref().and_then(|gpu| gpu.failure()) {
+            self.gpu_fallback(error);
+        }
         // A dialog in its own window locks this one.
         lock_for_modal(ctx);
         // Windows rendering set-up: show what the helper is doing.
@@ -323,5 +327,15 @@ impl ProceduralFxStudioApp {
         if let Some((_, title)) = ctx.data(|d| d.get_temp::<(egui::ViewportId, String)>(modal_key())) {
             modal_cover(ctx, &title);
         }
+    }
+
+    // Stops using the GPU viewport after `error`, and says so: the viewport is drawn on the
+    // CPU from now on (slower, without volumes); what needs the GPU says it does.
+    pub(crate) fn gpu_fallback(&mut self, error: String) {
+        self.gpu_viewport = None;
+        let first_line = error.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("an error").to_owned();
+        self.status = format!("The GPU couldn't draw the viewport ({first_line}), so it's drawn on the CPU now. Sprite sheets and real-time renders need the GPU: restart the app to try it again.");
+        self.gpu_failure = Some(error);
+        self.dirty = true;
     }
 }

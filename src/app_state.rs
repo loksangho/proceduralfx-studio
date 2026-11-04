@@ -705,6 +705,8 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) pyro_fit_request: Option<NodeId>,
     // The render node's Render button, pressed while its controls drew.
     pub(crate) start_render_request: bool,
+    // Why the GPU viewport was given up for the CPU one, if it was (see gpu_fallback).
+    pub(crate) gpu_failure: Option<String>,
     // Make Loop's Find best length, run after the panel draws.
     pub(crate) loop_search_request: Option<NodeId>,
     // USD Export node whose stage should be written this frame.
@@ -957,6 +959,7 @@ impl Default for ProceduralFxStudioApp {
             layout_name_prompt: None,
             pyro_fit_request: None,
             start_render_request: false,
+            gpu_failure: None,
             loop_search_request: None,
             usd_export_request: None,
             file_export_request: None,

@@ -564,6 +564,42 @@ pub struct GpuViewport {
     // Volumes, ray-marched into the splats' blended targets (gpu_volume.rs).
     volume_pass: crate::gpu_volume::Pass,
     volume: Option<crate::gpu_volume::Upload>,
+    // What went wrong on the GPU, if anything did (see watch_errors): the app then shows
+    // the viewport with the CPU renderer instead of crashing.
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+// A GPU error's message: what it says for validation and internal errors.
+fn error_text(error: &wgpu::Error) -> String {
+    match error {
+        wgpu::Error::OutOfMemory { .. } => "the GPU ran out of memory".into(),
+        wgpu::Error::Validation { description, .. } | wgpu::Error::Internal { description, .. } => description.clone(),
+    }
+}
+
+// Catches GPU errors that would otherwise crash the app (wgpu panics on any error nobody
+// catches): an error from the viewport's own work (its labels all start "viewport"), or
+// running out of GPU memory, is recorded in `failure` for the app to fall back to the CPU
+// renderer. Anything else is still fatal, as before. Tests keep every error fatal, so a
+// shader a GPU refuses fails them rather than quietly turning a test off.
+fn watch_errors(device: &wgpu::Device, failure: Arc<std::sync::Mutex<Option<String>>>) {
+    if !cfg!(test) {
+        catch_errors(device, failure);
+    }
+}
+
+fn catch_errors(device: &wgpu::Device, failure: Arc<std::sync::Mutex<Option<String>>>) {
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        let text = error_text(&error);
+        let ours = matches!(error, wgpu::Error::OutOfMemory { .. }) || text.contains("'viewport");
+        if !ours {
+            panic!("wgpu error: {text}");
+        }
+        eprintln!("GPU viewport error: {text}");
+        if let Ok(mut slot) = failure.lock() {
+            slot.get_or_insert(text);
+        }
+    }));
 }
 
 // The uploaded points: dots and splats, one instance each, and curves (hair), one
@@ -626,7 +662,29 @@ struct Target {
 }
 
 impl GpuViewport {
-    pub fn new(render_state: egui_wgpu::RenderState) -> Self {
+    // The viewport on this GPU, or what went wrong making it (a shader it refuses, say).
+    pub fn new(render_state: egui_wgpu::RenderState) -> Result<Self, String> {
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        watch_errors(&render_state.device, failure.clone());
+        let viewport = Self::build(render_state, failure.clone());
+        match failure.lock().ok().and_then(|f| f.clone()) {
+            Some(error) => Err(error),
+            None => Ok(viewport),
+        }
+    }
+
+    // For tests: as if the GPU had refused something.
+    #[cfg(test)]
+    pub fn fail(&self, error: &str) {
+        *self.failure.lock().unwrap() = Some(error.into());
+    }
+
+    // What went wrong on the GPU since the viewport was made, if anything.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|f| f.clone())
+    }
+
+    fn build(render_state: egui_wgpu::RenderState, failure: Arc<std::sync::Mutex<Option<String>>>) -> Self {
         let device = &render_state.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("viewport"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -838,7 +896,7 @@ impl GpuViewport {
         });
         let white = raster::Texture { width: 1, height: 1, pixels: vec![[255; 4]] };
         let blank = texture_bind_group(&render_state, &layout, &sampler, &white);
-        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, see_through, toon, outline, toon_depth, toon_table, toon_group, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None, volume_pass, volume: None }
+        GpuViewport { render_state, surfaces, edges, dots, strands, depth_only, see_through, toon, outline, toon_depth, toon_table, toon_group, splats, composite, composite_layout, layout, sampler, camera, camera_group, texture: None, blank, scene: None, points: None, target: None, blended: None, volume_pass, volume: None, failure }
     }
 
     // Whether the scene uploaded last has this key (what the mesh, lights and display mode hash to).
@@ -1214,7 +1272,13 @@ pub fn headless() -> Option<GpuViewport> {
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).ok()?;
     let renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8Unorm, Default::default());
     let state = egui_wgpu::RenderState { adapter, available_adapters: Vec::new(), device, queue, target_format: wgpu::TextureFormat::Rgba8Unorm, renderer: Arc::new(egui::mutex::RwLock::new(renderer)) };
-    Some(GpuViewport::new(state))
+    match GpuViewport::new(state) {
+        Ok(viewport) => Some(viewport),
+        Err(error) => {
+            eprintln!("The GPU couldn't run the real-time renderer: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1488,6 +1552,27 @@ mod tests {
         let other = middle(&gpu);
         assert!((0..4).all(|c| one[c].abs_diff(other[c]) <= 1), "order doesn't matter: {one:?} vs {other:?}");
         assert!(one[0] > one[2], "the nearer (red) splat weighs more: {one:?}");
+    }
+
+    #[test]
+    fn the_viewports_gpu_errors_are_caught_and_others_still_stop_the_app() {
+        let Some(gpu) = headless() else {
+            eprintln!("no GPU here; skipping");
+            return;
+        };
+        let device = gpu.render_state.device.clone();
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        catch_errors(&device, failure.clone());
+        let broken = |label: &str| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl("fn broken( {".into()) });
+        };
+        // A shader of the viewport's that the GPU refuses: recorded, not fatal.
+        broken("viewport test");
+        let error = failure.lock().unwrap().clone().expect("the error is recorded");
+        assert!(error.contains("viewport test"), "{error}");
+        // Anything else is still fatal, as before.
+        let other = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| broken("someone else's")));
+        assert!(other.is_err(), "errors outside the viewport aren't swallowed");
     }
 
     #[test]
