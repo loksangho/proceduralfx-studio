@@ -30,6 +30,8 @@ env:
 
 permissions:
   contents: write
+  # To delete the older dependency caches (see "Delete older build caches").
+  actions: write
 
 jobs:
   flatpak:
@@ -131,6 +133,16 @@ jobs:
         with:
           path: .flatpak-builder
           key: flatpak-${{ hashFiles('packaging/linux/**') }}-${{ github.sha }}
+
+      # Every main run saves a new copy of the cache (several GB), and the old ones stayed
+      # until the repository's 10 GB was full, when GitHub deleted the least recently used
+      # cache, which tends to be this one. Keep only the copy just saved.
+      - name: Delete older build caches
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/prune-caches.sh flatpak- 2
 
       - uses: actions/upload-artifact@v4
         with:

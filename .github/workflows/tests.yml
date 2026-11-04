@@ -50,3 +50,21 @@ jobs:
       - name: Performance budgets
         if: runner.os == 'Linux'
         run: cargo test --release -- --ignored cooking_stays_within_its_budget --nocapture
+
+  # Each new Cargo.lock (every release) gives each platform a new cache, and the old ones
+  # stayed, filling the repository's 10 GB until GitHub deleted the Flatpak's dependency
+  # cache to make room. Once the tests have saved theirs, keep only the newest per platform.
+  prune-caches:
+    needs: test
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete older test caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/prune-caches.sh v0-rust-test- 2
