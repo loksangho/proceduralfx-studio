@@ -118,6 +118,21 @@ jobs:
           flatpak build-bundle repo "$BUNDLE" "$APP_ID" \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
 
+      # A cancelled or timed-out build leaves its compilers running for a while, still
+      # writing to .flatpak-builder (ccache), and tar then fails to pack the cache
+      # ("file changed as we read it"), so nothing is saved: stop them first.
+      - name: Stop anything still building
+        if: always()
+        run: |
+          pkill -TERM -f 'flatpak-builder|bwrap' || true
+          for _ in $(seq 1 60); do
+            pgrep -f 'flatpak-builder|bwrap' >/dev/null || break
+            sleep 2
+          done
+          pkill -KILL -f 'flatpak-builder|bwrap' || true
+          sleep 2
+          pgrep -af 'flatpak-builder|bwrap' || echo "Nothing still building"
+
       - name: Record SDK commits
         if: always()
         run: |
