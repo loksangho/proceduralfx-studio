@@ -1,4 +1,5 @@
-// How each preset looks, exported: the middle frame of its range, rendered as Export
+// How each preset looks, exported: the middle frame of its range (the first, for rigid
+// bodies: see `frame_time`), rendered as Export
 // Sprite Sheet renders it, must still look like the picture in preset_pictures/.
 //
 // The pictures are compared shrunk to about 40 pixels across, so that platforms' small
@@ -27,15 +28,28 @@ fn file_name(preset: &presets::Preset) -> String {
     format!("{}.png", preset.name.to_lowercase().replace(' ', "_"))
 }
 
-// The middle frame of the preset's range, as Preview (and so Export) renders it.
+// Which frame is pictured: the middle of the range. Rigid bodies bouncing off each other
+// amplify the platforms' last-bit maths differences until, mid-collapse, the Breaking
+// wall's pieces lie in different places on Linux, Windows and a Mac; so those are pictured
+// at the start, before anything collides (old_scene_tests.rs checks where they land).
+fn frame_time(preset: &presets::Preset) -> f32 {
+    let (start, end) = preset.range;
+    let rigid = preset.scene.lines().any(|l| l.starts_with("node ") && (l.contains(" obj rbd_") || l.contains(" obj material_fracture")));
+    if rigid {
+        start
+    } else {
+        (((start + end) * 0.5) * sims::SIM_FPS).round() / sims::SIM_FPS
+    }
+}
+
+// The preset's pictured frame, as Preview (and so Export) renders it.
 fn render(gpu: gpu_viewport::GpuViewport, preset: &presets::Preset) -> image::RgbaImage {
     sims::clear_all();
     let mut app = ProceduralFxStudioApp::default();
     app.gpu_viewport = Some(gpu);
     app.load_preset(preset);
-    let (start, end) = preset.range;
-    let middle = (((start + end) * 0.5) * sims::SIM_FPS).round() / sims::SIM_FPS;
-    (app.playback_start, app.playback_end) = (middle, middle);
+    let at = frame_time(preset);
+    (app.playback_start, app.playback_end) = (at, at);
     app.sprite_sheet.seamless = false;
     app.preview_sprite_sheet();
     super::realtime_render_tests::run_recording_for(&mut app, 2000);
