@@ -1,0 +1,34 @@
+pfs 2
+node 0 40 20 0 obj geometry -1
+node 1 40 20 0 obj sphere 0.15 6 8
+node 2 40 100 0 obj xform 0 0.2 0 0 0 0 1 1 1
+node 3 40 180 0 obj popnet 2
+node 4 40 20 0 obj pop 0
+node 5 240 20 0 obj pop 2 0 1 0 120 3 0 1 0 3.5 0 1 0.8 1 0 1
+node 6 40 140 0 obj pop 1
+node 7 40 260 0 obj pop 3 0 -9.8 0
+node 8 0 320 0 obj pop 14 1 0 0 1 0.4 0.1 0.02
+node 9 40 260 0 obj particle_surface 0.13 0 20 2
+node 10 40 -80 0 obj camera 0 0.8 0 20 30 0 1.2 0.05 0 0 0 5.28
+link 4 6 0
+link 5 6 2
+link 6 7 0
+link 7 8 0
+link 1 2 0
+link 2 3 0
+link 3 9 0
+parent 1 0
+parent 2 0
+parent 3 0
+parent 4 3
+parent 5 3
+parent 6 3
+parent 7 3
+parent 8 3
+parent 9 0
+name 0 73706c617368
+name 10 73686565745f63616d657261
+display 0 9
+display 3 8
+channel 5 p 4 expr:2446203c20332e35203f20313230203a2030
+next 11

@@ -1,0 +1,18 @@
+pfs 2
+node 0 40 20 0 obj geometry -1
+node 1 40 20 0 obj sphere 0.18 12 24
+node 2 40 100 0 obj pyro 56 0 2.0 0 3.0 4.4 3.0 1 0.45 1 0 1.2 0.8 0.5 0.45 0.5 0 0 0 0 0.6
+node 3 40 180 0 obj make_loop 2 1 0.5
+node 4 40 -80 0 obj camera 0 1.2 0 0 0 0 1.2 0.5 1 0 0 3.4
+link 1 2 0
+link 2 3 0
+parent 1 0
+parent 2 0
+parent 3 0
+name 0 736d6f6b65
+name 1 736f75726365
+name 2 736d6f6b655f73696d
+name 3 736d6f6b655f6c6f6f70
+name 4 73686565745f63616d657261
+display 0 3
+next 5

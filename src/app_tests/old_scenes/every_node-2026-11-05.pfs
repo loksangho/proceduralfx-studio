@@ -1,0 +1,637 @@
+pfs 2
+node 0 40 20 0 obj geometry -1
+node 1 40 100 0 obj sop_import t:2f67656f -1
+node 2 160 100 0 obj usd_reference t:|2f726566 0
+node 3 280 100 0 obj usd_primitive t:2f7368617065732f737068657265 0 1 0 1 0
+node 4 400 100 0 obj usd_light t:2f6c69676874732f6b6579 0 4 6 4 0 0 0 1 0.97 0.9 1 1
+node 5 520 100 0 obj usd_camera t:2f63616d657261732f63616d 5 4 6 0 0 0 35 36
+node 6 640 100 0 obj usd_transform t:2f67656f2f2a 0 0 0 0 0 0 1 1 1
+node 7 760 100 0 obj assign_material t:2f67656f2f2a2a -1
+node 8 880 100 0 obj usd_prune t: 0
+node 9 1000 100 0 obj usd_merge 
+node 10 1120 100 0 obj usd_export t: 
+node 11 40 180 0 obj geometry -1
+node 12 160 180 0 obj camera 0 0 0 23 -35 0 1.2 0.5 0 0 0 6
+node 13 280 180 0 obj light 3 4 3 -35 35 0 1 0.95 0.85 0.9 0
+node 14 400 180 0 obj environment_light t: 1 1 1 1 0 1
+node 15 520 180 0 obj add 0 1 0 0 0 0 0
+node 16 640 180 0 obj grid 4 20
+node 17 760 180 0 obj plane 4 20
+node 18 880 180 0 obj cone 1 2 1 32 1
+node 19 1000 180 0 obj capsule 0.6 1.5 16 32
+node 20 1120 180 0 obj box 1.5 4
+node 21 40 260 0 obj sphere 1 16 32
+node 22 160 260 0 obj torus 1 0.35 16 32
+node 23 280 260 0 obj tube 0.5 0.5 2 8 24 1
+node 24 400 260 0 obj lsystem t:4641|413d2122465b26415d2f2f2f2f2f5b26415d2f2f2f2f2f2f2f5b26415d 6 28 0.6 0.78 0.06 0.7 0 1
+node 25 520 260 0 obj test_geometry 0 2 1 1 2 3 48 1 0 1
+node 26 640 260 0 obj particle_surface 0.05 0 160 1
+node 27 760 260 0 obj hair_guides 200 0.6 0.2 8 0.3 1
+node 28 880 260 0 obj guide_process 1 0.5 2 1
+node 29 1000 260 0 obj hair_generate 5000 8 0.3 0.15 0.2 0.004 0.001 1
+node 30 1120 260 0 obj hair_deform 1
+node 31 40 340 0 obj attribute_paint t:64656e73697479 1 0 40 0.5 0 1
+node 32 160 340 0 obj popnet 1
+node 33 280 340 0 obj particles 2000 400 4 2 0.35 -1.5 1 0 0.4 0.1 0.02 2 0
+node 34 400 340 0 obj flip 20000 64 0.95 0.1 -9.8 0.02 2 11 0 0 0 0 0 0
+node 35 520 340 0 obj whitewater_solver 200000 400 1 1 1 6 2 0.3 2 0.5 6 20 -9.8 0.01 1 1
+node 36 640 340 0 obj pyro 40 0 2 0 4 5 4 1 1 1 0 1 0.15 0.8 0.4 0.3 1 0 0 0 1
+node 37 760 340 0 obj rbd_solver 0 1 0.6 0.2 9.81 2 1 0 0 0 0 0 0 0
+node 38 880 340 0 obj cloth_solver 0 100000 1 0.5 1 0.02 -9.8 0.1 0.3 16 4 1 0 1
+node 39 1000 340 0 obj sop_solver 1
+node 40 1120 340 0 obj time_shift 0 0 0
+node 41 40 420 0 obj time_warp 0.5 0
+node 42 160 420 0 obj time_blend 
+node 43 280 420 0 obj trail 5 1 0 1
+node 44 400 420 0 obj loop_particles 1 1
+node 45 520 420 0 obj make_loop 2 1 0.5
+node 46 640 420 0 obj solver_input 0
+node 47 760 420 0 obj file t:| 0
+node 48 880 420 0 obj file_export t: 
+node 49 1000 420 0 obj object_merge 1 0
+node 50 1120 420 0 obj vdb 0.1 0 0 1 1
+node 51 40 500 0 obj convert_vdb 0 0
+node 52 160 500 0 obj volume_wrangle t:2f2f205468696e207468652064656e7369747920746f77617264732074686520746f70206f662074686520766f6c756d652e0a4064656e73697479202a3d206669742840502e792c20302c20322c20312c2030293b 
+node 53 280 500 0 obj xform 0 0 0 0 0 0 1 1 1
+node 54 400 500 0 obj noise 2.2 0.3
+node 55 520 500 0 obj taper 0.3
+node 56 640 500 0 obj twist 1
+node 57 760 500 0 obj bend 0.5
+node 58 880 500 0 obj point_deform 4 6 1
+node 59 1000 500 0 obj transform_pieces 
+node 60 1120 500 0 obj smooth 5 0.5
+node 61 40 580 0 obj bevel 0.25 2
+node 62 160 580 0 obj peak 0.1
+node 63 280 580 0 obj ripple 6 0.3 4
+node 64 400 580 0 obj jitter 0.05 1 1 1 1
+node 65 520 580 0 obj match_size 1 0 1 0 1 0 0 0 1 1 1
+node 66 640 580 0 obj subdivide 1
+node 67 760 580 0 obj remesh 2000
+node 68 880 580 0 obj fuse 0.001
+node 69 1000 580 0 obj mirror 0
+node 70 1120 580 0 obj copy 5 1.5 0 0 0 0 0 1
+node 71 40 660 0 obj copy_to_points t: 1 0 0 0
+node 72 160 660 0 obj extrude t:6578747275646546726f6e74|6578747275646553696465|657874727564654261636b 0.2 0 1 1 1 0 1 1
+node 73 280 660 0 obj clip 1 0 0
+node 74 400 660 0 obj blast 1 0 0
+node 75 520 660 0 obj scatter 1000 1 5 0
+node 76 640 660 0 obj boolean 2 0 128
+node 77 760 660 0 obj pack 1 0
+node 78 880 660 0 obj unpack 1
+node 79 1000 660 0 obj cache 1 1 1 100 1
+node 80 1120 660 0 obj reverse 
+node 81 40 740 0 obj extract_centroid 1 0
+node 82 160 740 0 obj convert_line 
+node 83 280 740 0 obj resample 1 0.1 10
+node 84 400 740 0 obj metaball 1 0.3 48
+node 85 520 740 0 obj switch 0
+node 86 640 740 0 obj merge 
+node 87 760 740 0 obj null 
+node 88 880 740 0 obj foreach_end t: 0 10 0 1 -1 1 -1
+node 89 1000 740 0 obj foreach_end t:6e616d65 1 10 0 1 -1 1 -1
+node 90 1120 740 0 obj foreach_end t: 2 10 0 1 -1 1 -1
+node 91 40 820 0 obj foreach_end t: 3 10 0 1 -1 1 -1
+node 92 160 820 0 obj foreach_end t: 4 10 0 1 -1 1 -1
+node 93 280 820 0 obj foreach_end t: 5 10 0 1 -1 1 -1
+node 94 400 820 0 obj compile_end -1
+node 95 520 820 0 obj subnet t: 
+node 96 640 820 0 obj subnet_input 0
+node 97 760 820 0 obj material t: 0
+node 98 880 820 0 obj material_fracture 0 20 1 0 0 0 4 9 1 5 0 200
+node 99 1000 820 0 obj material_fracture 1 20 1 0 0 0 4 9 1 5 0 200
+node 100 1120 820 0 obj material_fracture 2 20 1 0 0 0 4 9 1 5 0 200
+node 101 40 900 0 obj rbd_configure 1 0.6 0.2 1 0 0 0 1 1 1 1 0
+node 102 160 900 0 obj rbd_bullet_solver 1 0.6 0.2 9.81 4 1 0 1 0 0 0
+node 103 280 900 0 obj crowd_solver 1.4 0.2 120 0.6 2 0.3 0.1 0 0 0 0 0.5 1.5 1.75 1 1
+node 104 400 900 0 obj skeleton 0 1 6 2
+node 105 520 900 0 obj rig_pose t:||||||| 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+node 106 640 900 0 obj two_bone_ik t:74686967685f6c|7368696e5f6c|666f6f745f6c 0.1 0.3 0.3 0.1 0.5 1 1 1 1
+node 107 760 900 0 obj procedural_motion 0 1 1 1.2 0.6 0
+node 108 880 900 0 obj skeleton_blend 0.5
+node 109 1000 900 0 obj joint_capture 3 4 0
+node 110 1120 900 0 obj bone_deform 
+node 111 40 980 0 obj muscle 0 1 0 0 0 0 0.12 0 3 0.15 0 0.3 24 16 0 0
+node 112 160 980 0 obj muscle_solver 120 6 4 4
+node 113 280 980 0 obj muscle_skin 0.3 4
+node 114 400 980 0 obj terrain 20 20 256
+node 115 520 980 0 obj terrain_noise 0 0 1.5 4 6 0.5 0 0 1 1 0
+node 116 640 980 0 obj terrain_erode 50000 0.3 0.3 4 0.02 0.05 2 10 40 1
+node 117 760 980 0 obj terrain_terrace 0.5 0 0.6 0
+node 118 880 980 0 obj terrain_mask 1 30 90 5 1 0 0 1
+node 119 1000 980 0 obj terrain_colorize 0.76 0.7 0.5 0.24 0.4 0.16 0.42 0.38 0.34 0.95 0.96 0.98 0.08 0.75 35 0.05
+node 120 1120 980 0 obj heightfield_wrangle t:2f2f2041646420726970706c65732c207374726f6e67657220776865726520746865206d61736b2069732e0a40686569676874202b3d2073696e2840502e78202a203229202a20302e33202a202831202b20406d61736b293b 
+node 121 40 1060 0 obj attribute_create t:4364 4 1 0 3 3 1 1 0
+node 122 160 1060 0 obj attribute_randomize t:4364 4 1 1 0 3 0 1 0 3 0 0 0 0 1 1 1
+node 123 280 1060 0 obj attribute_delete t:707363616c65 4 0
+node 124 400 1060 0 obj color t: 0 0 1 0.45 0.1 0.1 0.3 1 1 1
+node 125 520 1060 0 obj attribute_transfer t:2a 0 4 1 0
+node 126 640 1060 0 obj enumerate t:696e646578| 0 0 1
+node 127 760 1060 0 obj attribute_blur t:4364 0 0 10 1 0.2 10 0
+node 128 880 1060 0 obj attribute_promote t:4364| 0 2 0 1
+node 129 1000 1060 0 obj wrangle 2:40502e79202b3d2073696e2840502e78202a20332e3029202a20302e323b
+node 130 1120 1060 0 obj attribute_vop 2
+node 131 40 1140 0 obj normal 1 60 0 0
+node 132 160 1140 0 obj measure t:|686569676874 0 0 1
+node 133 280 1140 0 obj connectivity t:636c617373 1
+node 134 400 1140 0 obj group_create t:67726f757031|40502e793e30 0 0 -1 -1 -1 1 1 1 50 1 0 1 0 30 0 0
+node 135 520 1140 0 obj uv_texture 3 1 1 1 0 0
+node 136 640 1140 0 obj uv_transform 0 0 0 1 1 0.5 0.5
+node 137 760 1140 0 obj uv_quickshade t: 
+node 138 880 1140 0 obj diffuse 0 0.8 0.8 0.8 0.5 0.5
+node 139 1000 1140 0 obj metal 1 0.9 0.7 0.3 0.3 0
+node 140 1120 1140 0 obj glass 2 1 1 1 0.02 1.5
+node 141 40 1220 0 obj emissive 3 1 0.9 0.7 0 1
+node 142 160 1220 0 obj principled_shader t:|| 0 0.8 0.8 0.8 0 0 0.4 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 143 280 1220 0 obj toon_shader 0 0.9 0.35 0.25 0.25 0.2 0.35 2 0 0.05 1 0.3 1 1 1 1 1 1 0 0 2 0.06 0.05 0.08
+node 144 400 1220 0 obj hair_shader 0 0.3 0.17 0.08 0.35 1.55 1 1 1 0
+node 145 520 1220 0 obj pyro_shader 0 0.2 0.2 0.2 1 0.3 1 1 1 1
+node 146 640 1220 0 obj material_builder 
+node 147 760 1220 0 obj moonray_render mr:6d6f6f6e726179|2d2d7363656e65207b7363656e657d202d2d6f7574707574207b6f75747075747d|6d6f6f6e7261795f72656e6465722e657872|1280|720|64|auto|5|2|2|0|0|0|0|0|1|0.1|0|2|0
+node 148 880 1220 0 obj principled_shader t:|| 1 1 1 1 0 0 0.02 1 1.333 1 0.86 0.95 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 149 1000 1220 0 obj principled_shader t:|| 2 1 1 1 0 0 0 1 1.5 1 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 150 1120 1220 0 obj principled_shader t:|| 3 1 1 1 0 0 0.3 1 1.5 1 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 151 40 1300 0 obj principled_shader t:|| 4 0.8 0.8 0.8 0 0 0.12 1 1.31 1 0.88 0.96 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 152 160 1300 0 obj principled_shader t:|| 5 1 1 1 0 0 0 1 2.42 1 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 153 280 1300 0 obj principled_shader t:|| 6 0.8 0.8 0.8 0 0 0.05 1 1.5 1 1 0.55 0.08 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 154 400 1300 0 obj principled_shader t:|| 7 0.8 0.8 0.8 0 0 0 1 1.33 1 1 1 1 1 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 1 1 1 0
+node 155 520 1300 0 obj principled_shader t:|| 8 1 0.77 0.34 0 1 0.18 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 156 640 1300 0 obj principled_shader t:|| 9 0.97 0.96 0.91 0 1 0.12 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 157 760 1300 0 obj principled_shader t:|| 10 0.95 0.64 0.54 0 1 0.25 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 158 880 1300 0 obj principled_shader t:|| 11 0.91 0.78 0.42 0 1 0.25 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 159 1000 1300 0 obj principled_shader t:|| 12 0.91 0.92 0.92 0 1 0.3 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 160 1120 1300 0 obj principled_shader t:|| 13 0.91 0.92 0.92 0 1 0.35 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0.75 0 1 1 0
+node 161 40 1380 0 obj principled_shader t:|| 14 0.62 0.63 0.64 0 1 0.03 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 162 160 1380 0 obj principled_shader t:|| 15 0.56 0.57 0.58 0 1 0.35 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 163 280 1380 0 obj principled_shader t:|| 16 0.96 0.96 0.97 0 1 0 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 164 400 1380 0 obj principled_shader t:|| 17 0.8 0.12 0.1 0 0 0.3 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 165 520 1380 0 obj principled_shader t:|| 18 0.1 0.3 0.8 0 0 0.08 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0.5 0.05 1 1 1 0 1 0 0 1 1 0
+node 166 640 1380 0 obj principled_shader t:|| 19 0.04 0.04 0.04 0 0 0.75 0.4 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 167 760 1380 0 obj principled_shader t:|| 20 0.55 0.02 0.03 0 0 0.35 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 1 0.02 1 1 1 0 1 0 0 1 1 0
+node 168 880 1380 0 obj principled_shader t:|| 21 0.95 0.94 0.9 0 0 0.1 1 1.5 0 1 1 1 0 0.25 1 0.95 0.9 0.3 0 1 1 1 0.3 1 0.02 1 1 1 0 1 0 0 1 1 0
+node 169 1000 1380 0 obj principled_shader t:|| 22 0.72 0.36 0.2 0 0 0.25 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0.8 0.05 1 1 1 0 1 0 0 1 1 0
+node 170 1120 1380 0 obj principled_shader t:|| 23 0.92 0.91 0.88 0 0 0.1 1 1.5 0 1 1 1 0 0.6 0.95 0.9 0.85 0.5 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 171 40 1460 0 obj principled_shader t:|| 24 0.3 0.6 0.35 0 0 0.15 1 1.5 0 1 1 1 0 1 0.4 0.9 0.5 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 172 160 1460 0 obj principled_shader t:|| 25 0.55 0.55 0.52 0 0 0.9 0.3 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 173 280 1460 0 obj principled_shader t:|| 26 0.7 0.42 0.3 0 0 0.85 0.2 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 174 400 1460 0 obj principled_shader t:|| 27 0.85 0.6 0.5 0 0 0.45 1 1.5 0 1 1 1 0 1 1 0.35 0.2 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 175 520 1460 0 obj principled_shader t:|| 28 0.95 0.9 0.75 0 0 0.3 1 1.5 0 1 1 1 0 1 1 0.8 0.5 2 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 176 640 1460 0 obj principled_shader t:|| 29 0.95 0.95 0.92 0 0 0.15 1 1.5 0 1 1 1 0 1 1 0.97 0.9 2 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 177 760 1460 0 obj principled_shader t:|| 30 0.25 0.12 0.06 0 0 0.3 1 1.5 0 1 1 1 0 0.3 0.6 0.3 0.1 0.3 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 178 880 1460 0 obj principled_shader t:|| 31 0.45 0.28 0.15 0 0 0.55 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0.3 0.05 1 1 1 0 1 0 0 1 1 0
+node 179 1000 1460 0 obj principled_shader t:|| 32 0.3 0.15 0.08 0 0 0.5 0.5 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 180 1120 1460 0 obj principled_shader t:|| 33 0.25 0.18 0.12 0 0 0.7 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0.3 0.2 1 1 1 0 1 0 0 1 1 0
+node 181 40 1540 0 obj principled_shader t:|| 34 0.4 0.02 0.1 0 0 0.9 0.2 1.5 0 1 1 1 0 0 1 0.45 0.3 1 1 1 0.5 0.6 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 182 160 1540 0 obj principled_shader t:|| 35 0.8 0.8 0.78 0 0 0.9 0.3 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0.5 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 183 280 1540 0 obj principled_shader t:|| 36 0.9 0.9 0.86 0 0 0.9 0.3 1.5 0 1 1 1 0 0.2 1 0.45 0.3 0.2 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 184 400 1540 0 obj principled_shader t:|| 37 0.05 0.04 0.04 0 0 0.8 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 0.35 0.05 8 1 0 0 1 1 0
+node 185 520 1540 0 obj principled_shader t:|| 38 0.1 0.1 0.1 0 0 0.4 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 0.2 0.8 1 20 1 0 0 1 1 0
+node 186 640 1540 0 obj toon_shader 1 0.9 0.35 0.25 0.25 0.2 0.35 2 0 0.05 1.2 0.15 1 1 1 1 1 1 0 0 2 0.06 0.05 0.08
+node 187 760 1540 0 obj toon_shader 2 0.9 0.35 0.25 0.25 0.2 0.35 3 0 0.05 1 0.3 1 1 1 1 1 1 0 0 2 0.06 0.05 0.08
+node 188 880 1540 0 obj toon_shader 3 0.9 0.35 0.25 0.25 0.2 0.35 3 1 0.05 0.6 0.5 1 1 1 1 1 1 0 0 2 0.06 0.05 0.08
+node 189 1000 1540 0 obj toon_shader 4 0.8 0.8 0.85 0.15 0.15 0.25 4 0 0.05 2 0.08 1 1 1 1 1 1 0 0 2 0.06 0.05 0.08
+node 190 1120 1540 0 obj toon_shader 5 0.9 0.35 0.25 0.72 0.6 0.78 2 0 0.35 0 0.3 1 1 1 1 1 1 0 1 2.5 0.06 0.05 0.08
+node 191 40 1620 0 obj hair_shader 1 0.3 0.17 0.08 0.35 1.55 1 1 1 0
+node 192 160 1620 0 obj hair_shader 2 0.75 0.58 0.33 0.35 1.55 1 1 1 0
+node 193 280 1620 0 obj hair_shader 3 0.03 0.02 0.015 0.25 1.55 1 1 1 0
+node 194 400 1620 0 obj hair_shader 4 0.55 0.15 0.05 0.35 1.55 1 1 1 0
+node 195 520 1620 0 obj hair_shader 5 0.75 0.75 0.75 0.35 1.55 1 1 1 0
+node 196 640 1620 0 obj hair_shader 6 0.45 0.32 0.2 0.55 1.55 1 1 1 0
+node 197 760 1620 0 obj pyro_shader 1 0.12 0.12 0.12 1 0.3 1 0.85 0.7 2
+node 198 880 1620 0 obj pyro_shader 2 0.55 0.55 0.55 1 0.3 1 1 1 0
+node 199 1000 1620 0 obj pyro_shader 3 0.08 0.08 0.08 1.5 0.3 1 0.6 0.3 6
+node 200 1120 1620 0 obj pyro_shader 4 0.95 0.95 0.97 0.5 0.6 1 1 1 0
+node 201 40 1700 0 obj pyro_shader 5 0.9 0.9 0.9 0.3 0.5 1 1 1 0
+node 202 160 1700 0 obj cop_network 
+node 203 280 1700 0 obj cop t: 0
+node 204 400 1700 0 obj cop 1
+node 205 520 1700 0 obj cop 2 0.18 0.18 0.18 1 1280 720
+node 206 640 1700 0 obj cop 3 0 0 0 1 1 1 0 1280 720
+node 207 760 1700 0 obj cop 4 0 0 0 1 1 1 120 4 0 0 1280 720
+node 208 880 1700 0 obj cop 5 0 1
+node 209 1000 1700 0 obj cop 18 0.1 0.8 0.2 0.25 0.15 1
+node 210 1120 1700 0 obj cop 20 0
+node 211 40 1780 0 obj cop 6 0 1 1 1 0 1 1 1 0 0 0
+node 212 160 1780 0 obj cop 7
+node 213 280 1780 0 obj cop 8 0 1 0 1
+node 214 400 1780 0 obj cop 9 4
+node 215 520 1780 0 obj cop 10 0.8 1.5
+node 216 640 1780 0 obj cop 11 0.8 20 1
+node 217 760 1780 0 obj cop 12 1
+node 218 880 1780 0 obj cop 13 0.5 0.6
+node 219 1000 1780 0 obj cop 14 0.05 0
+node 220 1120 1780 0 obj cop 15 0 0 0 1
+node 221 40 1860 0 obj cop 16 0 0 0 0
+node 222 160 1860 0 obj cop 17 1280 720
+node 223 280 1860 0 obj cop t: 19
+node 224 400 1860 0 obj top_network 
+node 225 520 1860 0 obj top 0 1 48 1
+node 226 640 1860 0 obj top t:7765646765 1 3 0 1 -1 0
+node 227 760 1860 0 obj top t: 2 -1
+node 228 880 1860 0 obj top t:6563686f206672616d65202446206974656d2040696e646578| 3
+node 229 1000 1860 0 obj top t: 4
+node 230 1120 1860 0 obj top 5
+node 231 40 1940 0 obj top t:24484f4d452f72656e6465722e6d7034 6 24
+node 232 160 1940 0 obj pop 0
+node 233 280 1940 0 obj pop 1
+node 234 400 1940 0 obj pop 2 0 0 200 0 2 0.5 1 0 1 0 0.3 0.3 0.3 0 1
+node 235 520 1940 0 obj pop 3 0 -9.8 0
+node 236 640 1940 0 obj pop 4 0 0 0 0 1 0.5
+node 237 760 1940 0 obj pop 5 1 0 0 1 0 1 0.5
+node 238 880 1940 0 obj pop 6 1 0 0 0
+node 239 1000 1940 0 obj pop 7 0 1 0.55 0.1 0.25 0.25 0.25 1
+node 240 1120 1940 0 obj pop t:2f2f2052756e73206f6e206576657279207061727469636c65206561636820737465702c20652e672e3a0a2f2f207640666f726365202b3d2073657428302c20322c203029202a202831202d2040616765202f20406c696665293b0a 8
+node 241 40 2020 0 obj pop 9
+node 242 160 2020 0 obj pop t:67726f757031|40502e79203e2031 10 1 0.5 0 0 0 1 1 1 1 1
+node 243 280 2020 0 obj pop t:40502e79203c202d31 11 0 0 0 0 1 1 1 0 0.5 1
+node 244 400 2020 0 obj pop 12 0 10
+node 245 520 2020 0 obj pop 13 0 1 0 5 0
+node 246 640 2020 0 obj pop 14 1 0 0 1 0.4 0.1 0.02
+node 247 760 2020 0 obj pop 15 10 0.5 0.1 0.5 0.5 0.5 0.5 1
+node 248 880 2020 0 obj pop 16 1 0.4 0.1 0.02
+node 249 1000 2020 0 obj pop 17 0 0.4 0.1 0.02
+node 250 1120 2020 0 obj pop 18 1 0 1 5 0.25
+node 251 40 2100 0 obj shader_node 0 0 0.8 0.8 0.8 0 0 0.4 1 1.5 0 1 1 1 0 0 1 0.45 0.3 1 0 1 1 1 0.3 0 0.05 1 1 1 0 1 0 0 1 1 0
+node 252 160 2100 0 obj shader_node t: 1 1 1 1 1 1 1
+node 253 280 2100 0 obj shader_node t: 2 1 1
+node 254 400 2100 0 obj shader_node t: 3 0 1 1 1
+node 255 520 2100 0 obj shader_node 5 0 0 0 1 1 1 4 1 0 0
+node 256 640 2100 0 obj shader_node 6 0.1 0.1 0.1 0.9 0.9 0.9 8 8
+node 257 760 2100 0 obj shader_node 7 0 0 0 1 1 1
+node 258 880 2100 0 obj shader_node 8 0 0 0 1 1 1 0.5
+node 259 1000 2100 0 obj shader_node 9 0.5 0.5 0.5 0 1 1
+node 260 1120 2100 0 obj vop t:50 0 1 0 0 0 0
+node 261 40 2180 0 obj vop t:616d6f756e74 2 0 0 0 0 0
+node 262 160 2180 0 obj vop t: 7 0 0 0 0 0
+node 263 280 2180 0 obj vop t: 8 0 0 0 0 0
+node 264 400 2180 0 obj vop t: 9 0 0 0 0 0
+node 265 520 2180 0 obj vop t: 10 0 0 0 0 0
+node 266 640 2180 0 obj vop t: 11 0 0 0 0 0
+node 267 760 2180 0 obj vop t: 12 0 0 0 0 0
+node 268 880 2180 0 obj vop t: 13 0 0 0 0 0
+node 269 1000 2180 0 obj vop t: 14 0 0 0 0 0
+node 270 1120 2180 0 obj vop t: 15 0 0 0 0 0
+node 271 40 2260 0 obj vop t: 16 0 0 0 0 0
+node 272 160 2260 0 obj vop t: 17 0 0 0 0 0
+node 273 280 2260 0 obj vop t: 18 0 0 0 0 0
+node 274 400 2260 0 obj vop t: 19 0 0 0 0 0
+node 275 520 2260 0 obj vop t: 20 0 0 0 0 0
+node 276 640 2260 0 obj vop t: 22 0 0 0 0 0
+node 277 760 2260 0 obj vop t: 23 0 0 0 0 0
+node 278 880 2260 0 obj vop t: 24 0 0 0 0 0
+node 279 1000 2260 0 obj vop t: 48 0 0 0 0 0
+node 280 1120 2260 0 obj vop t: 49 0 0 0 0 0
+node 281 40 2340 0 obj vop t: 50 0 0 0 0 0
+node 282 160 2340 0 obj vop t: 51 0 0 0 0 0
+node 283 280 2340 0 obj vop t: 52 0 0 0 0 0
+node 284 400 2340 0 obj vop t: 53 0 0 0 0 0
+node 285 520 2340 0 obj vop t: 54 0 0 0 0 0
+node 286 640 2340 0 obj vop t: 55 0 0 0 0 0
+node 287 760 2340 0 obj vop t: 56 0 0 0 0 0
+node 288 880 2340 0 obj vop t: 4 0 0 0 0 0
+node 289 1000 2340 0 obj vop t: 25 0 0 0 0 0
+node 290 1120 2340 0 obj vop t: 26 0 0 0 0 0
+node 291 40 2420 0 obj vop t: 27 0 0 0 0 0
+node 292 160 2420 0 obj vop t: 28 0 0 0 0 0
+node 293 280 2420 0 obj vop t: 29 0 0 0 0 0
+node 294 400 2420 0 obj vop t: 30 0 0 0 0 0
+node 295 520 2420 0 obj vop t: 31 0 0 0 0 0
+node 296 640 2420 0 obj vop t: 57 0 0 0 0 0
+node 297 760 2420 0 obj vop t:50 38 1 0 0 0 0
+node 298 880 2420 0 obj vop t:50 39 1 0 0 0 0
+node 299 1000 2420 0 obj vop t: 40 0 0 0 0 0
+node 300 1120 2420 0 obj vop t: 41 0 0 0 0 0
+node 301 40 2500 0 obj vop t: 42 0 0 0 0 0
+node 302 160 2500 0 obj vop t: 43 0 0 0 0 0
+node 303 280 2500 0 obj vop t: 44 0 0 0 0 0
+node 304 400 2500 0 obj vop t: 45 0 0 0 0 0
+node 305 520 2500 0 obj vop t: 46 0 0 0 0 0
+node 306 640 2500 0 obj vop t: 47 0 0 0 0 0
+node 307 760 2500 0 obj vop t: 33 0 0 0 0 0
+node 308 880 2500 0 obj vop t: 34 0 0 0 0 0
+node 309 1000 2500 0 obj vop t: 35 0 0 0 0 0
+node 310 1120 2500 0 obj vop t: 36 0 0 0 0 0
+node 311 40 2580 0 obj vop t: 58 0 0 0 0 0
+node 312 160 2580 0 obj vop t: 5 0 0 0 0 0
+node 313 280 2580 0 obj vop t:2430202a2032 6 0 0 0 0 0
+node 314 400 2580 0 obj vop t: 59 0 0 0 0 0
+node 315 520 2580 0 obj vop t: 60 0 0 0 0 0
+node 316 640 2580 0 obj vop t: 61 0 0 0 0 0
+node 317 760 2580 0 obj vop t:50 3 1 0 0 0 0
+parent 1 0
+parent 2 0
+parent 3 0
+parent 4 0
+parent 5 0
+parent 6 0
+parent 7 0
+parent 8 0
+parent 9 0
+parent 10 0
+parent 11 0
+parent 12 0
+parent 13 0
+parent 14 0
+parent 15 0
+parent 16 0
+parent 17 0
+parent 18 0
+parent 19 0
+parent 20 0
+parent 21 0
+parent 22 0
+parent 23 0
+parent 24 0
+parent 25 0
+parent 26 0
+parent 27 0
+parent 28 0
+parent 29 0
+parent 30 0
+parent 31 0
+parent 32 0
+parent 33 0
+parent 34 0
+parent 35 0
+parent 36 0
+parent 37 0
+parent 38 0
+parent 39 0
+parent 40 0
+parent 41 0
+parent 42 0
+parent 43 0
+parent 44 0
+parent 45 0
+parent 46 0
+parent 47 0
+parent 48 0
+parent 49 0
+parent 50 0
+parent 51 0
+parent 52 0
+parent 53 0
+parent 54 0
+parent 55 0
+parent 56 0
+parent 57 0
+parent 58 0
+parent 59 0
+parent 60 0
+parent 61 0
+parent 62 0
+parent 63 0
+parent 64 0
+parent 65 0
+parent 66 0
+parent 67 0
+parent 68 0
+parent 69 0
+parent 70 0
+parent 71 0
+parent 72 0
+parent 73 0
+parent 74 0
+parent 75 0
+parent 76 0
+parent 77 0
+parent 78 0
+parent 79 0
+parent 80 0
+parent 81 0
+parent 82 0
+parent 83 0
+parent 84 0
+parent 85 0
+parent 86 0
+parent 87 0
+parent 88 0
+parent 89 0
+parent 90 0
+parent 91 0
+parent 92 0
+parent 93 0
+parent 94 0
+parent 95 0
+parent 96 0
+parent 97 0
+parent 98 0
+parent 99 0
+parent 100 0
+parent 101 0
+parent 102 0
+parent 103 0
+parent 104 0
+parent 105 0
+parent 106 0
+parent 107 0
+parent 108 0
+parent 109 0
+parent 110 0
+parent 111 0
+parent 112 0
+parent 113 0
+parent 114 0
+parent 115 0
+parent 116 0
+parent 117 0
+parent 118 0
+parent 119 0
+parent 120 0
+parent 121 0
+parent 122 0
+parent 123 0
+parent 124 0
+parent 125 0
+parent 126 0
+parent 127 0
+parent 128 0
+parent 129 0
+parent 130 0
+parent 131 0
+parent 132 0
+parent 133 0
+parent 134 0
+parent 135 0
+parent 136 0
+parent 137 0
+parent 138 0
+parent 139 0
+parent 140 0
+parent 141 0
+parent 142 0
+parent 143 0
+parent 144 0
+parent 145 0
+parent 146 0
+parent 147 0
+parent 148 0
+parent 149 0
+parent 150 0
+parent 151 0
+parent 152 0
+parent 153 0
+parent 154 0
+parent 155 0
+parent 156 0
+parent 157 0
+parent 158 0
+parent 159 0
+parent 160 0
+parent 161 0
+parent 162 0
+parent 163 0
+parent 164 0
+parent 165 0
+parent 166 0
+parent 167 0
+parent 168 0
+parent 169 0
+parent 170 0
+parent 171 0
+parent 172 0
+parent 173 0
+parent 174 0
+parent 175 0
+parent 176 0
+parent 177 0
+parent 178 0
+parent 179 0
+parent 180 0
+parent 181 0
+parent 182 0
+parent 183 0
+parent 184 0
+parent 185 0
+parent 186 0
+parent 187 0
+parent 188 0
+parent 189 0
+parent 190 0
+parent 191 0
+parent 192 0
+parent 193 0
+parent 194 0
+parent 195 0
+parent 196 0
+parent 197 0
+parent 198 0
+parent 199 0
+parent 200 0
+parent 201 0
+parent 202 0
+parent 203 0
+parent 204 0
+parent 205 0
+parent 206 0
+parent 207 0
+parent 208 0
+parent 209 0
+parent 210 0
+parent 211 0
+parent 212 0
+parent 213 0
+parent 214 0
+parent 215 0
+parent 216 0
+parent 217 0
+parent 218 0
+parent 219 0
+parent 220 0
+parent 221 0
+parent 222 0
+parent 223 0
+parent 224 0
+parent 225 0
+parent 226 0
+parent 227 0
+parent 228 0
+parent 229 0
+parent 230 0
+parent 231 0
+parent 232 0
+parent 233 0
+parent 234 0
+parent 235 0
+parent 236 0
+parent 237 0
+parent 238 0
+parent 239 0
+parent 240 0
+parent 241 0
+parent 242 0
+parent 243 0
+parent 244 0
+parent 245 0
+parent 246 0
+parent 247 0
+parent 248 0
+parent 249 0
+parent 250 0
+parent 251 0
+parent 252 0
+parent 253 0
+parent 254 0
+parent 255 0
+parent 256 0
+parent 257 0
+parent 258 0
+parent 259 0
+parent 260 0
+parent 261 0
+parent 262 0
+parent 263 0
+parent 264 0
+parent 265 0
+parent 266 0
+parent 267 0
+parent 268 0
+parent 269 0
+parent 270 0
+parent 271 0
+parent 272 0
+parent 273 0
+parent 274 0
+parent 275 0
+parent 276 0
+parent 277 0
+parent 278 0
+parent 279 0
+parent 280 0
+parent 281 0
+parent 282 0
+parent 283 0
+parent 284 0
+parent 285 0
+parent 286 0
+parent 287 0
+parent 288 0
+parent 289 0
+parent 290 0
+parent 291 0
+parent 292 0
+parent 293 0
+parent 294 0
+parent 295 0
+parent 296 0
+parent 297 0
+parent 298 0
+parent 299 0
+parent 300 0
+parent 301 0
+parent 302 0
+parent 303 0
+parent 304 0
+parent 305 0
+parent 306 0
+parent 307 0
+parent 308 0
+parent 309 0
+parent 310 0
+parent 311 0
+parent 312 0
+parent 313 0
+parent 314 0
+parent 315 0
+parent 316 0
+parent 317 0
+next 318

@@ -43,3 +43,4 @@ mod three_d_presets;
 mod vat_scene_writer;
 mod gui_flows;
 mod perf_budgets;
+mod old_scene_tests;
