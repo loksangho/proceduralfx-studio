@@ -703,6 +703,8 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) layout_name_prompt: Option<String>,
     // Pyro node whose domain should be fitted around its source this frame.
     pub(crate) pyro_fit_request: Option<NodeId>,
+    // The render node's Render button, pressed while its controls drew.
+    pub(crate) start_render_request: bool,
     // Make Loop's Find best length, run after the panel draws.
     pub(crate) loop_search_request: Option<NodeId>,
     // USD Export node whose stage should be written this frame.
@@ -954,6 +956,7 @@ impl Default for ProceduralFxStudioApp {
             saved_layout: String::new(),
             layout_name_prompt: None,
             pyro_fit_request: None,
+            start_render_request: false,
             loop_search_request: None,
             usd_export_request: None,
             file_export_request: None,
