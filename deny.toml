@@ -1,0 +1,52 @@
+# cargo deny (run in CI, see .github/workflows/tests.yml): the app's dependencies must
+# have no known security advisories, use licenses that allow selling the app, and come
+# from crates.io.
+
+[advisories]
+# A crate withdrawn by its authors (yanked) fails too: update it.
+yanked = "deny"
+# Unmaintained crates that the GUI libraries (egui, wgpu) use, with no known security
+# problem and nothing to replace them with until those libraries do. A new advisory of
+# any kind still fails the check.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, used by wgpu's Metal backend, egui_dock and image; no known vulnerability" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained, egui's font reader; no known vulnerability" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, used by egui's accessibility support on Linux (accesskit, zbus); no known vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, as zvariant" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, as zvariant" },
+]
+
+[licenses]
+# Permissive licenses, which allow the app to be sold. OFL-1.1 and Ubuntu-font-1.0 are
+# egui's built-in fonts, which may be bundled in commercial software.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "NCSA",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The app's own license (see LICENSE).
+exceptions = [
+    { name = "proceduralfx_studio", allow = ["PolyForm-Noncommercial-1.0.0"] },
+]
+
+[bans]
+# GUI stacks pull in several versions of some crates; that's not worth failing for.
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

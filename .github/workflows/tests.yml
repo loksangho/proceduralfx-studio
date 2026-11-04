@@ -12,10 +12,15 @@ on:
       - 'assets/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'deny.toml'
       - 'build.rs'
       - '.github/workflows/tests.yml'
   pull_request:
   workflow_dispatch:
+  # Weekly too, so a security advisory published for a dependency shows up even when
+  # nothing in the app changed.
+  schedule:
+    - cron: '0 20 * * 0'
 
 concurrency:
   group: tests-${{ github.ref }}
@@ -59,6 +64,16 @@ jobs:
       - name: Performance budgets
         if: runner.os == 'Linux'
         run: cargo test --release -- --ignored cooking_stays_within_its_budget --nocapture
+
+  # The dependencies: no known security advisories, licenses that allow selling the app,
+  # all from crates.io (deny.toml says what's allowed and why).
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
 
   # Each new Cargo.lock (every release) gives each platform a new cache, and the old ones
   # stayed, filling the repository's 10 GB until GitHub deleted the Flatpak's dependency
