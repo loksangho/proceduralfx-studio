@@ -135,6 +135,15 @@ fn a_preset_opens_from_the_file_menu() {
     h.run_steps(2);
     h.get_by_label("Smoke (loop)").click_accesskit();
     h.run_steps(6);
+    // Its first frame cooks in the background (slowly on a busy CI machine); then the
+    // preset's message comes back.
+    for _ in 0..3000 {
+        if !h.state().status.ends_with("press Escape to cancel") {
+            break;
+        }
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let app = h.state();
     assert!(app.status.starts_with("New scene from the Smoke preset"), "{}", app.status);
     assert_eq!(app.graph.nodes.values().filter(|n| n.name == "sheet_camera").count(), 1, "the preset's scene, with its camera");
