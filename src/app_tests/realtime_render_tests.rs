@@ -89,6 +89,23 @@ fn previews_play_the_sheet_as_it_will_export() {
     let (first, last) = (&viewer.frames()[0], &viewer.frames()[3]);
     assert!(alpha(first, 22) > 0 && alpha(first, 42) > alpha(first, 22), "both ends show in the first frame");
     assert!(alpha(last, 22) == 0 && alpha(last, 42) > 200, "the last frame is as rendered");
+
+    // With Pixel art, the preview shows it: the same size, in hard-edged 4 × 4 blocks.
+    app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, pixel_art: true, pixel_scale: 4, pixel_colors: 4, ..Default::default() };
+    app.preview_sprite_sheet();
+    run_recording(&mut app);
+    let viewer = app.flipbook_viewer.as_ref().expect("the preview opens in the viewer");
+    assert!(app.status.contains("as pixel art"), "{}", app.status);
+    let frame = &viewer.frames()[3];
+    assert_eq!(frame.size, [64, 64]);
+    assert!(frame.pixels.iter().all(|p| p.a() == 0 || p.a() == 255), "no soft edges");
+    assert!(frame.pixels.iter().any(|p| p.a() == 255), "the ball shows");
+    for y in (0..64).step_by(4) {
+        for x in (0..64).step_by(4) {
+            let block = frame.pixels[y * 64 + x];
+            assert!((0..4).all(|dy| (0..4).all(|dx| frame.pixels[(y + dy) * 64 + x + dx] == block)), "a solid block at {x},{y}");
+        }
+    }
 }
 
 #[test]

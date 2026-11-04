@@ -78,6 +78,19 @@ pub fn downscale(frame: &egui::ColorImage, scale: u32) -> egui::ColorImage {
     out
 }
 
+// A frame made `scale` times bigger, each pixel a solid block: for showing pixel art.
+pub fn upscale(frame: &egui::ColorImage, scale: u32) -> egui::ColorImage {
+    let k = scale.max(1) as usize;
+    let [w, h] = frame.size;
+    let mut out = egui::ColorImage::filled([w * k, h * k], egui::Color32::TRANSPARENT);
+    for y in 0..h * k {
+        for x in 0..w * k {
+            out.pixels[y * w * k + x] = frame.pixels[(y / k) * w + x / k];
+        }
+    }
+    out
+}
+
 // A pixel's colour without its alpha, in sRGB.
 fn opaque_colour(c: egui::Color32) -> [u8; 3] {
     let [r, g, b, _] = c.to_srgba_unmultiplied();

@@ -585,9 +585,19 @@ impl ProceduralFxStudioApp {
             } else if let Some(blend) = done.capture.as_ref().and_then(|c| c.preview) {
                 let cut_off = cut_off();
                 let frames = if blend > 0 { spritesheet::seamless(&done.frames, blend) } else { done.frames.clone() };
+                // Pixel art as it will export, shown back at the render's size with sharp
+                // pixels, so it can be seen (and the palette file's errors show here too).
+                let (frames, pixel) = match self.sprite_sheet.pixel_art() {
+                    Ok(Some(settings)) => (pixelart::pixelate(&frames, &settings).iter().map(|f| pixelart::upscale(f, settings.scale)).collect(), ", as pixel art"),
+                    Ok(None) => (frames, ""),
+                    Err(e) => {
+                        self.status = format!("Sprite sheet preview: {e}");
+                        return;
+                    }
+                };
                 let times = done.times[..frames.len().min(done.times.len())].to_vec();
                 let looped = if blend > 0 { ", with the seamless blend" } else { "" };
-                self.status = format!("Previewing the sprite sheet: {} frames as they'll export{looped}{cut_off}", frames.len());
+                self.status = format!("Previewing the sprite sheet: {} frames as they'll export{looped}{pixel}{cut_off}", frames.len());
                 self.flipbook_viewer = Some(flipbook::Viewer::new(frames, times, sims::SIM_FPS / self.sprite_sheet.every.max(1) as f32));
             } else if let Some(output) = done.capture.as_ref().and_then(|c| c.sheet.clone()) {
                 let cut_off = cut_off();
