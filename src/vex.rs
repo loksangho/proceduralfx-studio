@@ -807,6 +807,7 @@ fn known_hint(name: &str) -> Option<Ty> {
     match name {
         "P" | "N" | "Cd" | "v" | "up" | "rest" | "scale" | "force" | "accel" | "uv" | "w" => Some(Ty::Vector),
         "ptnum" | "primnum" | "vtxnum" | "numpt" | "numprim" | "numvtx" | "elemnum" | "numelem" | "id" => Some(Ty::Int),
+        _ if name.starts_with("group_") => Some(Ty::Int),
         "Time" | "SimTime" | "TimeInc" | "Frame" | "SimFrame" | "pscale" => Some(Ty::Float),
         "orient" | "rot" => Some(Ty::Vec4),
         _ => None,
@@ -2070,6 +2071,15 @@ const READS_INPUT: [&str; 38] = [
 ];
 // Builtins whose first argument is the geometry they change: only the wrangle's own (0).
 const WRITES_INPUT: [&str; 9] = ["setpointattrib", "setprimattrib", "setdetailattrib", "setpointgroup", "setprimgroup", "addpoint", "addprim", "removepoint", "removeprim"];
+
+// What an attribute is stored as: @group_<name> is the group <name> (1 in it, 0 not), as
+// in Houdini; groups are stored as group:<name> on points and prim:group:<name> on prims.
+fn storage_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.strip_prefix("group_").filter(|g| !g.is_empty()) {
+        Some(group) => format!("group:{group}").into(),
+        None => name.into(),
+    }
+}
 
 // `opinput1_P` (as in @opinput1_P): input 1's P, for the same element.
 fn opinput(name: &str) -> Option<(usize, &str)> {
@@ -3399,7 +3409,7 @@ impl<'a> Runtime<'a> {
                 "primnum" => Value::Int(index),
                 "P" => Value::Vec(arr3(crate::poly::centroid(mesh, run))),
                 "N" => Value::Vec(arr3(crate::poly::normal(mesh, run))),
-                _ => read_storage(mesh, &format!("prim:{name}"), run.start, mesh.indices.len(), hint),
+                _ => read_storage(mesh, &format!("prim:{}", storage_name(name)), run.start, mesh.indices.len(), hint),
             };
         }
         let count = domain.count(mesh);
@@ -3413,7 +3423,7 @@ impl<'a> Runtime<'a> {
             (Domain::Prim, "P") => Value::Vec(arr3(tri_centroid(mesh, mesh.indices[index]))),
             (Domain::Prim, "N") => Value::Vec(arr3(tri_normal(mesh, mesh.indices[index]))),
             (Domain::Vertex, "P") => Value::Vec(arr3(mesh.vertices[mesh.indices[index / 3][index % 3]])),
-            _ => read_storage(mesh, &format!("{}{name}", domain.prefix()), index, count, hint),
+            _ => read_storage(mesh, &format!("{}{}", domain.prefix(), storage_name(name)), index, count, hint),
         }
     }
 
@@ -4596,7 +4606,7 @@ fn new_runtime<'a>(program: &'a Program, shared: &'a Shared<'a>, out: Mesh) -> R
         out,
         domain,
         count: shared.count,
-        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), a.name)).collect(),
+        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name(&a.name))).collect(),
         elem: 0,
         time: shared.time,
         time_inc: shared.time_inc,
@@ -4697,12 +4707,13 @@ fn run_with(
         channels,
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
-    let keys: Vec<String> = program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), a.name)).collect();
+    let keys: Vec<String> = program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name(&a.name))).collect();
     let warnings: Vec<String> = program
         .attrs
         .iter()
         .zip(&keys)
-        .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key) && opinput(&attr.name).is_none())
+        // (A group nothing is in reads as 0 in Houdini too: no warning.)
+        .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key) && opinput(&attr.name).is_none() && !attr.name.starts_with("group_"))
         .map(|(attr, _)| format!("Warning: @{} does not exist on the input and is never set, so it reads as 0", attr.name))
         .collect();
 
@@ -4916,6 +4927,7 @@ Types      int, float, vector, vector4, matrix3, matrix, string; arrays: float a
 Attributes @P @N @Cd @pscale (read/write), @ptnum @primnum @vtxnum @numpt @numprim
            @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel
            p@orient (vector4) 3@rot (matrix3) 4@xform (matrix); ch(\"amp\") adds a slider
+Groups     @group_top: 1 if the element is in group top, else 0; @group_top = 1 adds it
 Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   M_PI  M_E
 Operators  + - * / %  == != < <= > >=  && || !  ?:  = += -= *= /= %=  ++ --
            .x .y .z (.r .g .b) on vectors, [i] on arrays/vectors (negative from end),
@@ -5135,6 +5147,33 @@ mod tests {
         let (mesh, report) = run(grid(), "for (int i = 0; i < 5; i++) addpoint(0, set(i, 2, 0));", 0.0, 0);
         assert_eq!(report.error, None);
         assert_eq!(mesh.vertices.len(), 14);
+    }
+
+    #[test]
+    fn group_variables_read_and_write_groups_as_in_houdini() {
+        // Writing: points on the right join group "right"; the others are left out.
+        let (mesh, report) = run(grid(), "if (@P.x > 0) @group_right = 1;", 0.0, 2);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        let right = &mesh.point_attributes["group:right"];
+        assert!(mesh.vertices.iter().zip(right).all(|(p, g)| (*g > 0.5) == (p.x > 0.0)));
+        assert!(crate::groups::names(&mesh).0.contains(&"right".to_string()), "a real point group");
+        // Reading it back, and taking points out.
+        let (mesh, report) = run(mesh, "@Cd = set(@group_right, 0, 0); if (@P.z > 0) @group_right = 0;", 0.0, 2);
+        assert!(report.error.is_none() && !report.output.iter().any(|l| l.contains("Warning")), "{report:?}");
+        for (i, p) in mesh.vertices.iter().enumerate() {
+            assert_eq!(mesh.point_attributes["Cd"][i * 3], if p.x > 0.0 { 1.0 } else { 0.0 });
+            assert_eq!(mesh.point_attributes["group:right"][i] > 0.5, p.x > 0.0 && p.z <= 0.0);
+        }
+        // A group nothing is in reads as 0, without a warning (other missing attributes warn).
+        let (_, report) = run(grid(), "f@seen = @nothing;", 0.0, 2);
+        assert!(report.output.iter().any(|l| l.contains("Warning")), "{:?}", report.output);
+        let (mesh, report) = run(grid(), "f@seen = @group_nothing;", 0.0, 2);
+        assert!(!report.output.iter().any(|l| l.contains("Warning")), "{:?}", report.output);
+        assert!(mesh.point_attributes["seen"].iter().all(|v| *v == 0.0));
+        // Primitives: a primitive group.
+        let (mesh, report) = run(grid(), "@group_first = @primnum == 0;", 0.0, 1);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(crate::groups::names(&mesh).1.contains(&"first".to_string()), "a primitive group: {:?}", crate::groups::names(&mesh));
     }
 
     #[test]
