@@ -543,17 +543,34 @@ impl ProceduralFxStudioApp {
                         let colors = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3));
                         let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
                         let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
-                        splats.extend((0..point_count).filter(|&i| alpha[i] > 0.004 && !referenced[i]).map(|i| {
+                        // A fog volume (Pyro, a fog VDB) whose points are still on its grid is
+                        // ray-marched instead (gpu_volume.rs): smooth at any distance.
+                        let grid = volume::is_volume(mesh)
+                            .then(|| {
+                                let detail = |name: &str| mesh.point_attributes.get(name).filter(|v| !v.is_empty());
+                                let fog = detail("detail:volume_class").is_some_and(|c| c[0] >= 0.5);
+                                let voxel = detail("detail:volume_voxelsize")?[0];
+                                let origin = detail("detail:volume_origin").filter(|o| o.len() >= 3)?;
+                                let voxels: Vec<_> = (0..point_count).filter(|&i| alpha[i] > 0.004 && !referenced[i]).map(|i| (at(i), triple(colors, i, 0.8), alpha[i], triple(emission, i, 0.0))).collect();
+                                fog.then(|| gpu_volume::VolumeGrid::from_points([origin[0], origin[1], origin[2]], voxel, &voxels)).flatten()
+                            })
+                            .flatten();
+                        gpu.set_volume(grid.as_ref());
+                        splats.extend((0..point_count).filter(|&i| grid.is_none() && alpha[i] > 0.004 && !referenced[i]).map(|i| {
                             let a = alpha[i].clamp(0.0, 1.0);
                             let [r, g, b] = triple(colors, i, 0.8).map(|c| c.clamp(0.0, 1.0));
                             gpu_viewport::Point::new(at(i), pscale.map_or(0.05, |p| p[i]), [r, g, b, 1.0 - (1.0 - a * 0.5) * (1.0 - a * 0.6)], triple(emission, i, 0.0))
                         }));
                     } else if self.show_points || particle_display || has_unreferenced_points {
+                        gpu.set_volume(None);
                         let radius = if particle_display || has_unreferenced_points { 3.5 } else { 2.0 };
                         dots.extend((0..point_count).filter(|&i| !(has_unreferenced_points && referenced[i])).map(|i| {
                             let c = point_attribute_color(i);
                             gpu_viewport::Point::new(at(i), radius, [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0], [0.0; 3])
                         }));
+                    }
+                    if splat_alpha.is_none() && !(self.show_points || particle_display || has_unreferenced_points) {
+                        gpu.set_volume(None);
                     }
                     gpu.set_points(points_key, &dots, &splats, &curves);
                 }
