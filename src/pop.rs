@@ -50,12 +50,14 @@ pub const COLLIDE: usize = 14;
 pub const REPLICATE: usize = 15;
 pub const STATIC_OBJECT: usize = 16;
 pub const GROUND_PLANE: usize = 17;
+pub const ADVECT: usize = 18;
 
 pub const EMISSION: [&str; 3] = ["Scatter onto surfaces", "Random points", "All points"];
 pub const COLOR_MODES: [&str; 3] = ["Constant", "Random", "Ramp over life"];
 pub const GROUP_RULES: [&str; 4] = ["All", "Random", "Bounding box", "Expression"];
 pub const KILL_RULES: [&str; 3] = ["Expression", "Bounding box", "Random"];
 pub const ATTRACT_MODES: [&str; 2] = ["Constant pull", "Spring"];
+pub const ADVECT_MODES: [&str; 3] = ["Update velocity", "Update force", "Update position"];
 
 const SURFACE: [Param; 3] = [
     f("bounce", "Bounce", "Collision", 0.0, 1.0, 0.4),
@@ -71,6 +73,7 @@ pub fn choices(op: usize, key: &str) -> Option<&'static [&'static str]> {
         (GROUP, "rule") => Some(&GROUP_RULES),
         (KILL, "rule") => Some(&KILL_RULES),
         (ATTRACT, "mode") => Some(&ATTRACT_MODES),
+        (ADVECT, "mode") => Some(&ADVECT_MODES),
         _ => None,
     }
 }
@@ -281,6 +284,22 @@ pub const OPS: &[PopOp] = &[
         help: "An endless floor the particles collide with. Wire it into the network like a Static Object (merge it with the POP Object).",
         inputs: 0,
         params: &[f("height", "Height", "", -1000.0, 1000.0, 0.0), SURFACE[0], SURFACE[1], SURFACE[2]],
+        texts: &[],
+    },
+    PopOp {
+        label: "POP Advect",
+        name: "popadvect",
+        help: "Carries the particles along a velocity field from one of the POP Network's inputs: a Pyro simulation (its smoke's velocity), FLIP particles, or any points with a v attribute. \
+               Update velocity pulls each particle's velocity toward the field's (like wind), Update force pushes it by the field, Update position moves it along the field directly. \
+               Particles away from the field are left alone.",
+        inputs: 1,
+        params: &[
+            f("input", "Velocity field: POP Network input", "", 0.0, 3.0, 1.0),
+            f("mode", "Calculation", "", 0.0, 2.0, 0.0),
+            f("scale", "Velocity scale", "", -100.0, 100.0, 1.0),
+            f("air_resistance", "Air resistance", "", 0.0, 1000.0, 5.0),
+            f("radius", "Point field reach", "", 0.001, 100.0, 0.25),
+        ],
         texts: &[],
     },
 ];
@@ -804,7 +823,102 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
         }
         COLLIDE => collide(node, m, s, mask),
         REPLICATE => replicate(node, m, s, mask),
+        ADVECT => {
+            let Some(field) = s.inputs.get(node.input()).and_then(|g| VelocityField::new(g, node.v("radius"))) else { return };
+            let scale = node.v("scale");
+            let positions = m.vertices.clone();
+            for i in (0..n).filter(|&i| masked(mask, i)) {
+                let Some(flow) = field.at(positions[i]) else { continue };
+                let flow = flow.scale(scale);
+                match node.index("mode") {
+                    1 => {
+                        let force = attr(m, "force", 3, 0.0);
+                        let total = read3(force, i).add(flow);
+                        write3(force, i, total);
+                    }
+                    2 => m.vertices[i] = positions[i].add(flow.scale(s.dt)),
+                    _ => pull_toward(m, i, flow, node.v("air_resistance")),
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+// A velocity field to sample anywhere: a volume's voxels (Pyro smoke, with v per voxel),
+// blended between the eight around a point, or loose points with v (FLIP particles),
+// weighted by distance within `reach`. Nothing (None) where there's no field nearby.
+pub struct VelocityField {
+    cells: std::collections::HashMap<[i64; 3], Vec<(Vec3, Vec3)>>,
+    // Volumes: voxel size and the centre of voxel 0; points: the reach.
+    size: f32,
+    origin: Option<Vec3>,
+}
+
+impl VelocityField {
+    pub fn new(geometry: &Mesh, reach: f32) -> Option<VelocityField> {
+        let v = geometry.point_attributes.get("v").filter(|v| v.len() == geometry.vertices.len() * 3 && !v.is_empty())?;
+        let detail = |name: &str| geometry.point_attributes.get(name).filter(|d| !d.is_empty());
+        let voxel = detail("detail:volume_voxelsize").map(|d| d[0]).filter(|h| *h > 0.0);
+        let origin = detail("detail:volume_origin").filter(|o| o.len() >= 3).map(|o| Vec3::new(o[0], o[1], o[2]));
+        let (size, origin) = match (voxel, origin) {
+            (Some(h), Some(o)) => (h, Some(o)),
+            _ => (reach.max(1e-3), None),
+        };
+        let mut cells: std::collections::HashMap<[i64; 3], Vec<(Vec3, Vec3)>> = std::collections::HashMap::new();
+        for (i, p) in geometry.vertices.iter().enumerate() {
+            let at = match origin {
+                // Voxel points sit (jittered) in their voxel: the nearest voxel index.
+                Some(o) => [((p.x - o.x) / size).round() as i64, ((p.y - o.y) / size).round() as i64, ((p.z - o.z) / size).round() as i64],
+                None => [(p.x / size).floor() as i64, (p.y / size).floor() as i64, (p.z / size).floor() as i64],
+            };
+            cells.entry(at).or_default().push((*p, Vec3::new(v[i * 3], v[i * 3 + 1], v[i * 3 + 2])));
+        }
+        Some(VelocityField { cells, size, origin })
+    }
+
+    pub fn at(&self, p: Vec3) -> Option<Vec3> {
+        let mean = |values: &[(Vec3, f32)]| -> Option<Vec3> {
+            let weight: f32 = values.iter().map(|(_, w)| w).sum();
+            (weight > 1e-6).then(|| values.iter().fold(Vec3::zero(), |sum, (v, w)| sum.add(v.scale(*w))).scale(1.0 / weight))
+        };
+        match self.origin {
+            Some(o) => {
+                // Between the eight voxels round p, each weighted as in trilinear filtering;
+                // missing voxels (no smoke there) don't count.
+                let f = [(p.x - o.x) / self.size, (p.y - o.y) / self.size, (p.z - o.z) / self.size];
+                let base = f.map(|c| c.floor() as i64);
+                let t = [0, 1, 2].map(|a| f[a] - base[a] as f32);
+                let mut values = Vec::with_capacity(8);
+                for k in 0..8 {
+                    let corner = [base[0] + (k & 1) as i64, base[1] + ((k >> 1) & 1) as i64, base[2] + ((k >> 2) & 1) as i64];
+                    let w: f32 = (0..3).map(|a| if (k >> a) & 1 == 1 { t[a] } else { 1.0 - t[a] }).product();
+                    if let Some(cell) = self.cells.get(&corner) {
+                        values.push((cell[0].1, w));
+                    }
+                }
+                mean(&values)
+            }
+            None => {
+                // Points within reach, nearer ones counting more.
+                let c = [(p.x / self.size).floor() as i64, (p.y / self.size).floor() as i64, (p.z / self.size).floor() as i64];
+                let mut values = Vec::new();
+                for dz in -1..=1 {
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            for (q, v) in self.cells.get(&[c[0] + dx, c[1] + dy, c[2] + dz]).into_iter().flatten() {
+                                let d = q.sub(p).length();
+                                if d < self.size {
+                                    let w = 1.0 - d / self.size;
+                                    values.push((*v, w * w));
+                                }
+                            }
+                        }
+                    }
+                }
+                mean(&values)
+            }
+        }
     }
 }
 
@@ -1090,5 +1204,47 @@ mod tests {
         apply(&replicate, &mut m, &Step { time: 1.0, dt: 1.0, step: 24, frame_start: true, node_seed: 0, inputs: &[], colliders: &[] }, None);
         assert_eq!(m.vertices.len(), before + 50);
         assert_eq!(m.point_attributes["group:left"].len(), m.vertices.len());
+    }
+
+    #[test]
+    fn advect_carries_particles_along_a_velocity_field() {
+        // A volume (as Pyro outputs it): voxels 0.5 across along x, all flowing up at 2,
+        // and points (as FLIP outputs them) flowing +x at 3.
+        let mut smoke = Mesh { vertices: (0..4).map(|i| Vec3::new(i as f32 * 0.5, 0.0, 0.0)).collect(), ..Mesh::default() };
+        smoke.point_attributes.insert("v".into(), [0.0, 2.0, 0.0].repeat(4));
+        smoke.point_attributes.insert("detail:volume_voxelsize".into(), vec![0.5]);
+        smoke.point_attributes.insert("detail:volume_origin".into(), vec![0.0; 3]);
+        let mut water = Mesh { vertices: vec![Vec3::new(5.0, 0.0, 0.0), Vec3::new(5.1, 0.0, 0.0)], ..Mesh::default() };
+        water.point_attributes.insert("v".into(), [3.0, 0.0, 0.0].repeat(2));
+        let field = VelocityField::new(&smoke, 0.25).unwrap();
+        let up = field.at(Vec3::new(0.7, 0.1, 0.0)).unwrap();
+        assert!((up.y - 2.0).abs() < 1e-5 && up.x.abs() < 1e-5, "{up:?}");
+        assert!(field.at(Vec3::new(10.0, 0.0, 0.0)).is_none(), "nothing away from the smoke");
+        assert!((VelocityField::new(&water, 0.25).unwrap().at(Vec3::new(5.05, 0.05, 0.0)).unwrap().x - 3.0).abs() < 1e-5);
+        assert!(VelocityField::new(&Mesh::default(), 0.25).is_none(), "no v, no field");
+
+        let particles = || {
+            let mut m = Mesh { vertices: vec![Vec3::new(0.7, 0.1, 0.0), Vec3::new(10.0, 0.0, 0.0)], ..Mesh::default() };
+            tidy(&mut m);
+            m.point_attributes.insert("life".into(), vec![10.0; 2]);
+            m
+        };
+        let inputs = [smoke];
+        let step = Step { time: 0.0, dt: 0.1, step: 1, frame_start: true, node_seed: 0, inputs: &inputs, colliders: &[] };
+        let advect = |mode: f32| with(ADVECT, &[("input", &[0.0]), ("mode", &[mode])]);
+        // Update velocity: pulled toward the flow, as wind pulls; the one far away isn't.
+        let mut m = particles();
+        apply(&advect(0.0), &mut m, &step, None);
+        integrate(&mut m, 0.1);
+        let v = &m.point_attributes["v"];
+        assert!(v[1] > 0.5 && v[1] < 2.0 && v[4] == 0.0, "{v:?}");
+        // Update force: pushed by it.
+        let mut m = particles();
+        apply(&advect(1.0), &mut m, &step, None);
+        assert!((m.point_attributes["force"][1] - 2.0).abs() < 1e-5 && m.point_attributes["force"][4] == 0.0);
+        // Update position: moved along it, velocity untouched.
+        let mut m = particles();
+        apply(&advect(2.0), &mut m, &step, None);
+        assert!((m.vertices[0].y - 0.3).abs() < 1e-5 && m.point_attributes["v"][1] == 0.0);
     }
 }

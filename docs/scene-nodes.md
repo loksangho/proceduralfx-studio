@@ -460,6 +460,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | POP Replicate | `pop` | operation=15, rate=10, life=0.5, life_variance=0.1, inherit=0.5, variance.x=0.5, variance.y=0.5, variance.z=0.5, seed=1 |
 | Static Object | `pop` | operation=16, input=1, bounce=0.4, friction=0.1, radius=0.02 |
 | Ground Plane | `pop` | operation=17, height=0, bounce=0.4, friction=0.1, radius=0.02 |
+| POP Advect | `pop` | operation=18, input=1, mode=0, scale=1, air_resistance=5, radius=0.25 |
 
 ## Shader Nodes
 

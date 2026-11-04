@@ -965,6 +965,8 @@ fn pyro_output(s: &PyroState, set: &PyroSettings) -> Mesh {
     let mut columns: [Vec<f32>; 5] = Default::default();
     let mut colors = Vec::new();
     let mut emission = Vec::new();
+    // The gas's velocity, for POP Advect (particles carried by the smoke).
+    let mut velocity = Vec::new();
     for z in 0..nz {
         for y in 0..ny {
             for x in 0..nx {
@@ -989,6 +991,7 @@ fn pyro_output(s: &PyroState, set: &PyroSettings) -> Mesh {
                 colors.extend(color);
                 // Fire glows in renders: blackbody-like colour scaled by the flame amount.
                 emission.extend(fire.map(|c| c * flame));
+                velocity.extend([s.u[i], s.v[i], s.w[i]]);
             }
         }
     }
@@ -997,6 +1000,7 @@ fn pyro_output(s: &PyroState, set: &PyroSettings) -> Mesh {
     }
     mesh.point_attributes.insert("Cd".into(), colors);
     mesh.point_attributes.insert("emission".into(), emission);
+    mesh.point_attributes.insert("v".into(), velocity);
     // Render density per world unit matching the viewport's per-voxel opacity, and fire brightness.
     mesh.point_attributes.insert("detail:volume_extinction".into(), vec![set.opacity / g.h]);
     mesh.point_attributes.insert("detail:volume_emission".into(), vec![PYRO_EMISSION]);
@@ -1398,6 +1402,20 @@ mod tests {
             let image = image::GrayImage::from_fn(w, h, |x, y| image::Luma([((1.0 - (-column[(y * w + x) as usize] * 0.5).exp()) * 255.0) as u8]));
             image.save(format!("{dir}/{name}.png")).unwrap();
         }
+    }
+
+    // Smoke carries its velocity, for POP Advect: rising smoke flows upward.
+    #[test]
+    fn smoke_carries_its_velocity() {
+        let ball = crate::node_sphere(0.3, 8, 12);
+        clear_all();
+        let smoke = pyro(9300, &PyroSettings::default(), 1.0, false, |_| ball.clone(), Mesh::default);
+        let v = &smoke.point_attributes["v"];
+        assert_eq!(v.len(), smoke.vertices.len() * 3);
+        let mean_up = v.chunks(3).map(|c| c[1]).sum::<f32>() / smoke.vertices.len() as f32;
+        assert!(mean_up > 0.2, "{mean_up}");
+        let field = crate::pop::VelocityField::new(&smoke, 0.25).expect("a field");
+        assert!(field.at(Vec3::new(0.0, 0.5, 0.0)).is_some_and(|f| f.y > 0.0));
     }
 
     // Turbulence stirs a small plume, spreading it, but doesn't blow it aside: it used to
