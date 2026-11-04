@@ -214,6 +214,11 @@ pub fn install_panic_hook() {
 
 // A crash report as it would be sent: the user's home folder (in paths in the panic
 // message) shown as ~, so their account name doesn't leave the computer.
+// The user's home folder, as crash reports name it: HOME, or USERPROFILE on Windows.
+pub fn home_folder() -> Option<String> {
+    std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()
+}
+
 pub fn redacted(report: &str, home: Option<&str>) -> String {
     match home.map(|h| h.trim_end_matches(['/', '\\'])).filter(|h| h.len() > 1) {
         Some(home) => report.replace(home, "~"),

@@ -187,7 +187,7 @@ impl ProceduralFxStudioApp {
                 // Sending it: only what's shown here, only when asked.
                 let server = self.crash_report_server.clone();
                 if let (Some(server), Ok(text)) = (server, std::fs::read_to_string(report)) {
-                    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+                    let home = recovery::home_folder();
                     let shown = recovery::redacted(&text, home.as_deref());
                     if self.crash_sent.as_ref().is_none_or(|r| r.is_err()) {
                         ui.add_space(4.0);

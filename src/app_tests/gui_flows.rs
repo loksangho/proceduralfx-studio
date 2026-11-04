@@ -291,7 +291,7 @@ pub(crate) fn one_report_server() -> (String, std::sync::mpsc::Receiver<serde_js
 fn a_crash_report_is_sent_only_when_asked_and_as_shown() {
     let dir = recovery_dir().unwrap().join("crashes");
     std::fs::create_dir_all(&dir).unwrap();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/someone".into());
+    let home = recovery::home_folder().expect("a home folder");
     let report_path = dir.join("crash-gui-test.txt");
     std::fs::write(&report_path, format!("ProceduralFX Studio crash report\nVersion: 0.22.0\nPanic: couldn't read {home}/Desktop/scene.pfs\n")).unwrap();
     let (server, received) = one_report_server();
