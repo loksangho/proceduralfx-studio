@@ -42,3 +42,4 @@ mod vat_window_tests;
 mod three_d_presets;
 mod vat_scene_writer;
 mod gui_flows;
+mod perf_budgets;

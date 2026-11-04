@@ -1,0 +1,10 @@
+# Each preset's budget for cooking its first second, in yardsticks (see perf_budgets.rs).
+Fire: 536.9
+Toon fire: 262.8
+Smoke: 2.0
+Impact: 2.3
+Magic burst: 2.0
+Slash: 2.0
+Flag: 2.0
+Breaking wall: 2.0
+Splash: 7.1
