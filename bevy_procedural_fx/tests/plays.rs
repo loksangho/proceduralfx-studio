@@ -17,7 +17,11 @@ fn app() -> App {
 }
 
 fn load(app: &mut App) -> Handle<FxSheet> {
-    let handle: Handle<FxSheet> = app.world().resource::<AssetServer>().load("fx/fire.pfx.json");
+    load_path(app, "fx/fire.pfx.json")
+}
+
+fn load_path(app: &mut App, path: &'static str) -> Handle<FxSheet> {
+    let handle: Handle<FxSheet> = app.world().resource::<AssetServer>().load(path);
     for _ in 0..500 {
         app.update();
         if app.world().resource::<AssetServer>().is_loaded_with_dependencies(&handle) {
@@ -27,6 +31,23 @@ fn load(app: &mut App) -> Handle<FxSheet> {
     }
     let server = app.world().resource::<AssetServer>();
     panic!("the sheet didn't load: {:?} / {:?}", server.load_state(&handle), server.recursive_dependency_load_state(&handle));
+}
+
+// assets/fx/burst.pfx.json was exported as pixel art: its image loads unfiltered.
+#[test]
+fn pixel_art_sheets_load_unfiltered() {
+    use bevy::image::{ImageFilterMode, ImageSampler};
+    let mut app = app();
+    let pixel = load_path(&mut app, "fx/burst.pfx.json");
+    let smooth = load(&mut app);
+    let sheets = app.world().resource::<Assets<FxSheet>>();
+    let (pixel, smooth) = (sheets.get(&pixel).unwrap().image.clone(), sheets.get(&smooth).unwrap().image.clone());
+    let images = app.world().resource::<Assets<Image>>();
+    match &images.get(&pixel).unwrap().sampler {
+        ImageSampler::Descriptor(d) => assert!(d.mag_filter == ImageFilterMode::Nearest && d.min_filter == ImageFilterMode::Nearest),
+        other => panic!("pixel art sampled with {other:?}"),
+    }
+    assert!(matches!(images.get(&smooth).unwrap().sampler, ImageSampler::Default), "other sheets keep the app's default");
 }
 
 #[test]

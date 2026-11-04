@@ -44,11 +44,19 @@ pub struct Settings {
     pub normal_map: bool,
     // Also write name_glow.png: the glow brighter than the sheet holds (see encode_glow).
     pub glow: bool,
+    // Pixel art (see pixelart.rs): every `pixel_scale` rendered pixels make one, in
+    // `pixel_colors` colours picked from the frames (0 keeps them) or the palette file's.
+    pub pixel_art: bool,
+    pub pixel_scale: u32,
+    pub pixel_colors: u32,
+    pub pixel_palette: String,
+    pub pixel_dither: bool,
+    pub pixel_outline: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false, glow: false }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false, glow: false, pixel_art: false, pixel_scale: 4, pixel_colors: 16, pixel_palette: String::new(), pixel_dither: false, pixel_outline: false }
     }
 }
 
@@ -56,6 +64,18 @@ impl Settings {
     // How many extra frames a seamless loop of `count` frames renders past the end.
     pub fn extra_frames(&self, count: usize) -> usize {
         if self.seamless && count > 1 { (self.blend as usize).clamp(1, count) } else { 0 }
+    }
+
+    // The pixel-art settings, with the palette file read; None when it's off.
+    pub fn pixel_art(&self) -> Result<Option<crate::pixelart::PixelArt>, String> {
+        if !self.pixel_art {
+            return Ok(None);
+        }
+        let palette = match self.pixel_palette.trim() {
+            "" => Vec::new(),
+            path => crate::pixelart::load_palette(Path::new(path))?,
+        };
+        Ok(Some(crate::pixelart::PixelArt { scale: self.pixel_scale.max(1), colors: self.pixel_colors, palette, dither: self.pixel_dither, outline: self.pixel_outline }))
     }
 }
 
@@ -76,6 +96,24 @@ pub struct Output {
     pub motion_vectors: bool,
     pub normal_map: bool,
     pub glow: bool,
+    // Pixel art: the frames are turned into it first, and engines sample it unfiltered.
+    pub pixel_art: Option<crate::pixelart::PixelArt>,
+}
+
+impl Output {
+    // Writes an engine file beside the sheet (see write_beside); for pixel art, set to
+    // sample the textures unfiltered, so pixels stay sharp.
+    fn write(&self, path: &Path, text: &str) -> Result<(), String> {
+        if self.pixel_art.is_none() {
+            return write_beside(path, text);
+        }
+        let mut text = text.replace("filter_linear", "filter_nearest").replace("filterMode: 1", "filterMode: 0");
+        let node = "type=\"Sprite2D\"]\n";
+        if let Some(at) = text.find(node) {
+            text.insert_str(at + node.len(), "texture_filter = 1\n");
+        }
+        write_beside(path, &text)
+    }
 }
 
 // Cells across for `count` frames of `size`: as set, or what makes the sheet closest to square.
@@ -311,6 +349,17 @@ pub fn save_with_glow(frames: &[egui::ColorImage], glows: Option<&[egui::ColorIm
         }
         g => g,
     };
+    // Pixel art from the finished frames (after the loop's cross-fade, which would add
+    // colours); glow shrinks to match.
+    let (pixel_frames, pixel_glows);
+    let (frames, glows) = match &output.pixel_art {
+        Some(settings) => {
+            pixel_frames = crate::pixelart::pixelate(frames, settings);
+            pixel_glows = glows.map(|g| g.iter().map(|f| crate::pixelart::downscale(f, settings.scale)).collect::<Vec<_>>());
+            (&pixel_frames[..], pixel_glows.as_deref())
+        }
+        None => (frames, glows),
+    };
     let requested = match frames.first() {
         Some(f) if output.fill_grid => filled_columns(frames.len(), [f.size[0] as u32, f.size[1] as u32], output.columns),
         _ => output.columns,
@@ -354,6 +403,13 @@ pub fn save_with_glow(frames: &[egui::ColorImage], glows: Option<&[egui::ColorIm
     };
     let size = frames.first().map_or([0, 0], |f| [f.size[0] as u32, f.size[1] as u32]);
     let mut json = metadata(&sheet, &name, frames.len(), output.fps, size, motion.as_ref(), normal.as_deref());
+    if let Some(settings) = &output.pixel_art {
+        json["pixel_art"] = serde_json::json!({
+            "scale": settings.scale,
+            "filter": "nearest",
+            "note": "pixel art: sample every image of this sheet unfiltered (nearest), so pixels stay sharp",
+        });
+    }
     if let Some(name) = &glow {
         json["glow"] = serde_json::json!({
             "image": name,
@@ -366,19 +422,19 @@ pub fn save_with_glow(frames: &[egui::ColorImage], glows: Option<&[egui::ColorIm
     std::fs::rename(&partial, json_path(&png)).map_err(|e| e.to_string())?;
     let count = frames.len();
     if output.godot {
-        write_beside(&godot_path(&png), &godot_sprite_frames(&sheet, &name, count, output.fps))?;
+        output.write(&godot_path(&png), &godot_sprite_frames(&sheet, &name, count, output.fps))?;
         for (written, path) in [(normal.is_some(), normal_path(&png)), (glow.is_some(), glow_path(&png))] {
             if written {
-                write_beside(&with_suffix(&path, ".import"), &crate::vat::godot_texture_import())?;
+                output.write(&with_suffix(&path, ".import"), &crate::vat::godot_texture_import())?;
             }
         }
         if normal.is_some() || glow.is_some() {
             let [shader, material] = godot_sprite_paths(&png);
-            write_beside(&shader, &godot_sprite_shader(normal.is_some(), glow.is_some()))?;
-            write_beside(&material, &godot_sprite_material(&stem_of(&png), normal.as_deref(), glow.as_deref()))?;
+            output.write(&shader, &godot_sprite_shader(normal.is_some(), glow.is_some()))?;
+            output.write(&material, &godot_sprite_material(&stem_of(&png), normal.as_deref(), glow.as_deref()))?;
         }
         if output.fill_grid {
-            write_beside(&godot_particles_path(&png), &godot_particle_material(&sheet))?;
+            output.write(&godot_particles_path(&png), &godot_particle_material(&sheet))?;
         }
     }
     if output.unity {
@@ -389,12 +445,12 @@ pub fn save_with_glow(frames: &[egui::ColorImage], glows: Option<&[egui::ColorIm
             Some(_) => {
                 let path = normal_path(&png);
                 let g = crate::vat::unity_guid(&unity_meta_path(&path), &stem_of(&png));
-                write_beside(&unity_meta_path(&path), &unity_normal_meta(&g, sheet.image.width().max(sheet.image.height())))?;
+                output.write(&unity_meta_path(&path), &unity_normal_meta(&g, sheet.image.width().max(sheet.image.height())))?;
                 Some(g)
             }
             None => None,
         };
-        write_beside(&meta, &unity_meta(&sheet, &name, count, &guid, normal_guid.as_deref()))?;
+        output.write(&meta, &unity_meta(&sheet, &name, count, &guid, normal_guid.as_deref()))?;
     }
     if let Some(motion) = &motion {
         write_flipbook_engines(output, &png, &sheet, count, size, motion, normal.as_deref(), glow.as_deref())?;
@@ -1141,9 +1197,9 @@ fn write_flipbook_engines(output: &Output, png: &Path, sheet: &Sheet, count: usi
     let motion_png = motion_path(png);
     if output.godot {
         let [shader, scene] = godot_flipbook_paths(png);
-        write_beside(&shader, &godot_flipbook_shader(sheet, count, output.fps, motion, normal_map.is_some(), glow.is_some()))?;
-        write_beside(&with_suffix(&motion_png, ".import"), &crate::vat::godot_texture_import())?;
-        write_beside(&scene, &godot_flipbook_scene(sheet, png, source_size, motion, normal_map, glow))?;
+        output.write(&shader, &godot_flipbook_shader(sheet, count, output.fps, motion, normal_map.is_some(), glow.is_some()))?;
+        output.write(&with_suffix(&motion_png, ".import"), &crate::vat::godot_texture_import())?;
+        output.write(&scene, &godot_flipbook_scene(sheet, png, source_size, motion, normal_map, glow))?;
     }
     if output.unity {
         let [shader, material] = unity_flipbook_paths(png);
@@ -1153,20 +1209,20 @@ fn write_flipbook_engines(output: &Output, png: &Path, sheet: &Sheet, count: usi
         let shader_meta = format!("fileFormatVersion: 2\nguid: {shader_guid}\nShaderImporter:\n  externalObjects: {{}}\n  defaultTextures: []\n  nonModifiableTextures: []\n  preprocessorOverride: 0\n  userData: \n  assetBundleName: \n  assetBundleVariant: \n");
         let material_meta = format!("fileFormatVersion: 2\nguid: {material_guid}\nNativeFormatImporter:\n  externalObjects: {{}}\n  mainObjectFileID: 2100000\n  userData: \n  assetBundleName: \n  assetBundleVariant: \n");
         let largest = motion.sheet.image.width().max(motion.sheet.image.height());
-        write_beside(&unity_meta_path(&motion_png), &unity_motion_meta(&motion_guid, largest))?;
+        output.write(&unity_meta_path(&motion_png), &unity_motion_meta(&motion_guid, largest))?;
         let glow_guid = match glow {
             Some(_) => {
                 let path = glow_path(png);
                 let g = guid(&path);
-                write_beside(&unity_meta_path(&path), &unity_motion_meta(&g, largest))?;
+                output.write(&unity_meta_path(&path), &unity_motion_meta(&g, largest))?;
                 Some(g)
             }
             None => None,
         };
-        write_beside(&shader, &unity_flipbook_shader(&stem, sheet, count, output.fps, motion, glow.is_some()))?;
-        write_beside(&unity_meta_path(&shader), &shader_meta)?;
-        write_beside(&material, &unity_flipbook_material(&stem, &shader_guid, &sheet_guid, &motion_guid, glow_guid.as_deref(), sheet, count, output.fps, motion))?;
-        write_beside(&unity_meta_path(&material), &material_meta)?;
+        output.write(&shader, &unity_flipbook_shader(&stem, sheet, count, output.fps, motion, glow.is_some()))?;
+        output.write(&unity_meta_path(&shader), &shader_meta)?;
+        output.write(&material, &unity_flipbook_material(&stem, &shader_guid, &sheet_guid, &motion_guid, glow_guid.as_deref(), sheet, count, output.fps, motion))?;
+        output.write(&unity_meta_path(&material), &material_meta)?;
     }
     Ok(())
 }
@@ -1252,7 +1308,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let frames = vec![egui::ColorImage::filled([8, 8], egui::Color32::WHITE); 3];
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true, motion_vectors: false, normal_map: false, glow: false };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 24.0, live: false, blend: 0, godot: true, unity: true, fill_grid: true, motion_vectors: false, normal_map: false, glow: false, pixel_art: None };
         let (png, _) = save(&frames, &output).unwrap();
         let guid = |p: &Path| meta_guid(&std::fs::read_to_string(unity_meta_path(p)).unwrap()).unwrap();
         let first = guid(&png);
@@ -1355,7 +1411,7 @@ mod tests {
     fn saving_writes_the_png_and_its_json() {
         let dir = std::env::temp_dir().join(format!("pfx_sheet_{}", std::process::id()));
         let frames: Vec<_> = (0..4).map(|i| frame(8, 8, i, i)).collect();
-        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false, glow: false };
+        let output = Output { path: dir.join("spark.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false, glow: false, pixel_art: None };
         let (png, _) = save(&frames, &output).unwrap();
         assert_eq!(image::open(&png).unwrap().to_rgba8().dimensions(), (16, 16));
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("spark.pfx.json")).unwrap()).unwrap();
@@ -1381,7 +1437,7 @@ mod tests {
             egui::ColorImage { size: [64, 32], source_size: egui::vec2(64.0, 32.0), pixels }
         };
         let frames: Vec<_> = (0..5).map(|i| dot(20.0 + 3.0 * i as f32)).collect();
-        let output = Output { path: dir.join("dot.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: true, normal_map: false, glow: false };
+        let output = Output { path: dir.join("dot.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: false, unity: false, fill_grid: false, motion_vectors: true, normal_map: false, glow: false, pixel_art: None };
         let (png, sheet) = save(&frames, &output).unwrap();
         let motion = image::open(motion_path(&png)).unwrap().to_rgba8();
         assert_eq!(motion.dimensions(), sheet.image.dimensions(), "the same grid of the same cells");
@@ -1400,6 +1456,50 @@ mod tests {
     }
 
     #[test]
+    fn pixel_art_sheets_are_small_sharp_and_drawn_unfiltered() {
+        let dir = std::env::temp_dir().join(format!("pfx_pixel_sheet_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A soft white disc moving right across 64×32 frames.
+        let disc = |cx: f32| {
+            let mut image = egui::ColorImage::filled([64, 32], egui::Color32::TRANSPARENT);
+            for y in 0..32 {
+                for x in 0..64 {
+                    let d = ((x as f32 - cx).powi(2) + (y as f32 - 16.0).powi(2)).sqrt();
+                    image.pixels[y * 64 + x] = egui::Color32::from_rgb(250, 200, 90).gamma_multiply((1.0 - d / 10.0).clamp(0.0, 1.0));
+                }
+            }
+            image
+        };
+        let frames: Vec<_> = (0..4).map(|i| disc(16.0 + 8.0 * i as f32)).collect();
+        let pixel_art = Some(crate::pixelart::PixelArt { scale: 4, colors: 4, ..Default::default() });
+        let output = Output { path: dir.join("orb.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: true, glow: false, pixel_art };
+        let (png, sheet) = save(&frames, &output).unwrap();
+        assert_eq!(sheet.cell, [16, 8], "a quarter of the size");
+        let image = image::open(&png).unwrap().to_rgba8();
+        assert!(image.pixels().all(|p| p.0[3] == 0 || p.0[3] == 255), "no soft edges");
+        let colours: std::collections::BTreeSet<_> = image.pixels().filter(|p| p.0[3] > 0).map(|p| [p.0[0], p.0[1], p.0[2]]).collect();
+        assert!(colours.len() <= 4, "{colours:?}");
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(json_path(&png)).unwrap()).unwrap();
+        assert_eq!(json["pixel_art"]["filter"], "nearest");
+        assert_eq!(json["frame_size"], serde_json::json!([16, 8]));
+        // Godot: unfiltered samplers and node; Unity: point filtering.
+        let [g_shader, g_scene] = godot_flipbook_paths(&png);
+        let (shader, scene) = (std::fs::read_to_string(g_shader).unwrap(), std::fs::read_to_string(g_scene).unwrap());
+        assert!(shader.contains("filter_nearest") && !shader.contains("filter_linear"));
+        assert!(scene.contains("type=\"Sprite2D\"]\ntexture_filter = 1\n"));
+        for meta in [unity_meta_path(&png), unity_meta_path(&motion_path(&png)), unity_meta_path(&normal_path(&png))] {
+            let text = std::fs::read_to_string(&meta).unwrap();
+            assert!(text.contains("filterMode: 0") && !text.contains("filterMode: 1"), "{}", meta.display());
+        }
+        // Without pixel art, the same files filter as before.
+        let smooth = Output { path: dir.join("smooth.png"), pixel_art: None, ..output };
+        let (png, _) = save(&frames, &smooth).unwrap();
+        assert!(std::fs::read_to_string(unity_meta_path(&png)).unwrap().contains("filterMode: 1"));
+        assert!(std::fs::read_to_string(godot_flipbook_paths(&png)[0].clone()).unwrap().contains("filter_linear"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn engines_get_a_flipbook_that_uses_the_motion_vectors() {
         let dir = std::env::temp_dir().join(format!("pfx_flipbook_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1413,7 +1513,7 @@ mod tests {
             image
         };
         let frames: Vec<_> = (0..4).map(|i| dot(4 + 5 * i)).collect();
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: false, glow: false };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: false, glow: false, pixel_art: None };
         let (png, sheet) = save(&frames, &output).unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
         let [gd_shader, gd_scene] = godot_flipbook_paths(&png);
@@ -1456,7 +1556,7 @@ mod tests {
             image
         };
         let frames: Vec<_> = (0..3).map(|i| blob(6 + 4 * i)).collect();
-        let output = Output { path: dir.join("puff.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: true, glow: false };
+        let output = Output { path: dir.join("puff.png"), columns: 0, trim: true, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: true, glow: false, pixel_art: None };
         let (png, sheet) = save(&frames, &output).unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
         let normals = image::open(normal_path(&png)).unwrap().to_rgba8();
@@ -1504,7 +1604,7 @@ mod tests {
         };
         let frames: Vec<_> = (0..3).map(|i| dot(4 + 6 * i)).collect();
         let glows: Vec<_> = (0..3).map(|_| encode_glow([32, 16], Some(&vec![[2.0, 1.0, 0.0]; 32 * 16]))).collect();
-        let output = Output { path: dir.join("ember.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: false, glow: true };
+        let output = Output { path: dir.join("ember.png"), columns: 0, trim: false, fps: 12.0, live: false, blend: 0, godot: true, unity: true, fill_grid: false, motion_vectors: true, normal_map: false, glow: true, pixel_art: None };
         let (png, sheet) = save_with_glow(&frames, Some(&glows), &output).unwrap();
         let read = |p: &Path| std::fs::read_to_string(p).unwrap();
         let glow_png = image::open(glow_path(&png)).unwrap().to_rgba8();

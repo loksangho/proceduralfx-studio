@@ -1,6 +1,6 @@
 [package]
 name = "bevy_procedural_fx"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Play effects exported from ProceduralFX Studio in Bevy: sprite sheets, and vertex animation for 3D"
 license = "MIT OR Apache-2.0"

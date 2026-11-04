@@ -35,7 +35,7 @@
 
 use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext};
-use bevy::image::ImageLoaderSettings;
+use bevy::image::{ImageLoaderSettings, ImageSampler};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use serde::Deserialize;
@@ -234,6 +234,9 @@ struct SheetFile {
     normal_map: Option<NormalFile>,
     #[serde(default)]
     glow: Option<NormalFile>,
+    // Pixel art: every image is sampled unfiltered (nearest), so pixels stay sharp.
+    #[serde(default)]
+    pixel_art: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +290,17 @@ impl AssetLoader for FxSheetLoader {
     }
 }
 
+// How the sheet's data images (motion vectors, normals, glow) load: as numbers, not
+// colours, and for pixel art unfiltered.
+fn data_image(nearest: bool) -> impl Fn(&mut ImageLoaderSettings) + Send + Sync + 'static {
+    move |s: &mut ImageLoaderSettings| {
+        s.is_srgb = false;
+        if nearest {
+            s.sampler = ImageSampler::nearest();
+        }
+    }
+}
+
 fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxSheetError> {
     if file.format != "procedural-fx-sprite-sheet" {
         return Err(FxSheetError::Format(file.format));
@@ -302,10 +316,11 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
     let mut layout = TextureAtlasLayout::from_grid(frame_size, columns, rows, None, None);
     layout.textures.truncate(file.frame_count.max(1));
     let image_path = load_context.path().resolve_embed_str(&file.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
+    let nearest = file.pixel_art.is_some();
     let motion = match &file.motion_vectors {
         Some(m) => {
             let path = load_context.path().resolve_embed_str(&m.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
-            let image = load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.is_srgb = false).load(path);
+            let image = load_context.load_builder().with_settings(data_image(nearest)).load(path);
             Some(FxMotion { image, strength: m.strength.max(0.0), looping: m.looping })
         }
         None => None,
@@ -313,19 +328,23 @@ fn parse(file: SheetFile, load_context: &mut LoadContext) -> Result<FxSheet, FxS
     let normal_map = match &file.normal_map {
         Some(n) => {
             let path = load_context.path().resolve_embed_str(&n.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
-            Some(load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.is_srgb = false).load(path))
+            Some(load_context.load_builder().with_settings(data_image(nearest)).load(path))
         }
         None => None,
     };
     let glow = match &file.glow {
         Some(g) => {
             let path = load_context.path().resolve_embed_str(&g.image).map_err(|e| FxSheetError::Path(e.to_string()))?;
-            Some(load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.is_srgb = false).load(path))
+            Some(load_context.load_builder().with_settings(data_image(nearest)).load(path))
         }
         None => None,
     };
     Ok(FxSheet {
-        image: load_context.load(image_path),
+        image: if nearest {
+            load_context.load_builder().with_settings(|s: &mut ImageLoaderSettings| s.sampler = ImageSampler::nearest()).load(image_path)
+        } else {
+            load_context.load(image_path)
+        },
         layout: load_context.add_labeled_asset("layout", layout),
         frame_count: file.frame_count.max(1),
         fps: if file.fps > 0.0 { file.fps } else { 24.0 },

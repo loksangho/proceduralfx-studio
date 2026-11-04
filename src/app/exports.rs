@@ -298,6 +298,47 @@ impl ProceduralFxStudioApp {
                      with Godot or Unity ticked as well as Motion vectors, their flipbook shaders do too.",
                 );
                 ui.end_row();
+                ui.label("Pixel art");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut s.pixel_art, "Pixel art").on_hover_text(
+                        "Turns the frames into pixel art: each block of pixels becomes one, every pixel opaque or clear, in a few colours shared by every frame \
+                         (so nothing flickers). Render bigger than you need: the frame size is divided by the pixel size. \
+                         Bevy, Godot and Unity are told to draw it unfiltered, so the pixels stay sharp.",
+                    );
+                    if s.pixel_art {
+                        ui.horizontal(|ui| {
+                            ui.label("pixel size");
+                            ui.add(egui::DragValue::new(&mut s.pixel_scale).range(1..=32).suffix(" px"));
+                            let k = s.pixel_scale.max(1);
+                            ui.weak(format!("→ {}×{} pixels", (s.width / k).max(1), (s.height / k).max(1)));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("palette");
+                            let mut from_file = !s.pixel_palette.is_empty();
+                            ui.radio_value(&mut from_file, false, "pick").on_hover_text("Picks the colours from the frames themselves");
+                            ui.radio_value(&mut from_file, true, "from a file").on_hover_text("A palette from Lospec (.hex), GIMP or Aseprite (.gpl), or an image of swatches");
+                            if from_file && s.pixel_palette.is_empty() {
+                                if let Some(path) = rfd::FileDialog::new().set_title("Palette").add_filter("Palette", &["hex", "gpl", "png", "txt"]).pick_file() {
+                                    s.pixel_palette = path.display().to_string();
+                                }
+                            } else if !from_file {
+                                s.pixel_palette.clear();
+                            }
+                            if s.pixel_palette.is_empty() {
+                                ui.add(egui::DragValue::new(&mut s.pixel_colors).range(0..=64)).on_hover_text("How many colours; 0 keeps the frames' own");
+                                ui.label(if s.pixel_colors == 0 { "(all colours)" } else { "colours" });
+                            } else {
+                                let name = std::path::Path::new(&s.pixel_palette).file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                                ui.label(name).on_hover_text(&s.pixel_palette);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut s.pixel_dither, "Dither").on_hover_text("An ordered dither: gradients and soft edges (smoke fading out) become patterns of pixels instead of bands");
+                            ui.checkbox(&mut s.pixel_outline, "Outline").on_hover_text("A one-pixel outline around the shape: near-black, or the palette's darkest colour if it has a dark one");
+                        });
+                    }
+                });
+                ui.end_row();
                 ui.label("Trim");
                 ui.checkbox(&mut s.trim, "Crop empty space").on_hover_text("Crops every frame to the same box: what any frame shows, plus a 1-pixel transparent border. The JSON records where the box was in the full frame.");
                 ui.end_row();
@@ -398,13 +439,20 @@ impl ProceduralFxStudioApp {
     // Live re-exports keep the files current without adding to the Render Viewer.
     pub(crate) fn start_sprite_sheet(&mut self, path: PathBuf, live: bool) {
         let Some((times, blend)) = self.sprite_sheet_job() else { return };
+        let pixel_art = match self.sprite_sheet.pixel_art() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Sprite sheet not exported: {e}");
+                return;
+            }
+        };
         let s = &self.sprite_sheet;
         if s.live && !live {
             let exported = self.live_sheet_fingerprint();
             self.live_sheet = Some(LiveSheet { path: path.clone(), exported, pending: None });
         }
         let s = &self.sprite_sheet;
-        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity, fill_grid: s.fill_grid, motion_vectors: s.motion_vectors, normal_map: s.normal_map, glow: s.glow };
+        let output = spritesheet::Output { path, columns: s.columns, trim: s.trim, fps: sims::SIM_FPS / s.every.max(1) as f32, live, blend, godot: s.godot, unity: s.unity, fill_grid: s.fill_grid, motion_vectors: s.motion_vectors, normal_map: s.normal_map, glow: s.glow, pixel_art };
         let capture = flipbook::Capture { render: Some([s.width.clamp(8, 4096), s.height.clamp(8, 4096)]), save_to: None, sheet: Some(output), preview: None };
         self.render_camera_in_use();
         self.animate = false;
@@ -424,6 +472,7 @@ impl ProceduralFxStudioApp {
         )
         .hash(&mut hasher);
         (s.trim, s.seamless, s.blend, s.godot, s.unity, s.fill_grid, s.motion_vectors, s.normal_map, s.glow).hash(&mut hasher);
+        (s.pixel_art, s.pixel_scale, s.pixel_colors, &s.pixel_palette, s.pixel_dither, s.pixel_outline).hash(&mut hasher);
         hasher.finish()
     }
 

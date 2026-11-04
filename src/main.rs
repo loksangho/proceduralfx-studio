@@ -54,6 +54,7 @@ mod muscle;
 mod nodeinfo;
 mod packed;
 mod perf;
+mod pixelart;
 mod platform;
 mod paint;
 mod poly;

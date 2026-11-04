@@ -136,6 +136,21 @@ commands.spawn(FxFlipbook::looping(assets.load("fx/campfire.pfx.json")).with_glo
 `with_glow(1.0)` (the default) shows the glow as it was rendered, more makes it stronger,
 and `0.0` takes it away.
 
+## Pixel art
+
+Tick **Pixel art** when you export, and the sheet comes out as pixel art: each block of
+rendered pixels becomes one, every pixel opaque or clear, in a palette shared by every frame
+(picked from the effect's colours, or loaded from a Lospec `.hex` or `.gpl` palette). The
+plugin loads such sheets unfiltered, so the pixels stay sharp however far you scale them up;
+nothing else changes:
+
+```rust
+commands.spawn((
+    FxSprite::looping(assets.load("fx/burst.pfx.json")),
+    Transform::from_scale(Vec3::splat(4.0)),
+));
+```
+
 ## Vertex animation for 3D
 
 Simulations are too slow to run in a game, so you bake them. In ProceduralFX Studio,
@@ -227,6 +242,7 @@ Space to break another one.
 | `source_size`, `offset` | The size each frame was rendered at, and where the cropped frame's top-left corner was in it |
 | `normal_map` | If exported with one: `image`, laid out like the sheet, in tangent space with red right, green up and blue towards the viewer, each `(n + 1) / 2` |
 | `glow` | If exported as a glow sheet: `image`, laid out like the sheet. Each channel holds the glow `g` as `g / (1 + g)`; the sheet's colour already holds `1 - exp(-g)` of it, so add `g * strength - (1 - exp(-g))` |
+| `pixel_art` | If exported as pixel art: `scale` (rendered pixels per pixel) and `filter`, `"nearest"`: sample every image of the sheet unfiltered |
 | `motion_vectors` | If exported with them: `image` (laid out like the sheet), `strength` and `looping`. Red and green hold each pixel's shift to the next frame, across and down, in fractions of a frame: `(value - 0.5) * 2 * strength` |
 
 ## Bevy versions
