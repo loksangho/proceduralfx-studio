@@ -40,9 +40,9 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "Smoke",
-        description: "A looping wisp of soft grey smoke: puffs that rise, spread, sway and fade.",
+        description: "A looping wisp of soft grey smoke: a Pyro simulation rising from a small source, curling and fading, looped by a Make Loop node.",
         scene: include_str!("../assets/presets/smoke.pfs"),
-        range: (0.0, 1.0 - 1.0 / 24.0),
+        range: (2.0, 3.0 - 1.0 / 24.0),
         frame: [192, 256],
         looping: true,
         vertex_animation: false,
