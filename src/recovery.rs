@@ -212,6 +212,38 @@ pub fn install_panic_hook() {
     }));
 }
 
+// A crash report as it would be sent: the user's home folder (in paths in the panic
+// message) shown as ~, so their account name doesn't leave the computer.
+pub fn redacted(report: &str, home: Option<&str>) -> String {
+    match home.map(|h| h.trim_end_matches(['/', '\\'])).filter(|h| h.len() > 1) {
+        Some(home) => report.replace(home, "~"),
+        None => report.to_owned(),
+    }
+}
+
+// Sends a crash report (already redacted, as the user saw it) and their note to the
+// server's /v1/crash-reports.
+pub fn send_report(server: &str, report: &str, note: &str) -> Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+        .user_agent(format!("ProceduralFxStudio/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    let body = serde_json::json!({
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        "report": report,
+        "note": note,
+    });
+    match agent.post(&format!("{server}/v1/crash-reports")).send_json(body) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::StatusCode(429)) => Err("too many reports were sent from here just now; try again later".into()),
+        Err(ureq::Error::StatusCode(code)) => Err(format!("the server answered {code}")),
+        Err(e) => Err(format!("couldn't reach the server ({e})")),
+    }
+}
+
 pub fn crash_report_text(now: SystemTime, thread: &str, message: &str, location: &str, backtrace: &str) -> String {
     format!(
         "ProceduralFX Studio crash report\n\
@@ -307,6 +339,17 @@ pub fn ago(when: SystemTime, now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_hide_the_home_folder_before_they_leave() {
+        let report = "Panic: couldn't read /Users/ann/Desktop/a.pfs\nAt: /Users/ann/x.rs:1:1\n";
+        assert_eq!(redacted(report, Some("/Users/ann")), "Panic: couldn't read ~/Desktop/a.pfs\nAt: ~/x.rs:1:1\n");
+        assert_eq!(redacted(report, Some("/Users/ann/")), redacted(report, Some("/Users/ann")), "with or without the last slash");
+        assert_eq!(redacted("C:\\Users\\Ann\\a.pfs", Some("C:\\Users\\Ann")), "~\\a.pfs");
+        assert_eq!(redacted(report, Some("/")), report, "a root home isn't replaced everywhere");
+        assert_eq!(redacted(report, None), report);
+    }
+
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pfx-recovery-{name}-{}", std::process::id()));

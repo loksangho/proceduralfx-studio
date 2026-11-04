@@ -622,6 +622,13 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) recovery: Option<recovery::Session>,
     // Unsaved work, or a crash report, left by a session that didn't quit cleanly.
     pub(crate) recovery_offer: Option<recovery::Leftover>,
+    // Sending the crash report from the recovery prompt: the note the user adds, and the
+    // send in progress (or how it went).
+    pub(crate) crash_note: String,
+    pub(crate) crash_send: Option<mpsc::Receiver<Result<(), String>>>,
+    pub(crate) crash_sent: Option<Result<(), String>>,
+    // Where crash reports go: the credits server (tests point it elsewhere).
+    pub(crate) crash_report_server: Option<String>,
     // The asset library (the assets folder), as last read.
     pub(crate) asset_library: Vec<assets::Entry>,
     // Where assets are saved: the app's assets folder (tests set their own).
@@ -893,6 +900,10 @@ impl Default for ProceduralFxStudioApp {
             quitting: false,
             recovery: None,
             recovery_offer: None,
+            crash_note: String::new(),
+            crash_send: None,
+            crash_sent: None,
+            crash_report_server: assistant::credits_server(),
             asset_library: assets::library(default_asset_dir().as_deref()),
             asset_dir: default_asset_dir(),
             subnet_promote: (None, 0, String::new()),

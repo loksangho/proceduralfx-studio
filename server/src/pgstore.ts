@@ -1,7 +1,7 @@
 // The Store on Postgres. The schema is created on start (CREATE ... IF NOT EXISTS).
 
 import pg from "pg";
-import type { Device, Founder, Login, Stats, Store, UsageRow, User } from "./store.js";
+import { CRASH_REPORT_DAYS, type CrashReport, type Device, type Founder, type Login, type Stats, type Store, type UsageRow, type User } from "./store.js";
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS usage (
   at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS usage_user_at ON usage (user_id, at);
+CREATE TABLE IF NOT EXISTS crash_reports (
+  id BIGSERIAL PRIMARY KEY,
+  app_version TEXT NOT NULL,
+  os TEXT NOT NULL,
+  report TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS crash_reports_at ON crash_reports (at);
 CREATE TABLE IF NOT EXISTS founders (
   seat INTEGER PRIMARY KEY,
   payment_id TEXT NOT NULL UNIQUE,
@@ -231,6 +240,16 @@ export class PgStore implements Store {
   async founderCount() {
     const { rows } = await this.pool.query("SELECT count(*) AS n FROM founders");
     return Number(rows[0].n);
+  }
+
+  async addCrashReport(r: Omit<CrashReport, "id" | "at">) {
+    await this.pool.query(`DELETE FROM crash_reports WHERE at < now() - interval '${CRASH_REPORT_DAYS} days'`);
+    await this.pool.query("INSERT INTO crash_reports (app_version, os, report, note) VALUES ($1, $2, $3, $4)", [r.appVersion, r.os, r.report, r.note]);
+  }
+
+  async crashReports(limit: number): Promise<CrashReport[]> {
+    const { rows } = await this.pool.query("SELECT id, app_version, os, report, note, at FROM crash_reports ORDER BY at DESC, id DESC LIMIT $1", [limit]);
+    return rows.map((r: Row) => ({ id: String(r.id), at: r.at as Date, appVersion: String(r.app_version), os: String(r.os), report: String(r.report), note: String(r.note) }));
   }
 
   async stats(): Promise<Stats> {

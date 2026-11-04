@@ -174,9 +174,52 @@ impl ProceduralFxStudioApp {
                 ui.label(format!("Unsaved changes to {name} were kept{}.", when.map(|w| format!(" (autosaved {w})")).unwrap_or_default()));
             }
             if let Some(report) = &offer.crash_report {
-                ui.label("It crashed. A crash report was saved on this computer; nothing has been sent.");
+                if let Some(rx) = &self.crash_send {
+                    if let Ok(result) = rx.try_recv() {
+                        self.crash_sent = Some(result);
+                        self.crash_send = None;
+                    }
+                }
+                match &self.crash_sent {
+                    Some(Ok(())) => ui.label("It crashed. A crash report was saved on this computer, and you sent it: thank you."),
+                    _ => ui.label("It crashed. A crash report was saved on this computer; nothing has been sent."),
+                };
+                // Sending it: only what's shown here, only when asked.
+                let server = self.crash_report_server.clone();
+                if let (Some(server), Ok(text)) = (server, std::fs::read_to_string(report)) {
+                    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+                    let shown = recovery::redacted(&text, home.as_deref());
+                    if self.crash_sent.as_ref().is_none_or(|r| r.is_err()) {
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new("What would be sent").id_salt("crash_report_preview").show(ui, |ui| {
+                            ui.weak("This, and your note. Your home folder shows as ~. No account, scene or IP address is sent.");
+                            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(&shown).monospace().small()).wrap());
+                            });
+                        });
+                        ui.add(egui::TextEdit::multiline(&mut self.crash_note).hint_text("What were you doing when it crashed? (optional)").desired_rows(2).desired_width(f32::INFINITY));
+                        ui.horizontal(|ui| {
+                            let sending = self.crash_send.is_some();
+                            if ui.add_enabled(!sending, egui::Button::new(if sending { "Sending…" } else { "Send the report" })).clicked() {
+                                let (tx, rx) = mpsc::channel();
+                                let note = self.crash_note.trim().to_owned();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(recovery::send_report(&server, &shown, &note));
+                                });
+                                self.crash_send = Some(rx);
+                                self.crash_sent = None;
+                            }
+                            if sending {
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                            }
+                            if let Some(Err(e)) = &self.crash_sent {
+                                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), format!("Couldn't send it: {e}"));
+                            }
+                        });
+                    }
+                }
                 ui.horizontal_wrapped(|ui| {
-                    ui.weak("To help fix it, email the report to");
+                    ui.weak("Or email the report to");
                     ui.hyperlink_to("support@build3dstudio.com", "mailto:support@build3dstudio.com?subject=Crash%20report");
                 });
                 ui.horizontal(|ui| {
@@ -198,11 +241,13 @@ impl ProceduralFxStudioApp {
                         choice = Some(false);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Recover").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        // Enter recovers, unless it's typing a note.
+                        let typing = ui.memory(|m| m.focused().is_some());
+                        if ui.button("Recover").clicked() || (!typing && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                             choice = Some(true);
                         }
                     });
-                } else if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
+                } else if ui.button("OK").clicked() || (!ui.memory(|m| m.focused().is_some()) && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape))) {
                     choice = Some(false);
                 }
             });
@@ -215,6 +260,8 @@ impl ProceduralFxStudioApp {
         }
         recovery::forget(&dir, &offer.id);
         self.recovery_offer = None;
+        self.crash_note.clear();
+        self.crash_sent = None;
     }
 
     // Opens recovered work as unsaved changes to the scene it came from.

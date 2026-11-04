@@ -18,6 +18,7 @@ The app keeps the other two options as well: a user's own Claude key, or any Ope
   - Prompts and replies pass through without being stored. Only token counts and costs are logged.
 - **Payments:** payments go through Stripe Checkout, plans are changed or cancelled in Stripe's customer portal, and webhooks add the credit. Each payment is credited once.
 - **Your numbers:** `GET /admin/stats` with `Authorization: Bearer $ADMIN_TOKEN` returns users, requests, Anthropic cost, the amount charged, your margin, and top-ups paid.
+- **Crash reports:** after a crash, the app's recovery prompt offers to send the report, showing the exact text first (with the user's home folder as `~`). It goes to `POST /v1/crash-reports` with no sign-in: at most 64,000 characters, five tries an hour from one address. Reports are kept for 180 days, without an account or IP address. Read the newest with `GET /admin/crash-reports?limit=50` and the admin token, for example `curl -H "Authorization: Bearer $ADMIN_TOKEN" https://ai.yourdomain.com/admin/crash-reports`.
 
 ## Run it locally
 

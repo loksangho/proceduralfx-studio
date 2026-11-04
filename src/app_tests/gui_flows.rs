@@ -255,3 +255,85 @@ fn the_recovery_prompt_recovers_or_discards_an_autosave() {
         let _ = std::fs::remove_file(&autosave);
     }
 }
+
+// A stand-in for the server: answers one POST with 201 and hands over its body.
+pub(crate) fn one_report_server() -> (String, std::sync::mpsc::Receiver<serde_json::Value>) {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let (mut line, mut length, mut path) = (String::new(), 0usize, String::new());
+        while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+            if path.is_empty() {
+                path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = v.trim().parse().unwrap();
+            }
+            line.clear();
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let _ = (&stream).write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+        let mut json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["path"] = path.into();
+        let _ = tx.send(json);
+    });
+    (url, rx)
+}
+
+// After a crash, the prompt shows exactly what would be sent (home folder as ~), takes a
+// note, and sends only when asked.
+#[test]
+fn a_crash_report_is_sent_only_when_asked_and_as_shown() {
+    let dir = recovery_dir().unwrap().join("crashes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/someone".into());
+    let report_path = dir.join("crash-gui-test.txt");
+    std::fs::write(&report_path, format!("ProceduralFX Studio crash report\nVersion: 0.22.0\nPanic: couldn't read {home}/Desktop/scene.pfs\n")).unwrap();
+    let (server, received) = one_report_server();
+    let mut app = empty_network();
+    app.crash_report_server = Some(server);
+    app.recovery_offer = Some(recovery::Leftover { id: "gui-crash".into(), autosave: None, scene_path: None, when: None, crash_report: Some(report_path.clone()) });
+    let mut h = harness(app);
+    assert!(h.query_by_label_contains("nothing has been sent").is_some());
+    h.get_by_label("What would be sent").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("~/Desktop/scene.pfs").is_some(), "the preview shows the home folder as ~");
+    assert!(h.query_by_label_contains(&format!("{home}/Desktop")).is_none(), "and not the real one");
+    // A note; Enter while typing it doesn't close the prompt.
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput).click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("baking a splash".into()));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().recovery_offer.is_some(), "still open");
+    assert!(received.try_recv().is_err(), "nothing sent yet");
+    h.get_by_label("Send the report").click();
+    let mut sent = None;
+    for _ in 0..200 {
+        h.step();
+        if let Ok(body) = received.try_recv() {
+            sent = Some(body);
+        }
+        if h.query_by_label_contains("you sent it").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let sent = sent.unwrap_or_else(|| received.recv_timeout(std::time::Duration::from_secs(5)).expect("the report reached the server"));
+    assert_eq!(sent["path"], "/v1/crash-reports");
+    assert!(sent["report"].as_str().unwrap().contains("~/Desktop/scene.pfs") && !sent["report"].as_str().unwrap().contains(&format!("{home}/")), "sent as shown");
+    assert_eq!(sent["note"].as_str().unwrap().trim(), "baking a splash");
+    assert_eq!(sent["app_version"], env!("CARGO_PKG_VERSION"));
+    assert!(h.query_by_label_contains("you sent it").is_some(), "the prompt says so: {}", h.state().crash_sent.as_ref().map_or("not yet".into(), |r| format!("{r:?}")));
+    // The prompt shrinks once the form goes: let it settle where it'll be clicked.
+    h.run_steps(5);
+    h.get_by_label("OK").click();
+    h.run_steps(2);
+    assert!(h.state().recovery_offer.is_none());
+    let _ = std::fs::remove_file(&report_path);
+}

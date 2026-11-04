@@ -55,6 +55,19 @@ export interface Stats {
   founders: number;
 }
 
+// A crash report a user chose to send from the app (no account, and no IP address, kept).
+export interface CrashReport {
+  id: string;
+  at: Date;
+  appVersion: string;
+  os: string;
+  report: string;
+  note: string;
+}
+
+// Reports older than this are deleted.
+export const CRASH_REPORT_DAYS = 180;
+
 export interface Store {
   createDevice(d: Device): Promise<void>;
   deviceByUserCode(userCode: string): Promise<Device | null>;
@@ -90,6 +103,10 @@ export interface Store {
   founderCount(): Promise<number>;
 
   stats(): Promise<Stats>;
+
+  addCrashReport(r: Omit<CrashReport, "id" | "at">): Promise<void>;
+  // The newest first.
+  crashReports(limit: number): Promise<CrashReport[]>;
 }
 
 export function balanceMicros(u: User): number {
@@ -226,5 +243,15 @@ export class MemoryStore implements Store {
       paidMicros: this.paid,
       founders: this.founders.length,
     };
+  }
+
+  crashes: CrashReport[] = [];
+  async addCrashReport(r: Omit<CrashReport, "id" | "at">) {
+    const cutoff = Date.now() - CRASH_REPORT_DAYS * 86_400_000;
+    this.crashes = this.crashes.filter((c) => c.at.getTime() >= cutoff);
+    this.crashes.push({ ...r, id: String(this.next++), at: new Date() });
+  }
+  async crashReports(limit: number) {
+    return [...this.crashes].reverse().slice(0, limit);
   }
 }

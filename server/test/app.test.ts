@@ -332,3 +332,32 @@ test("Stripe Tax stays off until it's turned on", () => {
   assert.deepEqual(taxParams("exclusive", false), { automatic_tax: { enabled: true }, tax_id_collection: { enabled: true } });
   assert.deepEqual(taxBehavior("inclusive"), { tax_behavior: "inclusive" });
 });
+
+for (const [name, makeStore] of stores) {
+  test(`crash reports: sent without an account, read with the admin token (${name})`, async () => {
+    const t = await setup(makeStore);
+    try {
+      const report = "ProceduralFX Studio crash report\nVersion: 0.22.0\nPanic: index out of bounds\n";
+      const sent = await t.post("/v1/crash-reports", { app_version: "0.22.0", os: "macos aarch64", report, note: "while baking a splash" });
+      assert.equal(sent.status, 201);
+      assert.deepEqual(await sent.json(), { ok: true });
+      // Missing or oversized parts are refused.
+      assert.equal((await t.post("/v1/crash-reports", { app_version: "0.22.0", os: "macos" })).status, 400);
+      assert.equal((await t.post("/v1/crash-reports", { app_version: "0.22.0", os: "macos", report: "x".repeat(64_001) })).status, 400);
+      assert.equal((await t.post("/v1/crash-reports", { app_version: 3, os: "macos", report })).status, 400);
+      // Only with the admin token.
+      assert.equal((await fetch(`${t.base}/admin/crash-reports`)).status, 404);
+      const listed = await (await fetch(`${t.base}/admin/crash-reports`, { headers: { authorization: "Bearer admin" } })).json();
+      assert.equal(listed.length, 1);
+      assert.equal(listed[0].report, report);
+      assert.equal(listed[0].note, "while baking a splash");
+      assert.equal(listed[0].os, "macos aarch64");
+      assert.ok(!("ip" in listed[0]), "no IP address is kept");
+      // At most five tries an hour from one address (refused ones count too): four so far.
+      assert.equal((await t.post("/v1/crash-reports", { app_version: "0.22.0", os: "linux", report: "again" })).status, 201);
+      assert.equal((await t.post("/v1/crash-reports", { app_version: "0.22.0", os: "linux", report: "again" })).status, 429);
+    } finally {
+      t.server.close();
+    }
+  });
+}

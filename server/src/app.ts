@@ -30,6 +30,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
   app.disable("x-powered-by");
   const perIp = new Limiter(30, 60_000);
   const emails = new Limiter(5, 60 * 60_000);
+  const crashes = new Limiter(5, 60 * 60_000);
   const inFlight = new Map<string, number>();
 
   const ip = (req: Request) => req.ip ?? "unknown";
@@ -407,7 +408,44 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     }),
   );
 
+  // --- Crash reports --------------------------------------------------------------------
+
+  // A crash report the user chose to send from the app's recovery prompt (they see the
+  // whole text first). No sign-in: kept without an account or IP address, for
+  // CRASH_REPORT_DAYS. The IP only counts towards the rate limit, in memory.
+  app.post(
+    "/v1/crash-reports",
+    wrap(async (req, res) => {
+      if (!crashes.allow(`crash:${ip(req)}`)) return fail(res, 429, "rate_limited", "Too many reports; try again later.");
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const text = (key: string, max: number, required: boolean) => {
+        const v = body[key];
+        if (v === undefined && !required) return "";
+        return typeof v === "string" && v.length <= max && (!required || v.trim().length > 0) ? v : null;
+      };
+      const appVersion = text("app_version", 40, true);
+      const os = text("os", 60, true);
+      const report = text("report", 64_000, true);
+      const note = text("note", 2_000, false);
+      if (appVersion === null || os === null || report === null || note === null) {
+        return fail(res, 400, "invalid_request_error", "A report needs app_version, os and report (at most 64,000 characters), and an optional note.");
+      }
+      await store.addCrashReport({ appVersion, os, report, note });
+      res.status(201).json({ ok: true });
+    }),
+  );
+
   // --- For you ------------------------------------------------------------------------
+
+  app.get(
+    "/admin/crash-reports",
+    wrap(async (req, res) => {
+      if (!config.adminToken || req.headers.authorization !== `Bearer ${config.adminToken}`) return res.status(404).end();
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
+      const reports = await store.crashReports(limit);
+      res.json(reports.map((r) => ({ id: r.id, at: r.at.toISOString(), app_version: r.appVersion, os: r.os, note: r.note, report: r.report })));
+    }),
+  );
 
   app.get(
     "/admin/stats",
