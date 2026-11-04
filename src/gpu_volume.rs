@@ -119,7 +119,8 @@ struct Volume {
 @group(0) @binding(0) var colour: texture_3d<f32>;
 @group(0) @binding(1) var glow: texture_3d<f32>;
 @group(0) @binding(2) var linear_clamp: sampler;
-@group(0) @binding(3) var depth: texture_depth_2d;
+// The depth buffer read as plain numbers: OpenGL can't textureLoad a depth texture.
+@group(0) @binding(3) var depth: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> volume: Volume;
 @group(1) @binding(0) var<uniform> camera: Camera;
 
@@ -168,7 +169,7 @@ fn fs(@builtin(position) position: vec4<f32>) -> Blended {
     var enter = max(max(max(lo.x, lo.y), lo.z), near);
     var leave = max(min(min(hi.x, hi.y), hi.z), near);
     // Stop at the surfaces in front.
-    let d = textureLoad(depth, vec2<i32>(pixel), 0);
+    let d = textureLoad(depth, vec2<i32>(pixel), 0).r;
     var surface = 1e30;
     if (camera.mode.x > 0.5) {
         surface = near + d * (camera.lens.w - near);
@@ -242,7 +243,7 @@ impl Pass {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
