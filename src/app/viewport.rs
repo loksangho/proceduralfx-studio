@@ -641,7 +641,7 @@ impl ProceduralFxStudioApp {
                 let line: Vec<egui::Pos2> = range.clone().filter_map(|i| projected[i].map(|p| p.0)).collect();
                 if line.len() >= 2 {
                     let colour = cd_color(range.start).unwrap_or(hair);
-                    painter.add(egui::Shape::line(line, egui::Stroke::new(1.0, colour)));
+                    painter.add(egui::Shape::line(line, egui::Stroke::new(1.0_f32, colour)));
                 }
             }
         }
@@ -652,7 +652,7 @@ impl ProceduralFxStudioApp {
             for (j, p) in parent.iter().enumerate() {
                 if *p >= 0.0 {
                     if let (Some(a), Some(b)) = (projected.get(j).copied().flatten(), projected.get(*p as usize).copied().flatten()) {
-                        painter.line_segment([a.0, b.0], egui::Stroke::new(2.5, bone));
+                        painter.line_segment([a.0, b.0], egui::Stroke::new(2.5_f32, bone));
                     }
                 }
                 if let Some(a) = projected.get(j).copied().flatten() {
@@ -709,7 +709,7 @@ impl ProceduralFxStudioApp {
                 painter.circle_stroke(
                     position,
                     7.0,
-                    egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                    egui::Stroke::new(2.0_f32, egui::Color32::YELLOW),
                 );
                 painter.circle_filled(position, 3.0, egui::Color32::YELLOW);
             }
@@ -720,7 +720,7 @@ impl ProceduralFxStudioApp {
                 if let (Some(pa), Some(pb)) = (projected[a], projected[b]) {
                     painter.line_segment(
                         [pa.0, pb.0],
-                        egui::Stroke::new(3.0, egui::Color32::YELLOW),
+                        egui::Stroke::new(3.0_f32, egui::Color32::YELLOW),
                     );
                 }
             }
@@ -729,7 +729,7 @@ impl ProceduralFxStudioApp {
             if let (Some(pa), Some(pb)) = (projected.get(a).copied().flatten(), projected.get(b).copied().flatten()) {
                 painter.line_segment(
                     [pa.0, pb.0],
-                    egui::Stroke::new(4.0, egui::Color32::from_rgb(255, 150, 40)),
+                    egui::Stroke::new(4.0_f32, egui::Color32::from_rgb(255, 150, 40)),
                 );
             }
         }
@@ -743,7 +743,7 @@ impl ProceduralFxStudioApp {
             painter.rect_stroke(
                 selection_rect,
                 0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 190, 255)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(100, 190, 255)),
                 egui::StrokeKind::Inside,
             );
         }

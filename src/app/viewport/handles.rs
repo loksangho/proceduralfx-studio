@@ -30,18 +30,18 @@ impl ProceduralFxStudioApp {
                         egui::Color32::from_rgb(channel(color[0]), channel(color[1]), channel(color[2]))
                     };
                     let outline = if selected { egui::Color32::WHITE } else { tint };
-                    let stroke = egui::Stroke::new(if selected { 2.0 } else { 1.5 }, outline);
+                    let stroke = egui::Stroke::new(if selected { 2.0 } else { 1.5_f32 }, outline);
 
                     if *kind != 1 {
                         let dir = Vec3::new(0.0, 0.0, -1.0).rotate_deg(*rotation).normalize();
                         let tip = pos.add(dir.scale(unit * 3.5));
-                        view.line3d(painter, pos, tip, egui::Stroke::new(1.0, tint));
+                        view.line3d(painter, pos, tip, egui::Stroke::new(1.0_f32, tint));
                         let hint = if dir.y.abs() > 0.99 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
                         let side = dir.cross(hint).normalize().scale(unit * 0.25);
                         let lift = dir.cross(side).normalize().scale(unit * 0.25);
                         let base = tip.sub(dir.scale(unit * 0.6));
                         for offset in [side, side.scale(-1.0), lift, lift.scale(-1.0)] {
-                            view.line3d(painter, tip, base.add(offset), egui::Stroke::new(1.0, tint));
+                            view.line3d(painter, tip, base.add(offset), egui::Stroke::new(1.0_f32, tint));
                         }
                     }
 
@@ -67,7 +67,7 @@ impl ProceduralFxStudioApp {
                                 );
                             }
                             let filament = [at(-2.0, 0.0), at(-2.0, -5.0), at(0.0, -3.0), at(2.0, -5.0), at(2.0, 0.0)];
-                            painter.add(egui::Shape::line(filament.to_vec(), egui::Stroke::new(1.0, tint)));
+                            painter.add(egui::Shape::line(filament.to_vec(), egui::Stroke::new(1.0_f32, tint)));
                             if !node.bypass {
                                 for step in 0..8 {
                                     let angle = std::f32::consts::TAU * step as f32 / 8.0;
@@ -75,7 +75,7 @@ impl ProceduralFxStudioApp {
                                     if ray.y > 0.6 {
                                         continue;
                                     }
-                                    painter.line_segment([glass + ray * 12.0, glass + ray * 16.0], egui::Stroke::new(1.0, tint));
+                                    painter.line_segment([glass + ray * 12.0, glass + ray * 16.0], egui::Stroke::new(1.0_f32, tint));
                                 }
                             }
                             painter.text(
@@ -106,7 +106,7 @@ impl ProceduralFxStudioApp {
                     } else {
                         egui::Color32::from_rgb(80, 180, 220)
                     };
-                    let stroke = egui::Stroke::new(if selected { 2.5 } else { 1.5 }, if selected { egui::Color32::WHITE } else { tint });
+                    let stroke = egui::Stroke::new(if selected { 2.5 } else { 1.5_f32 }, if selected { egui::Color32::WHITE } else { tint });
                     let s = unit;
                     let put = |x: f32, y: f32, z: f32| {
                         eye.add(right.scale(x * s)).add(up.scale(y * s)).add(fwd.scale(z * s))

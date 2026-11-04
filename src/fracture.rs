@@ -186,6 +186,7 @@ fn seeds(mesh: &Mesh, set: &FractureSettings, lo: Vec3, hi: Vec3) -> Result<Vec<
     Ok(points.vertices)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // only the tests call it
 pub fn fracture(input: &Mesh, set: &FractureSettings) -> Result<Mesh, String> {
     fracture_all(input, &Mesh::default(), &Mesh::default(), set).map(|(geo, ..)| geo)
 }

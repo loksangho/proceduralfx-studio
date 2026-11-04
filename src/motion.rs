@@ -116,6 +116,7 @@ impl Flow {
         Flow { w, h, u: vec![0.0; w * h], v: vec![0.0; w * h] }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
     pub fn at(&self, x: usize, y: usize) -> (f32, f32) {
         (self.u[y * self.w + x], self.v[y * self.w + x])
     }
@@ -366,6 +367,7 @@ pub fn encode(flows: &[Flow], cell: [u32; 2]) -> (Vec<egui::ColorImage>, f32) {
 
 // The picture `t` of the way (0 to 1) from `a` to `b`, the way the engines' shaders draw it:
 // `a` slid forward along the flow, `b` slid back, blended. For tests and previews.
+#[cfg_attr(not(test), allow(dead_code))] // only the tests call it
 pub fn between(a: &egui::ColorImage, b: &egui::ColorImage, flow: &Flow, t: f32) -> egui::ColorImage {
     let [w, h] = a.size;
     let channel = |img: &egui::ColorImage, k: usize| Plane { w, h, data: img.pixels.iter().map(|c| c.to_array()[k] as f32).collect() };

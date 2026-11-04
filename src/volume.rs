@@ -35,12 +35,6 @@ pub struct Volume {
 }
 
 impl Volume {
-    pub fn name(&self) -> &'static str {
-        match self.class {
-            Class::LevelSet => "surface",
-            Class::Fog => "density",
-        }
-    }
 
     fn at(&self, x: usize, y: usize, z: usize) -> usize {
         x + self.dims[0] * (y + self.dims[1] * z)
@@ -87,10 +81,6 @@ impl Volume {
         let h = self.voxel * 0.5;
         let d = |o: Vec3| self.sample(p.add(o)) - self.sample(p.sub(o));
         Vec3::new(d(Vec3::new(h, 0.0, 0.0)), d(Vec3::new(0.0, h, 0.0)), d(Vec3::new(0.0, 0.0, h))).scale(1.0 / (2.0 * h))
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.values.iter().filter(|v| self.is_active(**v)).count()
     }
 
     fn is_active(&self, v: f32) -> bool {
@@ -546,7 +536,7 @@ pub fn to_polygons(volume: &Volume, iso: f32) -> Mesh {
         }
     }
     // Each grid edge crossing the surface becomes a quad joining the four cubes around it.
-    let mut quad = |cubes: [(usize, usize, usize); 4], flip: bool, mesh: &mut Mesh| {
+    let quad = |cubes: [(usize, usize, usize); 4], flip: bool, mesh: &mut Mesh| {
         let ids: Option<Vec<usize>> = cubes.iter().map(|c| cube_vertex.get(c).copied()).collect();
         if let Some(ids) = ids {
             let [a, b, c, d] = [ids[0], ids[1], ids[2], ids[3]];

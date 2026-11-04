@@ -42,7 +42,7 @@ impl ProceduralFxStudioApp {
                         ));
                         for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
                             if let (Some(pa), Some(pb)) = (local_screen(corner(a)), local_screen(corner(b))) {
-                                painter.line_segment([pa, pb], egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255)));
+                                painter.line_segment([pa, pb], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 200, 255)));
                             }
                         }
                         for i in 0..3 {
@@ -101,16 +101,16 @@ impl ProceduralFxStudioApp {
                     match (part.handle, part.points.as_slice()) {
                         (GizmoHandle::Center, [c]) => {
                             let rect = egui::Rect::from_center_size(*c, egui::vec2(11.0, 11.0));
-                            painter.rect_stroke(rect, 2.0, egui::Stroke::new(2.0, colour), egui::StrokeKind::Middle);
+                            painter.rect_stroke(rect, 2.0, egui::Stroke::new(2.0_f32, colour), egui::StrokeKind::Middle);
                         }
                         (GizmoHandle::Face(..), [c]) => {
                             // A dot with a stub pointing out of the face.
                             let out = part.axis_screen.normalized() * 14.0;
-                            painter.line_segment([*c, *c + out], egui::Stroke::new(2.0, colour));
+                            painter.line_segment([*c, *c + out], egui::Stroke::new(2.0_f32, colour));
                             painter.circle_filled(*c, if highlight { 6.5 } else { 5.0 }, colour);
                         }
                         (GizmoHandle::Axis(_), [a, b]) => {
-                            painter.line_segment([*a, *b], egui::Stroke::new(if highlight { 3.5 } else { 2.5 }, colour));
+                            painter.line_segment([*a, *b], egui::Stroke::new(if highlight { 3.5 } else { 2.5_f32 }, colour));
                             if self.gizmo_mode == GizmoMode::Scale {
                                 painter.rect_filled(egui::Rect::from_center_size(*b, egui::vec2(9.0, 9.0)), 1.0, colour);
                             } else {
@@ -121,7 +121,7 @@ impl ProceduralFxStudioApp {
                             }
                         }
                         (_, points) => {
-                            painter.add(egui::Shape::line(points.to_vec(), egui::Stroke::new(if highlight { 3.0 } else { 2.0 }, colour)));
+                            painter.add(egui::Shape::line(points.to_vec(), egui::Stroke::new(if highlight { 3.0 } else { 2.0_f32 }, colour)));
                         }
                     }
                 }

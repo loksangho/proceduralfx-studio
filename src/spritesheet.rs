@@ -289,6 +289,7 @@ pub fn glow_path(png: &Path) -> PathBuf {
 }
 
 // Writes the sheet PNG and its JSON (same name, .pfx.json); returns the PNG's path.
+#[cfg_attr(not(test), allow(dead_code))] // only the tests call it
 pub fn save(frames: &[egui::ColorImage], output: &Output) -> Result<(PathBuf, Sheet), String> {
     save_with_glow(frames, None, output)
 }

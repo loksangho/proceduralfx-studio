@@ -567,6 +567,7 @@ fn write_material(out: &mut String, prim: &Prim, path: &str, inner: &str) {
 // ============================================================================
 
 // Parses the bridge's prim description (see native/usd_bridge.cpp) into app space.
+#[cfg_attr(not(any(test, feature = "native-usd")), allow(dead_code))] // the OpenUSD build and the tests
 pub fn parse_bridge_dump(text: &str) -> Result<Stage, String> {
     let mut stage = Stage::default();
     let mut current: Option<String> = None;
@@ -642,6 +643,7 @@ pub fn parse_bridge_dump(text: &str) -> Result<Stage, String> {
 }
 
 // Fan-triangulates polygons; mirroring Z (and leftHanded orientation) set the winding.
+#[cfg_attr(not(any(test, feature = "native-usd")), allow(dead_code))] // the OpenUSD build and the tests
 fn triangulate(points: &[Vec3], counts: &[usize], indices: &[usize], colour: Option<&(String, Vec<f32>)>, left_handed: bool) -> Mesh {
     let mut mesh = Mesh { vertices: points.to_vec(), ..Default::default() };
     let mut face_of_tri = Vec::new();
@@ -740,6 +742,8 @@ fn load_cache() -> &'static Mutex<HashMap<(String, i64), Arc<Stage>>> {
 }
 
 // Opens a USD file with OpenUSD and returns its composed prims at `seconds`.
+// Without OpenUSD it can only refuse, so what follows is unreachable there.
+#[cfg_attr(not(feature = "native-usd"), allow(unreachable_code))]
 pub fn load_file(path: &str, seconds: f32) -> Result<Arc<Stage>, String> {
     if path.trim().is_empty() {
         return Err("no file chosen".into());

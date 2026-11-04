@@ -9,7 +9,6 @@
 use super::{Mesh, Vec3};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Write as _;
 
 pub fn extension(path: &str) -> String {
     std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
@@ -429,11 +428,6 @@ pub fn fbx_evaluate(scene: &ufbx::Scene, take: Option<usize>, seconds: f32, loop
     fbx_mesh(&evaluated)
 }
 
-// The meshes as they are stored (bind pose), for scenes the caller evaluates itself.
-pub fn fbx_rest(scene: &ufbx::Scene) -> Result<Mesh, String> {
-    fbx_mesh(scene)
-}
-
 fn fbx_mesh(scene: &ufbx::Scene) -> Result<Mesh, String> {
     let mut out = Mesh::default();
     let (mut colors, mut uvs, mut piece, mut prim_piece) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -756,14 +750,6 @@ pub fn write_fbx(mesh: &Mesh, name: &str) -> Vec<u8> {
     out
 }
 
-// Writes `bytes` atomically so a viewer reading the file never sees a half-written one.
-pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
-    let temp = format!("{path}.tmp");
-    let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
-    file.write_all(bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&temp, path).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,7 +855,7 @@ Connections:  {
         let _ = std::fs::remove_file(&path);
     }
 
-    use super::*;
+    
 
     fn coloured_quad() -> Mesh {
         let mut mesh = Mesh {

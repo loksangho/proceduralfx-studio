@@ -28,6 +28,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Any compiler warning fails the build, so warnings can't pile up again (deprecated
+    # calls, and the lints Rust is turning into errors). Dependencies' warnings don't count.
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

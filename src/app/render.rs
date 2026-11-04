@@ -360,7 +360,7 @@ impl ProceduralFxStudioApp {
         // temporary file to avoid failures when the configured output path is
         // on a read-only filesystem (for example when running from inside a
         // .app bundle Resources directory).
-        let output_path = PathBuf::from(&output);
+        let _output_path = PathBuf::from(&output);
         
         // Export the scene to temp
         // (use a unique filename to avoid clobbering concurrent renders)

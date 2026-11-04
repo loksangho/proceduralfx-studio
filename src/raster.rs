@@ -265,7 +265,7 @@ mod tests {
             let mut r = Raster::new(20, 20, false);
             let near = || (v(0.0, 0.0, 1.0), v(20.0, 0.0, 1.0), v(0.0, 20.0, 1.0));
             let far = || (v(0.0, 0.0, 5.0), v(20.0, 0.0, 5.0), v(0.0, 20.0, 5.0));
-            let mut draw = |r: &mut Raster, t: (ScreenVertex, ScreenVertex, ScreenVertex), c: f32| r.triangle([t.0, t.1, t.2], [[c; 3]; 3], None);
+            let draw = |r: &mut Raster, t: (ScreenVertex, ScreenVertex, ScreenVertex), c: f32| r.triangle([t.0, t.1, t.2], [[c; 3]; 3], None);
             if near_first {
                 draw(&mut r, near(), 1.0);
                 draw(&mut r, far(), 0.0);

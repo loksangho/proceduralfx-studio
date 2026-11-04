@@ -63,7 +63,7 @@ impl ProceduralFxStudioApp {
         painter.circle_stroke(
             gizmo_center,
             30.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(180)),
         );
         painter.text(
             gizmo_center + egui::vec2(0.0, -13.0),
@@ -94,7 +94,7 @@ impl ProceduralFxStudioApp {
     pub(super) fn paint_brush(&self, ctx: &egui::Context, response: &egui::Response, painter: &egui::Painter, view: &ViewCamera, paint_node: Option<NodeId>) -> Option<(NodeId, Vec<f32>)> {
         if let (Some(id), Some(hover)) = (paint_node, response.hover_pos()) {
             if let Some(NodeKind::AttributePaint { values, settings, .. }) = self.graph.nodes.get(&id).map(|n| &n.kind) {
-                painter.circle_stroke(hover, settings.radius, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 90)));
+                painter.circle_stroke(hover, settings.radius, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 210, 90)));
                 if response.dragged_by(egui::PointerButton::Primary) || response.clicked() {
                     // Paint on the node's own points, placed where the viewport shows them.
                     let mut points = self.graph.cook(id, self.time, &mut HashMap::new());
@@ -129,7 +129,7 @@ impl ProceduralFxStudioApp {
     pub(super) fn draw_floor_and_template(&self, painter: &egui::Painter, view: &ViewCamera) {
         // Floor grid + axes
         if self.show_floor {
-            let gs = egui::Stroke::new(1.0, egui::Color32::from_gray(62));
+            let gs = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(62));
             let steps = (self.grid_extent / self.grid_spacing).round() as i32;
             for i in -steps..=steps {
                 let s = i as f32 * self.grid_spacing;
@@ -145,14 +145,14 @@ impl ProceduralFxStudioApp {
                 );
             }
             let o = Vec3::zero();
-            view.line3d(painter, o, Vec3::new(1.0, 0.0, 0.0), egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 70, 70)));
-            view.line3d(painter, o, Vec3::new(0.0, 1.0, 0.0), egui::Stroke::new(2.0, egui::Color32::from_rgb(70, 200, 70)));
-            view.line3d(painter, o, Vec3::new(0.0, 0.0, 1.0), egui::Stroke::new(2.0, egui::Color32::from_rgb(70, 120, 230)));
+            view.line3d(painter, o, Vec3::new(1.0, 0.0, 0.0), egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(220, 70, 70)));
+            view.line3d(painter, o, Vec3::new(0.0, 1.0, 0.0), egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(70, 200, 70)));
+            view.line3d(painter, o, Vec3::new(0.0, 0.0, 1.0), egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(70, 120, 230)));
         }
 
         // Template geometry ghosted wireframe
         if self.template.is_some() && self.template_mesh.indices.len() <= 20_000 {
-            let ts = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(230, 80, 200, 140));
+            let ts = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(230, 80, 200, 140));
             let tm = &self.template_mesh;
             for (t, shown) in tm.indices.iter().zip(poly::outline_edges(tm)) {
                 for k in (0..3).filter(|k| shown[*k]) {

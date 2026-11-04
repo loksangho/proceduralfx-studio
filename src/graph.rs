@@ -566,6 +566,7 @@ impl Graph {
         merged.unwrap_or_default()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
     pub(crate) fn cook_many(&self, ids: &[NodeId], time: f32, cache: &mut HashMap<NodeId, Mesh>) -> Mesh {
         let mut merged: Option<Mesh> = None;
         for id in ids {
@@ -1521,7 +1522,7 @@ impl Graph {
         let mut inputs: Vec<(usize, NodeId)> = self.links.iter().filter(|l| l.to == id).map(|l| (l.slot, l.from)).collect();
         inputs.sort_unstable();
         let input = |slot: usize| inputs.iter().find(|(k, _)| *k == slot).map(|(_, from)| *from);
-        let mut upstream = |slot: usize, onto: Option<Mesh>, visiting: &mut HashSet<NodeId>| match input(slot) {
+        let upstream = |slot: usize, onto: Option<Mesh>, visiting: &mut HashSet<NodeId>| match input(slot) {
             Some(from) => self.pop_eval(from, prev, s, onto, visiting),
             None => onto.unwrap_or_else(|| prev.clone()),
         };

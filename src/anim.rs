@@ -71,6 +71,7 @@ impl Channel {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
     pub fn constant(t: f32, v: f32) -> Channel {
         let mut channel = Channel::default();
         channel.set_key(t, v);
@@ -209,7 +210,6 @@ pub struct ChannelRow<'a> {
 }
 
 pub struct GraphEditor {
-    pub open: bool,
     // Visible window: time (seconds) and value ranges.
     t0: f32,
     t1: f32,
@@ -235,7 +235,6 @@ enum Drag {
 impl Default for GraphEditor {
     fn default() -> Self {
         Self {
-            open: false,
             t0: 0.0,
             t1: 5.0,
             v0: -1.0,
@@ -426,7 +425,7 @@ impl GraphEditor {
         let mut frame = ((t0 * fps) / frame_step).floor() * frame_step;
         while frame <= t1 * fps {
             let x = to_x(frame / fps);
-            painter.line_segment([egui::pos2(x, ruler.max.y), egui::pos2(x, rect.max.y)], egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
+            painter.line_segment([egui::pos2(x, ruler.max.y), egui::pos2(x, rect.max.y)], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(40)));
             painter.text(egui::pos2(x + 2.0, rect.min.y + 2.0), egui::Align2::LEFT_TOP, format!("{}", frame as i64 + 1), egui::FontId::monospace(10.0), egui::Color32::from_gray(140));
             frame += frame_step;
         }
@@ -438,7 +437,7 @@ impl GraphEditor {
         while value <= v1 {
             let y = to_y(value);
             let colour = if value.abs() < value_step * 0.01 { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(40) };
-            painter.line_segment([egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)], egui::Stroke::new(1.0, colour));
+            painter.line_segment([egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)], egui::Stroke::new(1.0_f32, colour));
             painter.text(egui::pos2(rect.min.x + 3.0, y - 1.0), egui::Align2::LEFT_BOTTOM, format!("{value:.3}"), egui::FontId::monospace(10.0), egui::Color32::from_gray(120));
             value += value_step;
         }
@@ -456,7 +455,7 @@ impl GraphEditor {
                     egui::pos2(x, to_y(row.channel.eval(to_t(x))))
                 })
                 .collect();
-            painter.add(egui::Shape::line(points, egui::Stroke::new(1.6, colour)));
+            painter.add(egui::Shape::line(points, egui::Stroke::new(1.6_f32, colour)));
         }
 
         // Keys and tangent handles; collect their screen positions for picking.
@@ -473,7 +472,7 @@ impl GraphEditor {
                         // Handle direction in screen space for this slope.
                         let d = egui::vec2(rect.width() / (t1 - t0), -slope * (rect.height() - ruler.height()) / (v1 - v0));
                         let tip = p + d.normalized() * tangent_len * if outgoing { 1.0 } else { -1.0 };
-                        painter.line_segment([p, tip], egui::Stroke::new(1.0, egui::Color32::from_gray(190)));
+                        painter.line_segment([p, tip], egui::Stroke::new(1.0_f32, egui::Color32::from_gray(190)));
                         painter.circle_filled(tip, 3.5, egui::Color32::from_gray(220));
                         handles.push((r, k, outgoing, tip));
                     }
@@ -483,14 +482,14 @@ impl GraphEditor {
                 painter.add(egui::Shape::convex_polygon(
                     vec![p + egui::vec2(0.0, -size), p + egui::vec2(size, 0.0), p + egui::vec2(0.0, size), p + egui::vec2(-size, 0.0)],
                     fill,
-                    egui::Stroke::new(1.0, egui::Color32::BLACK),
+                    egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
                 ));
                 key_points.push((r, k, p));
             }
         }
         // Current time.
         let x = to_x(time);
-        painter.line_segment([egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)], egui::Stroke::new(1.5, egui::Color32::from_rgb(240, 80, 80)));
+        painter.line_segment([egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)], egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(240, 80, 80)));
 
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         let shift = ui.input(|i| i.modifiers.shift);
@@ -595,7 +594,7 @@ impl GraphEditor {
                 }
                 Drag::Box { start } => {
                     let area = egui::Rect::from_two_pos(start, p);
-                    painter.rect_stroke(area, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 190, 255)), egui::StrokeKind::Inside);
+                    painter.rect_stroke(area, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(100, 190, 255)), egui::StrokeKind::Inside);
                 }
             }
         }

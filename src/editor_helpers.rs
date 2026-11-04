@@ -490,7 +490,7 @@ pub(crate) fn draw_wire(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2, color: 
         [a, a + egui::vec2(0.0, d), b - egui::vec2(0.0, d), b],
         false,
         egui::Color32::TRANSPARENT,
-        egui::Stroke::new(2.0, color),
+        egui::Stroke::new(2.0_f32, color),
     ));
 }
 pub(crate) fn vec3_ui(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f64) -> bool {

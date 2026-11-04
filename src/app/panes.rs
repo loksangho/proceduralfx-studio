@@ -251,7 +251,7 @@ impl ProceduralFxStudioApp {
                         let x = scrub.rect.left() + rail + (t - self.playback_start) / span * width;
                         ui.painter().line_segment(
                             [egui::pos2(x, scrub.rect.top()), egui::pos2(x, scrub.rect.top() + 6.0)],
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 60)),
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60)),
                         );
                     }
                 }
@@ -870,7 +870,7 @@ impl ProceduralFxStudioApp {
         } else if !prim.visible {
             text = text.weak();
         }
-        let mut row = |ui: &mut egui::Ui, this: &mut Self| {
+        let row = |ui: &mut egui::Ui, this: &mut Self| {
             ui.horizontal(|ui| {
                 if ui.selectable_label(selected, text.clone()).clicked() {
                     this.stage_selected_prim = Some(path.to_string());
@@ -926,7 +926,7 @@ impl ProceduralFxStudioApp {
         let scale = ((rect.width() - 24.0) / img.w as f32).min((rect.height() - 48.0) / img.h as f32).max(0.01);
         let shown = egui::Rect::from_center_size(rect.center(), egui::vec2(img.w as f32, img.h as f32) * scale);
         painter.image(texture.id(), shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-        painter.rect_stroke(shown, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
+        painter.rect_stroke(shown, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Outside);
         let mut info = format!("{} × {}", img.w, img.h);
         if let Some(p) = response.hover_pos().filter(|p| shown.contains(*p)) {
             let (x, y) = (((p.x - shown.min.x) / scale) as usize, ((p.y - shown.min.y) / scale) as usize);

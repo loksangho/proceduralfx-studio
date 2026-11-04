@@ -145,6 +145,7 @@ pub struct Camera {
 
 impl Camera {
     // The rotation field for cam_rot_x and cam_rot_y.
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
     pub fn rotation(x: f32, y: f32) -> [f32; 4] {
         let ((sin_x, cos_x), (sin_y, cos_y)) = (x.sin_cos(), y.sin_cos());
         [sin_x, cos_x, sin_y, cos_y]
@@ -161,7 +162,8 @@ impl Camera {
         [rx, ry, rrz + self.zoom]
     }
 
-    // main.rs's project_cam, from the viewport's top-left corner.
+    // ViewCamera::project_cam, from the viewport's top-left corner.
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
     pub fn project(&self, c: [f32; 3]) -> egui::Vec2 {
         if self.orthographic {
             self.center + egui::vec2(c[0], -c[1]) * self.ortho_scale

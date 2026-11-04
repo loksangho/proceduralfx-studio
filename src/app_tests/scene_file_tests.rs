@@ -143,7 +143,7 @@ fn dragging_a_rows_label_changes_all_its_values() {
     // Draws "Scale" and its three fields; returns the label's rect.
     let ctx = egui::Context::default();
     let mut v = [1.0f32, 2.0, 3.0];
-    let mut frame = |ctx: &egui::Context, v: &mut [f32; 3], input: egui::RawInput| {
+    let frame = |ctx: &egui::Context, v: &mut [f32; 3], input: egui::RawInput| {
         let mut rect = egui::Rect::NOTHING;
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {

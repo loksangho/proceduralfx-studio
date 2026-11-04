@@ -129,7 +129,7 @@ impl ProceduralFxStudioApp {
                                 *code = example.to_string();
                                 *domain = *example_domain;
                                 c = true;
-                                ui.close_menu();
+                                ui.close_kind(egui::UiKind::Menu);
                             }
                         }
                     });

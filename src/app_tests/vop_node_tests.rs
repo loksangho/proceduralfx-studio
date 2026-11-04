@@ -16,7 +16,7 @@ fn lift_network() -> (Graph, NodeId, NodeId) {
     let grid = g.add(NodeKind::Grid { size: 2.0, res: 3 }, egui::pos2(0.0, 0.0));
     let net = g.add(NodeKind::AttributeVop { domain: 2 }, egui::pos2(0.0, 0.0));
     g.connect(grid, net, 0);
-    let mut child = |g: &mut Graph, kind: NodeKind| {
+    let child = |g: &mut Graph, kind: NodeKind| {
         let id = g.add(kind, egui::pos2(0.0, 0.0));
         g.nodes.get_mut(&id).unwrap().parent = Some(net);
         id

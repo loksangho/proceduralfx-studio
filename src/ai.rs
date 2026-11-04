@@ -711,6 +711,7 @@ fn place(graph: &mut Graph, placed: &[NodeId]) {
 }
 
 // Applies the edits in order; a failed edit is skipped (and reported), the rest still run.
+#[cfg_attr(not(test), allow(dead_code))] // only the tests call it
 pub fn apply(graph: &mut Graph, edits: &[Edit]) -> Report {
     apply_session(graph, edits, &mut BTreeMap::new())
 }

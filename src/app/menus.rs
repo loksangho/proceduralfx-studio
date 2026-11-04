@@ -298,7 +298,7 @@ impl ProceduralFxStudioApp {
                 Ok(path) => format!("Opened the documentation ({path})"),
                 Err(e) => format!("Couldn't open the documentation: {e}"),
             };
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         ui.separator();
         self.updater.menu(ui);

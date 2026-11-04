@@ -308,7 +308,7 @@ impl ProceduralFxStudioApp {
                             set.angle = *angle;
                             set.step = *step;
                             c = true;
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
                 });

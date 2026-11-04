@@ -58,7 +58,7 @@ fn foreach_loops_run_their_body_per_piece() {
     app.graph.connect(end, compile_end, 0);
     assert!(app.graph.in_compile_block(begin));
     let compiled = app.graph.cook(compile_end, 0.0, &mut HashMap::new());
-    let mut sorted = |m: &Mesh| { let mut v: Vec<(i32, i32, i32)> = m.vertices.iter().map(|p| ((p.x * 100.0) as i32, (p.y * 100.0) as i32, (p.z * 100.0) as i32)).collect(); v.sort(); v };
+    let sorted = |m: &Mesh| { let mut v: Vec<(i32, i32, i32)> = m.vertices.iter().map(|p| ((p.x * 100.0) as i32, (p.y * 100.0) as i32, (p.z * 100.0) as i32)).collect(); v.sort(); v };
     assert_eq!(sorted(&compiled), sorted(&out));
     // Feedback: each pass adds 1.
     let fb = add_in(&mut app, geo, NodeKind::ForEachEnd(flow::ForEachSettings { iterations: 5, ..flow::ForEachSettings::new(flow::FEEDBACK) }));

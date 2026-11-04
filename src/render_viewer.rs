@@ -555,7 +555,7 @@ impl RenderViewer {
             let min = image_rect.min + egui::vec2(*x0 as f32, *y0 as f32) * self.zoom;
             let max = image_rect.min + egui::vec2(*x1 as f32, *y1 as f32) * self.zoom;
             let arm = ((max.x - min.x).min(max.y - min.y) * 0.25).clamp(3.0, 14.0);
-            let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 190, 60));
+            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 190, 60));
             for (corner, dx, dy) in [(min, 1.0, 1.0), (egui::pos2(max.x, min.y), -1.0, 1.0), (egui::pos2(min.x, max.y), 1.0, -1.0), (max, -1.0, -1.0)] {
                 painter.line_segment([corner, corner + egui::vec2(arm * dx, 0.0)], stroke);
                 painter.line_segment([corner, corner + egui::vec2(0.0, arm * dy)], stroke);

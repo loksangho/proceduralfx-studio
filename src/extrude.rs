@@ -105,7 +105,7 @@ pub fn extrude(input: &Mesh, selected: Option<&[bool]>, set: &ExtrudeSettings) -
         }
     }
     // Layers of moved points: layer[k][p] for k in 1..=divisions (layer 0 is the original point).
-    let mut add_point = |out: &mut Mesh, point_source: &mut Vec<usize>, p: Vec3, from: usize| {
+    let add_point = |out: &mut Mesh, point_source: &mut Vec<usize>, p: Vec3, from: usize| {
         out.vertices.push(p);
         point_source.push(from);
         out.vertices.len() - 1

@@ -248,10 +248,6 @@ impl Table {
         }
     }
 
-    pub fn len(self) -> usize {
-        self.params().iter().map(Param::width).sum()
-    }
-
     fn offset(self, key: &str) -> Option<(usize, &'static Param)> {
         let mut at = 0;
         for p in self.params() {

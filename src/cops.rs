@@ -38,10 +38,6 @@ impl Image {
         Image { w, h, px: vec![fill; w * h] }
     }
 
-    pub fn is_image(mesh: &Mesh) -> bool {
-        mesh.point_attributes.contains_key(SIZE)
-    }
-
     pub fn from_mesh(mesh: &Mesh) -> Option<Image> {
         let size = mesh.point_attributes.get(SIZE).filter(|s| s.len() >= 2)?;
         let (w, h) = (size[0] as usize, size[1] as usize);

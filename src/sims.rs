@@ -514,7 +514,7 @@ const PRESSURE_ITERATIONS: usize = 30;
 
 fn pyro_step(s: &mut PyroState, set: &PyroSettings, dt: f32, time: f32, animated_source: Option<&[f32]>) {
     let g = s.grid;
-    let [nx, ny, nz] = g.n;
+    let [nx, ny, _nz] = g.n;
     let n = g.len();
     let solid = s.solid.clone();
     let static_source = s.source.clone();
@@ -769,7 +769,7 @@ fn project(s: &mut PyroState) {
 // Semi-Lagrangian advection with a midpoint backtrace. Smoke entering from outside the domain is empty.
 fn advect(s: &mut PyroState, dt: f32) {
     let g = s.grid;
-    let [nx, ny, nz] = g.n;
+    let [nx, ny, _nz] = g.n;
     let n = g.len();
     let slice = nx * ny;
     // Each z-slice on its own core: cells read the old fields and write only themselves.
@@ -1359,7 +1359,7 @@ mod tests {
     fn step_cache_resumes_and_rewinds() {
         clear_all();
         let calls = std::cell::Cell::new(0);
-        let mut simulate = |target: usize| {
+        let simulate = |target: usize| {
             run(
                 9001,
                 target,

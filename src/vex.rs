@@ -4522,6 +4522,7 @@ fn run(mesh: Mesh, code: &str, time: f32, domain_index: usize) -> (Mesh, VexRepo
     run_timed(mesh, code, time, 1.0 / crate::sims::SIM_FPS, domain_index)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // only the tests call it
 fn run_timed(mesh: Mesh, code: &str, time: f32, time_inc: f32, domain_index: usize) -> (Mesh, VexReport) {
     run_masked(mesh, &[], code, time, time_inc, domain_index, None, None)
 }

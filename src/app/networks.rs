@@ -886,7 +886,7 @@ impl ProceduralFxStudioApp {
         }
         if let (Some(start), Some(now)) = (self.node_box, ui.input(|i| i.pointer.interact_pos())) {
             let area = egui::Rect::from_two_pos(start, now);
-            painter.rect(area, 0.0, egui::Color32::from_rgba_unmultiplied(255, 200, 60, 20), egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 200, 60)), egui::StrokeKind::Inside);
+            painter.rect(area, 0.0, egui::Color32::from_rgba_unmultiplied(255, 200, 60, 20), egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 200, 60)), egui::StrokeKind::Inside);
             if canvas.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
                 self.node_box = None;
                 let mut inside: Vec<NodeId> = self.graph.nodes.iter()
@@ -925,7 +925,7 @@ impl ProceduralFxStudioApp {
             let at = egui::pos2((menu_pos.x - origin.x) / zoom, (menu_pos.y - origin.y) / zoom);
             if let Some(kind) = node_search_ui(ui, &mut query, &mut pick, &templates) {
                 actions.push(Action::Add(kind, at));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         });
         self.menu_query = query;
@@ -1006,34 +1006,34 @@ impl ProceduralFxStudioApp {
             resp.clone().context_menu(|ui| {
                 if is_geometry && ui.button("Enter (double-click)").clicked() {
                     actions.push(Action::Enter(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Rename (F2)").clicked() {
                     self.selected = Some(id);
                     self.focus_rename = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Node Info (hold middle button)").clicked() {
                     self.inspect_node = Some(id);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 let display_label = if is_object { "Toggle Active / Activate Camera" } else { "Set Display Flag" };
                 if ui.button(display_label).clicked() {
                     actions.push(Action::Display(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if !is_object && ui.button("Toggle Bypass (B)").clicked() {
                     actions.push(Action::Bypass(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 let together = chosen.len() > 1 && chosen.contains(&id);
                 if ui.button(if together { "Duplicate selected (Ctrl+D)" } else { "Duplicate (Ctrl+D)" }).clicked() {
                     actions.push(if together { Action::DuplicateMany(chosen.iter().copied().collect()) } else { Action::Duplicate(id) });
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Delete").clicked() {
                     actions.push(Action::Delete(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
 
@@ -1120,7 +1120,7 @@ impl ProceduralFxStudioApp {
                 egui::CornerRadius::same(6),
                 body,
                 egui::Stroke::new(
-                    if sel { 2.0 } else { 1.0 },
+                    if sel { 2.0 } else { 1.0_f32 },
                     if sel { egui::Color32::from_rgb(255, 200, 60) } else { egui::Color32::from_gray(95) },
                 ),
                 egui::StrokeKind::Outside,
@@ -1141,7 +1141,7 @@ impl ProceduralFxStudioApp {
                 painter.rect_stroke(
                     rect.shrink(3.0),
                     egui::CornerRadius::same(4),
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 80, 200)),
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(230, 80, 200)),
                     egui::StrokeKind::Outside,
                 );
             }

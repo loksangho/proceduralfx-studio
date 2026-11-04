@@ -102,13 +102,6 @@ impl RandomizeSettings {
         }
     }
 
-    pub fn key(&self) -> String {
-        if self.preset < CUSTOM {
-            return PRESETS[self.preset].to_owned();
-        }
-        attrib::key(&self.name, self.class)
-    }
-
     // Distributions that make sense for this type.
     pub fn distributions(kind: usize) -> Vec<usize> {
         match kind {

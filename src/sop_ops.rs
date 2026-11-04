@@ -683,7 +683,7 @@ pub(crate) fn lock_for_modal(ctx: &egui::Context) -> Option<(egui::ViewportId, S
 
 // Covers the app's window while a modal window is open, taking every click, and says why.
 pub(crate) fn modal_cover(ctx: &egui::Context, title: &str) {
-    let screen = ctx.screen_rect();
+    let screen = ctx.viewport_rect();
     egui::Area::new(egui::Id::new("pfx_modal_cover")).order(egui::Order::Foreground).fixed_pos(screen.min).interactable(true).show(ctx, |ui| {
         let response = ui.allocate_rect(screen, egui::Sense::click_and_drag());
         ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(110));
@@ -1377,95 +1377,6 @@ pub(crate) fn node_jitter(mut mesh: Mesh, amp: f32, seed: u32, scale: [f32; 3]) 
 pub(crate) struct FlipParticle {
     pub(crate) position: Vec3,
     pub(crate) velocity: Vec3,
-}
-
-pub(crate) fn point_inside_closed_mesh(point: Vec3, mesh: &Mesh) -> bool {
-    let mut crossings = 0usize;
-    for tri in &mesh.indices {
-        let a = mesh.vertices[tri[0]];
-        let b = mesh.vertices[tri[1]];
-        let c = mesh.vertices[tri[2]];
-        let direction = Vec3::new(1.0, 0.371, 0.173).normalize();
-        let edge1 = b.sub(a);
-        let edge2 = c.sub(a);
-        let h = direction.cross(edge2);
-        let det = edge1.dot(h);
-        if det.abs() < 1e-7 {
-            continue;
-        }
-        let inv_det = 1.0 / det;
-        let s = point.sub(a);
-        let u = inv_det * s.dot(h);
-        if !(0.0..=1.0).contains(&u) {
-            continue;
-        }
-        let q = s.cross(edge1);
-        let v = inv_det * direction.dot(q);
-        if v < 0.0 || u + v > 1.0 {
-            continue;
-        }
-        let t = inv_det * edge2.dot(q);
-        if t > 1e-6 {
-            crossings += 1;
-        }
-    }
-    crossings % 2 == 1
-}
-
-pub(crate) fn closest_mesh_surface(point: Vec3, mesh: &Mesh) -> Option<(Vec3, Vec3, f32)> {
-    let mut best = None;
-    for tri in &mesh.indices {
-        let a = mesh.vertices[tri[0]];
-        let b = mesh.vertices[tri[1]];
-        let c = mesh.vertices[tri[2]];
-        let ab = b.sub(a);
-        let ac = c.sub(a);
-        let n = ab.cross(ac).normalize();
-        if n.length() < 1e-6 {
-            continue;
-        }
-        let mut q = point;
-        let distance = point.sub(a).dot(n);
-        q = q.sub(n.scale(distance));
-        let v0 = b.sub(a);
-        let v1 = c.sub(a);
-        let v2 = q.sub(a);
-        let d00 = v0.dot(v0);
-        let d01 = v0.dot(v1);
-        let d11 = v1.dot(v1);
-        let d20 = v2.dot(v0);
-        let d21 = v2.dot(v1);
-        let denom = d00 * d11 - d01 * d01;
-        if denom.abs() < 1e-8 {
-            continue;
-        }
-        let v = (d11 * d20 - d01 * d21) / denom;
-        let w = (d00 * d21 - d01 * d20) / denom;
-        let u = 1.0 - v - w;
-        let closest = if u >= 0.0 && v >= 0.0 && w >= 0.0 {
-            q
-        } else {
-            let closest_segment = |p: Vec3, x: Vec3, y: Vec3| {
-                let edge = y.sub(x);
-                let t = p.sub(x).dot(edge) / edge.dot(edge).max(1e-8);
-                x.add(edge.scale(t.clamp(0.0, 1.0)))
-            };
-            let candidates = [
-                closest_segment(point, a, b),
-                closest_segment(point, b, c),
-                closest_segment(point, c, a),
-            ];
-            *candidates.iter().min_by(|left, right| {
-                point.sub(**left).length().partial_cmp(&point.sub(**right).length())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })?
-        };
-        let distance = point.sub(closest).length();
-        if best.as_ref().is_none_or(|(_, _, best_distance)| distance < *best_distance) {
-            best = Some((closest, n, distance));
-        }
-    }
-    best
 }
 
 pub(crate) fn segment_mesh_hit(start: Vec3, end: Vec3, mesh: &Mesh) -> Option<(Vec3, Vec3, f32)> {

@@ -183,6 +183,7 @@ impl Viewer {
         &self.frames
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }

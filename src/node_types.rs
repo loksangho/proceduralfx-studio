@@ -288,7 +288,7 @@ pub(crate) fn node_search_ui(ui: &mut egui::Ui, query: &mut String, pick: &mut u
                 };
                 if button.clicked() {
                     chosen = Some(kind.clone());
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         });
@@ -337,7 +337,7 @@ pub(crate) fn examples_menu(ui: &mut egui::Ui, code: &mut String, examples: &[(&
             if ui.button(*label).on_hover_text("Replaces the current code").clicked() {
                 *code = example.to_string();
                 changed = true;
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         }
     });
