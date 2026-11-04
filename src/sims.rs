@@ -490,6 +490,9 @@ struct PyroState {
     solid: Arc<Vec<bool>>,
     // Rasterized source of a static source; empty until the first step, unused when animated.
     source: Arc<Vec<f32>>,
+    // How finely the turbulence varies, set from the source's size when it first emits:
+    // swirls about the size of the source, so a small plume is stirred, not blown aside.
+    swirl_frequency: Option<f32>,
 }
 
 impl PyroState {
@@ -506,6 +509,7 @@ impl PyroState {
             flame: zeros,
             solid: Arc::new(solid),
             source: Arc::new(Vec::new()),
+            swirl_frequency: None,
         }
     }
 }
@@ -519,6 +523,23 @@ fn pyro_step(s: &mut PyroState, set: &PyroSettings, dt: f32, time: f32, animated
     let solid = s.solid.clone();
     let static_source = s.source.clone();
     let source: &[f32] = animated_source.unwrap_or(&static_source);
+
+    // The turbulence's scale: the larger of the domain's and the source's (see swirl_frequency).
+    if s.swirl_frequency.is_none() {
+        let (mut lo, mut hi) = ([usize::MAX; 3], [0usize; 3]);
+        for (i, _) in source.iter().enumerate().filter(|(_, w)| **w > 0.0) {
+            let at = [i % nx, (i / nx) % ny, i / (nx * ny)];
+            for a in 0..3 {
+                lo[a] = lo[a].min(at[a]);
+                hi[a] = hi[a].max(at[a]);
+            }
+        }
+        if hi[0] >= lo[0] && lo[0] != usize::MAX {
+            let extent = (0..3).map(|a| (hi[a] - lo[a] + 1) as f32 * g.h).fold(0.0, f32::max);
+            let domain = 2.5 / set.size.iter().cloned().fold(0.1, f32::max);
+            s.swirl_frequency = Some(domain.max(1.0 / extent.max(4.0 * g.h)));
+        }
+    }
 
     // Sources write the maximum of the current and source values, like Pyro's "maximum" mode.
     for (i, &weight) in source.iter().enumerate() {
@@ -546,9 +567,38 @@ fn pyro_step(s: &mut PyroState, set: &PyroSettings, dt: f32, time: f32, animated
     // Forces: buoyancy, wind and turbulence.
     let wind = Vec3::from_arr(set.wind);
     let wind_blend = if wind.length() > 0.0 { 1.0 - (-0.5 * dt).exp() } else { 0.0 };
-    let frequency = 2.5 / set.size.iter().cloned().fold(0.1, f32::max);
+    let frequency = s.swirl_frequency.unwrap_or(2.5 / set.size.iter().cloned().fold(0.1, f32::max));
     let slice = nx * ny;
     let (temperature, density) = (&s.temperature, &s.density);
+    // The turbulence in each cell with smoke or heat, less its average over them (weighted
+    // by how much there is): it stirs the smoke without pushing all of it one way.
+    let stirred = |i: usize| density[i] + temperature[i] > 0.01 && !solid[i];
+    let swirl: Vec<[f32; 3]> = if set.turbulence > 0.0 {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if !stirred(i) {
+                    return [0.0; 3];
+                }
+                let p = g.center(i % nx, (i / nx) % ny, i / slice);
+                let q = [p.x * frequency + time * 0.3, p.y * frequency - time * 0.6, p.z * frequency + time * 0.2];
+                [perlin3(q, 11), perlin3(q, 23), perlin3(q, 37)]
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mean = {
+        let (mut sum, mut weight) = ([0.0f64; 3], 0.0f64);
+        for (i, f) in swirl.iter().enumerate().filter(|(i, _)| stirred(*i)) {
+            let amount = (density[i] + temperature[i]) as f64;
+            for a in 0..3 {
+                sum[a] += f[a] as f64 * amount;
+            }
+            weight += amount;
+        }
+        if weight > 0.0 { sum.map(|v| (v / weight) as f32) } else { [0.0; 3] }
+    };
     // Each z-slice on its own core: a cell's forces change only its own velocity.
     s.u.par_chunks_mut(slice).zip(s.v.par_chunks_mut(slice)).zip(s.w.par_chunks_mut(slice)).enumerate().for_each(|(z, ((u, v), w))| {
         for y in 0..ny {
@@ -564,13 +614,11 @@ fn pyro_step(s: &mut PyroState, set: &PyroSettings, dt: f32, time: f32, animated
                     v[k] += (wind.y - v[k]) * wind_blend;
                     w[k] += (wind.z - w[k]) * wind_blend;
                 }
-                if set.turbulence > 0.0 && density[i] + temperature[i] > 0.01 {
-                    let p = g.center(x, y, z);
-                    let q = [p.x * frequency + time * 0.3, p.y * frequency - time * 0.6, p.z * frequency + time * 0.2];
+                if set.turbulence > 0.0 && stirred(i) {
                     let push = set.turbulence * 6.0 * dt;
-                    u[k] += perlin3(q, 11) * push;
-                    v[k] += perlin3(q, 23) * push;
-                    w[k] += perlin3(q, 37) * push;
+                    u[k] += (swirl[i][0] - mean[0]) * push;
+                    v[k] += (swirl[i][1] - mean[1]) * push;
+                    w[k] += (swirl[i][2] - mean[2]) * push;
                 }
             }
         }
@@ -1300,6 +1348,71 @@ pub fn rbd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A small plume, from a ball 0.4 across, in the default 4 × 5 × 4 domain: where its
+    // smoke is after 2 seconds, relative to the source, for sources at a few places (the
+    // noise differs at each). Returns (sideways drift, rise, sideways spread) per source.
+    pub(crate) fn small_plume_drift(settings: &PyroSettings) -> Vec<(f32, f32, f32)> {
+        [[0.0f32, 0.3, 0.0], [-1.1, 0.3, 0.6], [0.8, 0.3, -0.9]]
+            .into_iter()
+            .enumerate()
+            .map(|(k, at)| {
+                let mut ball = crate::node_sphere(0.2, 8, 12);
+                for v in &mut ball.vertices {
+                    *v = Vec3::new(v.x + at[0], v.y + at[1], v.z + at[2]);
+                }
+                clear_all();
+                let smoke = pyro(9100 + k as u64, settings, 2.0, false, |_| ball.clone(), Mesh::default);
+                let density = &smoke.point_attributes["density"];
+                let (mut sum, mut weight) = (Vec3::zero(), 0.0);
+                for (p, d) in smoke.vertices.iter().zip(density) {
+                    sum = sum.add(p.scale(*d));
+                    weight += d;
+                }
+                let c = sum.scale(1.0 / weight.max(1e-6));
+                let spread = (smoke.vertices.iter().zip(density).map(|(p, d)| ((p.x - c.x).powi(2) + (p.z - c.z).powi(2)) * d).sum::<f32>() / weight.max(1e-6)).sqrt();
+                (((c.x - at[0]).powi(2) + (c.z - at[2]).powi(2)).sqrt(), c.y - at[1], spread)
+            })
+            .collect()
+    }
+
+    // Side views (looking along z) of the first source's plume at 2 seconds, for looking at.
+    #[test]
+    #[ignore]
+    fn write_small_plume_views() {
+        let dir = std::env::var("PFX_PLUME_DIR").unwrap();
+        for (name, settings) in [("turbulent", PyroSettings::default()), ("calm", PyroSettings { turbulence: 0.0, ..PyroSettings::default() })] {
+            let ball = crate::node_sphere(0.2, 8, 12).vertices.iter().map(|v| Vec3::new(v.x, v.y + 0.3, v.z)).collect::<Vec<_>>();
+            let mut source = crate::node_sphere(0.2, 8, 12);
+            source.vertices = ball;
+            clear_all();
+            let smoke = pyro(9200, &settings, 2.0, false, |_| source.clone(), Mesh::default);
+            let (w, h) = (200u32, 250u32);
+            let mut column = vec![0.0f32; (w * h) as usize];
+            for (p, d) in smoke.vertices.iter().zip(&smoke.point_attributes["density"]) {
+                let (x, y) = (((p.x + 2.0) / 4.0 * w as f32) as i64, ((1.0 - (p.y + 0.5) / 5.0) * h as f32) as i64);
+                if (0..w as i64).contains(&x) && (0..h as i64).contains(&y) {
+                    column[(y as u32 * w + x as u32) as usize] += d;
+                }
+            }
+            let image = image::GrayImage::from_fn(w, h, |x, y| image::Luma([((1.0 - (-column[(y * w + x) as usize] * 0.5).exp()) * 255.0) as u8]));
+            image.save(format!("{dir}/{name}.png")).unwrap();
+        }
+    }
+
+    // Turbulence stirs a small plume, spreading it, but doesn't blow it aside: it used to
+    // vary on the scale of the whole domain, so a plume smaller than its swirls got one push
+    // all over, like a wind.
+    #[test]
+    fn turbulence_stirs_small_plumes_without_blowing_them_aside() {
+        let turbulent = small_plume_drift(&PyroSettings::default());
+        let calm = small_plume_drift(&PyroSettings { turbulence: 0.0, ..PyroSettings::default() });
+        for ((drift, rise, spread), (_, _, calm_spread)) in turbulent.iter().zip(&calm) {
+            assert!(*rise > 0.5, "it rises: {rise}");
+            assert!(drift / rise < 0.15, "sideways {drift} for a rise of {rise}");
+            assert!(*spread > calm_spread * 1.1, "turbulence spreads it: {spread} against {calm_spread} without");
+        }
+    }
 
     #[test]
     fn smoke_is_lit_by_the_scenes_lights_through_itself() {
