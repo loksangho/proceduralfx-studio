@@ -479,6 +479,8 @@ pub(crate) struct ProceduralFxStudioApp {
     // The output being wired: (node, output).
     pub(crate) dragging_link: Option<(NodeId, usize)>,
     pub(crate) graph_pan: egui::Vec2,
+    // Where the network editor's canvas was last drawn (end-to-end tests aim at nodes by it).
+    pub(crate) network_canvas: egui::Rect,
     pub(crate) graph_zoom: f32,
     pub(crate) menu_pos: egui::Pos2,
 
@@ -596,6 +598,9 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) frame_cache_misses: usize,
     pub(crate) simulation_rx: Option<Receiver<Mesh>>,
     pub(crate) simulation_key: String,
+    // The status message a background cook's progress message replaced, put back when the
+    // cook finishes (a preset's hint, say).
+    pub(crate) status_before_cook: Option<String>,
     pub(crate) cancelled_simulation_key: String,
     pub(crate) simulation_cancel: Option<Arc<AtomicBool>>,
     pub(crate) moonray_rx: Option<Receiver<RenderOutcome>>,
@@ -787,6 +792,7 @@ impl Default for ProceduralFxStudioApp {
             node_box: None,
             dragging_link: None,
             graph_pan: egui::Vec2::ZERO,
+            network_canvas: egui::Rect::NOTHING,
             graph_zoom: 1.0,
             menu_pos: egui::Pos2::ZERO,
             render_mode: RenderMode::ShadedWireframe,
@@ -872,6 +878,7 @@ impl Default for ProceduralFxStudioApp {
             frame_cache_misses: 0,
             simulation_rx: None,
             simulation_key: String::new(),
+            status_before_cook: None,
             cancelled_simulation_key: String::new(),
             simulation_cancel: None,
             moonray_rx: None,

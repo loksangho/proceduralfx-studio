@@ -212,6 +212,9 @@ impl ProceduralFxStudioApp {
                 self.simulation_cancel = Some(cancel);
                 self.simulation_key = frame_key;
                 self.cancelled_simulation_key.clear();
+                if !self.status.ends_with("… press Escape to cancel") {
+                    self.status_before_cook = Some(std::mem::take(&mut self.status));
+                }
                 self.status = format!("{}… press Escape to cancel", self.graph.cooking_label(&displays));
             } else if let Some(rx) = &self.simulation_rx {
                 match rx.try_recv() {
@@ -229,7 +232,12 @@ impl ProceduralFxStudioApp {
                         self.simulation_rx = None;
                         self.simulation_cancel = None;
                         self.simulation_key.clear();
-                        self.status.clear();
+                        // The progress message gives way to what it replaced; a message set
+                        // meanwhile stays.
+                        let before = self.status_before_cook.take().unwrap_or_default();
+                        if self.status.ends_with("… press Escape to cancel") {
+                            self.status = before;
+                        }
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -837,6 +845,7 @@ impl ProceduralFxStudioApp {
         let (canvas, painter) =
             ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         painter.rect_filled(canvas.rect, 0.0, egui::Color32::from_gray(30));
+        self.network_canvas = canvas.rect;
         let origin = canvas.rect.min.to_vec2() + self.graph_pan;
         if canvas.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);

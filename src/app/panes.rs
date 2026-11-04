@@ -223,7 +223,9 @@ impl ProceduralFxStudioApp {
                     .on_hover_text(format!("Playback rate. Scenes are {} frames a second, so {} plays in real time; frames that take longer to cook are waited for, never skipped", sims::SIM_FPS, sims::SIM_FPS));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.status.is_empty() {
-                        ui.label(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_GREEN));
+                        // Only as wide as what's left of the row: a long message is cut short
+                        // (with all of it on hover) instead of running over the buttons.
+                        ui.add(egui::Label::new(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_GREEN)).truncate()).on_hover_text(&self.status);
                     }
                 });
             });

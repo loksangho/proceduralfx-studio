@@ -11,6 +11,14 @@ impl eframe::App for ProceduralFxStudioApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl ProceduralFxStudioApp {
+    // One frame of the whole app. Separate from eframe's update so tests can drive the
+    // real UI without a window (see app_tests::gui_flows).
+    pub(crate) fn frame(&mut self, ctx: &egui::Context) {
         // A dialog in its own window locks this one.
         lock_for_modal(ctx);
         // Windows rendering set-up: show what the helper is doing.

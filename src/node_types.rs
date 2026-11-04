@@ -523,6 +523,11 @@ pub(crate) fn viewport_texture(ctx: &egui::Context, image: egui::ColorImage) -> 
 
 // Per-user settings folder (recent files, updater preferences).
 pub(crate) fn app_config_dir() -> Option<PathBuf> {
+    // Tests click through the real UI (recent scenes, layouts, assets): keep what they
+    // write out of the user's own settings.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("pfx_test_config_{}", std::process::id())));
+    }
     if cfg!(windows) {
         // %APPDATA%\ProceduralFX Studio (Windows doesn't set HOME).
         return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("ProceduralFX Studio"));
@@ -591,9 +596,7 @@ pub(crate) fn default_asset_dir() -> Option<PathBuf> {
 
 // Where autosaves and crash reports go. Tests mustn't touch the user's.
 pub(crate) fn recovery_dir() -> Option<PathBuf> {
-    if cfg!(test) {
-        return None;
-    }
+    // In tests this is in their own temporary settings folder (app_config_dir).
     Some(app_config_dir()?.join("recovery"))
 }
 

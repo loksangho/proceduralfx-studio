@@ -1,0 +1,257 @@
+// End-to-end tests of the whole app: the real UI, frame by frame, driven like a user
+// (moving the mouse, clicking menus and buttons by their labels, typing, pressing keys)
+// through egui_kittest. What they write goes to a temporary settings folder (see
+// app_config_dir), not the user's.
+use crate::*;
+use egui_kittest::kittest::Queryable;
+use egui_kittest::Harness;
+
+fn harness(app: ProceduralFxStudioApp) -> Harness<'static, ProceduralFxStudioApp> {
+    let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 60.0).build_state(|ctx, app: &mut ProceduralFxStudioApp| app.frame(ctx), app);
+    harness.run_steps(4);
+    harness
+}
+
+// An app showing an empty geometry network, not playing.
+fn empty_network() -> ProceduralFxStudioApp {
+    let mut app = ProceduralFxStudioApp::default();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnext 1\n".into());
+    app.current_network = Some(0);
+    app.selected = None;
+    app.animate = false;
+    app
+}
+
+fn pointer(h: &mut Harness<ProceduralFxStudioApp>, at: egui::Pos2) {
+    h.hover_at(at);
+    h.run_steps(2);
+}
+
+fn press(h: &Harness<ProceduralFxStudioApp>, at: egui::Pos2, pressed: bool) {
+    h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+}
+
+fn button(h: &mut Harness<ProceduralFxStudioApp>, at: egui::Pos2, pressed: bool) {
+    press(h, at, pressed);
+    h.run_steps(2);
+}
+
+fn click_at(h: &mut Harness<ProceduralFxStudioApp>, at: egui::Pos2) {
+    pointer(h, at);
+    button(h, at, true);
+    button(h, at, false);
+}
+
+// Drags with the left button from `from` to `to`, in steps, as a hand would.
+fn drag(h: &mut Harness<ProceduralFxStudioApp>, from: egui::Pos2, to: egui::Pos2) {
+    pointer(h, from);
+    button(h, from, true);
+    for k in 1..=8 {
+        pointer(h, from + (to - from) * (k as f32 / 8.0));
+    }
+    button(h, to, false);
+}
+
+// Tab over the network at `at`, type the node's name, Enter: returns the node added.
+fn add_with_tab(h: &mut Harness<ProceduralFxStudioApp>, at: egui::Pos2, name: &str) -> NodeId {
+    let before: std::collections::HashSet<NodeId> = h.state().graph.nodes.keys().copied().collect();
+    pointer(h, at);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    h.event(egui::Event::Text(name.into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let added: Vec<NodeId> = h.state().graph.nodes.keys().copied().filter(|id| !before.contains(id)).collect();
+    assert_eq!(added.len(), 1, "Tab, {name}, Enter adds one node: {added:?}");
+    added[0]
+}
+
+// A point in the network canvas, as fractions of its width and height.
+fn in_canvas(h: &Harness<ProceduralFxStudioApp>, x: f32, y: f32) -> egui::Pos2 {
+    let c = h.state().network_canvas;
+    egui::pos2(c.left() + c.width() * x, c.top() + c.height() * y)
+}
+
+// Where node `id` is on screen.
+fn node_on_screen(h: &Harness<ProceduralFxStudioApp>, id: NodeId) -> egui::Rect {
+    let app = h.state();
+    node_rect(app.graph.nodes[&id].pos, app.network_canvas.min.to_vec2() + app.graph_pan, app.graph_zoom)
+}
+
+#[test]
+fn a_network_is_built_from_the_tab_menu_and_wired_by_dragging() {
+    let mut h = harness(empty_network());
+    let canvas = h.state().network_canvas;
+    assert!(canvas.width() > 200.0 && canvas.height() > 150.0, "the network editor shows: {canvas:?}");
+
+    let at = in_canvas(&h, 0.15, 0.15);
+    let grid = add_with_tab(&mut h, at, "grid");
+    assert_eq!(h.state().graph.nodes[&grid].kind.name(), "grid");
+    assert_eq!(h.state().graph.nodes[&grid].parent, Some(0), "inside the network being viewed");
+    // Click empty canvas so the next node isn't wired below this one automatically.
+    let empty = in_canvas(&h, 0.8, 0.9);
+    click_at(&mut h, empty);
+    assert_eq!(h.state().selected, None, "clicking empty space deselects");
+    let at = in_canvas(&h, 0.3, 0.45);
+    let noise = add_with_tab(&mut h, at, "noise");
+    assert!(!h.state().graph.links.iter().any(|l| l.to == noise), "not wired yet");
+
+    // Drag from the grid's output to the noise's input.
+    let (from, to) = (out_port(node_on_screen(&h, grid)), in_port(node_on_screen(&h, noise), 0, h.state().graph.input_slots(noise)));
+    drag(&mut h, from, to);
+    let wired = |h: &Harness<ProceduralFxStudioApp>| h.state().graph.links.iter().any(|l| l.from == grid && l.to == noise && l.slot == 0);
+    assert!(wired(&h), "dragging between the ports wires them: {:?}", h.state().graph.links.iter().map(|l| (l.from, l.to, l.slot)).collect::<Vec<_>>());
+
+    // The toolbar's undo takes the wire away, and redo puts it back.
+    h.get_by_label("↶").click();
+    h.run_steps(3);
+    assert!(!wired(&h), "undone");
+    h.get_by_label("↷").click();
+    h.run_steps(3);
+    assert!(wired(&h), "redone");
+
+    // Double-clicking the noise shows it: the viewport cooks the grid through it.
+    let centre = node_on_screen(&h, noise).center();
+    pointer(&mut h, centre);
+    // A moment after the last click, or egui counts a triple-click.
+    h.run_steps(60);
+    // One frame each, so the two clicks come close enough together.
+    for pressed in [true, false, true, false] {
+        press(&h, centre, pressed);
+        h.step();
+    }
+    h.run_steps(3);
+    assert_eq!(h.state().graph.display_of(0), Some(noise), "the display flag moved to the noise");
+    assert!(!h.state().current_mesh.vertices.is_empty(), "and the viewport shows it");
+}
+
+#[test]
+fn a_preset_opens_from_the_file_menu() {
+    let mut h = harness(empty_network());
+    h.get_by_label("File").click();
+    h.run_steps(2);
+    h.get_by_label_contains("New from Preset").click();
+    h.run_steps(2);
+    h.get_by_label("Smoke (loop)").click_accesskit();
+    h.run_steps(6);
+    let app = h.state();
+    assert!(app.status.starts_with("New scene from the Smoke preset"), "{}", app.status);
+    assert_eq!(app.graph.nodes.values().filter(|n| n.name == "sheet_camera").count(), 1, "the preset's scene, with its camera");
+    assert_eq!((app.playback_start, app.playback_end), presets::find("Smoke").unwrap().range);
+}
+
+
+// A long status message stays beside the timeline's buttons, cut short, never over them.
+#[test]
+fn a_long_status_never_covers_the_play_buttons() {
+    let mut h = harness(empty_network());
+    h.state_mut().status = format!("Sprite sheet: saved to {} and every file each engine needs beside it", "/a/very/long/folder/name".repeat(12));
+    h.run_steps(3);
+    let status = h.get_by_label_contains("Sprite sheet: saved to").rect();
+    for button in ["⏮ Start", "▶ Play", "⏭ End", "🎞 Flipbook"] {
+        let rect = h.get_by_label(button).rect();
+        assert!(!status.intersects(rect), "the status ({status:?}) covers {button} ({rect:?})");
+    }
+    let row = h.get_by_label("⏮ Start").rect();
+    assert!((status.center().y - row.center().y).abs() < row.height(), "still on the buttons' row");
+}
+
+// A geometry network holding one Grid (size 4), selected and shown.
+fn one_grid() -> ProceduralFxStudioApp {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 8\nparent 1 0\ndisplay 0 1\nnext 2\n".into());
+    app.current_network = Some(0);
+    app.selected = Some(1);
+    app
+}
+
+fn width_of(mesh: &Mesh) -> f32 {
+    let xs = mesh.vertices.iter().map(|v| v.x);
+    xs.clone().fold(f32::MIN, f32::max) - xs.fold(f32::MAX, f32::min)
+}
+
+// Typing a new value into a parameter changes the node, and the viewport cooks it.
+#[test]
+fn typing_a_parameter_changes_the_node_and_the_viewport() {
+    let mut h = harness(one_grid());
+    assert!((width_of(&h.state().current_mesh) - 4.0).abs() < 1e-3, "a 4-wide grid shows");
+    let field = h.get_by_role_and_label(egui::accesskit::Role::SpinButton, "Size");
+    field.click();
+    h.run_steps(2);
+    // Editing: replace what's there with 6.5, and press Enter.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_steps(1);
+    h.event(egui::Event::Text("6.5".into()));
+    h.run_steps(1);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(6);
+    let app = h.state();
+    assert!(matches!(app.graph.nodes[&1].kind, NodeKind::Grid { size, .. } if (size - 6.5).abs() < 1e-4), "the grid's size is 6.5");
+    assert!((width_of(&app.current_mesh) - 6.5).abs() < 1e-3, "and the viewport shows it 6.5 wide: {}", width_of(&app.current_mesh));
+    assert!(app.has_unsaved_changes(), "an unsaved change");
+}
+
+// Save, change something, then open the saved scene again from File → Open Recent.
+#[test]
+fn a_scene_saves_and_reopens_from_open_recent() {
+    let dir = std::env::temp_dir().join(format!("pfx_gui_save_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("terrain.pfs");
+    let mut app = one_grid();
+    app.scene_path = Some(path.clone());
+    app.recent_scenes = vec![path.clone()];
+    let mut h = harness(app);
+    h.get_by_label("File").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Save Ctrl").click_accesskit();
+    h.run_steps(3);
+    let saved = std::fs::read_to_string(&path).expect("File → Save wrote the scene");
+    assert!(saved.contains(" grid 4 8"), "with the grid in it");
+    assert!(!h.state().has_unsaved_changes());
+
+    // A change: a second node from the Tab menu.
+    let at = in_canvas(&h, 0.4, 0.5);
+    add_with_tab(&mut h, at, "box");
+    assert_eq!(h.state().graph.nodes.len(), 3);
+
+    h.get_by_label("File").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Open Recent").click();
+    h.run_steps(2);
+    h.get_by_label("terrain.pfs").click_accesskit();
+    h.run_steps(4);
+    let app = h.state();
+    assert_eq!(app.graph.nodes.len(), 2, "back to what was saved");
+    assert!(app.status.starts_with("Loaded "), "{}", app.status);
+    assert!(!app.has_unsaved_changes());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// After a crash, the prompt's Recover brings the autosaved scene back as unsaved changes;
+// Discard deletes it.
+#[test]
+fn the_recovery_prompt_recovers_or_discards_an_autosave() {
+    for choice in ["Recover", "Discard"] {
+        let dir = recovery_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let autosave = dir.join(format!("gui-{choice}.pfs"));
+        std::fs::write(&autosave, "pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj torus 1 0.25 12 24\nparent 1 0\ndisplay 0 1\nnext 2\n").unwrap();
+        let mut app = empty_network();
+        app.recovery_offer = Some(recovery::Leftover { id: format!("gui-{choice}"), autosave: Some(autosave.clone()), scene_path: None, when: None, crash_report: None });
+        let mut h = harness(app);
+        assert!(h.query_by_label_contains("didn't close properly").is_some(), "the prompt shows");
+        h.get_by_label(choice).click();
+        h.run_steps(4);
+        let app = h.state();
+        assert!(app.recovery_offer.is_none(), "the prompt is gone");
+        let has_torus = app.graph.nodes.values().any(|n| n.kind.name() == "torus");
+        if choice == "Recover" {
+            assert!(has_torus && app.has_unsaved_changes(), "the autosave is back, unsaved");
+        } else {
+            assert!(!has_torus && !autosave.exists(), "the autosave is gone");
+        }
+        let _ = std::fs::remove_file(&autosave);
+    }
+}
