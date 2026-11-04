@@ -24,7 +24,8 @@
 <li>Choose <b>File → New from Preset → Fire (loop)</b>. A campfire flame appears, framed by its own camera.</li>
 <li>Press <b>Space</b> to play it. The first time, the fire simulates for a few seconds before it plays smoothly.</li>
 </ol>
-<p>There are five presets. Fire and Smoke loop. Impact, Magic burst and Slash play once. Each is already set up to export.</p>
+<p>There are five presets for 2D. Fire and Smoke loop. Impact, Magic burst and Slash play once. Each is already set up to export.</p>
+<p class="soon">Coming in the next update: smoke and fire are drawn as smooth volumes in the viewport and in what you export, rather than as many soft dots, and the Smoke preset becomes a real Pyro simulation, like Fire.</p>
 
 <h2>2. Change it</h2>
 <ol>
@@ -106,7 +107,23 @@ fn setup(mut commands: Commands, assets: Res&lt;AssetServer&gt;) {
 <li><b>Unity:</b> with Unity and Motion vectors ticked, set the flipbook material's <b>Glow strength</b>. Turn on HDR and Bloom.</li>
 </ul>
 
-<h2>9. Keep it updating while your game runs</h2>
+<h2>9. Pixel art</h2>
+<p class="soon">Coming in the next update: Pixel art isn't in version 0.22.0 yet.</p>
+<p>For a pixel-art game, tick <b>Pixel art</b> in the Export Sprite Sheet window. Each block of rendered pixels becomes one pixel, every pixel is either solid or clear, and the colours come from one small palette shared by every frame, so nothing flickers as it plays.</p>
+<ol>
+<li>Render bigger than you need: the <b>Frame size</b> is divided by the <b>pixel size</b>. 256 × 256 at a pixel size of 4 gives 64 × 64 pixels, and the window shows the result.</li>
+<li>Under <b>palette</b>, choose <b>pick</b> and a number of colours (16 suits most effects), or <b>from a file</b> to use your game's own palette: a <code>.hex</code> file from <a href="https://lospec.com/palette-list">Lospec</a>, a <code>.gpl</code> palette from GIMP or Aseprite, or an image of swatches.</li>
+<li>Tick <b>Dither</b> to turn gradients and fading smoke into patterns of pixels instead of bands, and <b>Outline</b> for a one-pixel dark outline.</li>
+</ol>
+<p>Small sparks still show up as single pixels. The engines draw it with sharp pixels, however far you scale it up:</p>
+<ul>
+<li><b>Bevy:</b> nothing to change. bevy_procedural_fx 0.3.1 and later loads pixel-art sheets unfiltered. Scale the sprite up by a whole number, such as <code>Transform::from_scale(Vec3::splat(4.0))</code>.</li>
+<li><b>Godot:</b> the flipbook scene is already set to <b>Nearest</b>. On an AnimatedSprite2D, set <b>CanvasItem → Texture → Filter</b> to <b>Nearest</b>, or make Nearest the default in Project Settings → Rendering → Textures.</li>
+<li><b>Unity:</b> with Unity ticked, the sheet imports with <b>Point</b> filtering.</li>
+</ul>
+<p>From a terminal: <code>proceduralfx_studio sprite-sheet burst.pfs burst.png --pixel-art 4 --colors 8 --outline</code>.</p>
+
+<h2>10. Keep it updating while your game runs</h2>
 <p>Tick <b>Keep updating</b> under <b>Live</b> before you export. From then on, the app exports again a moment after every change. A Bevy game run with Bevy's <code>file_watcher</code> feature shows the change while it runs. Godot and Unity pick up the new files when you switch back to their window.</p>
 
 <h2>Share it</h2>
