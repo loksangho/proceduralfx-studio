@@ -3329,6 +3329,7 @@ dependencies = [
  "egui_kittest",
  "exr",
  "image",
+ "log",
  "pkg-config",
  "pollster",
  "rapier3d",

@@ -204,6 +204,8 @@ pub fn install_panic_hook() {
                 .unwrap_or_else(|| "(no message)".into());
             let location = info.location().map_or_else(|| "unknown".into(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
             let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
+            log::error!("Crashed: {message} at {location} (thread {thread})");
+            log::logger().flush();
             let backtrace = std::backtrace::Backtrace::force_capture();
             let report = crash_report_text(SystemTime::now(), &thread, &message, &location, &backtrace.to_string());
             let _ = write_crash_report(&crash_dir(dir), id, &report);

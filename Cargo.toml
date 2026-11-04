@@ -27,6 +27,8 @@ bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
 # Runs wgpu's async set-up for the windowless GPU renderer (command-line renders, tests).
 pollster = "0.4"
+# The app log (applog.rs); already used by eframe and wgpu.
+log = "0.4"
 
 [features]
 default = []

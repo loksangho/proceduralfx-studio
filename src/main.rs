@@ -55,6 +55,7 @@ mod muscle;
 mod nodeinfo;
 mod packed;
 mod perf;
+mod applog;
 mod pixelart;
 mod platform;
 mod paint;
@@ -151,6 +152,7 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
     recovery::install_panic_hook();
+    applog::start(app_config_dir().as_deref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
@@ -184,6 +186,15 @@ fn main() -> eframe::Result<()> {
                 }
                 // PFX_VIEWPORT=cpu keeps the viewport on raster.rs (to compare the two).
                 let cpu = std::env::var("PFX_VIEWPORT").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"));
+                match &cc.wgpu_render_state {
+                    Some(state) => {
+                        let info = state.adapter.get_info();
+                        let gpu = format!("{} ({:?}{})", info.name, info.backend, [info.driver.as_str(), info.driver_info.as_str()].iter().filter(|s| !s.is_empty()).fold(String::new(), |out, s| out + ", " + s));
+                        log::info!("GPU: {gpu}{}", if cpu { "; viewport on the CPU (PFX_VIEWPORT=cpu)" } else { "" });
+                        app.gpu_info = Some(gpu);
+                    }
+                    None => log::info!("Renderer: OpenGL, without the GPU viewport"),
+                }
                 app.gpu_viewport = match cc.wgpu_render_state.clone().filter(|_| !cpu).map(gpu_viewport::GpuViewport::new) {
                     Some(Ok(viewport)) => Some(viewport),
                     // The GPU refused something: draw the viewport on the CPU instead.

@@ -1564,7 +1564,7 @@ mod tests {
         let failure = Arc::new(std::sync::Mutex::new(None));
         catch_errors(&device, failure.clone());
         let broken = |label: &str| {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl("fn broken( {".into()) });
+            let _ = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl("fn broken( {".into()) });
         };
         // A shader of the viewport's that the GPU refuses: recorded, not fatal.
         broken("viewport test");

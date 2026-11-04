@@ -707,6 +707,10 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) start_render_request: bool,
     // Why the GPU viewport was given up for the CPU one, if it was (see gpu_fallback).
     pub(crate) gpu_failure: Option<String>,
+    // The GPU the app runs on (name, backend, driver), for the log and Copy diagnostics.
+    pub(crate) gpu_info: Option<String>,
+    // The status line as last logged (applog.rs), so each message is logged once.
+    pub(crate) logged_status: String,
     // Make Loop's Find best length, run after the panel draws.
     pub(crate) loop_search_request: Option<NodeId>,
     // USD Export node whose stage should be written this frame.
@@ -960,6 +964,8 @@ impl Default for ProceduralFxStudioApp {
             pyro_fit_request: None,
             start_render_request: false,
             gpu_failure: None,
+            gpu_info: None,
+            logged_status: String::new(),
             loop_search_request: None,
             usd_export_request: None,
             file_export_request: None,

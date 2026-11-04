@@ -353,3 +353,26 @@ fn a_crash_report_is_sent_only_when_asked_and_as_shown() {
     assert!(h.state().recovery_offer.is_none());
     let _ = std::fs::remove_file(&report_path);
 }
+
+// Help → Copy diagnostics copies the version, system, viewport and recent log, with the
+// home folder as ~, and sends nothing.
+#[test]
+fn copy_diagnostics_copies_what_support_needs() {
+    applog::start(None);
+    let mut app = empty_network();
+    let home = recovery::home_folder().expect("a home folder");
+    app.status = format!("Sprite sheet: saved to {home}/fx/fire.png");
+    app.gpu_failure = Some("Validation Error\n  label = 'viewport volumes'".into());
+    let mut h = harness(app);
+    h.get_by_label("Help").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Copy diagnostics").click();
+    h.run_steps(2);
+    // The button ran (the copy itself goes to the system clipboard, outside the test).
+    assert!(h.state().status.starts_with("Copied the diagnostics"), "{}", h.state().status);
+    let copied = h.state().diagnostics();
+    assert!(copied.contains(&format!("ProceduralFX Studio {} diagnostics", env!("CARGO_PKG_VERSION"))), "{copied}");
+    assert!(copied.contains("System: ") && copied.contains("Viewport: CPU, after a GPU error: Validation Error / label = 'viewport volumes'"), "{copied}");
+    assert!(copied.contains("Sprite sheet: saved to ~/fx/fire.png"), "the status line was logged, home as ~: {copied}");
+    assert!(!copied.contains(&format!("{home}/")), "no home folder");
+}

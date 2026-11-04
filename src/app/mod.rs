@@ -12,3 +12,4 @@ mod selection;
 mod params;
 mod viewport;
 mod update;
+mod diagnostics;

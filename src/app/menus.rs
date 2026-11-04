@@ -301,6 +301,20 @@ impl ProceduralFxStudioApp {
             ui.close_kind(egui::UiKind::Menu);
         }
         ui.separator();
+        if ui.button("📋 Copy diagnostics").on_hover_text("Copies what support needs to help: the version, your system and GPU, and what the app did recently (your home folder shows as ~). Nothing is sent: paste it into an email.").clicked() {
+            ui.ctx().copy_text(self.diagnostics());
+            self.status = "Copied the diagnostics: paste them into an email to support@build3dstudio.com".into();
+            ui.close_kind(egui::UiKind::Menu);
+        }
+        if let Some(log) = applog::path().filter(|p| p.exists()) {
+            if ui.button("📄 Show the log file").on_hover_text(log.display().to_string()).clicked() {
+                if let Err(e) = platform::reveal(&log) {
+                    self.status = format!("Couldn't show the log file: {e}");
+                }
+                ui.close_kind(egui::UiKind::Menu);
+            }
+        }
+        ui.separator();
         self.updater.menu(ui);
         ui.separator();
         ui.weak("Houdini is a trademark of Side Effects Software Inc.\nProceduralFX Studio is not affiliated with or endorsed by SideFX.");

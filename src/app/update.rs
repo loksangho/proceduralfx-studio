@@ -23,6 +23,13 @@ impl ProceduralFxStudioApp {
         if let Some(error) = self.gpu_viewport.as_ref().and_then(|gpu| gpu.failure()) {
             self.gpu_fallback(error);
         }
+        // What the status line says goes in the log (see applog.rs), but not every frame's.
+        if self.status != self.logged_status {
+            if applog::worth_logging(&self.status) {
+                log::info!("{}", self.status);
+            }
+            self.logged_status = self.status.clone();
+        }
         // A dialog in its own window locks this one.
         lock_for_modal(ctx);
         // Windows rendering set-up: show what the helper is doing.
@@ -332,6 +339,7 @@ impl ProceduralFxStudioApp {
     // Stops using the GPU viewport after `error`, and says so: the viewport is drawn on the
     // CPU from now on (slower, without volumes); what needs the GPU says it does.
     pub(crate) fn gpu_fallback(&mut self, error: String) {
+        log::error!("GPU viewport given up, drawing on the CPU: {error}");
         self.gpu_viewport = None;
         let first_line = error.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("an error").to_owned();
         self.status = format!("The GPU couldn't draw the viewport ({first_line}), so it's drawn on the CPU now. Sprite sheets and real-time renders need the GPU: restart the app to try it again.");
