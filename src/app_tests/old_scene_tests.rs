@@ -44,8 +44,16 @@ fn summary(graph: &Graph) -> Vec<String> {
         .collect()
 }
 
-// Two summaries of an object agree: counts within 2% (or 2), bounds within 2% of their size.
-fn close(saved: &str, now: &str) -> bool {
+// Rigid bodies bouncing off each other amplify the last bits by which platforms' maths
+// libraries differ (sin, cos...), so their pieces end up a little apart on each: a Mac
+// and Linux differed by 2.3% of the wall's size half a second in. Their bounds get more room.
+fn chaotic(scene: &str) -> bool {
+    scene.lines().any(|l| l.starts_with("node ") && [" obj rbd_", " obj rbd_bullet", " obj material_fracture"].iter().any(|k| l.contains(k)))
+}
+
+// Two summaries of an object agree: counts within 2% (or 2), bounds within 2% of their size
+// (6% for rigid bodies, see chaotic).
+fn close(saved: &str, now: &str, loose: bool) -> bool {
     let (a, b): (Vec<&str>, Vec<&str>) = (saved.split_whitespace().collect(), now.split_whitespace().collect());
     if a.len() != b.len() || a.first() != b.first() {
         return false;
@@ -54,7 +62,8 @@ fn close(saved: &str, now: &str) -> bool {
     let (Some(x), Some(y)) = (numbers(&a), numbers(&b)) else { return a == b };
     let counts_ok = (0..2.min(x.len())).all(|i| (x[i] - y[i]).abs() <= (x[i].abs() * 0.02).max(2.0));
     let size = if x.len() == 8 { (0..3).map(|k| x[5 + k] - x[2 + k]).fold(0.0f64, f64::max).max(0.1) } else { 1.0 };
-    counts_ok && (2..x.len()).all(|i| (x[i] - y[i]).abs() <= size * 0.02 + 1e-3)
+    let room = if loose { 0.06 } else { 0.02 };
+    counts_ok && (2..x.len()).all(|i| (x[i] - y[i]).abs() <= size * room + 1e-3)
 }
 
 #[test]
@@ -96,7 +105,7 @@ fn old_scenes_open_save_and_cook_as_they_did() {
         }
         match saved.get(file.as_str()) {
             None => problems.push(format!("{file}: no saved result (write them again, see the top of old_scene_tests.rs)")),
-            Some(before) if before.len() != now.len() || !before.iter().zip(&now).all(|(a, b)| close(a, b)) => {
+            Some(before) if before.len() != now.len() || !before.iter().zip(&now).all(|(a, b)| close(a, b, chaotic(&text))) => {
                 problems.push(format!("{file}: cooks differently now:\n    was {before:?}\n    now {now:?}"));
             }
             _ => {}
@@ -109,12 +118,20 @@ fn old_scenes_open_save_and_cook_as_they_did() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+fn close_strict(saved: &str, now: &str) -> bool {
+    close(saved, now, false)
+}
+
 #[test]
 fn tolerances_allow_noise_but_not_changes() {
-    assert!(close("3: 1000 500 0 0 0 1 1 1", "3: 1010 500 0.01 0 0 1 1 1"));
-    assert!(!close("0.2s/3: 1000 500 0 0 0 1 1 1", "0.5s/3: 1000 500 0 0 0 1 1 1"), "another time");
-    assert!(!close("3: 1000 500 0 0 0 1 1 1", "3: 1100 500 0 0 0 1 1 1"), "10% more points");
-    assert!(!close("3: 1000 500 0 0 0 1 1 1", "3: 1000 500 0 0 0 1 1.5 1"), "taller");
-    assert!(!close("3: 0 0 empty", "3: 1000 500 0 0 0 1 1 1"));
-    assert!(close("3: 0 0 empty", "3: 0 0 empty"));
+    // What Linux and a Mac gave for the Breaking wall: fine for rigid bodies only.
+    let (mac, linux) = ("0.5s/0: 602 784 -2.021 -0.019 -2.242 2.051 1.907 0.167", "0.5s/0: 602 784 -2.071 -0.005 -2.337 2.032 1.807 0.162");
+    assert!(close(mac, linux, true) && !close(mac, linux, false));
+    assert!(chaotic("pfs 2\nnode 5 40 340 0 obj rbd_solver 0 1\n") && !chaotic("pfs 2\nnode 2 40 100 0 obj pyro 56\n"));
+    assert!(close_strict("3: 1000 500 0 0 0 1 1 1", "3: 1010 500 0.01 0 0 1 1 1"));
+    assert!(!close_strict("0.2s/3: 1000 500 0 0 0 1 1 1", "0.5s/3: 1000 500 0 0 0 1 1 1"), "another time");
+    assert!(!close_strict("3: 1000 500 0 0 0 1 1 1", "3: 1100 500 0 0 0 1 1 1"), "10% more points");
+    assert!(!close_strict("3: 1000 500 0 0 0 1 1 1", "3: 1000 500 0 0 0 1 1.5 1"), "taller");
+    assert!(!close_strict("3: 0 0 empty", "3: 1000 500 0 0 0 1 1 1"));
+    assert!(close_strict("3: 0 0 empty", "3: 0 0 empty"));
 }
