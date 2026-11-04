@@ -44,6 +44,15 @@ jobs:
       # GPU, and a crash there then names the test that caused it.
       - name: Test
         run: cargo test --release ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
+      # When a preset looks different (preset_pictures.rs), its new picture, the old one and
+      # the difference, to look at.
+      - name: Keep changed preset pictures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preset-pictures-${{ runner.os }}
+          path: target/preset-pictures/
+          if-no-files-found: ignore
       # Cooking speed: each preset's first second within its budget, measured against a
       # yardstick of plain arithmetic on the same machine, on one thread (see
       # src/app_tests/perf_budgets.rs). Linux only: one machine type keeps it comparable.
