@@ -272,6 +272,39 @@ for (const [name, makeStore] of stores) test(`Founder's licenses: checkout, seat
   }
 });
 
+for (const [name, makeStore] of stores) test(`Free Founder's licenses for testers, from the admin route (${name})`, async () => {
+  const t = await setup(makeStore, { FOUNDER_SEATS: "2", FOUNDER_PRICE: "49", FOUNDER_CREDIT: "10" });
+  try {
+    const give = (body: unknown, token = "admin") =>
+      fetch(`${t.base}/admin/founders`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+    assert.equal((await give({ email: "dev@example.com" }, "wrong")).status, 404, "admin only");
+    assert.equal((await give({ email: "not an email" })).status, 400);
+    const first = await give({ email: "Dev@Example.com", licensee: "Pixel Cave" });
+    assert.equal(first.status, 201);
+    assert.deepEqual(await first.json(), { seat: 1, email: "dev@example.com", emailed: true });
+    const letter = t.mails.at(-1)!;
+    assert.match(letter, /free Founder's license/);
+    assert.match(letter, /Founder's license #1 of 2/);
+    assert.match(letter, /Licensed to: Pixel Cave/);
+    assert.match(letter, /It's yours to keep, whatever happens/);
+    assert.match(letter, /A\$10 of AI credit/);
+    assert.equal((await t.store.userByEmail("dev@example.com"))!.topupMicros, 50_000 + 10_000_000, "the same credit as a paid one");
+    // Once per email: asking again gives no second seat or email.
+    const mailsBefore = t.mails.length;
+    const again = await give({ email: "dev@example.com" });
+    assert.deepEqual([again.status, await again.json()], [200, { email: "dev@example.com", already: true }]);
+    assert.equal(t.mails.length, mailsBefore);
+    // Out of the same seats as the paid ones.
+    assert.equal((await give({ email: "two@example.com" })).status, 201);
+    const full = await give({ email: "three@example.com" });
+    assert.equal(full.status, 409);
+    assert.match((await full.json()).error, /all 2 seats are taken/);
+    assert.deepEqual(await (await fetch(`${t.base}/v1/founders`)).json(), { open: false, seats: 2, sold: 2, left: 0, price: 49, currency: "aud", symbol: "A$" });
+  } finally {
+    t.server.close();
+  }
+});
+
 for (const [name, makeStore] of stores) test(`Founder's licenses are off unless FOUNDER_SEATS is set (${name})`, async () => {
   const t = await setup(makeStore);
   try {

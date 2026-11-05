@@ -79,29 +79,33 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     }
   }
 
-  // A paid Founder's license: the next seat, the AI credit on the account for that email
-  // (made if need be, so signing in with it finds the credit), and the license by email.
-  async function recordFounder(event: { id: string; email: string; licensee: string; paidMicros: number }) {
+  // A Founder's license, paid for or given (POST /admin/founders): the next seat, the AI
+  // credit on the account for that email (made if need be, so signing in with it finds the
+  // credit), and the license by email. Null if this payment (or gift) was recorded before.
+  async function recordFounder(event: { id: string; email: string; licensee: string; paidMicros: number }, gift = false) {
     const email = normalizeEmail(event.email) ?? event.email.trim().toLowerCase();
     const user = (await store.userByEmail(email)) ?? (await store.createUser(email, config.freeCreditMicros));
     const founder = await store.addFounder(event.id, user.id, email, event.licensee, event.paidMicros, config.founderCreditMicros);
-    if (!founder) return;
-    const mail_ = founderEmail(founder.seat, email, event.licensee);
+    if (!founder) return null;
+    const mail_ = founderEmail(founder.seat, email, event.licensee, gift);
+    let emailed = true;
     try {
       await mail(email, mail_.subject, mail_.text, mail_.html);
     } catch (e) {
       // The license is recorded either way; the email can be sent again by hand.
+      emailed = false;
       console.error(`Couldn't email Founder's license #${founder.seat} to ${email}:`, e);
     }
+    return { seat: founder.seat, email, emailed };
   }
 
-  function founderEmail(seat: number, email: string, licensee: string) {
+  function founderEmail(seat: number, email: string, licensee: string, gift = false) {
     const who = licensee || email;
     const credit = money(config.founderCreditMicros);
     const sym = symbol(config.currency);
     const terms = `${config.siteUrl}/founder`;
     const lines = [
-      `Thank you for backing ProceduralFX Studio early.`,
+      gift ? `Here's your free Founder's license for ProceduralFX Studio. Thank you for trying it early.` : `Thank you for backing ProceduralFX Studio early.`,
       ``,
       `This email is your Founder's license:`,
       ``,
@@ -114,7 +118,9 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       ...(config.founderCreditMicros > 0
         ? [`We've also added ${sym}${credit} of AI credit to the account for ${email}. Sign in with this email in the AI assistant's settings to use it.`, ``]
         : []),
-      `As a founder, your feedback shapes what comes next. Email support@build3dstudio.com any time with what works, what doesn't, and what you'd like.`,
+      gift
+        ? `It's yours to keep, whatever happens. What I'm hoping for in return: use it on your project, and tell me what gets in your way. Reply to this email, or send me Help → Copy diagnostics from the app with any problem, and I'll fix what I can, fast.`
+        : `As a founder, your feedback shapes what comes next. Email support@build3dstudio.com any time with what works, what doesn't, and what you'd like.`,
       ``,
       `Keep this email: it's your proof of license.`,
       ``,
@@ -444,6 +450,24 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
       const reports = await store.crashReports(limit);
       res.json(reports.map((r) => ({ id: r.id, at: r.at.toISOString(), app_version: r.appVersion, os: r.os, note: r.note, report: r.report })));
+    }),
+  );
+
+  // A free Founder's license for a tester: the same license, seat numbering and AI credit as
+  // a paid one, out of the same seats, emailed to them. One per email address (asking again
+  // changes nothing). JSON: { email, licensee? }.
+  app.post(
+    "/admin/founders",
+    wrap(async (req, res) => {
+      if (!config.adminToken || req.headers.authorization !== `Bearer ${config.adminToken}`) return res.status(404).end();
+      const email = normalizeEmail(String(req.body?.email ?? ""));
+      if (!email) return res.status(400).json({ error: "an email address is needed" });
+      const licensee = String(req.body?.licensee ?? "").trim().slice(0, 100);
+      if (config.founderSeats <= 0) return res.status(409).json({ error: "Founder's licenses are off (set FOUNDER_SEATS)" });
+      if ((await store.founderCount()) >= config.founderSeats) return res.status(409).json({ error: `all ${config.founderSeats} seats are taken` });
+      const founder = await recordFounder({ id: `gift:${email}`, email, licensee, paidMicros: 0 }, true);
+      if (!founder) return res.status(200).json({ email, already: true });
+      res.status(201).json(founder);
     }),
   );
 
