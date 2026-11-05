@@ -376,3 +376,31 @@ fn copy_diagnostics_copies_what_support_needs() {
     assert!(copied.contains("Sprite sheet: saved to ~/fx/fire.png"), "the status line was logged, home as ~: {copied}");
     assert!(!copied.contains(&format!("{home}/")), "no home folder");
 }
+
+// The welcome window starts from a preset, playing, with its simple controls at the top of
+// Parameters; a saved scene keeps its preset (and so its controls).
+#[test]
+fn the_welcome_window_starts_from_a_preset_with_simple_controls() {
+    let mut app = empty_network();
+    app.welcome_open = true;
+    let mut h = harness(app);
+    assert!(h.query_by_label_contains("Welcome to ProceduralFX Studio").is_some());
+    h.get_by_label("Start from Fire").click();
+    settle(&mut h);
+    let app = h.state();
+    assert!(!app.welcome_open, "closed");
+    assert_eq!(app.preset.map(|p| p.name), Some("Fire"));
+    assert!(app.graph.nodes.values().any(|n| n.name == "fire_sim"), "the Fire preset's scene");
+    assert!(h.query_by_label_contains("Fire controls").is_some(), "its controls show in Parameters");
+    for label in ["Size", "Height", "Flicker", "Smoke", "Wind"] {
+        assert!(h.query_by_label(label).is_some(), "the {label} slider");
+    }
+    // Saved and opened again, the scene still knows its preset.
+    let text = h.state().scene_text();
+    assert!(text.contains(&editor_helpers::preset_line("Fire")));
+    let mut other = empty_network();
+    other.use_saved_timeline(&text);
+    assert_eq!(other.preset.map(|p| p.name), Some("Fire"));
+    other.use_saved_timeline("pfs 2\nnext 0\n");
+    assert!(other.preset.is_none(), "a scene from no preset has no controls");
+}

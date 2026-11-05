@@ -278,6 +278,7 @@ impl ProceduralFxStudioApp {
 
         self.render_settings_window(ctx);
         self.sprite_sheet_window(ctx);
+        self.welcome_window(ctx);
         self.vat_window(ctx);
         self.viewer.ui(ctx);
 

@@ -47,6 +47,10 @@ impl ProceduralFxStudioApp {
                 }
             });
         });
+        if ui.button("Welcome…").on_hover_text("Start from a ready-made effect").clicked() {
+            self.welcome_open = true;
+            ui.close();
+        }
         ui.menu_button("New from Preset", |ui| {
             for (three_d, heading) in [(false, "Starter effects for 2D games (sprite sheets)"), (true, "For 3D games (vertex animation)")] {
                 if three_d {

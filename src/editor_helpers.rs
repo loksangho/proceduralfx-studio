@@ -94,6 +94,20 @@ pub(crate) fn timeline_line(start: f32, end: f32, fps: f32) -> String {
     format!("timeline {start} {end} {fps}\n")
 }
 
+// Which preset a scene was started from (for its simple controls), by name, in hex.
+pub(crate) fn preset_line(name: &str) -> String {
+    let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("preset {hex}\n")
+}
+
+pub(crate) fn parse_preset(text: &str) -> Option<&'static presets::Preset> {
+    text.lines().rev().find_map(|line| {
+        let hex = line.strip_prefix("preset ")?.trim();
+        let bytes: Option<Vec<u8>> = (0..hex.len() / 2).map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()).collect();
+        presets::find(&String::from_utf8(bytes?).ok()?)
+    })
+}
+
 pub(crate) fn parse_timeline(text: &str) -> Option<(f32, f32, f32)> {
     text.lines().rev().find_map(|line| match line.split_whitespace().collect::<Vec<_>>().as_slice() {
         ["timeline", start, end, fps] => {

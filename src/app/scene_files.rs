@@ -59,11 +59,12 @@ impl ProceduralFxStudioApp {
         let camera = self.graph.nodes.iter().filter(|(_, n)| matches!(n.kind, NodeKind::Camera { .. })).map(|(id, _)| *id).min();
         self.use_preset_settings(preset, camera);
         let export = if preset.vertex_animation { "Render → Export Vertex Animation… exports it for a 3D game" } else { "Render → Export Sprite Sheet… exports it for a game" };
-        self.status = format!("New scene from the {} preset. {export}.", preset.name);
+        self.status = format!("New scene from the {} preset: change it with the sliders at the top of Parameters. {export}.", preset.name);
     }
 
     // A preset's playback range, sprite-sheet settings and, given its camera, render camera.
     pub(crate) fn use_preset_settings(&mut self, preset: &presets::Preset, camera: Option<NodeId>) {
+        self.preset = presets::find(preset.name);
         self.animate = false;
         (self.playback_start, self.playback_end) = preset.range;
         self.time = preset.range.0;
@@ -135,11 +136,13 @@ impl ProceduralFxStudioApp {
 
     // What a saved scene file holds: the graph, then the timeline.
     pub(crate) fn scene_text(&self) -> String {
-        self.graph.serialize() + &timeline_line(self.playback_start, self.playback_end, self.playback_fps)
+        let preset = self.preset.map_or_else(String::new, |p| preset_line(p.name));
+        self.graph.serialize() + &timeline_line(self.playback_start, self.playback_end, self.playback_fps) + &preset
     }
 
-    // Uses a scene file's timeline, if it saved one.
+    // Uses a scene file's timeline, if it saved one, and its preset's simple controls.
     pub(crate) fn use_saved_timeline(&mut self, text: &str) {
+        self.preset = parse_preset(text);
         if let Some((start, end, fps)) = parse_timeline(text) {
             (self.playback_start, self.playback_end, self.playback_fps) = (start, end, fps);
             self.time = self.time.clamp(start, end);

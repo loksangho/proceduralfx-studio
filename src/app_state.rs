@@ -711,6 +711,11 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) gpu_info: Option<String>,
     // The status line as last logged (applog.rs), so each message is logged once.
     pub(crate) logged_status: String,
+    // The preset this scene was started from, for its simple controls (Parameters).
+    pub(crate) preset: Option<&'static presets::Preset>,
+    // The welcome window (welcome.rs), and its preset pictures once made into textures.
+    pub(crate) welcome_open: bool,
+    pub(crate) preset_pictures: HashMap<&'static str, egui::TextureHandle>,
     // Make Loop's Find best length, run after the panel draws.
     pub(crate) loop_search_request: Option<NodeId>,
     // USD Export node whose stage should be written this frame.
@@ -966,6 +971,9 @@ impl Default for ProceduralFxStudioApp {
             gpu_failure: None,
             gpu_info: None,
             logged_status: String::new(),
+            preset: None,
+            welcome_open: false,
+            preset_pictures: HashMap::new(),
             loop_search_request: None,
             usd_export_request: None,
             file_export_request: None,

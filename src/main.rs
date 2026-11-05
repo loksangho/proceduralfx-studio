@@ -184,6 +184,8 @@ fn main() -> eframe::Result<()> {
                     app.recovery = Some(session);
                     app.recovery_offer = leftovers.into_iter().next();
                 }
+                // New here: start from an effect (not while offering to recover work).
+                app.welcome_open = app.recovery_offer.is_none() && app::welcome_at_startup();
                 // PFX_VIEWPORT=cpu keeps the viewport on raster.rs (to compare the two).
                 let cpu = std::env::var("PFX_VIEWPORT").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"));
                 match &cc.wgpu_render_state {

@@ -161,7 +161,8 @@ impl ProceduralFxStudioApp {
         let before = self.selected.and_then(|id| self.graph.nodes.get(&id).map(|n| (id, n.kind.params(), n.xform)));
         TYPED.with(|t| *t.borrow_mut() = None);
         EXPRESSION_TIME.with(|t| t.set(self.time));
-        let edited = self.params_ui(ui);
+        let quick = self.preset_controls(ui);
+        let edited = self.params_ui(ui) | quick;
         if let (Some(typed), Some(before)) = (TYPED.with(|t| t.borrow_mut().take()), before) {
             self.apply_typed(before, typed);
         }

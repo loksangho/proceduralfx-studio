@@ -13,3 +13,5 @@ mod params;
 mod viewport;
 mod update;
 mod diagnostics;
+mod welcome;
+pub(crate) use welcome::welcome_at_startup;
