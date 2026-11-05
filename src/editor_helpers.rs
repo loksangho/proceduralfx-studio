@@ -86,7 +86,6 @@ pub(crate) fn scene_fingerprint(text: &str) -> u64 {
     lines.hash(&mut hasher);
     hasher.finish()
 }
-pub(crate) const LEGACY_SCENE_FILE: &str = "scene.mhip";
 
 // The timeline's playback range and frame rate, saved with the scene as one line after the
 // graph. Older versions of the app skip the line, so files still open in them.

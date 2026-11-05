@@ -760,41 +760,11 @@ pub(crate) struct ProceduralFxStudioApp {
 
 impl Default for ProceduralFxStudioApp {
     fn default() -> Self {
-        let mut g = Graph::default();
-        let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(40.0, 20.0));
-        let grid = g.add(NodeKind::Grid { size: 4.0, res: 20 }, egui::pos2(40.0, 20.0));
-        let noise = g.add(NodeKind::Noise { freq: 2.2, amp: 0.65 }, egui::pos2(40.0, 100.0));
-        let taper = g.add(NodeKind::Taper { factor: 0.0 }, egui::pos2(40.0, 180.0));
-        let twist = g.add(NodeKind::Twist { angle: 1.8 }, egui::pos2(40.0, 260.0));
-        for id in [grid, noise, taper, twist] {
-            if let Some(node) = g.nodes.get_mut(&id) {
-                node.parent = Some(geo);
-            }
-        }
-        g.connect(grid, noise, 0);
-        g.connect(noise, taper, 0);
-        g.connect(taper, twist, 0);
-        g.displays.insert(geo, twist);
-        g.add(
-            NodeKind::Light {
-                position: [3.0, 4.0, 3.0],
-                rotation: [-35.0, 35.0, 0.0],
-                color: [1.0, 0.95, 0.85],
-                intensity: 0.9,
-                kind: 0,
-            },
-            egui::pos2(240.0, 20.0),
-        );
-        let startup = std::fs::read_to_string(SCENE_FILE).or_else(|_| std::fs::read_to_string(LEGACY_SCENE_FILE)).ok();
-        let saved = startup.as_deref().map(Graph::deserialize).filter(|scene| !scene.nodes.is_empty());
-        // The saved scene's timeline, if it has one.
-        let (playback_start, playback_end, playback_fps) = saved
-            .as_ref()
-            .and(startup.as_deref())
-            .and_then(parse_timeline)
-            .unwrap_or((0.0, 20.0, sims::SIM_FPS));
-        let g = saved.unwrap_or(g);
-        let selected = g.geometry_ids().first().copied();
+        // An empty scene: new users start from the welcome window (app/welcome.rs), and
+        // scenes open from File (not from a scene.pfs that happens to be in the folder).
+        let g = Graph::default();
+        let (playback_start, playback_end, playback_fps) = (0.0, 20.0, sims::SIM_FPS);
+        let selected = None;
         let last_state = g.serialize();
         let saved_fingerprint = scene_fingerprint(&(last_state.clone() + &timeline_line(playback_start, playback_end, playback_fps)));
 
@@ -834,7 +804,8 @@ impl Default for ProceduralFxStudioApp {
             pending_render_output: None,
             cop_write_request: None,
             cop_texture: None,
-            animate: true,
+            // Not playing until asked (Space, or a preset from the welcome window).
+            animate: false,
             playback_fps,
             playback_due: 0.0,
             time: playback_start,

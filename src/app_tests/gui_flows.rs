@@ -404,3 +404,12 @@ fn the_welcome_window_starts_from_a_preset_with_simple_controls() {
     other.use_saved_timeline("pfs 2\nnext 0\n");
     assert!(other.preset.is_none(), "a scene from no preset has no controls");
 }
+
+// A new app starts with nothing in the scene and the timeline stopped.
+#[test]
+fn the_app_starts_empty_and_still() {
+    let app = ProceduralFxStudioApp::default();
+    assert!(app.graph.nodes.is_empty(), "no demo scene");
+    assert!(!app.animate, "not playing");
+    assert!(app.selected.is_none());
+}
