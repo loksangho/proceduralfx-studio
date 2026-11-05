@@ -52,7 +52,13 @@ fn render(gpu: gpu_viewport::GpuViewport, preset: &presets::Preset) -> image::Rg
     (app.playback_start, app.playback_end) = (at, at);
     app.sprite_sheet.seamless = false;
     app.preview_sprite_sheet();
-    super::realtime_render_tests::run_recording_for(&mut app, 2000);
+    // Until the frame is rendered: Fire's simulation takes a while on a slow (software
+    // GPU) CI machine, longer than a fixed number of steps allows. Three minutes at most.
+    let start = std::time::Instant::now();
+    while app.flipbook_recording.is_some() && start.elapsed() < std::time::Duration::from_secs(180) {
+        let _ = drive_recording(&mut app, Some(200), &mut |_, _| {});
+    }
+    assert!(app.flipbook_recording.is_none(), "{} rendered within 3 minutes: {}", preset.name, app.status);
     let frame = app.flipbook_viewer.as_ref().expect("the preview opens").frames()[0].clone();
     let mut image = image::RgbaImage::new(frame.size[0] as u32, frame.size[1] as u32);
     for (pixel, c) in image.pixels_mut().zip(&frame.pixels) {
