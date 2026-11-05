@@ -991,7 +991,9 @@ pub(crate) fn node_copy_pieces_to_points(source: Mesh, points: Mesh, scale: f32,
         .map(|(value, piece)| (key(value), piece))
         .collect();
     let n = points.vertices.len();
-    let chosen: Vec<f32> = match points.point_attributes.get(name).filter(|v| n > 0 && v.len() % n == 0) {
+    // A string attribute by that name (s@name) works too.
+    let point_name = crate::strings::resolve(&points, name);
+    let chosen: Vec<f32> = match points.point_attributes.get(&point_name).filter(|v| n > 0 && v.len() % n == 0) {
         Some(values) => values.chunks(values.len() / n).map(|c| c[0]).collect(),
         None if n == 0 => Vec::new(),
         None => return Err(format!("the points have no `{name}` attribute to choose their piece; give them one (Attribute Randomize, integer, 0 to the number of pieces − 1)")),
@@ -1318,7 +1320,20 @@ pub(crate) fn load_mesh_cache(path: &std::path::Path) -> Option<Mesh> {
     }
     for line in lines {
         let mut values = line.split_whitespace();
-        let Some(name) = values.next().and_then(|value| value.strip_prefix("@attr:")) else {
+        let Some(first) = values.next() else { continue };
+        // String attributes are saved as their text, each value x<hex> (strings.rs).
+        if let Some(name) = first.strip_prefix("@sattr:") {
+            let ids: Vec<f32> = values
+                .map(|v| {
+                    let hex = v.strip_prefix('x').unwrap_or("");
+                    let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()).collect();
+                    crate::strings::id(&String::from_utf8_lossy(&bytes))
+                })
+                .collect();
+            mesh.point_attributes.insert(name.to_string(), ids);
+            continue;
+        }
+        let Some(name) = first.strip_prefix("@attr:") else {
             continue;
         };
         let attribute: Vec<f32> = values.filter_map(|value| value.parse().ok()).collect();
@@ -1342,6 +1357,15 @@ pub(crate) fn save_mesh_cache(path: &std::path::Path, mesh: &Mesh) -> std::io::R
     // volume and terrain settings) that have other lengths.
     for (name, values) in &mesh.point_attributes {
         if name.contains(char::is_whitespace) {
+            continue;
+        }
+        if crate::strings::is_string_key(name) {
+            text.push_str(&format!("@sattr:{name}"));
+            for value in values {
+                let hex: String = crate::strings::text(*value).bytes().map(|b| format!("{b:02x}")).collect();
+                text.push_str(&format!(" x{hex}"));
+            }
+            text.push('\n');
             continue;
         }
         text.push_str(&format!("@attr:{name}"));

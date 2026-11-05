@@ -513,6 +513,9 @@ fn write_mesh(out: &mut String, mesh: &Mesh, inner: &str) {
     keys.sort();
     for key in keys {
         let values = &mesh.point_attributes[key];
+        // String attributes are ids into the app's table (strings.rs): written as text.
+        let key_text = crate::strings::display_key(key);
+        let (key, string): (&str, bool) = if crate::strings::is_string_key(key) { (key_text.as_str(), true) } else { (key.as_str(), false) };
         // Stored per triangle / triangle corner / point; written per face / face corner / point.
         let (interpolation, name, stored, elements): (&str, &str, usize, Vec<usize>) = if let Some(n) = key.strip_prefix("prim:") {
             ("uniform", n, tris, faces.iter().map(|f| f.tris.start).collect())
@@ -521,7 +524,7 @@ fn write_mesh(out: &mut String, mesh: &Mesh, inner: &str) {
         } else if let Some(n) = key.strip_prefix("detail:") {
             ("constant", n, 1, vec![0])
         } else {
-            ("vertex", key.as_str(), points, (0..points).collect())
+            ("vertex", key, points, (0..points).collect())
         };
         if stored == 0 || values.len() % stored != 0 || name == "id" {
             continue;
@@ -529,6 +532,15 @@ fn write_mesh(out: &mut String, mesh: &Mesh, inner: &str) {
         let comps = values.len() / stored;
         let name = if name == "Cd" { "displayColor".to_string() } else { sanitize_name(name) };
         let _ = write!(out, "{inner}");
+        if string {
+            if comps != 1 {
+                continue;
+            }
+            let _ = write!(out, "string[] primvars:{name} = ");
+            write_array(out, elements.iter(), |&i| format!("{:?}", &*crate::strings::text(values[i])));
+            let _ = writeln!(out, " (\n{inner}    interpolation = \"{interpolation}\"\n{inner})");
+            continue;
+        }
         match comps {
             1 => {
                 let _ = write!(out, "float[] primvars:{name} = ");

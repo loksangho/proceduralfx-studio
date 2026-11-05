@@ -70,6 +70,7 @@ mod snapshot;
 mod shading;
 mod sopkit;
 mod sops;
+mod strings;
 mod spritesheet;
 mod terrain;
 mod testgeo;

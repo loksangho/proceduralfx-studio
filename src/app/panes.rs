@@ -556,14 +556,23 @@ impl ProceduralFxStudioApp {
                     };
                     for attribute in sheet_attributes(mesh, summary_domain) {
                         let values = &mesh.point_attributes[&attribute.key];
-                        let ranges = (0..attribute.components.min(4))
+                        // Text: how many different values, and a few of them.
+                        let ranges = if crate::strings::is_string_key(&attribute.key) {
+                            let mut texts: Vec<String> = values.iter().map(|v| crate::strings::text(*v).to_string()).collect();
+                            texts.sort();
+                            texts.dedup();
+                            let shown: Vec<String> = texts.iter().take(4).map(|t| format!("{t:?}")).collect();
+                            format!("{} different: {}{}", texts.len(), shown.join(" "), if texts.len() > 4 { " …" } else { "" })
+                        } else {
+                            (0..attribute.components.min(4))
                             .map(|c| {
                                 let lane = values.iter().skip(c).step_by(attribute.components);
                                 let (lo, hi) = lane.fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
                                 if lo > hi { "-".to_string() } else { format!("{lo:.3} … {hi:.3}") }
                             })
                             .collect::<Vec<_>>()
-                            .join("   ");
+                            .join("   ")
+                        };
                         ui.monospace(&attribute.name);
                         ui.label(class);
                         ui.label(format!("{}{}", attribute.components, if attribute.size_ok { "" } else { " ⚠" }));

@@ -118,6 +118,8 @@ fn blend_volumes(own: &Mesh, other: &Mesh, w: f32) -> Option<Mesh> {
                 values.push(match name.as_str() {
                     // The voxel's size stays as it is.
                     "pscale" => va.or(vb).unwrap_or(0.0),
+                    // Text can't be blended: whichever weighs more (strings.rs).
+                    _ if crate::strings::is_string_key(name) => if w >= 0.5 { va.or(vb) } else { vb.or(va) }.unwrap_or(0.0),
                     "Cd" => {
                         let (wa, wb) = (w * alpha(own, a), (1.0 - w) * alpha(other, b));
                         if wa + wb > 0.0 { (wa * va.unwrap_or(0.0) + wb * vb.unwrap_or(0.0)) / (wa + wb) } else { va.or(vb).unwrap_or(0.0) }
@@ -152,7 +154,12 @@ fn blend_points(own: &Mesh, other: &Mesh, w: f32) -> Option<Mesh> {
     let names: Vec<String> = point_attributes(own).into_iter().map(|(k, _)| k.clone()).collect();
     for name in names {
         if let (Some(a), Some(b)) = (out.point_attributes.get_mut(&name), other.point_attributes.get(&name)) {
-            if a.len() == b.len() {
+            if a.len() == b.len() && crate::strings::is_string_key(&name) {
+                // Text can't be blended: whichever weighs more (strings.rs).
+                if w < 0.5 {
+                    a.copy_from_slice(b);
+                }
+            } else if a.len() == b.len() {
                 a.iter_mut().zip(b).for_each(|(x, y)| *x = *x * w + y * (1.0 - w));
             }
         }

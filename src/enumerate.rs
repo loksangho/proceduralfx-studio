@@ -50,6 +50,9 @@ pub fn enumerate(input: &Mesh, set: &EnumerateSettings) -> Result<Mesh, String> 
     let count = if points { input.vertices.len() } else { polys.len() };
     // Each element's piece: its own index, or the piece attribute's (first) value.
     let by = set.piece_attribute.trim();
+    // A string attribute by that name (s@name) works too.
+    let resolved = crate::strings::resolve(input, by);
+    let by = if by.is_empty() { by } else { resolved.as_str() };
     let keys: Vec<u32> = if by.is_empty() {
         (0..count as u32).collect()
     } else {

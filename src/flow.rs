@@ -205,6 +205,8 @@ pub fn named_pieces(mesh: &Mesh, name: &str) -> Result<Vec<(f32, Mesh)>, String>
         return Err("enter the attribute whose values make the pieces (name, piece, class…)".into());
     }
     let key = |v: f32| (v * 1000.0).round() as i64;
+    // A string attribute by that name (s@name) works too.
+    let name = &crate::strings::resolve(mesh, name);
     let prim = mesh.point_attributes.get(&format!("prim:{name}")).filter(|v| nt > 0 && v.len() == nt);
     let point = mesh.point_attributes.get(name).filter(|v| np > 0 && v.len() == np);
     let (values, elements): (Vec<f32>, usize) = match (prim, point) {

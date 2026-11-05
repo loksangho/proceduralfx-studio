@@ -343,7 +343,13 @@ pub fn resample(input: &Mesh, set: &ResampleSettings) -> Result<Mesh, String> {
             out.vertices.push(input.vertices[a].scale(1.0 - f).add(input.vertices[b].scale(f)));
             for ((key, w), store) in attrs.iter().zip(values.iter_mut()) {
                 let v = &input.point_attributes[*key];
-                store.extend((0..*w).map(|c| v[a * w + c] * (1.0 - f) + v[b * w + c] * f));
+                if crate::strings::is_string_key(key) {
+                    // Text can't be blended: the nearer point's.
+                    let from = if f < 0.5 { a } else { b };
+                    store.extend((0..*w).map(|c| v[from * w + c]));
+                } else {
+                    store.extend((0..*w).map(|c| v[a * w + c] * (1.0 - f) + v[b * w + c] * f));
+                }
             }
             curveu.push(i as f32 / segments as f32);
         }

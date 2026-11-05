@@ -143,7 +143,11 @@ pub fn summarize(mesh: &Mesh) -> Vec<Section> {
         };
         let size = if class == "Detail" { values.len() } else if elements > 0 { values.len() / elements } else { 0 };
         let slot = ["Point", "Primitive", "Vertex", "Detail"].iter().position(|c| *c == class).unwrap_or(0);
-        classes[slot].1.push(format!("{name} ({size})"));
+        // String attributes show by their own name, as text (strings.rs).
+        match name.strip_prefix(crate::strings::PREFIX) {
+            Some(text) => classes[slot].1.push(format!("{text} (string)")),
+            None => classes[slot].1.push(format!("{name} ({size})")),
+        }
     }
     let rows: Vec<(String, String)> = classes.iter().filter(|(_, l)| !l.is_empty()).map(|(c, l)| (c.to_string(), l.join(", "))).collect();
     if !rows.is_empty() {

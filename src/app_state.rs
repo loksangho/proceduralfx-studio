@@ -200,7 +200,8 @@ pub(crate) fn sheet_attributes(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetAtt
         .map(|(key, values)| {
             let components = if count > 0 { (values.len() / count).max(1) } else { 1 };
             SheetAttribute {
-                name: key[domain.prefix().len()..].to_string(),
+                // A string attribute shows by its own name (str:name is name: strings.rs).
+                name: key[domain.prefix().len()..].strip_prefix(crate::strings::PREFIX).unwrap_or(&key[domain.prefix().len()..]).to_string(),
                 key: key.clone(),
                 components,
                 size_ok: count > 0 && values.len() == count * components,
@@ -262,7 +263,7 @@ pub(crate) fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn
         SheetDomain::Detail => {}
     }
     for attribute in attributes {
-        let kind = if attribute.integral { "ints" } else { "floats" };
+        let kind = if crate::strings::is_string_key(&attribute.key) { "string" } else if attribute.integral { "ints" } else { "floats" };
         let mut tooltip = format!("{} ({} {kind})", attribute.name, attribute.components);
         if !attribute.size_ok {
             tooltip.push_str(" · warning: the value count does not match the element count");
@@ -315,6 +316,7 @@ pub(crate) fn sheet_cell(mesh: &Mesh, normals: &[Vec3], polys: &SheetPolys, sour
             // A polygon's primitive attributes are its (first) triangle's.
             let element = if key.starts_with("prim:") { polys.runs.get(row).map_or(row, |run| run.start) } else { row };
             match mesh.point_attributes.get(key).and_then(|values| values.get(element * components + component)) {
+                Some(v) if crate::strings::is_string_key(key) => crate::strings::text(*v).to_string(),
                 Some(v) if *integral => format!("{}", *v as i64),
                 Some(v) => float(*v),
                 None => String::new(),

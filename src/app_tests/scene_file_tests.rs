@@ -493,3 +493,28 @@ fn atomic_save_replaces_file() {
     assert!(!PathBuf::from(format!("{}.saving", path.display())).exists());
     let _ = std::fs::remove_file(&path);
 }
+
+// String attributes go through the Cache node's files as text, and come back as the same
+// strings (ids only mean something while the app runs).
+#[test]
+fn cached_geometry_keeps_its_string_attributes() {
+    let mut mesh = Mesh::default();
+    mesh.vertices = vec![Vec3::zero(), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)];
+    mesh.indices = vec![[0, 1, 2]];
+    mesh.point_attributes.insert("str:name".into(), ["piece one", "", "piece \"two\""].iter().map(|t| strings::id(t)).collect());
+    mesh.point_attributes.insert("prim:str:path".into(), vec![strings::id("/geo/wall")]);
+    let path = std::env::temp_dir().join(format!("pfx_strings_{}.mcache", std::process::id()));
+    save_mesh_cache(&path, &mesh).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("@sattr:str:name") && !text.contains("piece one"), "saved as text, hex-encoded");
+    let back = load_mesh_cache(&path).unwrap();
+    let texts = |key: &str| back.point_attributes[key].iter().map(|v| strings::text(*v).to_string()).collect::<Vec<_>>();
+    assert_eq!(texts("str:name"), vec!["piece one", "", "piece \"two\""]);
+    assert_eq!(texts("prim:str:path"), vec!["/geo/wall"]);
+    let _ = std::fs::remove_file(&path);
+    // The spreadsheet shows text, under the attribute's own name.
+    let columns = sheet_columns(&mesh, SheetDomain::Points);
+    let name = columns.iter().find(|c| c.header == "name").expect("a name column");
+    let polys = SheetPolys::new(&mesh);
+    assert_eq!(sheet_cell(&mesh, &[], &polys, &name.source, 2), "piece \"two\"");
+}

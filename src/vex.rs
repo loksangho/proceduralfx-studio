@@ -808,6 +808,7 @@ fn known_hint(name: &str) -> Option<Ty> {
         "P" | "N" | "Cd" | "v" | "up" | "rest" | "scale" | "force" | "accel" | "uv" | "w" => Some(Ty::Vector),
         "ptnum" | "primnum" | "vtxnum" | "numpt" | "numprim" | "numvtx" | "elemnum" | "numelem" | "id" => Some(Ty::Int),
         _ if name.starts_with("group_") => Some(Ty::Int),
+        "name" | "path" => Some(Ty::Str),
         "Time" | "SimTime" | "TimeInc" | "Frame" | "SimFrame" | "pscale" => Some(Ty::Float),
         "orient" | "rot" => Some(Ty::Vec4),
         _ => None,
@@ -1278,8 +1279,8 @@ impl Parser {
             Some('p') => Some(Ty::Vec4),
             Some('3') => Some(Ty::Mat3),
             Some('4') => Some(Ty::Mat4),
-            Some('s') => return Self::err_at(token, "string attributes (s@) are not supported yet"),
-            Some(c) => return Self::err_at(token, format!("{c}@ attributes are not supported (use f@, i@, v@, p@, 3@ or 4@)")),
+            Some('s') => Some(Ty::Str),
+            Some(c) => return Self::err_at(token, format!("{c}@ attributes are not supported (use f@, i@, v@, s@, p@, 3@ or 4@)")),
         };
         if let Some(&id) = self.attr_index.get(name) {
             if prefix.is_some() {
@@ -2081,6 +2082,15 @@ fn storage_name(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+// The same for an attribute of a known type: strings are kept under str:<name> (strings.rs).
+fn storage_name_as(name: &str, hint: Option<Ty>) -> std::borrow::Cow<'_, str> {
+    if hint == Some(Ty::Str) {
+        format!("{}{name}", crate::strings::PREFIX).into()
+    } else {
+        storage_name(name)
+    }
+}
+
 // `opinput1_P` (as in @opinput1_P): input 1's P, for the same element.
 fn opinput(name: &str) -> Option<(usize, &str)> {
     let rest = name.strip_prefix("opinput")?;
@@ -2156,6 +2166,10 @@ fn with_line(error: String, line: usize) -> String {
 
 // Reads one element of a stored attribute; missing attributes read as zero of the hinted type.
 fn read_storage(mesh: &Mesh, key: &str, index: usize, count: usize, hint: Option<Ty>) -> Value {
+    if hint == Some(Ty::Str) || crate::strings::is_string_key(key) {
+        let id = mesh.point_attributes.get(key).filter(|v| count > 0 && !v.is_empty()).and_then(|v| v.get(index * (v.len() / count).max(1)).copied()).unwrap_or(0.0);
+        return Value::Str(Rc::from(&*crate::strings::text(id)));
+    }
     match mesh.point_attributes.get(key) {
         Some(vals) if count > 0 && !vals.is_empty() => {
             let comps = (vals.len() / count).max(1);
@@ -2198,7 +2212,18 @@ fn reshape(old: &[f32], count: usize, comps: usize) -> Vec<f32> {
 
 fn write_storage(mesh: &mut Mesh, key: &str, index: usize, count: usize, v: &Value, hint: Option<Ty>, name: &str) -> R<()> {
     match v {
-        Value::Str(_) => return Err(format!("cannot store a string in @{name}: string attributes are not supported yet")),
+        Value::Str(text) if hint == Some(Ty::Str) || crate::strings::is_string_key(key) => {
+            if index < count {
+                let vals = mesh.point_attributes.entry(key.to_string()).or_default();
+                if vals.len() != count {
+                    *vals = reshape(vals, count, 1);
+                }
+                vals[index] = crate::strings::id(text);
+            }
+            return Ok(());
+        }
+        Value::Str(_) => return Err(format!("cannot store a string in @{name}, a number attribute: use s@{name} for a string attribute")),
+        _ if hint == Some(Ty::Str) || crate::strings::is_string_key(key) => return Err(format!("s@{name} is a string attribute: give it text, such as \"piece\"")),
         // {..} literals for wide attributes (p@orient = {0, 0, 0, 1}) have that many items.
         Value::Arr(items)
             if items.len() != 3 && !matches!((hint, items.len()), (Some(Ty::Vec4), 4) | (Some(Ty::Mat3), 9) | (Some(Ty::Mat4), 16)) =>
@@ -3400,21 +3425,25 @@ impl<'a> Runtime<'a> {
 
     fn input_attr_as(&self, domain: Domain, name: &str, index: i32, hint: Option<Ty>) -> Value {
         let mesh = self.input;
+        // A string attribute by that name reads as its text (point(0, "name", 3)).
+        let string = hint == Some(Ty::Str) || mesh.point_attributes.contains_key(&format!("{}{}{name}", domain.prefix(), crate::strings::PREFIX));
+        let hint = if string { Some(Ty::Str) } else { hint };
+        let missing = || if string { Value::Str("".into()) } else { hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value) };
         // Primitive numbers are polygons: read the polygon's first triangle.
         if domain == Domain::Prim {
             let Some(run) = usize::try_from(index).ok().and_then(|p| self.polys.get(p)) else {
-                return hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value);
+                return missing();
             };
             return match name {
                 "primnum" => Value::Int(index),
                 "P" => Value::Vec(arr3(crate::poly::centroid(mesh, run))),
                 "N" => Value::Vec(arr3(crate::poly::normal(mesh, run))),
-                _ => read_storage(mesh, &format!("prim:{}", storage_name(name)), run.start, mesh.indices.len(), hint),
+                _ => read_storage(mesh, &format!("prim:{}", storage_name_as(name, hint)), run.start, mesh.indices.len(), hint),
             };
         }
         let count = domain.count(mesh);
         let Some(index) = usize::try_from(index).ok().filter(|i| *i < count) else {
-            return hint.filter(|t| *t != Ty::Str).map_or(Value::Float(0.0), Ty::default_value);
+            return missing();
         };
         match (domain, name) {
             (Domain::Point, "P") => Value::Vec(arr3(mesh.vertices[index])),
@@ -3423,7 +3452,7 @@ impl<'a> Runtime<'a> {
             (Domain::Prim, "P") => Value::Vec(arr3(tri_centroid(mesh, mesh.indices[index]))),
             (Domain::Prim, "N") => Value::Vec(arr3(tri_normal(mesh, mesh.indices[index]))),
             (Domain::Vertex, "P") => Value::Vec(arr3(mesh.vertices[mesh.indices[index / 3][index % 3]])),
-            _ => read_storage(mesh, &format!("{}{}", domain.prefix(), storage_name(name)), index, count, hint),
+            _ => read_storage(mesh, &format!("{}{}", domain.prefix(), storage_name_as(name, hint)), index, count, hint),
         }
     }
 
@@ -3830,7 +3859,7 @@ impl<'a> Runtime<'a> {
             "detail" => self.input_attr(Domain::Detail, &a[1].string()?, 0),
             "haspointattrib" => {
                 let attr = a[1].string()?;
-                Int((matches!(&*attr, "P" | "N") || self.input.point_attributes.contains_key(&*attr)) as i32)
+                Int((matches!(&*attr, "P" | "N") || self.input.point_attributes.contains_key(&*attr) || self.input.point_attributes.contains_key(&format!("{}{attr}", crate::strings::PREFIX))) as i32)
             }
             "inpointgroup" | "inprimgroup" => {
                 let (domain, key) = if name == "inpointgroup" {
@@ -3850,7 +3879,11 @@ impl<'a> Runtime<'a> {
                 }
                 Int(index as i32)
             }
-            "hasprimattrib" => Int(self.input.point_attributes.contains_key(&format!("prim:{}", a[1].string()?)) as i32),
+            "hasprimattrib" => {
+                let attr = a[1].string()?;
+                let has = |key: String| self.input.point_attributes.contains_key(&key);
+                Int((has(format!("prim:{attr}")) || has(format!("prim:{}{attr}", crate::strings::PREFIX))) as i32)
+            }
             "setpointattrib" | "setprimattrib" => {
                 let domain = if name == "setpointattrib" { Domain::Point } else { Domain::Prim };
                 let index = index_of(&a[2])?;
@@ -4387,12 +4420,14 @@ fn apply_pending(mesh: &mut Mesh, pending: Pending, log: &mut Vec<String>) -> R<
         if index >= count {
             continue;
         }
-        let key = format!("{}{name}", domain.prefix());
+        // Text goes to the string attribute of that name (strings.rs).
+        let hint = if matches!(value, Value::Str(_)) { Some(Ty::Str) } else { known_hint(&name) };
+        let key = format!("{}{}", domain.prefix(), storage_name_as(&name, hint));
         let current = || {
             if domain == Domain::Point && name == "P" {
                 Value::Vec(arr3(mesh.vertices[index]))
             } else {
-                read_storage(mesh, &key, index, count, known_hint(&name))
+                read_storage(mesh, &key, index, count, hint)
             }
         };
         let value = match mode {
@@ -4405,7 +4440,7 @@ fn apply_pending(mesh: &mut Mesh, pending: Pending, log: &mut Vec<String>) -> R<
         if domain == Domain::Point && name == "P" {
             mesh.vertices[index] = vec3(value.vec()?);
         } else {
-            write_storage(mesh, &key, index, count, &value, known_hint(&name), &name)?;
+            write_storage(mesh, &key, index, count, &value, hint, &name)?;
         }
     }
 
@@ -4606,7 +4641,7 @@ fn new_runtime<'a>(program: &'a Program, shared: &'a Shared<'a>, out: Mesh) -> R
         out,
         domain,
         count: shared.count,
-        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name(&a.name))).collect(),
+        keys: program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name_as(&a.name, a.hint))).collect(),
         elem: 0,
         time: shared.time,
         time_inc: shared.time_inc,
@@ -4707,7 +4742,7 @@ fn run_with(
         channels,
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
-    let keys: Vec<String> = program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name(&a.name))).collect();
+    let keys: Vec<String> = program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name_as(&a.name, a.hint))).collect();
     let warnings: Vec<String> = program
         .attrs
         .iter()
@@ -4925,7 +4960,7 @@ pub const SYNTAX_HELP: &str = "\
 Types      int, float, vector, vector4, matrix3, matrix, string; arrays: float a[] = {1, 2};
            vector4 q = quaternion(radians(45), {0,1,0});  matrix m = ident();  v * m transforms
 Attributes @P @N @Cd @pscale (read/write), @ptnum @primnum @vtxnum @numpt @numprim
-           @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel
+           @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel s@name
            p@orient (vector4) 3@rot (matrix3) 4@xform (matrix); ch(\"amp\") adds a slider
 Groups     @group_top: 1 if the element is in group top, else 0; @group_top = 1 adds it
 Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   M_PI  M_E
@@ -5147,6 +5182,40 @@ mod tests {
         let (mesh, report) = run(grid(), "for (int i = 0; i < 5; i++) addpoint(0, set(i, 2, 0));", 0.0, 0);
         assert_eq!(report.error, None);
         assert_eq!(mesh.vertices.len(), 14);
+    }
+
+    #[test]
+    fn string_attributes_hold_text() {
+        // s@ writes text; reading it back, comparing and building strings work.
+        let (mesh, report) = run(grid(), "s@side = @P.x > 0 ? \"right\" : \"left\"; s@label = sprintf(\"pt%d\", @ptnum);", 0.0, 2);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        let side = &mesh.point_attributes["str:side"];
+        for (p, id) in mesh.vertices.iter().zip(side) {
+            assert_eq!(&*crate::strings::text(*id), if p.x > 0.0 { "right" } else { "left" });
+        }
+        assert_eq!(&*crate::strings::text(mesh.point_attributes["str:label"][3]), "pt3");
+        // Read in another wrangle, by name too, and compared.
+        let (mesh, report) = run(mesh, "f@is_right = s@side == \"right\"; s@echo = point(0, \"side\", @ptnum); i@has = haspointattrib(0, \"side\");", 0.0, 2);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        for i in 0..mesh.vertices.len() {
+            let right = mesh.vertices[i].x > 0.0;
+            assert_eq!(mesh.point_attributes["is_right"][i], right as u8 as f32);
+            assert_eq!(&*crate::strings::text(mesh.point_attributes["str:echo"][i]), if right { "right" } else { "left" });
+        }
+        assert!(mesh.point_attributes["has"].iter().all(|h| *h == 1.0));
+        // @name is a string without the s, as in Houdini; setpointattrib with text writes one.
+        let (mesh, report) = run(grid(), "@name = \"piece\"; if (@ptnum == 0) setpointattrib(0, \"tag\", 1, \"first\");", 0.0, 2);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(mesh.point_attributes["str:name"].iter().all(|id| &*crate::strings::text(*id) == "piece"));
+        assert_eq!(&*crate::strings::text(mesh.point_attributes["str:tag"][1]), "first");
+        assert_eq!(&*crate::strings::text(mesh.point_attributes["str:tag"][0]), "", "unset elements are empty");
+        // On primitives.
+        let (mesh, report) = run(grid(), "s@part = @primnum < 2 ? \"front\" : \"back\";", 0.0, 1);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(mesh.point_attributes.contains_key("prim:str:part"));
+        // Mixing them up says how to fix it.
+        assert!(error("f@n = 1; s@n = 2;").contains("text") || error("s@s = 2;").contains("text"));
+        assert!(error("f@v = \"x\";").contains("s@v"));
     }
 
     #[test]
