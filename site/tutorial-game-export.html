@@ -21,12 +21,14 @@
 
 <h2>1. Start from a preset</h2>
 <ol>
-<li>Choose <b>File → New from Preset → Fire (loop)</b>. A campfire flame appears, framed by its own camera.</li>
-<li>Press <b>Space</b> to play it. The first time, the fire simulates for a few seconds before it plays smoothly.</li>
+<li>When the app starts, click <b>Fire</b> in the welcome window. (Later, it's <b>File → New from Preset → Fire (loop)</b>, or <b>File → Welcome…</b>.) A campfire flame appears, framed by its own camera, and plays.</li>
+<li>The first time, the fire simulates for a few seconds before it plays smoothly. <b>Space</b> pauses and plays it.</li>
 </ol>
-<p>There are five presets for 2D. Fire and Smoke loop. Impact, Magic burst and Slash play once. Each is already set up to export.</p>
+<p>There are six presets for 2D. Fire, Toon fire and Smoke loop. Impact, Magic burst and Slash play once. Each is already set up to export.</p>
 
 <h2>2. Change it</h2>
+<p>The quickest way: the <b>Fire controls</b> at the top of the Parameters panel. Drag <b>Height</b>, <b>Flicker</b> or <b>Wind</b>, and the fire changes. Every preset has its own controls like these.</p>
+<p>To see how it's made, and change anything else:</p>
 <ol>
 <li>In the network editor, double-click the <b>fire</b> node to go inside it. You'll see <code>source</code> (a small sphere the fire burns from), <code>fire_sim</code> (the Pyro simulation) and <code>fire_loop</code> (which makes it loop).</li>
 <li>Click <code>fire_sim</code>. Its settings appear in the Parameters panel.</li>
