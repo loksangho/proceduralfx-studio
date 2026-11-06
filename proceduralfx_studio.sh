@@ -98,6 +98,8 @@ fi
 # The full app, optimised, built in its own folder (target/full) so that test builds
 # (plain `cargo test --release`, without the native features) don't replace it.
 if [[ ${1-} == "run-release" ]]; then
+  # The AI credits server, as in release apps, so the assistant keeps your sign-in.
+  export PFX_AI_SERVER="${PFX_AI_SERVER:-https://ai.build3dstudio.com}"
   if [[ -n "${HD_RENDER_BIN-}" ]]; then
     python3 scripts/hydra_plugins.py "$PFX_HYDRA" "$PFX_BUILD/hydra-plugins" >/dev/null
     export PFX_HD_RENDER="$HD_RENDER_BIN" PFX_HYDRA_PLUGIN_PATH="$PFX_BUILD/hydra-plugins"
