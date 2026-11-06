@@ -708,7 +708,9 @@ pub(crate) fn ramp_editor(ui: &mut egui::Ui, salt: impl std::hash::Hash, label: 
     let id = ui.make_persistent_id(("ramp_editor", salt));
     let mut selected: usize = ui.data(|d| d.get_temp(id)).unwrap_or(0).min(r.keys.len() - 1);
     let mut changed = false;
-    ui.label(label);
+    if !label.is_empty() {
+        ui.label(label);
+    }
     // As wide as the panel shows (it can be wider than it is, with a wide row in it).
     let visible = ui.clip_rect().right() - ui.cursor().left() - 10.0;
     let size = egui::vec2(ui.available_width().min(visible).clamp(120.0, 360.0), if colour { 30.0 } else { 70.0 });

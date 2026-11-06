@@ -972,6 +972,7 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("chf", 1, 1, "Parameters", "chf(\"name\") float slider on the node"),
     ("chi", 1, 1, "Parameters", "chi(\"name\") integer parameter on the node"),
     ("chv", 1, 1, "Parameters", "chv(\"name\") vector parameter on the node"),
+    ("chramp", 2, 2, "Parameters", "chramp(\"name\", t) a ramp on the node, looked up at t (0-1): a float, or a colour (vector) when the ramp is a colour ramp"),
     ("set", 1, 16, "Vector", "set(x, y, z) / set(x, y, z, w) / set(9 or 16 values) for matrices"),
     ("vector", 1, 3, "Vector", "vector(x) / vector(x, y, z)"),
     ("length", 1, 1, "Vector", "length(v)"),
@@ -1933,12 +1934,17 @@ fn hint_vector(e: &mut Expr) {
 // 'f' (ch/chf), 'i' (chi) or 'v' (chv).
 pub fn channel_refs(code: &str) -> Vec<(String, char)> {
     static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    static RAMPS: OnceLock<regex::Regex> = OnceLock::new();
     let pattern = PATTERN.get_or_init(|| regex::Regex::new(r#"\bch([fiv]?)\s*\(\s*"([^"]+)"\s*\)"#).unwrap());
+    let ramps = RAMPS.get_or_init(|| regex::Regex::new(r#"\bchramp\s*\(\s*"([^"]+)"\s*,"#).unwrap());
+    // In the order they appear: (where, name, kind), kind 'r' for chramp.
+    let mut found: Vec<(usize, String, char)> = pattern.captures_iter(code).map(|cap| (cap.get(0).unwrap().start(), cap[2].to_owned(), cap[1].chars().next().unwrap_or('f'))).collect();
+    found.extend(ramps.captures_iter(code).map(|cap| (cap.get(0).unwrap().start(), cap[1].to_owned(), 'r')));
+    found.sort_by_key(|(at, ..)| *at);
     let mut out: Vec<(String, char)> = Vec::new();
-    for cap in pattern.captures_iter(code) {
-        let kind = cap[1].chars().next().unwrap_or('f');
-        if !out.iter().any(|(n, _)| n == &cap[2]) {
-            out.push((cap[2].to_owned(), kind));
+    for (_, name, kind) in found {
+        if !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, kind));
         }
     }
     out
@@ -2126,6 +2132,8 @@ struct Runtime<'a> {
     fields: Vec<(String, crate::fields::Field)>,
     // Values of the node's ch() parameters.
     channels: Option<&'a Channels>,
+    // Its chramp() ramps, read once each.
+    ramps: Vec<(String, (crate::ramp::Ramp, bool))>,
     // pcopen handles for the current element (cleared when the element changes).
     pc_handles: Vec<PcHandle>,
     pc_elem: usize,
@@ -4055,6 +4063,20 @@ impl<'a> Runtime<'a> {
             "ch" | "chf" => Float(self.channel(&a[0].string()?)[0]),
             "chi" => Int(self.channel(&a[0].string()?)[0].round() as i32),
             "chv" => V(self.channel(&a[0].string()?)),
+            "chramp" => {
+                let name = a[0].string()?;
+                let t = a[1].num()?;
+                let at = match self.ramps.iter().position(|(n, _)| n.as_str() == &*name) {
+                    Some(at) => at,
+                    None => {
+                        let ramp = self.channels.and_then(|c| channel_ramp(c, &name)).unwrap_or_else(|| (default_ramp(), false));
+                        self.ramps.push((name.to_string(), ramp));
+                        self.ramps.len() - 1
+                    }
+                };
+                let (ramp, colour) = &self.ramps[at].1;
+                if *colour { V(ramp.eval(t)) } else { Float(ramp.eval1(t)) }
+            }
             // ---- strings ----
             "strip" | "lstrip" | "rstrip" => {
                 let text = a[0].string()?;
@@ -4523,6 +4545,51 @@ pub fn check(code: &str) -> Result<(), String> {
 // A node's ch() parameter values by name (float, int and vector parameters share it).
 pub type Channels = std::collections::BTreeMap<String, [f32; 3]>;
 
+// chramp("name", t) ramps are kept among the node's channels, so they save, copy and undo
+// with them: "name#ramp" holds [key count, colour (1) or float (0), 0], and each key k has
+// "name#ramp<k>" ([position, interpolation, 0]) and "name#ramp<k>v" (its value).
+pub const RAMP_TAG: &str = "#ramp";
+
+pub fn channel_ramp(channels: &Channels, name: &str) -> Option<(crate::ramp::Ramp, bool)> {
+    let head = channels.get(&format!("{name}{RAMP_TAG}"))?;
+    let count = head[0].max(0.0) as usize;
+    let keys: Option<Vec<crate::ramp::Key>> = (0..count)
+        .map(|k| {
+            let at = channels.get(&format!("{name}{RAMP_TAG}{k}"))?;
+            let value = *channels.get(&format!("{name}{RAMP_TAG}{k}v"))?;
+            Some(crate::ramp::Key { pos: at[0], interp: at[1].max(0.0) as usize, value })
+        })
+        .collect();
+    let keys = keys.filter(|k| !k.is_empty())?;
+    let mut ramp = crate::ramp::Ramp { keys };
+    ramp.sort();
+    Some((ramp, head[1] > 0.5))
+}
+
+pub fn set_channel_ramp(channels: &mut Channels, name: &str, ramp: &crate::ramp::Ramp, colour: bool) {
+    channels.retain(|key, _| !is_ramp_entry(key, name));
+    channels.insert(format!("{name}{RAMP_TAG}"), [ramp.keys.len() as f32, colour as u8 as f32, 0.0]);
+    for (k, key) in ramp.keys.iter().enumerate() {
+        channels.insert(format!("{name}{RAMP_TAG}{k}"), [key.pos, key.interp as f32, 0.0]);
+        channels.insert(format!("{name}{RAMP_TAG}{k}v"), if colour { key.value } else { [key.value[0]; 3] });
+    }
+}
+
+// Whether a channel holds part of the ramp called `name`.
+pub fn is_ramp_entry(key: &str, name: &str) -> bool {
+    key.strip_prefix(name).is_some_and(|rest| rest.starts_with(RAMP_TAG))
+}
+
+// Whether a channel holds part of any ramp (they're shown as ramps, not as numbers).
+pub fn is_any_ramp_entry(key: &str) -> bool {
+    key.contains(RAMP_TAG)
+}
+
+// The ramp chramp() reads when the node has none yet: 0 to 1, as Houdini's.
+pub fn default_ramp() -> crate::ramp::Ramp {
+    crate::ramp::Ramp::linear([0.0; 3], [1.0; 3])
+}
+
 // `mask` limits the run to some elements of the domain (a node's group); None runs on all.
 // A parameter expression, as typed into a parameter: VEX, with Houdini's
 // variables $F (frame, whole), $FF (frame, fractional), $T (seconds) and $FPS.
@@ -4655,6 +4722,7 @@ fn new_runtime<'a>(program: &'a Program, shared: &'a Shared<'a>, out: Mesh) -> R
         point_grid: None,
         fields: Vec::new(),
         channels: shared.channels,
+        ramps: Vec::new(),
         pc_handles: Vec::new(),
         pc_elem: usize::MAX,
         polys: shared.polys.clone(),
@@ -4982,6 +5050,29 @@ Notes      int / int is integer division (1 / 2 == 0, write 1.0 / 2 for 0.5).
 
 #[cfg(test)]
 mod tests {
+    use crate::ramp::Ramp;
+
+    #[test]
+    fn chramp_reads_float_and_colour_ramps_from_the_channels() {
+        let mesh = Mesh { vertices: (0..3).map(|i| Vec3::new(i as f32 * 0.5, 0.0, 0.0)).collect(), ..Mesh::default() };
+        let code = "f@w = chramp(\"shape\", @P.x); v@Cd = chramp(\"tint\", @P.x);";
+        assert_eq!(channel_refs(code), vec![("shape".to_owned(), 'r'), ("tint".to_owned(), 'r')]);
+        let mut channels = Channels::new();
+        set_channel_ramp(&mut channels, "shape", &Ramp::parse("0 0 linear; 0.5 1 linear; 1 0 linear", 1).unwrap(), false);
+        set_channel_ramp(&mut channels, "tint", &Ramp::parse("0 1 0 0 linear; 1 0 0 1 linear", 3).unwrap(), true);
+        let out = run_wrangle(mesh.clone(), &[], code, 0.0, 1.0 / 24.0, 2, None, Some(&channels));
+        assert_eq!(out.point_attributes["w"], vec![0.0, 1.0, 0.0]);
+        assert_eq!(&out.point_attributes["Cd"][3..6], &[0.5, 0.0, 0.5]);
+        // A float ramp read into a vector fills every component; no ramp yet reads 0 to 1.
+        let out = run_wrangle(mesh, &[], "v@Cd = chramp(\"shape\", @P.x); f@d = chramp(\"none\", 0.25);", 0.0, 1.0 / 24.0, 2, None, Some(&channels));
+        assert_eq!(&out.point_attributes["Cd"][3..6], &[1.0, 1.0, 1.0]);
+        assert_eq!(out.point_attributes["d"][0], 0.25);
+        let (back, colour) = channel_ramp(&channels, "tint").unwrap();
+        assert!(colour && back.keys.len() == 2 && back.keys[1].value == [0.0, 0.0, 1.0]);
+        set_channel_ramp(&mut channels, "tint", &Ramp::flat(0.5), false);
+        assert_eq!(channels.keys().filter(|k| is_ramp_entry(k, "tint")).count(), 1 + 2 * 2, "old keys are replaced");
+    }
+
     use super::*;
 
     // A 3×3 grid of points (9 points, 8 triangles) in the XZ plane.
@@ -5378,6 +5469,7 @@ mod tests {
             point_grid: None,
             fields: Vec::new(),
             channels: None,
+            ramps: Vec::new(),
             pc_handles: Vec::new(),
             pc_elem: usize::MAX,
             polys: crate::poly::runs(&input),

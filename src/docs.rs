@@ -15,7 +15,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("environment_light", "HDRI image-based lighting for MoonRay, matched in the viewport's lighting and background."),
     // Generators
     ("add", "Points: explicit positions and/or a line or grid of them, added to the optional input. Can delete the input's polygons but keep its points."),
-    ("curve", "A curve through the points you place, in order: a polyline, a smooth curve through every point (Catmull-Rom), or a smoother one drawn toward them (B-spline). Open or closed, with curveu from 0 at its start to 1 at its end, for POP Curve Force, Resample, Copy to Points and the renderers."),
+    ("curve", "A curve through the points you place, in order: a polyline, a smooth curve through every point (Catmull-Rom), or a smoother one drawn toward them (B-spline). Open or closed, with curveu from 0 at its start to 1 at its end, for POP Curve Force, Resample, Copy to Points and the renderers. Turn on Draw in the viewport to click points onto a construction plane, drag them and right-click to remove them."),
     ("grid", "A flat square grid of quads in the XZ plane."),
     ("plane", "A flat plane."),
     ("cone", "A cone, optionally capped."),
@@ -398,7 +398,9 @@ const VEX_GUIDE: &str = r#"
 <p><code>@P</code> (position), <code>@N</code>, <code>@Cd</code>, <code>@pscale</code> and other known names have fixed types; others take a type prefix: <code>f@mass</code>, <code>i@id</code>, <code>v@vel</code>, <code>s@name</code>, <code>p@orient</code> (vector4), <code>3@rot</code> (matrix3), <code>4@xform</code> (matrix). Read-only: <code>@ptnum</code>, <code>@primnum</code>, <code>@numpt</code>, <code>@Time</code>, <code>@Frame</code>, <code>@TimeInc</code>. Writing a new attribute creates it.</p>
 <pre>@P.y += sin(@P.x * 3 + @Time) * ch("amp");   // ch() adds a slider to the node
 v@vel = set(0, 1, 0);
+@pscale = chramp("taper", @curveu);           // chramp() adds a ramp to the node
 if (@P.y < 0) removepoint(0, @ptnum);</pre>
+<p>A <code>chramp()</code> ramp is a float ramp, or a colour ramp when its Colour box is ticked (then it gives a vector: <code>@Cd = chramp("heat", @age / @life);</code>).</p>
 <h4>Functions</h4>
 <p>Define functions before using them. Arguments are passed by reference (changing one changes the caller's variable). A name can have several versions with different parameter types (overloads); the one whose types fit the call best runs. Recursion works.</p>
 <pre>float smoothpulse(float x; float w) { return smooth(0, w, x) * (1 - smooth(1 - w, 1, x)); }

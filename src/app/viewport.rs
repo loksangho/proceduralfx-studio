@@ -2,12 +2,14 @@
 
 use crate::*;
 
+mod curve_draw;
 mod gizmo;
 mod handles;
 mod overlays;
 mod picking;
 mod view;
 
+pub(crate) use curve_draw::PLANES as CURVE_PLANES;
 pub(crate) use view::ViewCamera;
 
 impl ProceduralFxStudioApp {
@@ -95,10 +97,11 @@ impl ProceduralFxStudioApp {
                 }
             });
         }
+        self.curve_drag_start(ctx, &response);
         let paint_node = self
             .selected
             .filter(|id| self.paint_active && matches!(self.graph.nodes.get(id).map(|n| &n.kind), Some(NodeKind::AttributePaint { .. })));
-        if response.dragged_by(egui::PointerButton::Primary) && !box_select_modifier && self.gizmo_drag.is_none() && paint_node.is_none() {
+        if response.dragged_by(egui::PointerButton::Primary) && !box_select_modifier && self.gizmo_drag.is_none() && paint_node.is_none() && self.curve_drag.is_none() {
             self.cam_rot_y += response.drag_delta().x * 0.01;
             self.cam_rot_x = (self.cam_rot_x + response.drag_delta().y * 0.01).clamp(-1.55, 1.55);
         }
@@ -131,6 +134,8 @@ impl ProceduralFxStudioApp {
         let view = ViewCamera { center, sin_x, cos_x, sin_y, cos_y, focal, zoom, ortho_scale, target, near_plane, rect: response.rect, orthographic: self.orthographic };
         self.draw_environment(&painter, &view);
         let gizmo_clicked = self.view_axes(&painter, &response, recording);
+        // Drawing a Curve: its clicks place points rather than pick geometry.
+        let gizmo_clicked = if recording { gizmo_clicked } else { self.curve_draw_frame(ctx, &response, &painter, &view) || gizmo_clicked };
 
         let to_cam = |p: Vec3| view.to_cam(p);
         let project_cam = |c: Vec3| view.project_cam(c);

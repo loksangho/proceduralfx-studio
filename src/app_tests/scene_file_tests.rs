@@ -518,3 +518,18 @@ fn cached_geometry_keeps_its_string_attributes() {
     let polys = SheetPolys::new(&mesh);
     assert_eq!(sheet_cell(&mesh, &[], &polys, &name.source, 2), "piece \"two\"");
 }
+
+#[test]
+fn chramp_ramps_save_and_load_with_the_wrangle() {
+    let mut g = Graph::default();
+    let grid = g.add(NodeKind::Grid { size: 2.0, res: 3 }, egui::pos2(0.0, 0.0));
+    let wrangle = g.add(NodeKind::Wrangle { code: "@P.y = chramp(\"lift\", @P.x * 0.5 + 0.5);".into(), domain: 2 }, egui::pos2(0.0, 80.0));
+    g.connect(grid, wrangle, 0);
+    vex::set_channel_ramp(&mut g.nodes.get_mut(&wrangle).unwrap().channels, "lift", &ramp::Ramp::parse("0 0 constant; 0.5 2 constant", 1).unwrap(), false);
+    let loaded = Graph::deserialize(&g.serialize());
+    let (r, colour) = vex::channel_ramp(&loaded.nodes[&wrangle].channels, "lift").unwrap();
+    assert!(!colour && r.keys.len() == 2 && r.keys[0].interp == ramp::CONSTANT);
+    let out = loaded.cook(wrangle, 0.0, &mut HashMap::new());
+    // Left of the middle holds 0, from the middle on 2.
+    assert!(out.vertices.iter().all(|p| (p.x < -1e-4 && p.y == 0.0) || (p.x >= -1e-4 && p.y == 2.0)), "{:?}", out.vertices);
+}

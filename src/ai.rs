@@ -336,7 +336,11 @@ pub fn describe(graph: &Graph) -> String {
                 let _ = write!(line, " [{}]", params.join(" "));
             }
             if !n.channels.is_empty() {
-                let channels: Vec<String> = n.channels.iter().map(|(name, v)| if v[1] == 0.0 && v[2] == 0.0 { format!("{name}={}", fmt_value(v[0])) } else { format!("{name}=[{}, {}, {}]", fmt_value(v[0]), fmt_value(v[1]), fmt_value(v[2])) }).collect();
+                // Ramps (chramp) as their text; the rest as numbers.
+                let ramp_names: Vec<String> = n.channels.keys().filter_map(|k| k.strip_suffix(vex::RAMP_TAG).map(str::to_owned)).collect();
+                let ramps = ramp_names.iter().filter_map(|name| vex::channel_ramp(&n.channels, name).map(|(r, colour)| format!("{name}=\"{}\"", r.format(if colour { 3 } else { 1 }))));
+                let channels: Vec<String> = n.channels.iter().filter(|(k, _)| !vex::is_any_ramp_entry(k)).map(|(name, v)| if v[1] == 0.0 && v[2] == 0.0 { format!("{name}={}", fmt_value(v[0])) } else { format!("{name}=[{}, {}, {}]", fmt_value(v[0]), fmt_value(v[1]), fmt_value(v[2])) }).collect();
+                let channels: Vec<String> = channels.into_iter().chain(ramps).collect();
                 let _ = write!(line, " channels: {}", channels.join(" "));
             }
             if !n.group.is_empty() {
@@ -660,7 +664,19 @@ fn apply_one(graph: &mut Graph, edit: &Edit, ids: &mut BTreeMap<String, NodeId>,
             let id = Resolver { graph, ids }.node(node)?;
             let n = graph.nodes.get_mut(&id).expect("resolved");
             // Names of the node's user channels (read in VEX with ch()) set those.
-            let (channels, params): (BTreeMap<String, serde_json::Value>, BTreeMap<String, serde_json::Value>) = params.clone().into_iter().partition(|(name, _)| n.channels.contains_key(name));
+            // Ramps the code reads with chramp() take ramp text ("0 0 linear; 1 1 linear").
+            let ramp_refs: Vec<String> = n.kind.texts().iter().flat_map(|t| vex::channel_refs(t)).filter(|(_, k)| *k == 'r').map(|(name, _)| name).collect();
+            let (ramps, params): (BTreeMap<String, serde_json::Value>, BTreeMap<String, serde_json::Value>) =
+                params.clone().into_iter().partition(|(name, v)| v.is_string() && (ramp_refs.contains(name) || n.channels.contains_key(&format!("{name}{}", vex::RAMP_TAG))));
+            for (name, value) in ramps {
+                let text = value.as_str().unwrap_or_default();
+                // A colour ramp if the text gives three numbers a key, or it was one already.
+                let colour = text.split(';').next().is_some_and(|k| k.split_whitespace().take_while(|w| w.parse::<f32>().is_ok()).count() >= 4)
+                    || vex::channel_ramp(&n.channels, &name).is_some_and(|(_, c)| c);
+                let ramp = ramp::Ramp::parse(text, if colour { 3 } else { 1 }).ok_or_else(|| format!("{name}: a ramp is keys like \"0 0 linear; 1 1 linear\""))?;
+                vex::set_channel_ramp(&mut n.channels, &name, &ramp, colour);
+            }
+            let (channels, params): (BTreeMap<String, serde_json::Value>, BTreeMap<String, serde_json::Value>) = params.into_iter().partition(|(name, _)| n.channels.contains_key(name));
             let mut kind = n.kind.clone();
             notes.extend(set_params(&mut kind, &params)?.into_iter().map(|note| format!("{node}: {note}")));
             for (name, value) in channels {

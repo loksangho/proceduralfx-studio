@@ -826,6 +826,22 @@ impl ProceduralFxStudioApp {
             }
             NodeKind::Curve(set) => {
                 ui.small("A curve through (or near) the points below, in order. Curves are points with curveu (0 at the start, 1 at the end): POP Curve Force, Resample and Copy to Points use them.");
+                let drawing = self.curve_draw;
+                if ui
+                    .selectable_label(drawing, if drawing { "✏ Drawing: click in the viewport to add points" } else { "✏ Draw in the viewport" })
+                    .on_hover_text("While on, a click in the viewport adds a point at the end of the curve, on the construction plane; drag a point to move it, right-click one to remove it. Left-dragging elsewhere still orbits.")
+                    .clicked()
+                {
+                    self.curve_draw = !drawing;
+                    self.curve_drag = None;
+                }
+                if self.curve_draw {
+                    egui::ComboBox::from_label("Construction plane").selected_text(super::super::viewport::CURVE_PLANES[self.curve_plane.min(3)]).show_ui(ui, |ui| {
+                        for (value, label) in super::super::viewport::CURVE_PLANES.iter().enumerate() {
+                            ui.selectable_value(&mut self.curve_plane, value, *label);
+                        }
+                    });
+                }
                 egui::ComboBox::from_label("Type").selected_text(curve::TYPES[set.kind.min(curve::TYPES.len() - 1)]).show_ui(ui, |ui| {
                     for (value, label) in curve::TYPES.iter().enumerate() {
                         c |= ui.selectable_value(&mut set.kind, value, *label).changed();

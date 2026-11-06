@@ -447,7 +447,8 @@ pub(crate) fn channel_params_ui(ui: &mut egui::Ui, code: &str, channels: &mut ve
     let refs = vex::channel_refs(code);
     let mut changed = false;
     let before = channels.len();
-    channels.retain(|name, _| refs.iter().any(|(n, _)| n == name));
+    // Values the code no longer reads go; a chramp() ramp is several entries.
+    channels.retain(|key, _| refs.iter().any(|(n, kind)| if *kind == 'r' { vex::is_ramp_entry(key, n) } else { n == key }));
     changed |= channels.len() != before;
     if refs.is_empty() {
         return changed;
@@ -455,6 +456,26 @@ pub(crate) fn channel_params_ui(ui: &mut egui::Ui, code: &str, channels: &mut ve
     ui.separator();
     ui.strong("Parameters");
     for (name, kind) in refs {
+        if kind == 'r' {
+            let (ramp, mut colour) = vex::channel_ramp(channels, &name).unwrap_or_else(|| (vex::default_ramp(), false));
+            if vex::channel_ramp(channels, &name).is_none() {
+                vex::set_channel_ramp(channels, &name, &ramp, colour);
+            }
+            let mut ramp_changed = false;
+            ui.horizontal(|ui| {
+                ui.label(&name);
+                ramp_changed |= ui.checkbox(&mut colour, "Colour").on_hover_text("A colour ramp: chramp() gives a vector (a colour) instead of a float").changed();
+            });
+            let width = if colour { 3 } else { 1 };
+            let mut text = ramp.format(width);
+            ramp_changed |= ramp_editor(ui, ("chramp", &name), "", &mut text, width, vex::default_ramp);
+            if ramp_changed {
+                let ramp = ramp::Ramp::from_text(&text, width, vex::default_ramp);
+                vex::set_channel_ramp(channels, &name, &ramp, colour);
+                changed = true;
+            }
+            continue;
+        }
         let value = channels.entry(name.clone()).or_insert([0.0; 3]);
         ui.horizontal(|ui| {
             if kind == 'v' {
@@ -481,7 +502,7 @@ pub(crate) fn channel_params_ui(ui: &mut egui::Ui, code: &str, channels: &mut ve
             }
         });
     }
-    ui.small("From ch(\"name\") / chi / chv in the code. Drag past the slider's end for larger values.");
+    ui.small("From ch(\"name\") / chi / chv / chramp in the code. Drag past the slider's end for larger values.");
     changed
 }
 

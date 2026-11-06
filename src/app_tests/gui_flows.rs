@@ -502,3 +502,49 @@ fn a_curve_from_the_tab_menu_and_a_key_clicked_onto_a_ramp() {
     assert_eq!(ramp.keys.len(), 3, "a key was added: {}", set.ramp);
     assert!(h.state().has_unsaved_changes());
 }
+
+// With Draw in the viewport on, a click adds a Curve point on the ground, a drag moves one
+// and a right-click removes one.
+#[test]
+fn curve_points_are_placed_moved_and_removed_in_the_viewport() {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj curve 0 0 12 -1 0 0 1 0 0\nparent 1 0\ndisplay 0 1\nnext 2\n".into());
+    app.current_network = Some(0);
+    app.selected = Some(1);
+    let mut h = harness(app);
+    h.get_by_label("✏ Draw in the viewport").click();
+    h.run_steps(3);
+    assert!(h.state().curve_draw);
+    let points = |h: &Harness<ProceduralFxStudioApp>| match &h.state().graph.nodes[&1].kind {
+        NodeKind::Curve(c) => c.points.clone(),
+        _ => panic!(),
+    };
+    // A click below the middle of the viewport lands on the ground in front of the origin.
+    let view = h.state().viewport_rect.unwrap();
+    click_at(&mut h, view.center() + egui::vec2(60.0, 40.0));
+    let after = points(&h);
+    assert_eq!(after.len(), 3, "a point was added: {after:?}");
+    assert!(after[2][1].abs() < 1e-3, "on the ground: {:?}", after[2]);
+    assert_eq!(h.state().selected, Some(1), "the curve stays selected");
+
+    // Drag point 0 to the right: it moves on the ground.
+    let handle = h.state().curve_handles.iter().find(|(_, i, _)| *i == 0).unwrap().2;
+    drag(&mut h, handle, handle + egui::vec2(80.0, 0.0));
+    let moved = points(&h);
+    assert!(moved[0][0] > -0.9 && moved[0][1].abs() < 1e-3, "{:?}", moved[0]);
+    assert_eq!(moved.len(), 3, "dragging a point doesn't add one");
+
+    // A click on a point (not a drag) doesn't add another.
+    let handle = h.state().curve_handles.iter().find(|(_, i, _)| *i == 1).unwrap().2;
+    click_at(&mut h, handle);
+    assert_eq!(points(&h).len(), 3);
+    // Right-click point 2: removed.
+    let handle = h.state().curve_handles.iter().find(|(_, i, _)| *i == 2).unwrap().2;
+    pointer(&mut h, handle);
+    h.event(egui::Event::PointerButton { pos: handle, button: egui::PointerButton::Secondary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(2);
+    h.event(egui::Event::PointerButton { pos: handle, button: egui::PointerButton::Secondary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(3);
+    assert_eq!(points(&h).len(), 2);
+    assert!(h.state().has_unsaved_changes());
+}

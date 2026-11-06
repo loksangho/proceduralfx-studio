@@ -684,6 +684,12 @@ pub(crate) struct ProceduralFxStudioApp {
     // Viewport drags paint the selected Attribute Paint node instead of orbiting.
     pub(crate) paint_active: bool,
     pub(crate) paint_fill: Option<NodeId>,
+    // Placing a Curve's points in the viewport: on, the construction plane (see
+    // curve_draw.rs), the point being dragged, and where its handles were drawn last frame.
+    pub(crate) curve_draw: bool,
+    pub(crate) curve_plane: usize,
+    pub(crate) curve_drag: Option<(NodeId, usize)>,
+    pub(crate) curve_handles: Vec<(NodeId, usize, egui::Pos2)>,
     // Group names on a node's input, for its Group menu: (node, point groups, primitive groups).
     pub(crate) group_choices: Option<(NodeId, Vec<String>, Vec<String>)>,
     pub(crate) group_choices_request: Option<NodeId>,
@@ -938,6 +944,10 @@ impl Default for ProceduralFxStudioApp {
             asset_save: (None, String::new(), String::new()),
             paint_active: false,
             paint_fill: None,
+            curve_draw: false,
+            curve_plane: 0,
+            curve_drag: None,
+            curve_handles: Vec::new(),
             group_choices: None,
             group_choices_request: None,
             group_pick: None,
