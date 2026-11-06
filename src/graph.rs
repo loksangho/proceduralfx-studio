@@ -1503,7 +1503,9 @@ impl Graph {
             stack.extend(self.links.iter().filter(|l| l.to == at).map(|l| l.from));
         }
         let s = pop::Step { time, dt, step, frame_start, node_seed: 0, inputs, colliders: &colliders };
-        let out = self.pop_eval(display, prev, &s, None, &mut HashSet::new());
+        let mut out = self.pop_eval(display, prev, &s, None, &mut HashSet::new());
+        // A stream left open at the end doesn't carry into the next step.
+        out.point_attributes.remove(pop::STREAM_MASK);
         SOLVER_TIME_INC.with(|inc| inc.set(outer_inc));
         out
     }
@@ -1530,33 +1532,50 @@ impl Graph {
         let out = match kind.as_ref() {
             _ if node.bypass => upstream(0, onto, visiting),
             // Each input in turn: the first gives the particles, the rest act on them.
+            // A POP Stream ends at the Merge, so each input starts from all the particles.
             NodeKind::Merge => {
+                let outer = onto.as_ref().and_then(|m| m.point_attributes.get(pop::STREAM_MASK).cloned());
                 let mut particles = onto;
                 for (_, from) in &inputs {
-                    particles = Some(self.pop_eval(*from, prev, s, particles, visiting));
+                    let mut out = self.pop_eval(*from, prev, s, particles, visiting);
+                    match &outer {
+                        Some(stream) if stream.len() == out.vertices.len() => {
+                            out.point_attributes.insert(pop::STREAM_MASK.into(), stream.clone());
+                        }
+                        _ => {
+                            out.point_attributes.remove(pop::STREAM_MASK);
+                        }
+                    }
+                    particles = Some(out);
                 }
                 particles.unwrap_or_else(|| prev.clone())
             }
             NodeKind::Pop(p) if p.op == pop::OBJECT => onto.unwrap_or_else(|| prev.clone()),
             NodeKind::Pop(p) if p.op == pop::SOLVER => {
-                let objects = upstream(0, onto, visiting);
+                let mut objects = upstream(0, onto, visiting);
+                objects.point_attributes.remove(pop::STREAM_MASK);
                 let mut particles = match input(1) {
                     Some(pre) => self.pop_eval(pre, prev, s, Some(objects), visiting),
                     None => objects,
                 };
+                // Streams in the pre-solve input end there.
+                particles.point_attributes.remove(pop::STREAM_MASK);
                 pop::integrate(&mut particles, s.dt);
                 if !s.colliders.is_empty() {
                     pop::bounce_off(&mut particles, s.colliders, None);
                 }
-                match input(2) {
+                let mut out = match input(2) {
                     Some(post) => self.pop_eval(post, prev, s, Some(particles), visiting),
                     None => particles,
-                }
+                };
+                out.point_attributes.remove(pop::STREAM_MASK);
+                out
             }
             NodeKind::Pop(p) => {
                 let mut particles = upstream(0, onto, visiting);
                 pop::tidy(&mut particles);
-                let mask = groups::point_mask(&particles, &node.group).ok().flatten();
+                // Its group's particles, and below a POP Stream, only the stream's.
+                let mask = pop::stream_mask(&particles, groups::point_mask(&particles, &node.group).ok().flatten());
                 // VEX input 0 is the particles; 1-3 are the POP Network's inputs 0-2.
                 let others = &s.inputs[..s.inputs.len().min(vex::INPUTS - 1)];
                 match p.op {
@@ -2280,6 +2299,8 @@ impl Graph {
                 NodeKind::Metaball(settings) => self.report(id, sopkit::metaball(&input(0, cache), settings)),
                 NodeKind::Connectivity(settings) => self.report(id, sopkit::connectivity(&input(0, cache), settings)),
                 NodeKind::Resample(settings) => self.report(id, sopkit::resample(&input(0, cache), settings)),
+                NodeKind::Curve(settings) => self.report(id, curve::curve(settings)),
+                NodeKind::AttributeRemap(settings) => self.report(id, remap::remap(&input(0, cache), settings)),
                 NodeKind::PointDeform(settings) => self.report(id, deform::point_deform(&input(0, cache), &input(1, cache), &input(2, cache), settings)),
                 NodeKind::TransformPieces => {
                     let rest = self.input_of(id, 2).map(|_| input(2, cache));

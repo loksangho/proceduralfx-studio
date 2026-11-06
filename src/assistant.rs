@@ -203,6 +203,7 @@ pub fn system_prompt() -> String {
          - Geometry is polygons (quads where natural). Primitive numbers and groups refer to polygons.\n\
          - Parameters are set by name, as listed in the catalog; vectors take arrays (t: [0, 1, 0]); text parameters take strings.\n\
          - Inputs and outputs count from 1. Nodes in different objects can't be wired; use object_merge to bring geometry across.\n\
+         - Ramps (color's ramp, attribute_remap's ramp, POP Color's and POP Curve Force's ramps) are text: keys separated by semicolons, each a position 0-1, a value (one number, or three for a colour) and an interpolation (constant, linear, catmull-rom, monotone or bspline), e.g. \"0 0 linear; 0.5 1 catmull-rom; 1 0 linear\" or \"0 1 0.5 0 linear; 1 0.1 0.1 0.1 linear\". Colours are linear, like Cd.\n\
          - Wrangles run VEX, a C-like language for attributes: @P, @N, @Cd, @pscale, @ptnum, @primnum, @Time, @Frame, and functions like rand, noise, fit, sin, point, setpointattrib, removepoint.\n\
          - Edits to a node that's already in the scene keep its other parameters; prefer changing the existing network to rebuilding it when the user asks for a change.\n\n\
          # Effects for 2D games\n\

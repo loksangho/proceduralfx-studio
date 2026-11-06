@@ -696,3 +696,144 @@ mod font_tests {
         }
     }
 }
+
+// A ramp's editor: its curve (or, for a colour, its gradient) with the keys on it. Drag a
+// key along the ramp, and up and down on a float ramp; click an empty spot to add a key,
+// right-click a key to remove it. The selected key's position, value and interpolation
+// are below. Writes the ramp back to `text` when it changes; `fallback` is the ramp an
+// empty text stands for.
+pub(crate) fn ramp_editor(ui: &mut egui::Ui, salt: impl std::hash::Hash, label: &str, text: &mut String, width: usize, fallback: impl FnOnce() -> ramp::Ramp) -> bool {
+    let mut r = ramp::Ramp::from_text(text, width, fallback);
+    let colour = width >= 3;
+    let id = ui.make_persistent_id(("ramp_editor", salt));
+    let mut selected: usize = ui.data(|d| d.get_temp(id)).unwrap_or(0).min(r.keys.len() - 1);
+    let mut changed = false;
+    ui.label(label);
+    // As wide as the panel shows (it can be wider than it is, with a wide row in it).
+    let visible = ui.clip_rect().right() - ui.cursor().left() - 10.0;
+    let size = egui::vec2(ui.available_width().min(visible).clamp(120.0, 360.0), if colour { 30.0 } else { 70.0 });
+    let (response, painter) = ui.allocate_painter(size, egui::Sense::click());
+    let rect = response.rect.shrink2(egui::vec2(7.0, if colour { 4.0 } else { 7.0 }));
+    let (lo, hi) = if colour {
+        (0.0, 1.0)
+    } else {
+        let (min, max) = r.keys.iter().fold((0.0f32, 1.0f32), |(a, b), k| (a.min(k.value[0]), b.max(k.value[0])));
+        (min, if max - min < 1e-4 { min + 1.0 } else { max })
+    };
+    let x_of = |t: f32| rect.left() + t * rect.width();
+    let y_of = |v: f32| rect.bottom() - (v - lo) / (hi - lo) * rect.height();
+    let accent = ui.visuals().selection.bg_fill;
+    painter.rect_filled(response.rect, 3.0, ui.visuals().extreme_bg_color);
+    if colour {
+        let columns = (rect.width() / 2.0).ceil().max(1.0) as usize;
+        for k in 0..columns {
+            let t0 = k as f32 / columns as f32;
+            let c = r.eval((k as f32 + 0.5) / columns as f32).map(|v| (color::to_display(v) * 255.0).round() as u8);
+            let column = egui::Rect::from_min_max(egui::pos2(x_of(t0), rect.top()), egui::pos2(x_of((k + 1) as f32 / columns as f32) + 0.5, rect.bottom()));
+            painter.rect_filled(column, 0.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+        }
+    } else {
+        let guide = ui.visuals().widgets.noninteractive.bg_stroke;
+        for v in [0.0, 1.0] {
+            if (lo..=hi).contains(&v) {
+                painter.hline(rect.x_range(), y_of(v), guide);
+            }
+        }
+        let points: Vec<egui::Pos2> = (0..=120).map(|k| k as f32 / 120.0).map(|t| egui::pos2(x_of(t), y_of(r.eval1(t)))).collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.8_f32, accent)));
+    }
+    // The keys: drawn and dragged. A key moves no further than its neighbours, so the keys
+    // keep their order (and their handles) while dragged.
+    let (mut remove, mut moved) = (None, None);
+    for (i, key) in r.keys.iter().enumerate() {
+        let centre = if colour { egui::pos2(x_of(key.pos), rect.bottom()) } else { egui::pos2(x_of(key.pos), y_of(key.value[0])) };
+        let handle = ui
+            .interact(egui::Rect::from_center_size(centre, egui::vec2(14.0, 14.0)), id.with(i), egui::Sense::click_and_drag())
+            .on_hover_text("Drag to move the key; right-click to remove it");
+        if handle.clicked() || handle.drag_started() {
+            selected = i;
+        }
+        if handle.dragged() {
+            let d = handle.drag_delta();
+            let low = if i > 0 { r.keys[i - 1].pos } else { 0.0 };
+            let high = if i + 1 < r.keys.len() { r.keys[i + 1].pos } else { 1.0 };
+            let pos = (key.pos + d.x / rect.width()).clamp(low, high);
+            let value = if colour { key.value } else { [key.value[0] - d.y / rect.height() * (hi - lo); 3] };
+            moved = Some((i, pos, value));
+        }
+        if handle.secondary_clicked() && r.keys.len() > 1 {
+            remove = Some(i);
+        }
+        let fill = if colour {
+            let c = key.value.map(|v| (color::to_display(v) * 255.0).round() as u8);
+            egui::Color32::from_rgb(c[0], c[1], c[2])
+        } else {
+            accent
+        };
+        let ring = if i == selected { egui::Stroke::new(2.0_f32, ui.visuals().strong_text_color()) } else { egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()) };
+        painter.circle(centre, if i == selected { 5.5 } else { 4.5 }, fill, ring);
+    }
+    if let Some((i, pos, value)) = moved {
+        r.keys[i].pos = pos;
+        r.keys[i].value = value;
+        changed = true;
+    }
+    if let Some(i) = remove.take() {
+        r.keys.remove(i);
+        selected = selected.min(r.keys.len() - 1);
+        changed = true;
+    }
+    // A click on the ramp itself adds a key there.
+    if response.clicked() {
+        if let Some(at) = response.interact_pointer_pos() {
+            let t = ((at.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let value = if colour { r.eval(t) } else { [lo + (rect.bottom() - at.y) / rect.height() * (hi - lo); 3] };
+            let interp = r.keys.iter().rev().find(|k| k.pos <= t).map_or(ramp::LINEAR, |k| k.interp);
+            r.keys.push(ramp::Key { pos: t, value, interp });
+            r.sort();
+            selected = r.keys.iter().position(|k| k.pos == t).unwrap_or(0);
+            changed = true;
+        }
+    }
+    // The selected key.
+    let mut resort = false;
+    ui.horizontal(|ui| {
+        let n = r.keys.len();
+        let key = &mut r.keys[selected];
+        ui.weak(format!("Key {}/{n}", selected + 1));
+        let before = key.pos;
+        changed |= ui.add(egui::DragValue::new(&mut key.pos).range(0.0..=1.0).speed(0.005).max_decimals(3).prefix("at ")).on_hover_text("Position along the ramp, 0 to 1").changed();
+        resort |= key.pos != before;
+        if colour {
+            changed |= ui.color_edit_button_rgb(&mut key.value).changed();
+        } else {
+            changed |= ui.add(egui::DragValue::new(&mut key.value[0]).speed(0.01).max_decimals(3)).on_hover_text("The key's value").changed();
+            key.value = [key.value[0]; 3];
+        }
+        egui::ComboBox::from_id_salt(id.with("interp")).width(96.0).selected_text(ramp::INTERPS[key.interp.min(ramp::INTERPS.len() - 1)]).show_ui(ui, |ui| {
+            for (value, name) in ramp::INTERPS.iter().enumerate() {
+                changed |= ui.selectable_value(&mut key.interp, value, *name).changed();
+            }
+        })
+        .response
+        .on_hover_text("How this key leads into the next: held, a straight line, a smooth curve through the keys (Catmull-Rom), one that never overshoots them (Monotone Cubic), or a smoother one that passes near them (B-Spline)");
+        if ui.add_enabled(n > 1, egui::Button::new("✕").small()).on_hover_text("Remove this key").clicked() {
+            remove = Some(selected);
+        }
+    });
+    if let Some(i) = remove.filter(|_| r.keys.len() > 1) {
+        r.keys.remove(i);
+        selected = selected.min(r.keys.len() - 1);
+        changed = true;
+    }
+    if resort {
+        let pos = r.keys[selected].pos;
+        r.sort();
+        selected = r.keys.iter().position(|k| k.pos == pos).unwrap_or(selected);
+    }
+    ui.data_mut(|d| d.insert_temp(id, selected));
+    if changed {
+        *text = r.format(width);
+    }
+    changed
+}

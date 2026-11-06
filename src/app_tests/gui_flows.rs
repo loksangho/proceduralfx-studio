@@ -474,3 +474,31 @@ fn a_preset_sliders_open_shows_the_node_it_changes() {
     assert_eq!(app.selected, Some(source));
     assert_eq!(app.current_network, app.graph.nodes[&source].parent, "inside its network");
 }
+
+// A Curve from the Tab menu draws a curve; clicking on a Color node's ramp adds a key.
+#[test]
+fn a_curve_from_the_tab_menu_and_a_key_clicked_onto_a_ramp() {
+    let mut h = harness(one_grid());
+    let at = in_canvas(&h, 0.6, 0.5);
+    let curve = add_with_tab(&mut h, at, "curve");
+    assert!(matches!(h.state().graph.nodes[&curve].kind, NodeKind::Curve(_)));
+    let mesh = h.state().graph.cook(curve, 0.0, &mut HashMap::new());
+    assert_eq!(crate::groom::curves(&mesh).len(), 1, "one curve");
+    h.get_by_label("➕ Add point").click();
+    h.run_steps(2);
+    assert!(matches!(&h.state().graph.nodes[&curve].kind, NodeKind::Curve(c) if c.points.len() == 5));
+
+    // A Color node on its Ramp mode, selected: its ramp starts as From → To, two keys.
+    let mut app = one_grid();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj color 0 2 1 0.45 0.1 0.1 0.3 1 1 1\nparent 1 0\ndisplay 0 1\nnext 2\n".into());
+    app.current_network = Some(0);
+    app.selected = Some(1);
+    let mut h = harness(app);
+    let label = h.get_by_label("Color ramp (low → high along the axis)").rect();
+    // The ramp's gradient is just below its label: click a third of the way along it.
+    click_at(&mut h, egui::pos2(label.left() + 110.0, label.bottom() + 16.0));
+    let NodeKind::Color(set) = &h.state().graph.nodes[&1].kind else { panic!() };
+    let ramp = ramp::Ramp::parse(&set.ramp, 3).expect("the ramp was written");
+    assert_eq!(ramp.keys.len(), 3, "a key was added: {}", set.ramp);
+    assert!(h.state().has_unsaved_changes());
+}

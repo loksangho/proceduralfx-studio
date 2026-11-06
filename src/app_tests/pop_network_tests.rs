@@ -282,3 +282,70 @@ fn pop_vops_run_and_networks_survive_save_and_load() {
     let Some(NodeKind::Pop(p)) = loaded.nodes.get(&collide).map(|n| &n.kind) else { panic!() };
     assert_eq!(p.op, pop::COLLIDE);
 }
+
+#[test]
+fn a_stream_in_the_network_pushes_only_its_particles() {
+    let (mut app, net) = new_network();
+    let (solver, gravity) = (child(&app, net, pop::SOLVER), child(&app, net, pop::GRAVITY));
+    let source = child(&app, net, pop::SOURCE);
+    set(&mut app, source, "velocity", &[0.0, 0.0, 0.0]);
+    set(&mut app, source, "variance", &[0.0, 0.0, 0.0]);
+    set(&mut app, gravity, "force", &[0.0, 0.0, 0.0]);
+    // Pre-solve: half the particles in a stream, pushed along +x; the stream ends at the merge,
+    // so the drag merged after it slows everyone.
+    let stream = pop_child(&mut app, net, pop::STREAM);
+    let force = pop_child(&mut app, net, pop::FORCE);
+    set(&mut app, force, "force", &[20.0, 0.0, 0.0]);
+    let drag = pop_child(&mut app, net, pop::DRAG);
+    set(&mut app, drag, "wind", &[0.0, 0.0, 3.0]);
+    let merge = app.graph.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
+    app.graph.nodes.get_mut(&merge).unwrap().parent = Some(net);
+    app.graph.connect(stream, force, 0);
+    app.graph.connect(force, merge, 0);
+    app.graph.connect(drag, merge, 1);
+    app.graph.connect(merge, solver, 1);
+
+    let out = cook(&app, net, 0.5);
+    let n = out.vertices.len();
+    let member = &out.point_attributes["group:stream_stream1"];
+    let joined = member.iter().filter(|m| **m > 0.5).count();
+    assert!(joined > n / 4 && joined < n * 3 / 4, "{joined} of {n} in the stream");
+    let (v, age) = (&out.point_attributes["v"], &out.point_attributes["age"]);
+    for i in (0..n).filter(|&i| age[i] > 0.1) {
+        let pushed = v[i * 3] > 0.5;
+        assert_eq!(pushed, member[i] > 0.5, "particle {i}: only the stream is pushed");
+        assert!(v[i * 3 + 2] > 0.1, "particle {i}: the drag after the merge reaches everyone");
+    }
+    assert!(!out.point_attributes.contains_key(pop::STREAM_MASK));
+}
+
+#[test]
+fn a_curve_force_carries_particles_along_a_curve_node() {
+    let (mut app, net) = new_network();
+    let (solver, gravity) = (child(&app, net, pop::SOLVER), child(&app, net, pop::GRAVITY));
+    let source = child(&app, net, pop::SOURCE);
+    set(&mut app, source, "velocity", &[0.0, 0.0, 0.0]);
+    set(&mut app, source, "variance", &[0.0, 0.0, 0.0]);
+    set(&mut app, gravity, "force", &[0.0, 0.0, 0.0]);
+    // A curve rising from the origin, into the network's input 1.
+    let mut settings = curve::CurveSettings::defaults();
+    settings.points = vec![[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [2.0, 4.0, 0.0]];
+    let curve = app.graph.add(NodeKind::Curve(settings), egui::pos2(0.0, 0.0));
+    app.graph.nodes.get_mut(&curve).unwrap().parent = app.graph.nodes[&net].parent;
+    app.graph.connect(curve, net, 1);
+    let flow = pop_child(&mut app, net, pop::CURVE_FORCE);
+    set(&mut app, flow, "mode", &[1.0]);
+    set(&mut app, flow, "air_resistance", &[20.0]);
+    app.graph.connect(flow, solver, 1);
+
+    let out = cook(&app, net, 1.0);
+    let (v, age) = (&out.point_attributes["v"], &out.point_attributes["age"]);
+    let old: Vec<usize> = (0..out.vertices.len()).filter(|&i| age[i] > 0.5).collect();
+    assert!(!old.is_empty());
+    // Up the curve and staying near it.
+    for &i in &old {
+        let p = out.vertices[i];
+        assert!(p.y > 0.5 && v[i * 3 + 1] > 0.5, "particle {i} at {p:?} rides up the curve");
+        assert!(p.z.abs() < 0.05, "{p:?}");
+    }
+}

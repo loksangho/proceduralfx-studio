@@ -1173,6 +1173,10 @@ pub(crate) enum NodeKind {
     Metaball(sopkit::MetaballSettings),
     Connectivity(sopkit::ConnectivitySettings),
     Resample(sopkit::ResampleSettings),
+    // A curve through (or near) points you place: polyline, smooth or B-spline, open or closed.
+    Curve(curve::CurveSettings),
+    // Reshapes an attribute's values through a ramp, from an input range to an output range.
+    AttributeRemap(remap::RemapSettings),
     // Flow control (see flow.rs): For-Each and Compile blocks are Begin/End pairs.
     ForEachBegin,
     ForEachEnd(flow::ForEachSettings),
@@ -1325,7 +1329,8 @@ impl NodeKind {
             | NodeKind::AttributeTransfer(_)
             | NodeKind::AttributePaint { .. }
             | NodeKind::GuideProcess(_)
-            | NodeKind::HairDeform(_) => GroupSupport::Restrict,
+            | NodeKind::HairDeform(_)
+            | NodeKind::AttributeRemap(_) => GroupSupport::Restrict,
             NodeKind::Wrangle { .. }
             | NodeKind::AttributeVop { .. }
             | NodeKind::Blast { .. }
@@ -1448,6 +1453,8 @@ impl NodeKind {
             NodeKind::Metaball(_) => names(&["radius", "threshold", "resolution"]),
             NodeKind::Connectivity(_) => names(&["class"]),
             NodeKind::Resample(_) => names(&["by_length", "length", "segments"]),
+            NodeKind::Curve(_) => names(&["type", "closed", "divisions"]),
+            NodeKind::AttributeRemap(_) => names(&["class", "auto_range", "input_min", "input_max", "output_min", "output_max"]),
             NodeKind::LSystem(_) => names(&["generations", "angle", "step", "step_scale", "thickness", "thickness_scale", "angle_random", "seed"]),
             NodeKind::TestGeometry(_) => names(&["shape", "size", "on_ground", "colours", "p", "q", "detail", "clip", "look", "looping"]),
             NodeKind::PointDeform(_) => names(&["influences", "fit_neighbours", "follow_rotation"]),
@@ -1468,7 +1475,7 @@ impl NodeKind {
             NodeKind::TerrainColorize(_) => names(&["sand.r", "sand.g", "sand.b", "grass.r", "grass.g", "grass.b", "rock.r", "rock.g", "rock.b", "snow.r", "snow.g", "snow.b", "sand_level", "snow_level", "rock_slope", "blend"]),
             NodeKind::UvTexture(_) => names(&["projection", "axis", "scale.u", "scale.v", "offset.u", "offset.v"]),
             NodeKind::AttributeTransfer(_) => names(&["class", "samples", "distance", "blend_width"]),
-            NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis"]),
+            NodeKind::Color(_) => names(&["class", "mode", "color.r", "color.g", "color.b", "color2.r", "color2.g", "color2.b", "seed", "axis", "auto_range", "range_min", "range_max"]),
             NodeKind::Enumerate(_) => names(&["class", "start", "increment"]),
             NodeKind::AttributeBlur(_) => names(&["mode", "weighting", "iterations", "step", "radius", "max_points", "pin_border"]),
             NodeKind::AttributePromote(_) => names(&["from", "to", "method", "delete_original"]),
@@ -1578,10 +1585,11 @@ impl NodeKind {
             NodeKind::Extrude(e) => vec![e.front_group.clone(), e.side_group.clone(), e.back_group.clone()],
             NodeKind::EnvironmentLight { file, .. } => vec![file.clone()],
             NodeKind::GroupCreate(g) => vec![g.name.clone(), g.expression.clone()],
-            NodeKind::Color(s) => vec![s.random_by.clone()],
+            NodeKind::Color(s) => vec![s.random_by.clone(), s.ramp.clone(), s.ramp_attribute.clone()],
             NodeKind::CopyToPoints { piece_attribute, .. } => vec![piece_attribute.clone()],
             NodeKind::Enumerate(s) => vec![s.attribute.clone(), s.piece_attribute.clone()],
             NodeKind::AttributeBlur(s) => vec![s.pattern.clone()],
+            NodeKind::AttributeRemap(s) => vec![s.attribute.clone(), s.ramp.clone()],
             NodeKind::AttributePromote(s) => vec![s.pattern.clone(), s.rename.clone()],
             NodeKind::AttributeTransfer(s) => vec![s.pattern.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
@@ -1647,13 +1655,21 @@ impl NodeKind {
                 next(&mut g.name);
                 next(&mut g.expression);
             }
-            NodeKind::Color(s) => next(&mut s.random_by),
+            NodeKind::Color(s) => {
+                next(&mut s.random_by);
+                next(&mut s.ramp);
+                next(&mut s.ramp_attribute);
+            }
             NodeKind::CopyToPoints { piece_attribute, .. } => next(piece_attribute),
             NodeKind::Enumerate(s) => {
                 next(&mut s.attribute);
                 next(&mut s.piece_attribute);
             }
             NodeKind::AttributeBlur(s) => next(&mut s.pattern),
+            NodeKind::AttributeRemap(s) => {
+                next(&mut s.attribute);
+                next(&mut s.ramp);
+            }
             NodeKind::AttributePromote(s) => {
                 next(&mut s.pattern);
                 next(&mut s.rename);
@@ -1770,6 +1786,9 @@ impl NodeKind {
             "peak" => ("Push along the normals", "Peak"),
             "metaball" => ("Blobs", "Metaball"),
             "lsystem" => ("Branching plants", "L-System"),
+            "attribute_remap" => ("Reshape an attribute with a ramp", "Attribute Remap"),
+            "POP Curve Force" => ("Flow along a curve", "POP Curve Force"),
+            "POP Stream" => ("Act on some of the particles", "POP Stream"),
             "trail" => ("Motion trail", "Trail"),
             "time_shift" => ("Time offset", "Time Shift"),
             "cop_network" => ("Image network", "COP Network"),
@@ -1881,6 +1900,7 @@ impl NodeKind {
                 "Generators",
                 vec![
                     NodeKind::Add { count: 0, spacing: 1.0, layout: 0, points: vec![[0.0; 3]], delete_geometry: false },
+                    NodeKind::Curve(curve::CurveSettings::defaults()),
                     NodeKind::Grid { size: 4.0, res: 20 },
                     NodeKind::Plane { size: 4.0, res: 20 },
                     NodeKind::Cone { radius: 1.0, height: 2.0, rows: 1, cols: 32, caps: true },
@@ -2105,6 +2125,7 @@ impl NodeKind {
                     NodeKind::AttributeTransfer(transfer::TransferSettings::defaults()),
                     NodeKind::Enumerate(enumerate::EnumerateSettings::defaults()),
                     NodeKind::AttributeBlur(blur::BlurSettings::defaults()),
+                    NodeKind::AttributeRemap(remap::RemapSettings::defaults()),
                     NodeKind::AttributePromote(promote::PromoteSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
@@ -2282,6 +2303,8 @@ impl NodeKind {
             NodeKind::Metaball(_) => "metaball",
             NodeKind::Connectivity(_) => "connectivity",
             NodeKind::Resample(_) => "resample",
+            NodeKind::Curve(_) => "curve",
+            NodeKind::AttributeRemap(_) => "attribute_remap",
             NodeKind::VolumeWrangle { .. } => "volume_wrangle",
             NodeKind::HeightfieldWrangle { .. } => "heightfield_wrangle",
             NodeKind::LSystem(_) => "lsystem",
@@ -2419,7 +2442,9 @@ impl NodeKind {
             | NodeKind::Color(_)
             | NodeKind::Enumerate(_)
             | NodeKind::AttributeBlur(_)
+            | NodeKind::AttributeRemap(_)
             | NodeKind::AttributePromote(_) => 1,
+            NodeKind::Curve(_) => 0,
             // Input 0 is the geometry they change; 1-3 are read by point(1, ...), @opinput1_P and the like.
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => vex::INPUTS,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
@@ -2661,6 +2686,8 @@ impl NodeKind {
             NodeKind::Metaball(m) => vec![m.radius, m.threshold, m.resolution as f32],
             NodeKind::Connectivity(c) => vec![c.class as f32],
             NodeKind::Resample(r) => vec![r.by_length as u8 as f32, r.length, r.segments as f32],
+            NodeKind::Curve(c) => c.params(),
+            NodeKind::AttributeRemap(r) => r.params(),
             NodeKind::PointDeform(s) => vec![s.influences as f32, s.fit_neighbours as f32, s.rotate as u8 as f32],
             NodeKind::TransformPieces => vec![],
             NodeKind::ForEachBegin | NodeKind::CompileBegin => vec![],
@@ -3065,6 +3092,8 @@ impl NodeKind {
                     resolution: (p.get(2).copied().unwrap_or(d.resolution as f32) as usize).clamp(8, 256),
                 })
             }
+            "curve" => NodeKind::Curve(curve::CurveSettings::from_params(p)),
+            "attribute_remap" => NodeKind::AttributeRemap(remap::RemapSettings::from_params(p)),
             "connectivity" => NodeKind::Connectivity(sopkit::ConnectivitySettings { class: u(0).min(1), ..sopkit::ConnectivitySettings::defaults() }),
             "resample" => {
                 let d = sopkit::ResampleSettings::defaults();

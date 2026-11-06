@@ -74,7 +74,11 @@ fn text_names(kind: &NodeKind) -> Vec<String> {
         NodeKind::GroupCreate(_) => &["name", "expression"],
         NodeKind::AttributeRandomize(_) | NodeKind::AttributeCreate(_) => &["name"],
         NodeKind::AttributeDelete(_) => &["pattern"],
-        NodeKind::Color(_) => &["random_by"],
+        NodeKind::Color(_) => &["random_by", "ramp", "ramp_attribute"],
+        NodeKind::AttributeRemap(_) => &["attribute", "ramp"],
+        NodeKind::Pop(n) => {
+            return n.def().texts.iter().map(|(label, _)| label.to_lowercase().replace(' ', "_")).chain(n.def().ramps.iter().map(|r| r.key.to_owned())).collect();
+        }
         NodeKind::Enumerate(_) => &["attribute", "piece_attribute"],
         NodeKind::AttributeBlur(_) => &["pattern"],
         NodeKind::AttributePromote(_) => &["pattern", "rename"],
@@ -119,6 +123,8 @@ fn options(node: &str, param: &str) -> Option<&'static [&'static str]> {
         ("attribute_transfer", "class") => &transfer::CLASSES,
         ("color", "mode") => &color::MODES,
         ("color", "axis") => &color::AXES,
+        ("curve", "type") => &curve::TYPES,
+        ("attribute_remap", "class") => &remap::CLASSES,
         ("group_create", "method") => &groups::CREATE_METHODS,
         ("group_create", "combine") => &groups::COMBINE_MODES,
         ("pack", "pack") => &packed::MODES,
@@ -186,7 +192,9 @@ fn note(node: &str) -> Option<&'static str> {
         "attribute_promote" => "moves the attributes matching pattern from class from (Points, Vertices, Primitives or Detail) to class to, combining values that meet with method (Average, Minimum, Maximum, Sum, Median, First, Last); rename gives one attribute a new name; delete_original removes the old one. To blur primitive attributes: promote to points, attribute_blur, promote back",
         "attribute_blur" => "pattern is the point attributes to blur (\"Cd\", \"mask Cd\", \"*\"; P only when named, which smooths the shape); mode Connectivity (points sharing polygon edges) or Proximity (nearest max_points within radius, for loose points); iterations passes moving step (0-1) toward the neighbours' average; weighting Uniform or Edge length; pin_border keeps open edges",
         "enumerate" => "writes 0, 1, 2… (start, increment) to attribute on each point or primitive (class Points or Primitives); piece_attribute numbers pieces instead (elements sharing its value share a number)",
-        "color" => "sets Cd. class Points or Primitives; mode Constant (color), Random (bright random colours; random_by an attribute such as piece gives each piece one colour) or Ramp (color to color2 along axis X, Y or Z, across the geometry's bounds)",
+        "color" => "sets Cd. class Points or Primitives; mode Constant (color), Random (bright random colours; random_by an attribute such as piece gives each piece one colour), Ramp (along axis X, Y or Z, across the geometry's bounds) or Ramp from attribute (by ramp_attribute's value, over its own range when auto_range is 1, else range_min to range_max). The colour ramp is the text ramp (see Ramps under facts about the app); empty means color to color2",
+        "curve" => "a curve through points, in order: set points to a list of [x, y, z] (at least two). type Polyline, Smooth (through the points) or B-Spline (toward them); closed joins the end to the start; divisions is points per span. Outputs points with curveu 0 at the start to 1 at the end, for pop curve force (as a POP Network input), resample and copy_to_points",
+        "attribute_remap" => "remaps attribute (class Points or Primitives) through the text ramp (see Ramps under facts about the app): each value's place in the input range (its own range when auto_range is 1, else input_min to input_max) is looked up on the ramp and set between output_min and output_max; vectors per component",
         "attribute_delete" => "pattern is names separated by spaces, * matches anything and ^ keeps a name (\"Cd N\", \"fx_*\", \"* ^P\"); class points, primitives, detail, vertices or all",
         "volume_wrangle" => "input must be a volume (vdb, pyro, convert_vdb output); code runs per voxel with @density (fog) or @surface (level set) and @P at the voxel centre (positions can't change); volumesample(0, \"density\", pos) reads neighbours",
         "heightfield_wrangle" => "input must be a terrain (terrain node chain); code runs per grid point with @height and @mask; x and z stay fixed; volumesample(0, \"height\", pos) reads neighbouring heights",
@@ -504,6 +512,8 @@ fn set_params(kind: &mut NodeKind, values: &BTreeMap<String, serde_json::Value>)
     let mut texts = kind.texts();
     let mut wrangle_code: Option<String> = None;
     let mut wrangle_domain: Option<usize> = None;
+    // Curve and Add: a list of [x, y, z] positions, after their named parameters.
+    let mut points: Option<Vec<f32>> = None;
     let index = |n: &str| names.iter().position(|p| p == n);
     let number = |name: &str, v: &serde_json::Value| -> Result<f32, String> {
         match v {
@@ -532,6 +542,18 @@ fn set_params(kind: &mut NodeKind, values: &BTreeMap<String, serde_json::Value>)
         }
         if let Some(t) = tnames.iter().position(|t| t == name) {
             texts[t] = value.as_str().ok_or_else(|| format!("'{name}' takes text"))?.to_owned();
+            continue;
+        }
+        if name == "points" && matches!(kind, NodeKind::Curve(_) | NodeKind::Add { .. }) {
+            let list = value.as_array().ok_or("'points' takes a list of [x, y, z] positions")?;
+            let mut flat = Vec::with_capacity(list.len() * 3);
+            for p in list {
+                let xyz = p.as_array().filter(|a| a.len() == 3).ok_or("each of 'points' is [x, y, z]")?;
+                for v in xyz {
+                    flat.push(number(name, v)?);
+                }
+            }
+            points = Some(flat);
             continue;
         }
         if let Some(list) = value.as_array() {
@@ -576,6 +598,10 @@ fn set_params(kind: &mut NodeKind, values: &BTreeMap<String, serde_json::Value>)
             *domain = d;
         }
         return Ok(Vec::new());
+    }
+    if let Some(flat) = points {
+        params.truncate(names.len());
+        params.extend(flat);
     }
     let mut rebuilt = NodeKind::from_params(kind.name(), &params).ok_or_else(|| format!("{} doesn't take these values", kind.name()))?;
     rebuilt.set_texts(&texts);
@@ -915,6 +941,25 @@ mod tests {
 
     fn edits(json: serde_json::Value) -> Vec<Edit> {
         parse_edits(&json).unwrap()
+    }
+
+    #[test]
+    fn the_assistant_sets_curve_points_and_ramps() {
+        let mut kind = NodeKind::Curve(curve::CurveSettings::defaults());
+        let values: BTreeMap<String, serde_json::Value> = serde_json::from_str(r#"{"points": [[0, 0, 0], [1, 2, 3]], "type": "Polyline", "closed": 0}"#).unwrap();
+        set_params(&mut kind, &values).unwrap();
+        let NodeKind::Curve(c) = &kind else { panic!() };
+        assert_eq!((c.points.clone(), c.kind), (vec![[0.0; 3], [1.0, 2.0, 3.0]], 0));
+        let mut remap = NodeKind::AttributeRemap(remap::RemapSettings::defaults());
+        let values: BTreeMap<String, serde_json::Value> = serde_json::from_str(r#"{"attribute": "Alpha", "ramp": "0 1 linear; 1 0 linear", "output_max": 2}"#).unwrap();
+        set_params(&mut remap, &values).unwrap();
+        let NodeKind::AttributeRemap(r) = &remap else { panic!() };
+        assert_eq!((r.attribute.as_str(), r.ramp.as_str(), r.out_range), ("Alpha", "0 1 linear; 1 0 linear", [0.0, 2.0]));
+        let mut force = NodeKind::Pop(pop::PopNode::new(pop::CURVE_FORCE));
+        let values: BTreeMap<String, serde_json::Value> = serde_json::from_str(r#"{"falloff": "0 1 constant", "follow": 5}"#).unwrap();
+        set_params(&mut force, &values).unwrap();
+        let NodeKind::Pop(p) = &force else { panic!() };
+        assert_eq!((p.ramp("falloff").eval1(0.9), p.v("follow")), (1.0, 5.0));
     }
 
     #[test]

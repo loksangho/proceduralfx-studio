@@ -19,6 +19,7 @@
 // in main.rs, which has the wrangle runner; everything else is here.
 
 use super::{hash01, Mesh, Vec3};
+use crate::ramp::{Ramp, RampParam};
 use crate::shading::{c, f, t, vector, Param};
 
 pub struct PopOp {
@@ -30,6 +31,8 @@ pub struct PopOp {
     pub params: &'static [Param],
     // Text fields: label and default.
     pub texts: &'static [(&'static str, &'static str)],
+    // Ramps, kept as text after the text fields (see ramp.rs).
+    pub ramps: &'static [RampParam],
 }
 
 pub const OBJECT: usize = 0;
@@ -51,13 +54,16 @@ pub const REPLICATE: usize = 15;
 pub const STATIC_OBJECT: usize = 16;
 pub const GROUND_PLANE: usize = 17;
 pub const ADVECT: usize = 18;
+pub const CURVE_FORCE: usize = 19;
+pub const STREAM: usize = 20;
 
 pub const EMISSION: [&str; 3] = ["Scatter onto surfaces", "Random points", "All points"];
-pub const COLOR_MODES: [&str; 3] = ["Constant", "Random", "Ramp over life"];
+pub const COLOR_MODES: [&str; 4] = ["Constant", "Random", "Ramp over life", "Ramp by speed"];
 pub const GROUP_RULES: [&str; 4] = ["All", "Random", "Bounding box", "Expression"];
 pub const KILL_RULES: [&str; 3] = ["Expression", "Bounding box", "Random"];
 pub const ATTRACT_MODES: [&str; 2] = ["Constant pull", "Spring"];
 pub const ADVECT_MODES: [&str; 3] = ["Update velocity", "Update force", "Update position"];
+pub const CURVE_FORCE_MODES: [&str; 2] = ["Force", "Wind (pull toward the flow)"];
 
 const SURFACE: [Param; 3] = [
     f("bounce", "Bounce", "Collision", 0.0, 1.0, 0.4),
@@ -74,7 +80,25 @@ pub fn choices(op: usize, key: &str) -> Option<&'static [&'static str]> {
         (KILL, "rule") => Some(&KILL_RULES),
         (ATTRACT, "mode") => Some(&ATTRACT_MODES),
         (ADVECT, "mode") => Some(&ADVECT_MODES),
+        (CURVE_FORCE, "mode") => Some(&CURVE_FORCE_MODES),
+        (STREAM, "rule") => Some(&GROUP_RULES),
         _ => None,
+    }
+}
+
+// Whether a parameter (or ramp) is shown, given the node's mode and rule: some only matter
+// for one of them.
+pub fn shown(op: usize, key: &str, mode: usize, rule: usize) -> bool {
+    match (op, key) {
+        (COLOR, "color") => mode == 0,
+        (COLOR, "color2") => false,
+        (COLOR, "seed") => mode == 1,
+        (COLOR, "ramp") => mode >= 2,
+        (COLOR, "max_speed") => mode == 3,
+        (CURVE_FORCE, "air_resistance") => mode == 1,
+        (GROUP | STREAM, "ratio") => rule == 1,
+        (GROUP | STREAM, "center" | "size") => rule == 2,
+        _ => true,
     }
 }
 
@@ -93,6 +117,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 0,
         params: &[],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Solver",
@@ -101,6 +126,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 3,
         params: &[],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Source",
@@ -121,6 +147,7 @@ pub const OPS: &[PopOp] = &[
             f("seed", "Seed", "Velocity", 0.0, 10000.0, 1.0),
         ],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "Gravity Force",
@@ -129,6 +156,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 1,
         params: &[vector("force", "Gravity", "", -1000.0, 1000.0, [0.0, -9.8, 0.0])],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Force",
@@ -137,6 +165,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 1,
         params: &[vector("force", "Force", "", -1000.0, 1000.0, [0.0, 0.0, 0.0]), NOISE[0], NOISE[1], NOISE[2]],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Wind",
@@ -151,6 +180,7 @@ pub const OPS: &[PopOp] = &[
             NOISE[2],
         ],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Drag",
@@ -159,19 +189,24 @@ pub const OPS: &[PopOp] = &[
         inputs: 1,
         params: &[f("air_resistance", "Air resistance", "", 0.0, 100.0, 1.0), vector("wind", "Air velocity", "", -1000.0, 1000.0, [0.0, 0.0, 0.0])],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Color",
         name: "popcolor",
-        help: "Colours the particles (Cd): one colour, a random colour each, or a ramp from the first colour at birth to the second at the end of their life.",
+        help: "Colours the particles (Cd): one colour, a random colour each, or a colour ramp over their life (birth on the left, death on the right) or by their speed (still on the left, Max speed and faster on the right).",
         inputs: 1,
         params: &[
-            f("mode", "Color", "", 0.0, 2.0, 0.0),
+            f("mode", "Color", "", 0.0, 3.0, 0.0),
             c("color", "Color (at birth)", "", [1.0, 0.55, 0.1]),
             c("color2", "Color at the end of life", "", [0.25, 0.25, 0.25]),
             f("seed", "Seed", "", 0.0, 10000.0, 1.0),
+            // Added later: kept at the end so older scenes load their values in place.
+            f("max_speed", "Max speed (the ramp's right end)", "", 0.001, 10000.0, 5.0),
         ],
         texts: &[],
+        // Empty: from Color (at birth) to Color at the end of life, as before ramps.
+        ramps: &[RampParam { key: "ramp", label: "Color ramp", color: true, default: "" }],
     },
     PopOp {
         label: "POP Wrangle",
@@ -180,6 +215,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 1,
         params: &[],
         texts: &[("VEX code", "// Runs on every particle each step, e.g.:\n// v@force += set(0, 2, 0) * (1 - @age / @life);\n")],
+        ramps: &[],
     },
     PopOp {
         label: "POP VOP",
@@ -188,6 +224,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 1,
         params: &[],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Group",
@@ -203,6 +240,7 @@ pub const OPS: &[PopOp] = &[
             f("seed", "Seed", "", 0.0, 10000.0, 1.0),
         ],
         texts: &[("Group name", "group1"), ("Expression", "@P.y > 1")],
+        ramps: &[],
     },
     PopOp {
         label: "POP Kill",
@@ -218,6 +256,7 @@ pub const OPS: &[PopOp] = &[
             f("seed", "Seed", "", 0.0, 10000.0, 1.0),
         ],
         texts: &[("Expression", "@P.y < -1")],
+        ramps: &[],
     },
     PopOp {
         label: "POP Speed Limit",
@@ -226,6 +265,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 1,
         params: &[f("min", "Minimum speed", "", 0.0, 10000.0, 0.0), f("max", "Maximum speed", "", 0.0, 10000.0, 10.0)],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Attract",
@@ -238,6 +278,7 @@ pub const OPS: &[PopOp] = &[
             f("mode", "Pull", "", 0.0, 1.0, 0.0),
         ],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Collide",
@@ -254,6 +295,7 @@ pub const OPS: &[PopOp] = &[
             f("radius", "Particle radius", "", 0.0, 10.0, 0.02),
         ],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Replicate",
@@ -269,6 +311,7 @@ pub const OPS: &[PopOp] = &[
             f("seed", "Seed", "", 0.0, 10000.0, 1.0),
         ],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "Static Object",
@@ -277,6 +320,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 0,
         params: &[f("input", "Geometry: POP Network input", "", 0.0, 3.0, 1.0), SURFACE[0], SURFACE[1], SURFACE[2]],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "Ground Plane",
@@ -285,6 +329,7 @@ pub const OPS: &[PopOp] = &[
         inputs: 0,
         params: &[f("height", "Height", "", -1000.0, 1000.0, 0.0), SURFACE[0], SURFACE[1], SURFACE[2]],
         texts: &[],
+        ramps: &[],
     },
     PopOp {
         label: "POP Advect",
@@ -301,6 +346,49 @@ pub const OPS: &[PopOp] = &[
             f("radius", "Point field reach", "", 0.001, 100.0, 0.25),
         ],
         texts: &[],
+        ramps: &[],
+    },
+    PopOp {
+        label: "POP Curve Force",
+        name: "popcurveforce",
+        help: "Moves the particles near curves from one of the POP Network's inputs (a Curve node, L-system, hair, or points in order): Follow pushes them along the curve from its start to its end, Suction pulls them in toward it, Orbit spins them around it. \
+               Only particles within Max influence radius feel it, by the Falloff ramp (the curve on the left, the radius on the right); the other ramps scale each part along the curve (its start on the left, its end on the right). \
+               As Wind, the particles are pulled toward the flow's velocity instead, so they settle into it.",
+        inputs: 1,
+        params: &[
+            f("input", "Curves: POP Network input", "", 0.0, 3.0, 1.0),
+            f("radius", "Max influence radius", "", 0.001, 1000.0, 1.0),
+            f("follow", "Follow (along the curve)", "", -1000.0, 1000.0, 2.0),
+            f("suction", "Suction (toward the curve)", "", -1000.0, 1000.0, 1.0),
+            f("orbit", "Orbit (around the curve)", "", -1000.0, 1000.0, 0.0),
+            f("mode", "Treat as", "", 0.0, 1.0, 0.0),
+            f("air_resistance", "Air resistance (Wind)", "", 0.0, 1000.0, 2.0),
+        ],
+        texts: &[],
+        ramps: &[
+            RampParam { key: "falloff", label: "Falloff (at the curve → at the max radius)", color: false, default: "0 1 monotone; 1 0 monotone" },
+            RampParam { key: "follow_ramp", label: "Follow (start → end)", color: false, default: "0 1 linear; 1 1 linear" },
+            RampParam { key: "suction_ramp", label: "Suction (start → end)", color: false, default: "0 1 linear; 1 1 linear" },
+            RampParam { key: "orbit_ramp", label: "Orbit (start → end)", color: false, default: "0 1 linear; 1 1 linear" },
+        ],
+    },
+    PopOp {
+        label: "POP Stream",
+        name: "popstream",
+        help: "Splits off a stream of particles: the POPs wired below it act only on the particles in the stream (all of them, a random fraction, those in a box, or those an expression picks). \
+               Wire the stream, with the POPs below it, into a Merge with the rest; the stream ends there. A stream below another takes particles from that stream only. \
+               Its particles are also in the group stream_<name>, for other POPs' Group fields.",
+        inputs: 1,
+        params: &[
+            f("rule", "Rule", "", 0.0, 3.0, 1.0),
+            f("ratio", "Random: fraction in the stream", "", 0.0, 1.0, 0.5),
+            BOX[0],
+            BOX[1],
+            t("births_only", "Only decide for new particles (members stay members)", "", true),
+            f("seed", "Seed", "", 0.0, 10000.0, 1.0),
+        ],
+        texts: &[("Stream name", "stream1"), ("Expression", "@P.y > 1")],
+        ramps: &[],
     },
 ];
 
@@ -318,7 +406,34 @@ impl PopNode {
         PopNode {
             op,
             values: def.params.iter().flat_map(|p| p.default[..p.width()].to_vec()).collect(),
-            texts: def.texts.iter().map(|(_, default)| default.to_string()).collect(),
+            texts: def.texts.iter().map(|(_, default)| default.to_string()).chain(def.ramps.iter().map(|r| r.default.to_string())).collect(),
+        }
+    }
+
+    // A ramp parameter's text, by key.
+    pub fn ramp_text_mut(&mut self, key: &str) -> Option<&mut String> {
+        let at = self.def().texts.len() + self.def().ramps.iter().position(|r| r.key == key)?;
+        if self.texts.len() <= at {
+            let defaults = PopNode::new(self.op).texts;
+            self.texts.extend(defaults.into_iter().skip(self.texts.len()));
+        }
+        self.texts.get_mut(at)
+    }
+
+    // A ramp parameter, read from its text (or its fallback when that's empty).
+    pub fn ramp(&self, key: &str) -> Ramp {
+        let def = self.def();
+        let Some(i) = def.ramps.iter().position(|r| r.key == key) else { return Ramp::flat(1.0) };
+        let param = def.ramps[i];
+        let text = self.texts.get(def.texts.len() + i).map_or(param.default, |s| s.as_str());
+        Ramp::from_text(text, param.width(), || self.ramp_fallback(key))
+    }
+
+    // What an empty ramp stands for: POP Color's from its two colours, else 1 all along.
+    pub fn ramp_fallback(&self, key: &str) -> Ramp {
+        match (self.op, key) {
+            (COLOR, "ramp") => Ramp::linear(self.get("color"), self.get("color2")),
+            _ => Ramp::flat(1.0),
         }
     }
 
@@ -393,7 +508,7 @@ impl PopNode {
     // The VEX a POP Group or POP Kill runs for its Expression rule, if it uses one.
     pub fn expression_code(&self) -> Option<String> {
         let expression = match self.op {
-            GROUP if self.index("rule") == 3 => self.text(1),
+            GROUP | STREAM if self.index("rule") == 3 => self.text(1),
             KILL if self.index("rule") == 0 => self.text(0),
             _ => return None,
         };
@@ -404,6 +519,18 @@ impl PopNode {
 
 // Where an Expression rule's result is left for apply().
 pub const EXPRESSION: &str = "__popexpr";
+
+// The particles in the current POP Stream (1) and the rest (0), for the POPs below it. A
+// Merge or a solver ends the stream (see pop_eval in graph.rs).
+pub const STREAM_MASK: &str = "__popstream";
+
+// The particles a POP acts on: those in its group (`mask`; all when None) and, below a POP
+// Stream, in the stream.
+pub fn stream_mask(m: &Mesh, mask: Option<Vec<bool>>) -> Option<Vec<bool>> {
+    let n = m.vertices.len();
+    let Some(stream) = m.point_attributes.get(STREAM_MASK).filter(|s| s.len() == n) else { return mask };
+    Some((0..n).map(|i| stream[i] > 0.5 && mask.as_ref().is_none_or(|g| g.get(i).copied().unwrap_or(false))).collect())
+}
 
 // ============================================================================
 // The particles
@@ -750,8 +877,10 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
             }
         }
         COLOR => {
-            let (age, life, id) = (m.point_attributes["age"].clone(), m.point_attributes["life"].clone(), m.point_attributes["id"].clone());
-            let (a, b) = (node.vec("color"), node.vec("color2"));
+            let (age, life, id, v) = (m.point_attributes["age"].clone(), m.point_attributes["life"].clone(), m.point_attributes["id"].clone(), m.point_attributes["v"].clone());
+            let a = node.vec("color");
+            let ramp = node.ramp("ramp");
+            let max_speed = node.v("max_speed").max(1e-6);
             let cd = attr(m, "Cd", 3, 1.0);
             for i in (0..n).filter(|&i| masked(mask, i)) {
                 let color = match node.index("mode") {
@@ -759,17 +888,19 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
                         let r = |k: u32| hash01((id[i] as u32).wrapping_mul(7).wrapping_add(k), seed ^ 0x2c1b_3c6d);
                         Vec3::new(r(1), r(2), r(3))
                     }
-                    2 => a.add(b.sub(a).scale(if life[i] > 0.0 { (age[i] / life[i]).clamp(0.0, 1.0) } else { 0.0 })),
+                    2 => Vec3::from_arr(ramp.eval(if life[i] > 0.0 { (age[i] / life[i]).clamp(0.0, 1.0) } else { 0.0 })),
+                    3 => Vec3::from_arr(ramp.eval((read3(&v, i).length() / max_speed).clamp(0.0, 1.0))),
                     _ => a,
                 };
                 write3(cd, i, color);
             }
         }
-        GROUP => {
-            let name = format!("group:{}", node.text(0).trim().replace(char::is_whitespace, "_"));
-            if name == "group:" {
+        GROUP | STREAM => {
+            let base = node.text(0).trim().replace(char::is_whitespace, "_");
+            if base.is_empty() {
                 return;
             }
+            let name = if node.op == STREAM { format!("group:stream_{base}") } else { format!("group:{base}") };
             let expression = m.point_attributes.remove(EXPRESSION);
             let (age, id) = (m.point_attributes["age"].clone(), m.point_attributes["id"].clone());
             let positions = m.vertices.clone();
@@ -788,6 +919,12 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
                         _ => expression.as_ref().is_some_and(|e| e.get(i).is_some_and(|v| *v > 0.5)),
                     };
                 group[i] = if inside { 1.0 } else if births_only { group[i] } else { 0.0 };
+            }
+            if node.op == STREAM {
+                // The POPs below act on the stream: its members that were in the stream above
+                // (if this one is below another), and in this node's group.
+                let members: Vec<f32> = (0..n).map(|i| if masked(mask, i) && m.point_attributes[&name][i] > 0.5 { 1.0 } else { 0.0 }).collect();
+                m.point_attributes.insert(STREAM_MASK.into(), members);
             }
         }
         KILL => {
@@ -822,6 +959,7 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
             }
         }
         COLLIDE => collide(node, m, s, mask),
+        CURVE_FORCE => curve_force(node, m, s, mask),
         REPLICATE => replicate(node, m, s, mask),
         ADVECT => {
             let Some(field) = s.inputs.get(node.input()).and_then(|g| VelocityField::new(g, node.v("radius"))) else { return };
@@ -990,6 +1128,118 @@ fn source(node: &PopNode, m: &mut Mesh, s: &Step) {
     append(m, births);
 }
 
+// The curves of a POP Network input, as segments: their ends, where along their curve
+// (0 at its start, 1 at its end) each end is, and a grid of them for finding those near a
+// particle.
+struct Curves {
+    segments: Vec<(Vec3, Vec3, f32, f32)>,
+    cells: std::collections::HashMap<[i64; 3], Vec<usize>>,
+    // Segments too long to put in cells, tried for every particle.
+    long: Vec<usize>,
+    size: f32,
+}
+
+impl Curves {
+    fn new(geometry: &Mesh, reach: f32) -> Option<Curves> {
+        let mut runs = crate::groom::curves(geometry);
+        // Points without curveu (an Add node, a Scatter): one curve through them in order.
+        if runs.is_empty() && geometry.vertices.len() >= 2 {
+            runs.push(0..geometry.vertices.len());
+        }
+        let mut segments = Vec::new();
+        for run in runs {
+            let p: Vec<Vec3> = run.map(|i| geometry.vertices[i]).collect();
+            let mut along = vec![0.0f32];
+            for w in p.windows(2) {
+                along.push(along.last().unwrap() + w[1].sub(w[0]).length());
+            }
+            let total = along.last().copied().unwrap_or(0.0).max(1e-9);
+            for k in 0..p.len() - 1 {
+                if p[k + 1].sub(p[k]).length() > 1e-9 {
+                    segments.push((p[k], p[k + 1], along[k] / total, along[k + 1] / total));
+                }
+            }
+        }
+        if segments.is_empty() {
+            return None;
+        }
+        let size = reach.max(1e-3);
+        let cell = |v: Vec3| [(v.x / size).floor() as i64, (v.y / size).floor() as i64, (v.z / size).floor() as i64];
+        let mut cells: std::collections::HashMap<[i64; 3], Vec<usize>> = std::collections::HashMap::new();
+        let mut long = Vec::new();
+        for (k, (a, b, _, _)) in segments.iter().enumerate() {
+            let lo = cell(Vec3::new(a.x.min(b.x) - size, a.y.min(b.y) - size, a.z.min(b.z) - size));
+            let hi = cell(Vec3::new(a.x.max(b.x) + size, a.y.max(b.y) + size, a.z.max(b.z) + size));
+            let count = (0..3).map(|c| (hi[c] - lo[c] + 1) as u64).product::<u64>();
+            if count > 4096 {
+                long.push(k);
+                continue;
+            }
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        cells.entry([x, y, z]).or_default().push(k);
+                    }
+                }
+            }
+        }
+        Some(Curves { segments, cells, long, size })
+    }
+
+    // The nearest point on the curves to p within `reach`: the point, the curve's direction
+    // there and how far along the curve it is.
+    fn nearest(&self, p: Vec3, reach: f32) -> Option<(Vec3, Vec3, f32)> {
+        let c = [(p.x / self.size).floor() as i64, (p.y / self.size).floor() as i64, (p.z / self.size).floor() as i64];
+        let mut best: Option<(f32, Vec3, Vec3, f32)> = None;
+        for &k in self.cells.get(&c).into_iter().flatten().chain(self.long.iter()) {
+            let (a, b, ua, ub) = self.segments[k];
+            let ab = b.sub(a);
+            let t = (p.sub(a).dot(ab) / ab.dot(ab)).clamp(0.0, 1.0);
+            let q = a.add(ab.scale(t));
+            let d = p.sub(q).length();
+            if d <= reach && best.is_none_or(|(bd, ..)| d < bd) {
+                best = Some((d, q, ab.normalize(), ua + (ub - ua) * t));
+            }
+        }
+        best.map(|(_, q, tangent, u)| (q, tangent, u))
+    }
+}
+
+fn curve_force(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
+    let reach = node.v("radius").max(1e-4);
+    let Some(curves) = s.inputs.get(node.input()).and_then(|g| Curves::new(g, reach)) else { return };
+    let (falloff, follow_ramp, suction_ramp, orbit_ramp) = (node.ramp("falloff"), node.ramp("follow_ramp"), node.ramp("suction_ramp"), node.ramp("orbit_ramp"));
+    let (follow, suction, orbit) = (node.v("follow"), node.v("suction"), node.v("orbit"));
+    let wind = node.index("mode") == 1;
+    let n = m.vertices.len();
+    let positions = m.vertices.clone();
+    for i in (0..n).filter(|&i| masked(mask, i)) {
+        let p = positions[i];
+        let Some((q, tangent, u)) = curves.nearest(p, reach) else { continue };
+        let offset = p.sub(q);
+        let distance = offset.length();
+        // Out from the curve; on it, any direction across it.
+        let out = if distance > 1e-6 {
+            offset.scale(1.0 / distance)
+        } else {
+            let side = if tangent.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+            tangent.cross(side).normalize()
+        };
+        let weight = falloff.eval1(distance / reach);
+        let flow = tangent
+            .scale(follow * follow_ramp.eval1(u))
+            .sub(out.scale(suction * suction_ramp.eval1(u)))
+            .add(tangent.cross(out).scale(orbit * orbit_ramp.eval1(u)));
+        if wind {
+            pull_toward(m, i, flow, node.v("air_resistance") * weight.max(0.0));
+        } else {
+            let force = attr(m, "force", 3, 0.0);
+            let total = read3(force, i).add(flow.scale(weight));
+            write3(force, i, total);
+        }
+    }
+}
+
 fn collide(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
     if let Some(collider) = Collider::of(node, s.inputs) {
         bounce_off(m, &[collider], mask);
@@ -1100,6 +1350,7 @@ pub fn output(state: &Mesh) -> Mesh {
     let mut out = state.clone();
     out.point_attributes.remove("detail:pop_next_id");
     out.point_attributes.remove(EXPRESSION);
+    out.point_attributes.remove(STREAM_MASK);
     out
 }
 
@@ -1204,6 +1455,85 @@ mod tests {
         apply(&replicate, &mut m, &Step { time: 1.0, dt: 1.0, step: 24, frame_start: true, node_seed: 0, inputs: &[], colliders: &[] }, None);
         assert_eq!(m.vertices.len(), before + 50);
         assert_eq!(m.point_attributes["group:left"].len(), m.vertices.len());
+    }
+
+    #[test]
+    fn curve_forces_follow_pull_and_orbit_with_their_ramps() {
+        // A straight curve along +x, 10 long.
+        let line = crate::curve::curve(&crate::curve::CurveSettings { kind: 0, points: vec![[0.0; 3], [10.0, 0.0, 0.0]], ..crate::curve::CurveSettings::defaults() }).unwrap();
+        let inputs = [line];
+        let s = Step { time: 0.0, dt: 0.1, step: 1, frame_start: true, node_seed: 0, inputs: &inputs, colliders: &[] };
+        let particles = |at: &[[f32; 3]]| {
+            let mut m = Mesh { vertices: at.iter().map(|p| Vec3::from_arr(*p)).collect(), ..Mesh::default() };
+            tidy(&mut m);
+            m
+        };
+        let force = |m: &Mesh, i: usize| read3(&m.point_attributes["force"], i);
+        // Follow pushes along it, suction pulls in; past the radius, nothing.
+        let mut m = particles(&[[5.0, 0.5, 0.0], [5.0, 2.0, 0.0]]);
+        apply(&with(CURVE_FORCE, &[("input", &[0.0])]), &mut m, &s, None);
+        let (near, far) = (force(&m, 0), force(&m, 1));
+        assert!(near.x > 0.5 && near.y < -0.2 && near.z.abs() < 1e-5, "{near:?}");
+        assert_eq!(far.length(), 0.0);
+        // Halfway out, the falloff (1 to 0, monotone) is about a half.
+        assert!((near.x - 2.0 * 0.5).abs() < 0.15, "{near:?}");
+        // Orbit spins around the curve's direction: +x with the particle above, toward +z.
+        let mut m = particles(&[[5.0, 0.5, 0.0]]);
+        apply(&with(CURVE_FORCE, &[("input", &[0.0]), ("follow", &[0.0]), ("suction", &[0.0]), ("orbit", &[1.0])]), &mut m, &s, None);
+        assert!(force(&m, 0).z > 0.2 && force(&m, 0).x.abs() < 1e-5);
+        // A ramp that fades follow out toward the end.
+        let mut fade = with(CURVE_FORCE, &[("input", &[0.0]), ("suction", &[0.0])]);
+        *fade.ramp_text_mut("follow_ramp").unwrap() = "0 1 linear; 1 0 linear".into();
+        let mut m = particles(&[[1.0, 0.0, 0.0], [9.5, 0.0, 0.0]]);
+        apply(&fade, &mut m, &s, None);
+        assert!(force(&m, 0).x > 1.5 && force(&m, 1).x < 0.15, "{:?} {:?}", force(&m, 0), force(&m, 1));
+        // As wind: a pull toward the flow instead of a push.
+        let mut m = particles(&[[5.0, 0.0, 0.0]]);
+        apply(&with(CURVE_FORCE, &[("input", &[0.0]), ("mode", &[1.0])]), &mut m, &s, None);
+        assert!(m.point_attributes["airresist"][0] > 1.0 && m.point_attributes["targetv"][0] > 1.5);
+        assert_eq!(force(&m, 0).length(), 0.0);
+    }
+
+    #[test]
+    fn colour_ramps_over_life_and_by_speed() {
+        let mut m = Mesh { vertices: vec![Vec3::zero(); 2], ..Mesh::default() };
+        tidy(&mut m);
+        m.point_attributes.insert("age".into(), vec![0.0, 1.0]);
+        m.point_attributes.insert("life".into(), vec![2.0, 2.0]);
+        m.point_attributes.insert("v".into(), vec![0.0, 0.0, 0.0, 10.0, 0.0, 0.0]);
+        // Before ramps, mode 2 went from Color to Color at the end of life: it still does.
+        let mut node = with(COLOR, &[("mode", &[2.0]), ("color", &[1.0, 0.0, 0.0]), ("color2", &[0.0, 0.0, 1.0])]);
+        apply(&node, &mut m, &step(1, &[]), None);
+        assert_eq!(&m.point_attributes["Cd"][3..6], &[0.5, 0.0, 0.5]);
+        // By speed, through a ramp: still on the left, Max speed (5) and faster on the right.
+        *node.ramp_text_mut("ramp").unwrap() = "0 0 0 0 linear; 1 1 1 0 linear".into();
+        for (p, slot) in node.param_mut() {
+            if p.key == "mode" {
+                slot[0] = 3.0;
+            }
+        }
+        apply(&node, &mut m, &step(1, &[]), None);
+        assert_eq!(&m.point_attributes["Cd"][..], &[0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn streams_mark_their_particles_for_the_pops_below() {
+        let mut m = Mesh { vertices: (0..10).map(|i| Vec3::new(i as f32, 0.0, 0.0)).collect(), ..Mesh::default() };
+        tidy(&mut m);
+        m.point_attributes.insert("id".into(), (0..10).map(|i| i as f32).collect());
+        let mut stream = with(STREAM, &[("rule", &[2.0]), ("center", &[2.0, 0.0, 0.0]), ("size", &[5.0, 2.0, 2.0])]);
+        stream.texts[0] = "left".into();
+        apply(&stream, &mut m, &step(1, &[]), None);
+        assert_eq!(m.point_attributes["group:stream_left"].iter().filter(|g| **g > 0.5).count(), 5);
+        let only = stream_mask(&m, None).unwrap();
+        assert_eq!(only.iter().filter(|k| **k).count(), 5);
+        // A stream below another takes from that one only.
+        let mut inner = with(STREAM, &[("rule", &[2.0]), ("center", &[4.0, 0.0, 0.0]), ("size", &[5.0, 2.0, 2.0])]);
+        inner.texts[0] = "inner".into();
+        let outer = stream_mask(&m, None);
+        apply(&inner, &mut m, &step(1, &[]), outer.as_deref());
+        assert_eq!(stream_mask(&m, None).unwrap().iter().filter(|k| **k).count(), 3, "x 2, 3 and 4");
+        assert!(output(&m).point_attributes.get(STREAM_MASK).is_none());
     }
 
     #[test]

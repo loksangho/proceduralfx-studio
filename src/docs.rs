@@ -15,6 +15,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("environment_light", "HDRI image-based lighting for MoonRay, matched in the viewport's lighting and background."),
     // Generators
     ("add", "Points: explicit positions and/or a line or grid of them, added to the optional input. Can delete the input's polygons but keep its points."),
+    ("curve", "A curve through the points you place, in order: a polyline, a smooth curve through every point (Catmull-Rom), or a smoother one drawn toward them (B-spline). Open or closed, with curveu from 0 at its start to 1 at its end, for POP Curve Force, Resample, Copy to Points and the renderers."),
     ("grid", "A flat square grid of quads in the XZ plane."),
     ("plane", "A flat plane."),
     ("cone", "A cone, optionally capped."),
@@ -44,7 +45,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("rbd_solver", "Rigid bodies (rapier, Bullet-style): each connected piece, or each value of `piece`, falls and collides. Input 2: static collider."),
     ("cloth_solver", "XPBD cloth, hair, softbody or grains with a collider, a ground plane, self-collision and pinning (f@pin, a pin group or animated pins)."),
     ("sop_solver", "Runs its network once per step on the previous step's result (Prev_Frame), for custom simulations."),
-    ("popnet", "A particle simulation built from POP nodes inside it: double-click to edit. A POP Source births particles into a POP Solver, with forces (Gravity, Force, Wind, Drag, Attract), colour, groups, kills, collisions and VEX (POP Wrangle, POP VOP) wired before or after the solver. Inputs 0-3 are geometry to birth from, collide with or read in VEX. Outputs points with v, age, life and id."),
+    ("popnet", "A particle simulation built from POP nodes inside it: double-click to edit. A POP Source births particles into a POP Solver, with forces (Gravity, Force, Wind, Drag, Attract, Curve Force along curves), colour (with ramps over life or by speed), groups, streams (POPs that act on some of the particles), kills, collisions and VEX (POP Wrangle, POP VOP) wired before or after the solver. Inputs 0-3 are geometry to birth from, collide with or read in VEX. Outputs points with v, age, life and id."),
     ("solver_input", "Inside a SOP Solver: Prev_Frame (the last step) or Input_1 (the solver's input)."),
     ("subnet", "A network packaged as one node: double-click to build inside, between Subnet Input nodes and the display node. Promote parameters of the nodes inside to show them on the Subnet as its own sliders. Save it as an asset to reuse it: it appears in the TAB menu under Assets, and copies can update to newer versions."),
     ("subnet_input", "Inside a Subnet: what's wired into one of the Subnet's four inputs."),
@@ -59,6 +60,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("test_geometry", "Ready-made shapes to start from: Spot (a cow), Bob (a rubber toy) and Blub (a fish) with their painted colours (Keenan Crane's public-domain models), the Platonic solids, a torus knot, a shader ball, and an animated character (Quaternius's public-domain human: Idle, Walk, Run, Jump, Punch, Death and Working, looping or not, in six looks), at a chosen size, on the ground or centred."),
     ("lsystem", "An L-system: a premise rewritten by rules for a number of generations, then drawn by a 3D turtle as curves with a tapering width. F draws, + - & ^ \\ / turn, [ ] branch, ! thins; several rules for one symbol pick at random. Presets: trees, a fractal plant, grass, Koch and Hilbert curves."),
     ("resample", "Evenly spaced points along curves, by maximum segment length or a number of segments; point attributes are interpolated."),
+    ("attribute_remap", "Reshapes a point or primitive attribute's values through a ramp: each value's place in the input range (or the attribute's own lowest-to-highest) is looked up on the ramp and set into the output range. Keys can be held, straight, or smooth (Catmull-Rom, Monotone Cubic, B-Spline)."),
     ("object_merge", "Brings in an object's geometry (its display output) or any node inside an object, including other nodes in this network, optionally moved into this object's space. Pick sources from a menu per object."),
     // Volumes
     ("volume_wrangle", "Runs VEX over a volume's voxels: @density (fog) or @surface (level set), with @P at each voxel's centre. volumesample(), volumegradient() and volumeindex() read the volume anywhere; removepoint() switches voxels off. Positions don't move. Inputs 1-3 are other volumes to read: volumesample(1, \"density\", @P)."),
@@ -138,7 +140,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("attribute_promote", "Moves attributes between points, vertices, primitives and the detail, combining the values that meet (average, minimum, maximum, sum, median, first or last), optionally under a new name. Promote to points, blur, and promote back to blur primitive attributes."),
     ("attribute_blur", "Blurs point attributes (Cd, a mask, N, or P to smooth the shape) toward the average of each point's neighbours: points sharing a polygon edge, or the nearest points within a radius. Iterations and step size set how far it spreads; the group's points change, the others feed in."),
     ("enumerate", "Numbers points or primitives 0, 1, 2… (from Start, by Increment) in an attribute. With a piece attribute, elements sharing its value share one number, so it numbers pieces."),
-    ("color", "Sets the colour (Cd) of points or primitives: one colour, bright random colours (each element its own, or one per value of an attribute such as piece), or a ramp between two colours along an axis."),
+    ("color", "Sets the colour (Cd) of points or primitives: one colour, bright random colours (each element its own, or one per value of an attribute such as piece), a colour ramp along an axis, or a colour ramp looked up by an attribute's value (pscale, a mask, speed)."),
     ("group_create", "Makes a named group by bounding box, random percentage, normal direction or expression."),
     ("uv_texture", "UV projection: planar, cylindrical, spherical or box."),
     ("uv_transform", "Moves, rotates and scales UVs."),

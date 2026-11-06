@@ -36,6 +36,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | Node | Saved as | Parameters |
 | --- | --- | --- |
 | add | `add` | point_count=0, spacing=1, layout=0, delete_geometry=0, #4=0, #5=0, #6=0 |
+| curve | `curve` | type=1, closed=0, divisions=12, #3=-2, #4=0, #5=0, #6=-1, #7=1, #8=0, #9=1, #10=-0.5, #11=0, #12=2, #13=0.5, #14=0 |
 | grid | `grid` | size=4, resolution=20 |
 | plane | `plane` | size=4, resolution=20 |
 | cone | `cone` | radius=1, height=2, rows=1, columns=32, caps=1 |
@@ -214,10 +215,11 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | attribute_create | `attribute_create` | 1 text field(s); #0=4, value.x=1, class=0, type=3, size=3, value.y=1, value.z=1, value.w=0 |
 | attribute_randomize | `attribute_randomize` | 1 text field(s); #0=4, amount=1, seed=1, class=0, size=3, min.x=0, max.x=1, mode=0, type=3, distribution=0, min.y=0, min.z=0, min.w=0, max.y=1, max.z=1, max.w=1 |
 | attribute_delete | `attribute_delete` | 1 text field(s); #0=4, class=0 |
-| color | `color` | 1 text field(s); class=0, mode=0, color.r=1, color.g=0.45, color.b=0.1, color2.r=0.1, color2.g=0.3, color2.b=1, seed=1, axis=1 |
+| color | `color` | 3 text field(s); class=0, mode=0, color.r=1, color.g=0.45, color.b=0.1, color2.r=0.1, color2.g=0.3, color2.b=1, seed=1, axis=1, auto_range=1, range_min=0, range_max=1 |
 | attribute_transfer | `attribute_transfer` | 1 text field(s); class=0, samples=4, distance=1, blend_width=0 |
 | enumerate | `enumerate` | 2 text field(s); class=0, start=0, increment=1 |
 | attribute_blur | `attribute_blur` | 1 text field(s); mode=0, weighting=0, iterations=10, step=1, radius=0.2, max_points=10, pin_border=0 |
+| attribute_remap | `attribute_remap` | 2 text field(s); class=0, auto_range=1, input_min=0, input_max=1, output_min=0, output_max=1 |
 | attribute_promote | `attribute_promote` | 2 text field(s); from=0, to=2, method=0, delete_original=1 |
 | wrangle | `wrangle` | the run-over domain (0–3), `:`, then the code in hex |
 | attribute_vop | `attribute_vop` | run_over=2 |
@@ -449,7 +451,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | POP Force | `pop` | operation=4, force.x=0, force.y=0, force.z=0, noise=0, frequency=1, speed=0.5 |
 | POP Wind | `pop` | operation=5, wind.x=1, wind.y=0, wind.z=0, air_resistance=1, noise=0, frequency=1, speed=0.5 |
 | POP Drag | `pop` | operation=6, air_resistance=1, wind.x=0, wind.y=0, wind.z=0 |
-| POP Color | `pop` | operation=7, mode=0, color.r=1, color.g=0.55, color.b=0.1, color2.r=0.25, color2.g=0.25, color2.b=0.25, seed=1 |
+| POP Color | `pop` | 1 text field(s); operation=7, mode=0, color.r=1, color.g=0.55, color.b=0.1, color2.r=0.25, color2.g=0.25, color2.b=0.25, seed=1, max_speed=5 |
 | POP Wrangle | `pop` | 1 text field(s); operation=8 |
 | POP VOP | `pop` | operation=9 |
 | POP Group | `pop` | 2 text field(s); operation=10, rule=1, ratio=0.5, center.x=0, center.y=0, center.z=0, size.x=1, size.y=1, size.z=1, births_only=1, seed=1 |
@@ -461,6 +463,8 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | Static Object | `pop` | operation=16, input=1, bounce=0.4, friction=0.1, radius=0.02 |
 | Ground Plane | `pop` | operation=17, height=0, bounce=0.4, friction=0.1, radius=0.02 |
 | POP Advect | `pop` | operation=18, input=1, mode=0, scale=1, air_resistance=5, radius=0.25 |
+| POP Curve Force | `pop` | 4 text field(s); operation=19, input=1, radius=1, follow=2, suction=1, orbit=0, mode=0, air_resistance=2 |
+| POP Stream | `pop` | 2 text field(s); operation=20, rule=1, ratio=0.5, center.x=0, center.y=0, center.z=0, size.x=1, size.y=1, size.z=1, births_only=1, seed=1 |
 
 ## Shader Nodes
 

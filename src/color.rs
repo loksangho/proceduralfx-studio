@@ -1,6 +1,6 @@
 // Color node: sets Cd on points or primitives, as one colour, random colours (per
-// element, or per value of an attribute such as `piece`), or a ramp between two
-// colours along an axis.
+// element, or per value of an attribute such as `piece`), a colour ramp along an axis,
+// or a colour ramp looked up by an attribute's value (pscale, speed, a mask...).
 
 use super::{hash01, poly, Mesh, Vec3};
 
@@ -19,7 +19,7 @@ pub fn to_linear(v: f32) -> f32 {
 }
 
 pub const CLASSES: [&str; 2] = ["Points", "Primitives"];
-pub const MODES: [&str; 3] = ["Constant", "Random", "Ramp"];
+pub const MODES: [&str; 4] = ["Constant", "Random", "Ramp", "Ramp from attribute"];
 pub const AXES: [&str; 3] = ["X", "Y", "Z"];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,17 +33,36 @@ pub struct ColorSettings {
     pub axis: usize,
     // Random: elements sharing this attribute's value get the same colour (empty: each its own).
     pub random_by: String,
+    // The colour ramp (see ramp.rs); empty: from color to color2.
+    pub ramp: String,
+    // Ramp from attribute: the attribute, and the range of its values the ramp spans
+    // (its own lowest to highest when auto_range is on).
+    pub ramp_attribute: String,
+    pub auto_range: bool,
+    pub range: [f32; 2],
 }
 
 impl ColorSettings {
     pub fn defaults() -> ColorSettings {
-        ColorSettings { class: 0, mode: 0, color: [1.0, 0.45, 0.1], color2: [0.1, 0.3, 1.0], seed: 1, axis: 1, random_by: String::new() }
+        ColorSettings {
+            class: 0,
+            mode: 0,
+            color: [1.0, 0.45, 0.1],
+            color2: [0.1, 0.3, 1.0],
+            seed: 1,
+            axis: 1,
+            random_by: String::new(),
+            ramp: String::new(),
+            ramp_attribute: "pscale".into(),
+            auto_range: true,
+            range: [0.0, 1.0],
+        }
     }
 
     pub fn params(&self) -> Vec<f32> {
         let [r, g, b] = self.color;
         let [r2, g2, b2] = self.color2;
-        vec![self.class as f32, self.mode as f32, r, g, b, r2, g2, b2, self.seed as f32, self.axis as f32]
+        vec![self.class as f32, self.mode as f32, r, g, b, r2, g2, b2, self.seed as f32, self.axis as f32, self.auto_range as u8 as f32, self.range[0], self.range[1]]
     }
 
     pub fn from_params(p: &[f32], random_by: String) -> ColorSettings {
@@ -57,6 +76,9 @@ impl ColorSettings {
             seed: g(8, 1.0).max(0.0) as u32,
             axis: (g(9, 1.0) as usize).min(2),
             random_by,
+            auto_range: g(10, 1.0) > 0.5,
+            range: [g(11, 0.0), g(12, 1.0)],
+            ..d
         }
     }
 }
@@ -75,6 +97,12 @@ fn random_color(key: u32, seed: u32) -> [f32; 3] {
         3 => [p, q, v],
         4 => [t, p, v],
         _ => [v, p, q],
+    }
+}
+
+impl ColorSettings {
+    pub fn ramp(&self) -> crate::ramp::Ramp {
+        crate::ramp::Ramp::from_text(&self.ramp, 3, || crate::ramp::Ramp::linear(self.color, self.color2))
     }
 }
 
@@ -101,6 +129,26 @@ pub fn color(input: &Mesh, set: &ColorSettings) -> Result<Mesh, String> {
         };
         Some(found.ok_or_else(|| format!("there's no attribute called {by} to pick colours by"))?)
     };
+    // Ramp from attribute: each element's value (its first component).
+    let by_value: Option<Vec<f32>> = if set.mode == 3 {
+        let name = set.ramp_attribute.trim();
+        let read = |key: &str, n: usize| input.point_attributes.get(key).filter(|v| n > 0 && !v.is_empty() && v.len() % n == 0).map(|v| (v, v.len() / n));
+        let found = if points {
+            read(name, input.vertices.len()).map(|(v, w)| (0..count).map(|i| v[i * w]).collect())
+        } else if let Some((v, w)) = read(&format!("prim:{name}"), input.indices.len()) {
+            Some(polys.iter().map(|run| v[run.start * w]).collect())
+        } else {
+            read(name, input.vertices.len()).map(|(v, w)| polys.iter().map(|run| v[input.indices[run.start][0] * w]).collect())
+        };
+        Some(found.ok_or_else(|| format!("there's no attribute called {name} to colour by"))?)
+    } else {
+        None
+    };
+    let ramp = set.ramp();
+    let (value_lo, value_hi) = match &by_value {
+        Some(values) if set.auto_range => values.iter().filter(|v| v.is_finite()).fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v))),
+        _ => (set.range[0], set.range[1]),
+    };
     let position = |i: usize| if points { input.vertices[i] } else { poly::centroid(input, &polys[i]) };
     let axis_of = |p: Vec3| [p.x, p.y, p.z][set.axis.min(2)];
     let (lo, hi) = (0..count).map(|i| axis_of(position(i))).fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
@@ -112,7 +160,12 @@ pub fn color(input: &Mesh, set: &ColorSettings) -> Result<Mesh, String> {
             }
             2 => {
                 let t = if hi > lo { (axis_of(position(i)) - lo) / (hi - lo) } else { 0.0 };
-                [0, 1, 2].map(|c| set.color[c] + (set.color2[c] - set.color[c]) * t)
+                ramp.eval(t)
+            }
+            3 => {
+                let v = by_value.as_ref().map_or(0.0, |values| values[i]);
+                let span = value_hi - value_lo;
+                ramp.eval(if span.abs() > 1e-12 { ((v - value_lo) / span).clamp(0.0, 1.0) } else { 0.0 })
             }
             _ => set.color,
         })
@@ -172,5 +225,23 @@ mod tests {
         assert_eq!(&cd[6..9], &cd[9..12]);
         assert_ne!(&cd[..3], &cd[6..9]);
         assert!(color(&mesh, &ColorSettings { mode: 1, random_by: "nope".into(), ..ColorSettings::defaults() }).unwrap_err().contains("nope"));
+    }
+
+    #[test]
+    fn colour_ramps_along_an_axis_and_from_an_attribute() {
+        let mut mesh = quad_pair();
+        // Along Y, through a ramp that's red to the middle, then blue.
+        let set = ColorSettings { mode: 2, ramp: "0 1 0 0 constant; 0.5 0 0 1 constant".into(), ..ColorSettings::defaults() };
+        let cd = color(&mesh, &set).unwrap().point_attributes["Cd"].clone();
+        assert_eq!((&cd[..3], &cd[4 * 3..4 * 3 + 3]), (&[1.0, 0.0, 0.0][..], &[0.0, 0.0, 1.0][..]));
+        // By pscale, over its own range: the lowest value at the ramp's left.
+        mesh.point_attributes.insert("pscale".into(), vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        let by = ColorSettings { mode: 3, color: [0.0; 3], color2: [1.0; 3], ..ColorSettings::defaults() };
+        let cd = color(&mesh, &by).unwrap().point_attributes["Cd"].clone();
+        assert_eq!((cd[0], cd[3], cd[6]), (0.0, 0.5, 1.0));
+        let fixed = ColorSettings { auto_range: false, range: [0.0, 2.0], ..by.clone() };
+        assert_eq!(color(&mesh, &fixed).unwrap().point_attributes["Cd"][6], 1.0, "past the range: the ramp's end");
+        assert!(color(&mesh, &ColorSettings { ramp_attribute: "nope".into(), ..by }).is_err());
+        assert_eq!(ColorSettings::from_params(&set.params(), String::new()).range, set.range);
     }
 }

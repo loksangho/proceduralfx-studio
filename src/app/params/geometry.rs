@@ -592,7 +592,7 @@ impl ProceduralFxStudioApp {
                         c |= ui.selectable_value(&mut set.class, value, *label).changed();
                     }
                 });
-                egui::ComboBox::from_label("Color type").selected_text(color::MODES[set.mode.min(2)]).show_ui(ui, |ui| {
+                egui::ComboBox::from_label("Color type").selected_text(color::MODES[set.mode.min(color::MODES.len() - 1)]).show_ui(ui, |ui| {
                     for (value, label) in color::MODES.iter().enumerate() {
                         c |= ui.selectable_value(&mut set.mode, value, *label).changed();
                     }
@@ -605,19 +605,30 @@ impl ProceduralFxStudioApp {
                             c |= ui.add(egui::TextEdit::singleline(&mut set.random_by).hint_text("element, or e.g. piece").desired_width(130.0)).changed();
                         });
                     }
-                    2 => {
-                        ui.horizontal(|ui| {
-                            ui.label("From");
-                            c |= ui.color_edit_button_rgb(&mut set.color).changed();
-                            ui.label("to");
-                            c |= ui.color_edit_button_rgb(&mut set.color2).changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Along");
-                            for (value, label) in color::AXES.iter().enumerate() {
-                                c |= ui.selectable_value(&mut set.axis, value, *label).changed();
+                    2 | 3 => {
+                        if set.mode == 2 {
+                            ui.horizontal(|ui| {
+                                ui.label("Along");
+                                for (value, label) in color::AXES.iter().enumerate() {
+                                    c |= ui.selectable_value(&mut set.axis, value, *label).changed();
+                                }
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Attribute");
+                                c |= ui.add(egui::TextEdit::singleline(&mut set.ramp_attribute).hint_text("pscale, mask, speed…").desired_width(130.0)).changed();
+                            });
+                            c |= ui.checkbox(&mut set.auto_range, "Use the attribute's own range").on_hover_text("Its lowest value at the ramp's left end, its highest at the right").changed();
+                            if !set.auto_range {
+                                ui.horizontal(|ui| {
+                                    c |= pfield(ui, pdrag(&mut set.range[0]).speed(0.01).prefix("From ")).changed();
+                                    c |= pfield(ui, pdrag(&mut set.range[1]).speed(0.01).prefix("to ")).changed();
+                                });
                             }
-                        });
+                        }
+                        let (from, to) = (set.color, set.color2);
+                        let label = if set.mode == 2 { "Color ramp (low → high along the axis)" } else { "Color ramp (low → high values)" };
+                        c |= ramp_editor(ui, (id, "color_ramp"), label, &mut set.ramp, 3, || ramp::Ramp::linear(from, to));
                     }
                     _ => {
                         ui.horizontal(|ui| {
@@ -812,6 +823,87 @@ impl ProceduralFxStudioApp {
                     ui.label("Attribute");
                     c |= ui.add(egui::TextEdit::singleline(&mut set.attribute).desired_width(120.0)).changed();
                 });
+            }
+            NodeKind::Curve(set) => {
+                ui.small("A curve through (or near) the points below, in order. Curves are points with curveu (0 at the start, 1 at the end): POP Curve Force, Resample and Copy to Points use them.");
+                egui::ComboBox::from_label("Type").selected_text(curve::TYPES[set.kind.min(curve::TYPES.len() - 1)]).show_ui(ui, |ui| {
+                    for (value, label) in curve::TYPES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.kind, value, *label).changed();
+                    }
+                });
+                c |= ui.checkbox(&mut set.closed, "Closed").on_hover_text("Joins the end back to the start (three points or more)").changed();
+                if set.kind != 0 {
+                    c |= pfield(ui, pslider(&mut set.divisions, 1..=64).text("Divisions")).on_hover_text("Points on the curve between two of yours").changed();
+                }
+                ui.separator();
+                ui.strong("Points");
+                let (mut remove, mut swap) = (None, None);
+                let count = set.points.len();
+                for (i, p) in set.points.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        c |= group_label(ui, format!("{i}"), 0.01, &mut p[..]);
+                        for k in 0..3 {
+                            c |= pfield(ui, pdrag(&mut p[k]).speed(0.01)).changed();
+                        }
+                        if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text("Move up").clicked() {
+                            swap = Some(i - 1);
+                        }
+                        if ui.add_enabled(i + 1 < count, egui::Button::new("⏷").small()).on_hover_text("Move down").clicked() {
+                            swap = Some(i);
+                        }
+                        if ui.add_enabled(count > 2, egui::Button::new("✕").small()).on_hover_text("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = swap {
+                    set.points.swap(i, i + 1);
+                    c = true;
+                }
+                if let Some(i) = remove {
+                    set.points.remove(i);
+                    c = true;
+                }
+                if ui.button("➕ Add point").on_hover_text("Adds a point past the last one, carrying on in its direction").clicked() {
+                    let n = set.points.len();
+                    let next = match n {
+                        0 => [0.0; 3],
+                        1 => [set.points[0][0] + 1.0, set.points[0][1], set.points[0][2]],
+                        _ => {
+                            let (a, b) = (set.points[n - 2], set.points[n - 1]);
+                            [2.0 * b[0] - a[0], 2.0 * b[1] - a[1], 2.0 * b[2] - a[2]]
+                        }
+                    };
+                    set.points.push(next);
+                    c = true;
+                }
+            }
+            NodeKind::AttributeRemap(set) => {
+                ui.small("Reshapes an attribute's values through the ramp: each value's place in the input range (0 at its start, 1 at its end) is looked up on the ramp, and the result spans the output range. Vectors and colours have each component remapped.");
+                ui.horizontal(|ui| {
+                    ui.label("Attribute");
+                    c |= ui.add(egui::TextEdit::singleline(&mut set.attribute).hint_text("pscale, mask, Alpha…").desired_width(130.0)).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Class");
+                    for (value, label) in remap::CLASSES.iter().enumerate() {
+                        c |= ui.selectable_value(&mut set.class, value, *label).changed();
+                    }
+                });
+                c |= ui.checkbox(&mut set.auto_range, "Input range: the attribute's own").on_hover_text("From its lowest value to its highest").changed();
+                if !set.auto_range {
+                    ui.horizontal(|ui| {
+                        ui.label("Input range");
+                        c |= pfield(ui, pdrag(&mut set.in_range[0]).speed(0.01)).changed();
+                        c |= pfield(ui, pdrag(&mut set.in_range[1]).speed(0.01)).changed();
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Output range");
+                    c |= pfield(ui, pdrag(&mut set.out_range[0]).speed(0.01)).changed();
+                    c |= pfield(ui, pdrag(&mut set.out_range[1]).speed(0.01)).changed();
+                });
+                c |= ramp_editor(ui, (id, "remap"), "Ramp (input → output)", &mut set.ramp, 1, || ramp::Ramp::parse(remap::DEFAULT_RAMP, 1).unwrap());
             }
             NodeKind::Resample(set) => {
                 ui.small("Evenly spaced points along curves (Convert Line, grooms…); attributes are interpolated.");

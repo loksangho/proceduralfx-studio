@@ -28,8 +28,8 @@ impl ProceduralFxStudioApp {
                     let rule = pop_node.v("rule").round() as usize;
                     for (i, ((label, _), text)) in labels.iter().zip(pop_node.texts.iter_mut()).enumerate() {
                         // The expression only matters for the Expression rule.
-                        let is_expression = (op == pop::GROUP && i == 1) || op == pop::KILL;
-                        let expression_rule = (op == pop::GROUP && rule == 3) || (op == pop::KILL && rule == 0);
+                        let is_expression = (matches!(op, pop::GROUP | pop::STREAM) && i == 1) || op == pop::KILL;
+                        let expression_rule = (matches!(op, pop::GROUP | pop::STREAM) && rule == 3) || (op == pop::KILL && rule == 0);
                         if is_expression && !expression_rule {
                             continue;
                         }
@@ -40,7 +40,12 @@ impl ProceduralFxStudioApp {
                         });
                     }
                 }
+                let mode = pop_node.v("mode").round() as usize;
+                let rule = pop_node.v("rule").round() as usize;
                 for (param, slot) in pop_node.param_mut() {
+                    if !pop::shown(op, param.key, mode, rule) {
+                        continue;
+                    }
                     if let Some(choices) = pop::choices(op, param.key) {
                         let mut value = (slot[0].round().max(0.0) as usize).min(choices.len() - 1);
                         egui::ComboBox::from_label(param.label).selected_text(choices[value]).show_ui(ui, |ui| {
@@ -60,6 +65,28 @@ impl ProceduralFxStudioApp {
                         }
                         _ => c |= shader_param_ui(ui, param, slot),
                     }
+                }
+                // Ramps, after the other settings.
+                let ramps = pop_node.def().ramps;
+                let mut draw = |ui: &mut egui::Ui, param: &ramp::RampParam, pop_node: &mut pop::PopNode| {
+                    let fallback = pop_node.ramp_fallback(param.key);
+                    if let Some(text) = pop_node.ramp_text_mut(param.key) {
+                        ui.add_space(4.0);
+                        c |= ramp_editor(ui, (id, param.key), param.label, text, param.width(), || fallback);
+                    }
+                };
+                let (main, along): (Vec<&ramp::RampParam>, Vec<&ramp::RampParam>) =
+                    ramps.iter().filter(|r| pop::shown(op, r.key, mode, rule)).partition(|r| !(op == pop::CURVE_FORCE && r.key != "falloff"));
+                for param in main {
+                    draw(ui, param, pop_node);
+                }
+                if !along.is_empty() {
+                    egui::CollapsingHeader::new("Strength along the curve").id_salt((id, "along")).show(ui, |ui| {
+                        ui.small("Scales Follow, Suction and Orbit from the curve's start (left) to its end (right).");
+                        for param in along {
+                            draw(ui, param, pop_node);
+                        }
+                    });
                 }
                 if op == pop::VOP {
                     ui.small("Double-click to edit its VOP network. Bind reads the particles' attributes (P, v, force, age, Cd...) and Export writes them back.");
