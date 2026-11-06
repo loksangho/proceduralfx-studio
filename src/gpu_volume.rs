@@ -156,7 +156,10 @@ struct Blended {
 
 @fragment
 fn fs(@builtin(position) position: vec4<f32>) -> Blended {
-    let pixel = position.xy;
+    // The camera is in the view's own units (points), the target in pixels: on a Retina
+    // screen, or a render bigger than the view, there are more pixels than points.
+    let target_size = vec2<f32>(textureDimensions(depth));
+    let pixel = position.xy * camera.screen.zw / target_size;
     let near = camera.lens.z;
     // The ray as world = a + b * t, t being camera depth.
     let a = on_ray(pixel, 0.0);
@@ -169,7 +172,7 @@ fn fs(@builtin(position) position: vec4<f32>) -> Blended {
     var enter = max(max(max(lo.x, lo.y), lo.z), near);
     var leave = max(min(min(hi.x, hi.y), hi.z), near);
     // Stop at the surfaces in front.
-    let d = textureLoad(depth, vec2<i32>(pixel), 0).r;
+    let d = textureLoad(depth, vec2<i32>(position.xy), 0).r;
     var surface = 1e30;
     if (camera.mode.x > 0.5) {
         surface = near + d * (camera.lens.w - near);

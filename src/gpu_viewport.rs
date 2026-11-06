@@ -1617,7 +1617,22 @@ mod tests {
         // Glow adds light in its colour.
         let glowing = look(&mut gpu, 2.0, [3.0, 1.0, 0.0], &straight_on());
         assert!(glowing[0] >= behind[0] && glowing[2] <= behind[2] + 1 && glowing[1] > behind[1], "{glowing:?} against {behind:?}");
+        // A render with more pixels than the view (a Retina screen, a big export) frames
+        // the volume the same: centred, the same share of the picture.
+        let wide = |gpu: &mut GpuViewport, size: [u32; 2]| {
+            gpu.set_scene(300, &[], &[], &[], &[], None);
+            gpu.set_points(2, &[], &[], &[]);
+            gpu.set_volume(Some(&cube([0.0; 3])));
+            let camera = Camera { size: egui::vec2(40.0, 40.0), center: egui::vec2(20.0, 20.0), focal: 40.0, ..straight_on() };
+            gpu.render(size, &camera)
+        };
+        let (small, big) = (wide(&mut gpu, [40, 40]), wide(&mut gpu, [80, 80]));
+        let coverage = |image: &[[u8; 4]]| image.iter().filter(|p| p[3] > 60).count() as f32 / image.len() as f32;
+        assert!(coverage(&small) > 0.05 && (coverage(&small) - coverage(&big)).abs() < 0.02, "same framing: {} vs {}", coverage(&small), coverage(&big));
+        assert!(big[40 * 80 + 40][3] > 150, "still centred: {:?}", big[40 * 80 + 40]);
+        assert!(big[4 * 80 + 4][3] == 0, "and not pulled to the corner");
         // Nothing to march: the wall alone.
+        gpu.set_scene(400, &dark(2.0), &[], &[], &[], None);
         gpu.set_volume(None);
         gpu.draw([20, 20], &straight_on());
         assert_eq!(middle(&gpu), [51, 51, 51, 255]);
