@@ -197,7 +197,7 @@ pub fn find(name: &str) -> Option<&'static Preset> {
 
 impl Control {
     // The node the control changes, if the scene still has it.
-    fn target(&self, graph: &crate::Graph) -> Option<crate::NodeId> {
+    pub fn target(&self, graph: &crate::Graph) -> Option<crate::NodeId> {
         match self.node.strip_prefix('#') {
             Some(id) => id.parse().ok().filter(|id| graph.nodes.contains_key(id)),
             None => graph.nodes.iter().filter(|(_, n)| n.name == self.node).map(|(id, _)| *id).min(),

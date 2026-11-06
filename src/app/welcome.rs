@@ -114,11 +114,12 @@ impl ProceduralFxStudioApp {
             return false;
         }
         let mut changed = false;
+        let (mut open_node, mut ask) = (None, false);
         egui::CollapsingHeader::new(egui::RichText::new(format!("{} controls", preset.name)).strong())
             .id_salt("preset_controls")
             .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new("preset_controls_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                egui::Grid::new("preset_controls_grid").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
                     for (control, mut value) in live {
                         ui.label(control.label).on_hover_text(control.help);
                         let slider = egui::Slider::new(&mut value, control.range.0..=control.range.1);
@@ -126,11 +127,30 @@ impl ProceduralFxStudioApp {
                         if ui.add(slider).on_hover_text(control.help).changed() {
                             changed |= control.set(&mut self.graph, value);
                         }
+                        if let Some(id) = control.target(&self.graph) {
+                            let title = self.graph.nodes.get(&id).map_or_else(String::new, |n| n.title(id));
+                            let kind = self.graph.nodes.get(&id).map_or_else(String::new, |n| n.kind.menu_display());
+                            if ui.small_button("Open").on_hover_text(format!("Shows the node this slider changes, {title} ({kind}), with all of its settings")).clicked() {
+                                open_node = Some(id);
+                            }
+                        }
                         ui.end_row();
                     }
                 });
-                ui.small("Each slider changes a node inside the network: select a node to see all of its settings.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("Change more: Open shows the node a slider changes, with all of its settings. Or describe the change to the");
+                    ask = ui.small_button("✨ AI assistant").on_hover_text("It changes the nodes for you, and says what it changed").clicked();
+                });
             });
+        if let Some(id) = open_node {
+            let network = self.graph.nodes.get(&id).and_then(|n| n.parent);
+            self.enter_network(network);
+            self.selected = Some(id);
+            self.status = "This node is what the slider changes: its settings are in Parameters".into();
+        }
+        if ask {
+            self.assistant.open = true;
+        }
         ui.separator();
         changed
     }

@@ -458,3 +458,19 @@ fn the_export_window_says_how_to_use_the_sheet_in_each_engine() {
     assert!(h.query_by_label("Copy").is_none(), "no Bevy code for Godot");
     assert!(h.state().sprite_sheet.godot && !h.state().sprite_sheet.unity, "Godot's files are written");
 }
+
+// A preset slider's Open shows the node it changes, inside its network, selected.
+#[test]
+fn a_preset_sliders_open_shows_the_node_it_changes() {
+    let mut app = ProceduralFxStudioApp::default();
+    app.welcome_open = false;
+    app.load_preset(presets::PRESETS.iter().find(|p| p.name == "Fire").unwrap());
+    app.animate = false;
+    let mut h = harness(app);
+    h.get_all_by_label("Open").next().expect("an Open beside the Size slider").click();
+    h.run_steps(3);
+    let app = h.state();
+    let source = app.graph.nodes.iter().find(|(_, n)| n.name == "source").map(|(id, _)| *id).unwrap();
+    assert_eq!(app.selected, Some(source));
+    assert_eq!(app.current_network, app.graph.nodes[&source].parent, "inside its network");
+}
