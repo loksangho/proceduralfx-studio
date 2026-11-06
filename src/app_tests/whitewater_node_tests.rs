@@ -87,3 +87,33 @@ fn whitewater_points_render_in_moonray() {
     let lit = render.pixels().filter(|p| p[0] + p[1] + p[2] > 0.05).count();
     assert!(lit > 50, "{lit} lit pixels");
 }
+
+// Particle presets render in MoonRay: their points become glowing spheres, coloured and
+// faded by their attributes. `cargo test --release -- --ignored particles_render`.
+#[test]
+#[ignore]
+fn particles_render_in_moonray() {
+    let preset = presets::PRESETS.iter().find(|p| p.name == "Impact").unwrap();
+    let mut app = ProceduralFxStudioApp::default();
+    app.load_preset(preset);
+    app.render_at = Some(0.15);
+    let scene = app.render_scene().unwrap();
+    assert!(scene.parts.iter().any(|(mesh, _)| renders_points(mesh)), "the sparks are in the scene");
+    let dir = std::env::temp_dir();
+    let (rdla, exr) = (dir.join("pfx_particles.rdla"), dir.join("pfx_particles.exr"));
+    app.export_scene_rdla(&rdla, &scene, 128, 96, 4).unwrap();
+    let run = Command::new("native/moonray/macos/moonray")
+        .env("RDL2_DSO_PATH", "/Users/loksangho/moonray/build/rdl2dso")
+        .args(["-in", rdla.to_str().unwrap(), "-out", exr.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let log = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+    assert!(run.status.success() && !log.contains("Error"), "{log}");
+    let render = image::open(&exr).unwrap().to_rgb32f();
+    // Sparks glow orange: red above blue.
+    let glowing = render.pixels().filter(|p| p[0] > 0.5 && p[0] > p[2] * 1.5).count();
+    assert!(glowing > 20, "{glowing} glowing pixels");
+    if let Ok(dir) = std::env::var("PFX_KEEP_RENDER") {
+        let _ = std::fs::copy(&exr, std::path::Path::new(&dir).join("particles.exr"));
+    }
+}

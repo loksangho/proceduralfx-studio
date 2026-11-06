@@ -952,12 +952,13 @@ impl ProceduralFxStudioApp {
             f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
         }
 
-        // Whitewater and other marked points: spheres of radius pscale.
+        // Particles (Whitewater, and points with a size or a glow): spheres of radius
+        // pscale, carrying their colour, alpha and emission for their material.
         for (index, (mesh, _)) in parts.iter().enumerate() {
             if !renders_points(mesh) {
                 continue;
             }
-            let pscale = mesh.point_attributes.get("pscale").filter(|p| p.len() == mesh.vertices.len());
+            let pscale = per_point(mesh, "pscale", 1);
             let mut body = format!("RdlPointGeometry(\"/scene/objects/points{index}\") {{\n    [\"vertex_list_0\"] = {{\n");
             for v in &mesh.vertices {
                 body.push_str(&format!("        Vec3({:.6}, {:.6}, {:.6}),\n", v.x, v.y, -v.z));
@@ -966,7 +967,31 @@ impl ProceduralFxStudioApp {
             for i in 0..mesh.vertices.len() {
                 body.push_str(&format!("        {:.6},\n", pscale.map_or(0.01, |p| p[i]).max(1e-5)));
             }
-            body.push_str("    }\n}\n\n");
+            body.push_str("    },\n");
+            let mut data = String::new();
+            let mut names = Vec::new();
+            for (key, width) in POINT_DATA {
+                let Some(values) = per_point(mesh, key, width) else { continue };
+                let name = format!("/scene/objects/points{index}_{key}");
+                names.push(format!("UserData(\"{name}\")"));
+                if width == 3 {
+                    data.push_str(&format!("UserData(\"{name}\") {{\n    [\"color_key\"] = \"{key}\",\n    [\"color_values_0\"] = {{\n"));
+                    for c in values.chunks(3) {
+                        data.push_str(&format!("        Rgb({:.4}, {:.4}, {:.4}),\n", c[0], c[1], c[2]));
+                    }
+                } else {
+                    data.push_str(&format!("UserData(\"{name}\") {{\n    [\"float_key\"] = \"{key}\",\n    [\"float_values_0\"] = {{\n"));
+                    for a in values {
+                        data.push_str(&format!("        {a:.4},\n"));
+                    }
+                }
+                data.push_str("    }\n}\n\n");
+            }
+            if !names.is_empty() {
+                body.push_str(&format!("    [\"primitive_attributes\"] = {{ {} }},\n", names.join(", ")));
+            }
+            body.push_str("}\n\n");
+            body.push_str(&data);
             f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
         }
 
@@ -1066,7 +1091,7 @@ impl ProceduralFxStudioApp {
         write!(f, "{default_body}\n") .map_err(|e| e.to_string())?;
         let mut written: Vec<NodeId> = Vec::new();
         let mut layer_materials: Vec<String> = Vec::new();
-        for (index, (_, material)) in parts.iter().enumerate() {
+        for (index, (mesh, material)) in parts.iter().enumerate() {
             let node = match material {
                 PartMaterial::Node(id) => self.graph.nodes.get(id).map(|n| (*id, &n.kind)),
                 _ => None,
@@ -1123,6 +1148,12 @@ impl ProceduralFxStudioApp {
                     let (class, body) = rdla_material(&name, kind, color, *roughness, value);
                     write!(f, "{body}\n") .map_err(|e| e.to_string())?;
                     format!("{class}(\"{name}\")")
+                }
+                // Particles with no material of their own: their colour, alpha and glow.
+                _ if renders_points(mesh) && POINT_DATA.iter().any(|(key, width)| per_point(mesh, key, *width).is_some()) => {
+                    let name = format!("/scene/materials/points{index}");
+                    write!(f, "{}", particle_material(&name, mesh)).map_err(|e| e.to_string())?;
+                    format!("DwaBaseMaterial(\"{name}\")")
                 }
                 _ => format!("{default_class}(\"/scene/materials/default\")"),
             };
@@ -1553,4 +1584,35 @@ mod shader_search_tests {
         assert!(!message.contains('\u{1b}') && !message.contains("[31m"), "{message}");
         assert_eq!(moonray_message("\u{1b}[1mRendered\u{1b}[0m"), "Rendered");
     }
+}
+
+// The point attributes particles carry to MoonRay, and their widths.
+const POINT_DATA: [(&str, usize); 3] = [("Cd", 3), ("Alpha", 1), ("emission", 3)];
+
+// The material of particles without one: albedo from Cd, presence from Alpha, and glowing
+// with emission, each where the points have it.
+fn particle_material(name: &str, mesh: &Mesh) -> String {
+    let map = |key: &str, ty: i32, default: f32| {
+        format!(
+            "AttributeMap(\"{name}_{key}\") {{\n    [\"primitive_attribute_name\"] = \"{key}\",\n    [\"primitive_attribute_type\"] = {ty},\n    [\"default_value\"] = Rgb({default}, {default}, {default}),\n}}\n\n"
+        )
+    };
+    let mut maps = String::new();
+    let mut attrs = vec!["    [\"specular\"] = 0.0,".to_owned()];
+    if per_point(mesh, "Cd", 3).is_some() {
+        maps.push_str(&map("Cd", 3, 1.0));
+        attrs.push(format!("    [\"albedo\"] = bind(AttributeMap(\"{name}_Cd\")),"));
+    } else {
+        attrs.push("    [\"albedo\"] = Rgb(0.8, 0.8, 0.8),".to_owned());
+    }
+    if per_point(mesh, "Alpha", 1).is_some() {
+        maps.push_str(&map("Alpha", 0, 1.0));
+        attrs.push(format!("    [\"presence\"] = bind(AttributeMap(\"{name}_Alpha\")),"));
+    }
+    if per_point(mesh, "emission", 3).is_some() {
+        maps.push_str(&map("emission", 3, 0.0));
+        attrs.push("    [\"show_emission\"] = true,".to_owned());
+        attrs.push(format!("    [\"emission\"] = bind(AttributeMap(\"{name}_emission\")),"));
+    }
+    format!("{maps}DwaBaseMaterial(\"{name}\") {{\n{}\n}}\n\n", attrs.join("\n"))
 }

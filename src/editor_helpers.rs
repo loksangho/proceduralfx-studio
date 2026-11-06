@@ -433,8 +433,20 @@ pub(crate) fn used_points(mesh: &Mesh, curves: &[std::ops::Range<usize>]) -> Vec
     used
 }
 
+// Points the renderer draws as spheres: geometry that's only points, marked for rendering
+// (Whitewater), or with a size (pscale) or a glow (emission), as particle effects have.
+// Other point clouds (scattered points to copy onto, say) are left out.
 pub(crate) fn renders_points(mesh: &Mesh) -> bool {
-    mesh.indices.is_empty() && !mesh.vertices.is_empty() && mesh.point_attributes.get(whitewater::RENDER_POINTS).is_some_and(|v| v.first() == Some(&1.0))
+    let n = mesh.vertices.len();
+    let marked = mesh.point_attributes.get(whitewater::RENDER_POINTS).is_some_and(|v| v.first() == Some(&1.0));
+    let sized = mesh.point_attributes.get("pscale").is_some_and(|v| v.len() == n);
+    let glowing = mesh.point_attributes.get("emission").is_some_and(|v| v.len() == n * 3);
+    mesh.indices.is_empty() && n > 0 && (marked || sized || glowing)
+}
+
+// A point attribute with one value (or `width` values) per point, if it has them.
+pub(crate) fn per_point<'a>(mesh: &'a Mesh, key: &str, width: usize) -> Option<&'a Vec<f32>> {
+    mesh.point_attributes.get(key).filter(|v| v.len() == mesh.vertices.len() * width)
 }
 
 pub(crate) fn rdla_material(name: &str, kind: usize, color: [f32; 3], roughness: f32, value: f32) -> (&'static str, String) {
