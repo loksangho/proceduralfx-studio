@@ -152,6 +152,8 @@ footer .legal-note { flex-basis: 100%; margin: 4px 0 0; font-size: 13px; opacity
 .founder-buy .seats { margin: 0; font-size: 20px; font-weight: 700; color: var(--text); }
 .founder-buy p { margin: 0; }
 .btn.disabled { opacity: 0.5; pointer-events: none; }
+.founder-buy .agree { display: flex; gap: 10px; align-items: flex-start; font-size: 15px; color: var(--text); cursor: pointer; }
+.founder-buy .agree input { margin-top: 4px; width: 18px; height: 18px; flex: none; accent-color: var(--amber); }
 @media (max-width: 760px) { .price.founder { grid-template-columns: 1fr; } }
 
 /* Tutorials */

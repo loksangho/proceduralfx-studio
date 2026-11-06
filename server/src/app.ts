@@ -257,7 +257,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       if ((await store.founderCount()) >= config.founderSeats) {
         return res.status(410).send(messagePage("Sold out", `All ${config.founderSeats} Founder's licenses have been sold. Thank you to everyone who took one!`));
       }
-      res.redirect(303, await billing.checkoutFounder(config.founderPrice, config.currency, config.publicUrl, `${config.siteUrl}/#pricing`));
+      res.redirect(303, await billing.checkoutFounder(config.founderPrice, config.currency, config.publicUrl, `${config.siteUrl}/#pricing`, config.siteUrl));
     }),
   );
 

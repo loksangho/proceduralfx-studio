@@ -152,8 +152,9 @@
       </div>
       <div class="founder-buy">
         <p class="seats" id="founder-seats">Limited to 100</p>
-        <a class="btn btn-primary" id="founder-buy" href="https://ai.build3dstudio.com/founder">Buy a Founder's license</a>
-        <p class="small muted"><a href="/founder">Read the license</a>. Later licenses will cost more, and their prices will be published here first.</p>
+        <label class="agree" id="founder-agree"><input type="checkbox" id="founder-agree-box"> I have read and agree to the <a href="/founder" target="_blank">Founder's license</a> and the <a href="/terms" target="_blank">terms</a>.</label>
+        <a class="btn btn-primary disabled" id="founder-buy" href="https://ai.build3dstudio.com/founder" aria-disabled="true">Buy a Founder's license</a>
+        <p class="small muted">Later licenses will cost more, and their prices will be published here first.</p>
       </div>
     </div>
     <div class="grid grid-3">
@@ -180,6 +181,17 @@
   </div>
 </section>
 <script>
+// The buy button works once the license is agreed to; checkout asks again before payment.
+(function () {
+  var box = document.getElementById("founder-agree-box"), buy = document.getElementById("founder-buy");
+  function update() {
+    if (buy.textContent === "Sold out") return;
+    buy.classList.toggle("disabled", !box.checked);
+    buy.setAttribute("aria-disabled", String(!box.checked));
+  }
+  box.addEventListener("change", update);
+  update();
+})();
 // Seats left, from the credits server. Without it the card still works: it says "Limited to 100".
 fetch("https://ai.build3dstudio.com/v1/founders")
   .then(function (r) { return r.json(); })
@@ -193,6 +205,7 @@ fetch("https://ai.build3dstudio.com/v1/founders")
       buy.removeAttribute("href");
       buy.classList.add("disabled");
       buy.textContent = "Sold out";
+      document.getElementById("founder-agree").style.display = "none";
     }
   })
   .catch(function () {});

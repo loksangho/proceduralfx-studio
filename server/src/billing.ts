@@ -23,7 +23,8 @@ export interface Billing {
   checkoutPlan(customerId: string, userId: string, priceId: string, returnUrl: string): Promise<string>;
   checkoutTopup(customerId: string, userId: string, amount: number, currency: string, returnUrl: string): Promise<string>;
   // Checkout for a Founder's license; Stripe asks for the buyer's email.
-  checkoutFounder(amount: number, currency: string, returnUrl: string, cancelUrl: string): Promise<string>;
+  // `siteUrl` is where the license and terms are, which the buyer agrees to before paying.
+  checkoutFounder(amount: number, currency: string, returnUrl: string, cancelUrl: string, siteUrl: string): Promise<string>;
   portal(customerId: string, returnUrl: string): Promise<string>;
   // The price of the customer's active subscription, if any.
   activePrice(customerId: string): Promise<string | null>;
@@ -135,7 +136,7 @@ export class StripeBilling implements Billing {
     return s.url!;
   }
 
-  async checkoutFounder(amount: number, currency: string, returnUrl: string, cancelUrl: string) {
+  async checkoutFounder(amount: number, currency: string, returnUrl: string, cancelUrl: string, siteUrl: string) {
     const s = await this.stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [
@@ -150,6 +151,12 @@ export class StripeBilling implements Billing {
         },
       ],
       custom_fields: [{ key: "licensee", label: { type: "custom", custom: "Name or studio on the license" }, type: "text", optional: true, text: { maximum_length: 80 } }],
+      // Payment waits for a tick confirming the license and terms (Stripe needs a terms of
+      // service URL in its public details for this).
+      consent_collection: { terms_of_service: "required" },
+      custom_text: {
+        terms_of_service_acceptance: { message: `I agree to the [Founder's license](${siteUrl}/founder) and the [terms](${siteUrl}/terms).` },
+      },
       metadata: { kind: "founder" },
       ...taxParams(this.tax, false),
       // Seats are counted when this opens; an unfinished checkout gives its place back soon.
