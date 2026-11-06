@@ -1187,6 +1187,30 @@ impl ProceduralFxStudioApp {
             light_names.push("EnvLight(\"/scene/lights/env\")".to_string());
         }
 
+        // Toon materials' own light (see shading::toon_rdla): from the strongest light, or
+        // the key light's direction, at the strength that shows a lit band at its colour.
+        let toon_parts: Vec<bool> = parts.iter().map(|(_, m)| matches!(m, PartMaterial::Node(id) if matches!(self.graph.nodes.get(id).map(|n| &n.kind), Some(NodeKind::Shader(v)) if v.table == shading::Table::Toon))).collect();
+        if toon_parts.iter().any(|t| *t) {
+            let strongest = scene.lights.iter().max_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+            let direction = match strongest {
+                Some((position, _, _, _, 1)) => Vec3::zero().sub(*position).normalize(),
+                Some((_, direction, ..)) => *direction,
+                None => Vec3::from_arr(self.key_light_dir).normalize(),
+            };
+            let color = strongest.map_or([1.0; 3], |l| l.2);
+            let z = Vec3::new(-direction.x, -direction.y, direction.z).normalize();
+            let hint = if z.y.abs() > 0.99 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+            let x = hint.cross(z).normalize();
+            let y = z.cross(x);
+            writeln!(f, "DistantLight(\"/scene/lights/toon\") {{") .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"node_xform\"] = {},", mat4(x, y, z, Vec3::zero())) .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"color\"] = Rgb({:.4}, {:.4}, {:.4}),", color[0], color[1], color[2]) .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"intensity\"] = {TOON_LIGHT:.4},") .map_err(|e| e.to_string())?;
+            writeln!(f, "    [\"angular_extent\"] = 0.53,") .map_err(|e| e.to_string())?;
+            writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
+            writeln!(f, "LightSet(\"/scene/lightsets/toon\") {{\n    DistantLight(\"/scene/lights/toon\"),\n}}\n") .map_err(|e| e.to_string())?;
+        }
+
         writeln!(f, "LightSet(\"/scene/lightsets/LightSet1\") {{") .map_err(|e| e.to_string())?;
         for light in &light_names {
             writeln!(f, "    {light},") .map_err(|e| e.to_string())?;
@@ -1194,9 +1218,10 @@ impl ProceduralFxStudioApp {
         writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
 
         writeln!(f, "Layer(\"/scene/layers/Layer1\") {{") .map_err(|e| e.to_string())?;
-        for (geometry, material) in part_geometry.iter().zip(&layer_materials) {
+        for ((geometry, material), toon) in part_geometry.iter().zip(&layer_materials).zip(&toon_parts) {
+            let lights = if *toon { "toon" } else { "LightSet1" };
             for geometry in geometry {
-                writeln!(f, "    {{{geometry}, \"\", {material}, LightSet(\"/scene/lightsets/LightSet1\"), undef(), undef(), undef(), undef()}},") .map_err(|e| e.to_string())?;
+                writeln!(f, "    {{{geometry}, \"\", {material}, LightSet(\"/scene/lightsets/{lights}\"), undef(), undef(), undef(), undef()}},") .map_err(|e| e.to_string())?;
             }
         }
         for index in 0..scene.volumes.len() {
@@ -1616,3 +1641,7 @@ fn particle_material(name: &str, mesh: &Mesh) -> String {
     }
     format!("{maps}DwaBaseMaterial(\"{name}\") {{\n{}\n}}\n\n", attrs.join("\n"))
 }
+
+// How strong toon materials' own light is: MoonRay's toon diffuse is flat, at half what a
+// plain surface facing a light of strength 1 gets, so 2 shows a lit band at its colour.
+pub(crate) const TOON_LIGHT: f32 = 2.0 * DISTANT_LIGHT_SCALE;

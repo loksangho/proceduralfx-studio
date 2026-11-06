@@ -72,7 +72,7 @@ pub struct ToonMaterial {
     pub shadow: [f32; 4],
     // Highlight colour times its strength.
     pub highlight: [f32; 4],
-    // Emission colour times its intensity.
+    // Emission colour times its intensity, and the glow (its own colour times this).
     pub emission: [f32; 4],
     pub outline: [f32; 4],
 }
@@ -91,7 +91,7 @@ impl ToonMaterial {
         let k = ((f - (1.0 - w)) / w).clamp(0.0, 1.0);
         let band = ((x.floor() + k * k * (3.0 - 2.0 * k)) / (bands - 1.0)).clamp(0.0, 1.0);
         let spot = if t >= 1.0 - 0.3 * self.shade[3] { 1.0 } else { 0.0 };
-        std::array::from_fn(|c| (base[c] * (self.shadow[c] + (1.0 - self.shadow[c]) * band) + self.highlight[c] * spot + self.emission[c]).clamp(0.0, 1.0))
+        std::array::from_fn(|c| (base[c] * (self.shadow[c] + (1.0 - self.shadow[c]) * band + self.emission[3]) + self.highlight[c] * spot + self.emission[c]).clamp(0.0, 1.0))
     }
 }
 
@@ -418,7 +418,7 @@ struct Toon {
     shade: vec4<f32>,     // bands, softness, shadow size, highlight size
     shadow: vec4<f32>,    // shadow tint, outline width (pixels)
     highlight: vec4<f32>, // colour × strength
-    emission: vec4<f32>,  // colour × intensity
+    emission: vec4<f32>,  // colour × intensity, and glow (own colour × w)
     outline: vec4<f32>,   // colour
 };
 @group(2) @binding(0) var<uniform> toons: array<Toon, 16>;
@@ -456,7 +456,7 @@ fn fs_toon(in: ToonOut) -> @location(0) vec4<f32> {
     var rgb = in.color.rgb * mix(m.shadow.rgb, vec3<f32>(1.0), band);
     let edge = 1.0 - 0.3 * m.shade.w;
     let spot = smoothstep(edge - fwidth(t), edge, t);
-    rgb = rgb + m.highlight.rgb * spot + m.emission.rgb;
+    rgb = rgb + m.highlight.rgb * spot + m.emission.rgb + in.color.rgb * m.emission.w;
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 

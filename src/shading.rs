@@ -113,6 +113,8 @@ pub const TOON: &[Param] = &[
     t("use_point_color", "Use point colour (Cd)", "Toon", false),
     f("outline_width", "Outline width (pixels)", "Outline", 0.0, 12.0, 2.0),
     c("outline_color", "Outline color", "Outline", [0.06, 0.05, 0.08]),
+    // Glows in its own lit colour (Cd, with Use point colour) times this: flames, magic.
+    f("glow", "Glow (own colour)", "Emission", 0.0, 3.0, 0.0),
 ];
 
 pub type Preset = (&'static str, &'static [(&'static str, [f32; 3])]);
@@ -360,7 +362,7 @@ impl Values {
             shade: [self.float("bands").round().clamp(2.0, 8.0), self.float("softness").clamp(0.0, 1.0), self.float("terminator"), self.float("highlight_size").clamp(0.0, 1.0)],
             shadow: [sr, sg, sb, self.float("outline_width").max(0.0)],
             highlight: [highlight[0], highlight[1], highlight[2], 0.0],
-            emission: [emission[0], emission[1], emission[2], 0.0],
+            emission: [emission[0], emission[1], emission[2], self.float("glow").max(0.0)],
             outline: [or, og, ob, 1.0],
         }
     }
@@ -506,32 +508,54 @@ pub fn hair_rdla(name: &str, p: &Values) -> (&'static str, String) {
 
 // DwaToonMaterial: banded ramp diffuse from the shadow tint up to the lit colour,
 // with a hard-edged toon highlight.
+// MoonRay's toon material, made to look like the viewport's Toon shading (fs_toon in
+// gpu_viewport.rs), which shows the lit band at the surface's own colour however bright
+// the light is, the unlit side at that colour times the shadow tint, and no shading
+// between bands. MoonRay's toon diffuse is flat within a band but looks its ramp up from
+// fully lit (0) to edge-on (1), is lit only on the side facing the light, and scales with
+// the light; so:
+// - the ramp runs from the top band at 0 down to the darkest, with the shadow size folded
+//   into where the bands change;
+// - the shadow tint's share comes from emission (base × shadow tint, everywhere, as in the
+//   viewport, which casts no shadows), and the ramp adds the rest, (1 - tint) × band;
+// - toon materials are lit by one light of their own (TOON_LIGHT in render.rs), strong
+//   enough that a fully lit band shows the base colour exactly.
+// Glow and the emission colour add to the emission.
 pub fn toon_rdla(name: &str, p: &Values, objects: &mut String) -> (&'static str, String) {
     let bands = (p.float("bands").round() as usize).clamp(2, 8);
-    let shadow = p.color("shadow_color");
-    let mut positions = Vec::new();
+    let shadow = p.color("shadow_color").map(|c| c.clamp(0.0, 1.0));
+    let shift = p.float("terminator");
+    // The viewport's band k starts where the light, cos + shift, reaches k / bands, i.e. at
+    // 1 - cos = 1 + shift - k / bands. MoonRay's stepped ramp shows each key's colour up to
+    // its position (from the key before), so each band's key sits where the band ends:
+    // band k ends at 1 + shift - k / bands, and the darkest at 1.
+    let mut positions: Vec<f32> = Vec::new();
     let mut colours = Vec::new();
-    for i in 0..bands {
-        let t = i as f32 / (bands - 1) as f32;
-        positions.push(format!("{:.4}", i as f32 / bands as f32));
-        colours.push(rgb(std::array::from_fn(|k| shadow[k] + (1.0 - shadow[k]) * t)));
+    for j in 0..bands {
+        let band = bands - 1 - j;
+        let at = if band == 0 { 1.0 } else { (1.0 + shift - band as f32 / bands as f32).clamp(0.0, 1.0) };
+        positions.push(at.max(positions.last().copied().unwrap_or(0.0)));
+        let level = band as f32 / (bands - 1) as f32;
+        colours.push(rgb(std::array::from_fn(|k| (1.0 - shadow[k]) * level)));
     }
     let interpolation = if p.float("softness") > 0.5 { 1 } else { 0 };
     let mut body = String::new();
-    let albedo = if p.flag("use_point_color") {
+    let point_colour = p.flag("use_point_color").then(|| {
         let map = format!("{name}_point_color");
         objects.push_str(&attribute_map(&map, "Cd", 3, p.color("base_color")));
-        // Bound, as maps must be: given plainly, MoonRay keeps the attribute's default (grey).
-        format!("bind(AttributeMap(\"{map}\"))")
-    } else {
-        rgb(p.color("base_color"))
+        map
+    });
+    let albedo = match &point_colour {
+        Some(map) => format!("bind(AttributeMap(\"{map}\"))"),
+        None => rgb(p.color("base_color")),
     };
     body.push_str(&format!("    [\"albedo\"] = {albedo},\n"));
     body.push_str("    [\"diffuse_model\"] = 1,\n");
-    body.push_str(&format!("    [\"positions\"] = {{{}}},\n", positions.join(", ")));
+    body.push_str(&format!("    [\"positions\"] = {{{}}},\n", positions.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", ")));
     body.push_str(&format!("    [\"colors\"] = {{{}}},\n", colours.join(", ")));
     body.push_str(&format!("    [\"interpolations\"] = {{{}}},\n", vec![interpolation.to_string(); bands].join(", ")));
-    body.push_str(&format!("    [\"terminator_shift\"] = {:.4},\n", p.float("terminator")));
+    // The shadow size is in the positions above.
+    body.push_str("    [\"terminator_shift\"] = 0.0,\n");
     let highlight = p.float("highlight");
     if highlight > 0.0 {
         body.push_str("    [\"specular_model\"] = 2,\n");
@@ -541,10 +565,26 @@ pub fn toon_rdla(name: &str, p: &Values, objects: &mut String) -> (&'static str,
     } else {
         body.push_str("    [\"show_specular\"] = false,\n");
     }
-    let emission = p.float("emission_intensity");
-    if emission > 0.0 {
+    // Emission: base × (shadow tint + glow) + the emission colour.
+    let glow = p.float("glow").max(0.0);
+    let gain: [f32; 3] = std::array::from_fn(|k| shadow[k] + glow);
+    let constant = p.color("emission_color").map(|c| c * p.float("emission_intensity").max(0.0));
+    if gain.iter().chain(&constant).any(|v| *v > 0.0) {
         body.push_str("    [\"show_emission\"] = true,\n");
-        body.push_str(&format!("    [\"emission\"] = {},\n", rgb(p.color("emission_color").map(|c| c * emission))));
+        match &point_colour {
+            Some(map) => {
+                let glow_map = format!("{name}_glow");
+                objects.push_str(&format!(
+                    "ColorCorrectGainOffsetMap(\"{glow_map}\") {{\n    [\"input\"] = bind(AttributeMap(\"{map}\")),\n    [\"use_per_channel_gain_offset\"] = true,\n    [\"gain_r\"] = {:.4},\n    [\"gain_g\"] = {:.4},\n    [\"gain_b\"] = {:.4},\n    [\"offset_r\"] = {:.4},\n    [\"offset_g\"] = {:.4},\n    [\"offset_b\"] = {:.4},\n}}\n\n",
+                    gain[0], gain[1], gain[2], constant[0], constant[1], constant[2]
+                ));
+                body.push_str(&format!("    [\"emission\"] = bind(ColorCorrectGainOffsetMap(\"{glow_map}\")),\n"));
+            }
+            None => {
+                let base = p.color("base_color");
+                body.push_str(&format!("    [\"emission\"] = {},\n", rgb(std::array::from_fn(|k| base[k] * gain[k] + constant[k]))));
+            }
+        }
     }
     ("DwaToonMaterial", format!("DwaToonMaterial(\"{name}\") {{\n{body}}}\n"))
 }

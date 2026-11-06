@@ -139,4 +139,7 @@ fn toon_fire_renders_in_colour_in_moonray() {
     let lit = render.pixels().filter(|p| p[0] + p[1] + p[2] > 0.1).count();
     let coloured = render.pixels().filter(|p| p[0] + p[1] + p[2] > 0.1 && p[0] > p[2] * 1.5).count();
     assert!(lit > 200 && coloured * 2 > lit, "{coloured} of {lit} lit pixels are warm");
+    // As bright as the viewport shows it: its lit bands at their full colour, glowing.
+    let bright = render.pixels().filter(|p| p[0] > 0.9).count();
+    assert!(bright * 3 > lit, "{bright} of {lit} lit pixels are bright");
 }
