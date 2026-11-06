@@ -852,7 +852,7 @@ pub(crate) fn render_buckets(
                 }
                 let result = match status {
                     Ok(s) if s.success() => image::open(&bucket_out).map(|img| img.to_rgba32f()).map_err(|e| format!("could not read bucket: {e}")),
-                    Ok(s) => Err(format!("MoonRay exited with {s}: {}", read_log_tail(&bucket_log, 600).trim())),
+                    Ok(s) => Err(format!("MoonRay exited with {s}: {}", moonray_message(&read_log_tail(&bucket_log, 600)).trim())),
                     Err(e) => Err(e),
                 };
                 let _ = std::fs::remove_file(&bucket_out);
@@ -3211,4 +3211,31 @@ impl NodeKind {
             _ => return None,
         })
     }
+}
+
+// MoonRay's output made readable: without its terminal colour codes, and saying plainly
+// when it couldn't find its shaders.
+pub(crate) fn moonray_message(log: &str) -> String {
+    let mut plain = String::with_capacity(log.len());
+    let mut chars = log.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ ... letter
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        plain.push(c);
+    }
+    if plain.contains("the DSO could not be found") {
+        let class = plain.split("global variable '").nth(1).and_then(|r| r.split('\'').next()).unwrap_or("a shader");
+        return format!("MoonRay couldn't find its {class} shader: its rdl2dso folder isn't beside it (set RDL2_DSO_PATH to that folder). {}", plain.trim());
+    }
+    plain
 }

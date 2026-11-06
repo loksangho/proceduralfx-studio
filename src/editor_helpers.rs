@@ -544,3 +544,25 @@ pub(crate) enum Action {
     DuplicateMany(Vec<NodeId>),
     Delete(NodeId),
 }
+
+// A status message in green that copies itself when clicked (to paste an error into an
+// email or a search), saying "Copied" for a moment. `truncate` cuts a long one short, with
+// all of it on hover.
+pub(crate) fn copyable_status(ui: &mut egui::Ui, text: &str, truncate: bool) -> egui::Response {
+    let label = egui::Label::new(egui::RichText::new(text).color(egui::Color32::LIGHT_GREEN)).sense(egui::Sense::click());
+    let label = if truncate { label.truncate() } else { label };
+    let response = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let id = response.id.with("copied");
+    let now = ui.input(|i| i.time);
+    if response.clicked() {
+        ui.ctx().copy_text(text.to_owned());
+        ui.data_mut(|d| d.insert_temp(id, now));
+    }
+    let copied = ui.data(|d| d.get_temp::<f64>(id)).is_some_and(|at| now - at < 1.5);
+    if copied {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        response.on_hover_text("Copied")
+    } else {
+        response.on_hover_text(format!("{text}\n\nClick to copy"))
+    }
+}

@@ -793,7 +793,7 @@ impl RenderViewer {
             }
             if !self.status.is_empty() {
                 ui.separator();
-                ui.colored_label(egui::Color32::LIGHT_GREEN, &self.status);
+                crate::editor_helpers::copyable_status(ui, &self.status, false);
             }
         });
     }

@@ -226,7 +226,7 @@ impl ProceduralFxStudioApp {
                     if !self.status.is_empty() {
                         // Only as wide as what's left of the row: a long message is cut short
                         // (with all of it on hover) instead of running over the buttons.
-                        ui.add(egui::Label::new(egui::RichText::new(&self.status).color(egui::Color32::LIGHT_GREEN)).truncate()).on_hover_text(&self.status);
+                        editor_helpers::copyable_status(ui, &self.status, true);
                     }
                 });
             });

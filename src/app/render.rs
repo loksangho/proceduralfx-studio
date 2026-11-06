@@ -1,6 +1,7 @@
 // Rendering with MoonRay and Hydra: the settings, the scene it's given, lights, and the render's progress.
 
 use crate::*;
+use std::path::Path;
 
 impl ProceduralFxStudioApp {
     pub(crate) fn start_moonray_render(&mut self) {
@@ -676,36 +677,9 @@ impl ProceduralFxStudioApp {
                 if !hydra {
                     args.extend(extra_args);
                 }
-                let mut dso_paths: Option<String> = None;
-                // If running from inside an app bundle, help MoonRay find its
-                // RDL DSOs by setting RDL2_DSO_PATH to the bundle Resources
-                // directory (where packaging should copy DSOs). Also include
-                // the executable parent as a fallback.
-                if let Ok(cur_exe) = std::env::current_exe() {
-                    if let Some(bundle_dir) = cur_exe.parent().and_then(|p| p.parent()) {
-                        let mut candidates = Vec::new();
-                        candidates.push(bundle_dir.join("Resources").join("rdl2dso"));
-                        candidates.push(bundle_dir.join("Resources"));
-                        candidates.push(bundle_dir.join("MacOS"));
-                        candidates.push(bundle_dir.join("rdl2dso"));
-                        if let Ok(existing) = std::env::var("RDL2_DSO_PATH") {
-                            for p in existing.split(':') {
-                                if !p.is_empty() {
-                                    candidates.push(std::path::PathBuf::from(p));
-                                }
-                            }
-                        }
-                        // join as colon-separated paths
-                        let paths = candidates.iter()
-                            .filter(|p| p.exists())
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join(":");
-                        if !paths.is_empty() {
-                            dso_paths = Some(paths);
-                        }
-                    }
-                }
+                // Where MoonRay finds its shaders (DwaBaseMaterial and the rest): beside the
+                // MoonRay being run, in the app bundle, and any RDL2_DSO_PATH already set.
+                let dso_paths = Some(rdl2_dso_paths(Path::new(&exec_run))).filter(|p| !p.is_empty());
                 let make_cmd = |args: &[String]| {
                     let mut cmd = Command::new(&exec_run);
                     platform::no_window(&mut cmd);
@@ -734,7 +708,7 @@ impl ProceduralFxStudioApp {
                             if status.success() {
                                 Ok(())
                             } else {
-                                let tail = read_log_tail(&log_path, 600);
+                                let tail = moonray_message(&read_log_tail(&log_path, 600));
                                 let hint = wslrender::failure_hint(&tail).map(|h| format!("{h}. ")).unwrap_or_default();
                                 Err(format!("{hint}{} exited with {status}: {}", if hydra { "hd_render" } else { "MoonRay" }, tail.trim()))
                             }
@@ -1481,5 +1455,77 @@ pub(crate) fn sequence_fps(times: &[f32]) -> f32 {
     match times {
         [a, b, ..] if b > a => (1.0 / (b - a)).clamp(1.0, 120.0),
         _ => sims::SIM_FPS,
+    }
+}
+
+// The folders MoonRay's shaders (RDL2 DSOs) may be in, ":"-joined: next to the MoonRay
+// being run (followed through links, as a build tree or an install keeps them), next to
+// the app (its bundle's Resources), then RDL2_DSO_PATH. Only folders that exist.
+pub(crate) fn rdl2_dso_paths(moonray: &Path) -> String {
+    let near = |exe: &Path| -> Vec<PathBuf> {
+        let Some(dir) = exe.parent() else { return Vec::new() };
+        let up = dir.parent().unwrap_or(dir);
+        vec![dir.join("rdl2dso"), up.join("rdl2dso"), up.join("Resources").join("rdl2dso"), up.join("lib").join("rdl2dso"), up.join("Resources"), up.join("MacOS")]
+    };
+    let mut candidates = near(moonray);
+    if let Ok(real) = std::fs::canonicalize(moonray) {
+        candidates.extend(near(&real));
+    }
+    if let Ok(app) = std::env::current_exe() {
+        candidates.extend(near(&app));
+    }
+    if let Ok(existing) = std::env::var("RDL2_DSO_PATH") {
+        candidates.extend(existing.split(':').filter(|p| !p.is_empty()).map(PathBuf::from));
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for candidate in candidates {
+        // A folder of shaders: has a .so in it (Resources and MacOS hold other things too).
+        let has_shaders = std::fs::read_dir(&candidate).is_ok_and(|entries| entries.flatten().any(|e| e.path().extension().is_some_and(|x| x == "so")));
+        let path = candidate.to_string_lossy().into_owned();
+        if has_shaders && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths.join(":")
+}
+
+#[cfg(test)]
+mod shader_search_tests {
+    use super::*;
+
+    // MoonRay copied out of its build (or installed) finds its shaders beside it, through
+    // a link too; folders without shaders aren't passed on.
+    #[test]
+    fn moonrays_shaders_are_found_beside_it() {
+        let root = std::env::temp_dir().join(format!("pfx_dso_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::create_dir_all(build.join("rdl2dso")).unwrap();
+        std::fs::write(build.join("rdl2dso/DwaBaseMaterial.so"), b"").unwrap();
+        std::fs::write(build.join("bin/moonray"), b"").unwrap();
+        let paths = rdl2_dso_paths(&build.join("bin/moonray"));
+        assert!(paths.split(':').any(|p| Path::new(p) == build.join("rdl2dso")), "{paths}");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+            std::os::unix::fs::symlink(build.join("bin/moonray"), root.join("elsewhere/moonray")).unwrap();
+            let paths = rdl2_dso_paths(&root.join("elsewhere/moonray"));
+            let wanted = std::fs::canonicalize(build.join("rdl2dso")).unwrap();
+            assert!(paths.split(':').any(|p| std::fs::canonicalize(p).is_ok_and(|p| p == wanted)), "through the link: {paths}");
+        }
+        let empty = root.join("empty");
+        std::fs::create_dir_all(empty.join("rdl2dso")).unwrap();
+        assert!(!rdl2_dso_paths(&empty.join("moonray")).split(':').any(|p| Path::new(p) == empty.join("rdl2dso")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn moonray_errors_read_plainly() {
+        let log = "\u{1b}[31mError: RDLA Error: scene.rdla:20: global variable 'DwaBaseMaterial' was never declared (assign a value to it before using it), or if 'DwaBaseMaterial' is a constructor for a DSO type, the DSO could not be found\n\u{1b}[0m";
+        let message = moonray_message(log);
+        assert!(message.starts_with("MoonRay couldn't find its DwaBaseMaterial shader"), "{message}");
+        assert!(!message.contains('\u{1b}') && !message.contains("[31m"), "{message}");
+        assert_eq!(moonray_message("\u{1b}[1mRendered\u{1b}[0m"), "Rendered");
     }
 }
