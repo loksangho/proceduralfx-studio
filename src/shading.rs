@@ -521,7 +521,8 @@ pub fn toon_rdla(name: &str, p: &Values, objects: &mut String) -> (&'static str,
     let albedo = if p.flag("use_point_color") {
         let map = format!("{name}_point_color");
         objects.push_str(&attribute_map(&map, "Cd", 3, p.color("base_color")));
-        format!("AttributeMap(\"{map}\")")
+        // Bound, as maps must be: given plainly, MoonRay keeps the attribute's default (grey).
+        format!("bind(AttributeMap(\"{map}\"))")
     } else {
         rgb(p.color("base_color"))
     };

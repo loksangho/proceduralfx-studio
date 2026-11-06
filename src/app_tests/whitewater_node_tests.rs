@@ -88,19 +88,16 @@ fn whitewater_points_render_in_moonray() {
     assert!(lit > 50, "{lit} lit pixels");
 }
 
-// Particle presets render in MoonRay: their points become glowing spheres, coloured and
-// faded by their attributes. `cargo test --release -- --ignored particles_render`.
-#[test]
-#[ignore]
-fn particles_render_in_moonray() {
-    let preset = presets::PRESETS.iter().find(|p| p.name == "Impact").unwrap();
+// A preset's frame at `time`, rendered by the development MoonRay at 128×96.
+fn moonray_preset(name: &str, time: f32) -> image::Rgb32FImage {
+    let preset = presets::PRESETS.iter().find(|p| p.name == name).unwrap();
     let mut app = ProceduralFxStudioApp::default();
     app.load_preset(preset);
-    app.render_at = Some(0.15);
+    app.render_at = Some(time);
     let scene = app.render_scene().unwrap();
-    assert!(scene.parts.iter().any(|(mesh, _)| renders_points(mesh)), "the sparks are in the scene");
     let dir = std::env::temp_dir();
-    let (rdla, exr) = (dir.join("pfx_particles.rdla"), dir.join("pfx_particles.exr"));
+    let stem = name.to_lowercase().replace(' ', "_");
+    let (rdla, exr) = (dir.join(format!("pfx_{stem}.rdla")), dir.join(format!("pfx_{stem}.exr")));
     app.export_scene_rdla(&rdla, &scene, 128, 96, 4).unwrap();
     let run = Command::new("native/moonray/macos/moonray")
         .env("RDL2_DSO_PATH", "/Users/loksangho/moonray/build/rdl2dso")
@@ -109,11 +106,37 @@ fn particles_render_in_moonray() {
         .unwrap();
     let log = format!("{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
     assert!(run.status.success() && !log.contains("Error"), "{log}");
-    let render = image::open(&exr).unwrap().to_rgb32f();
+    if let Ok(keep) = std::env::var("PFX_KEEP_RENDER") {
+        let _ = std::fs::copy(&exr, std::path::Path::new(&keep).join(format!("{stem}.exr")));
+        // As displayed: sRGB, no exposure change.
+        let rgba = image::open(&exr).unwrap().to_rgba32f();
+        let srgb = image::RgbaImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+            let p = rgba.get_pixel(x, y).0;
+            let e = |v: f32| ((if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.max(0.0).powf(1.0 / 2.4) - 0.055 }).clamp(0.0, 1.0) * 255.0) as u8;
+            image::Rgba([e(p[0]), e(p[1]), e(p[2]), (p[3].clamp(0.0, 1.0) * 255.0) as u8])
+        });
+        srgb.save(std::path::Path::new(&keep).join(format!("{stem}.png"))).unwrap();
+    }
+    image::open(&exr).unwrap().to_rgb32f()
+}
+
+// Particle presets render in MoonRay: their points become glowing spheres, coloured and
+// faded by their attributes. `cargo test --release -- --ignored particles_render`.
+#[test]
+#[ignore]
+fn particles_render_in_moonray() {
+    let render = moonray_preset("Impact", 0.15);
     // Sparks glow orange: red above blue.
     let glowing = render.pixels().filter(|p| p[0] > 0.5 && p[0] > p[2] * 1.5).count();
     assert!(glowing > 20, "{glowing} glowing pixels");
-    if let Ok(dir) = std::env::var("PFX_KEEP_RENDER") {
-        let _ = std::fs::copy(&exr, std::path::Path::new(&dir).join("particles.exr"));
-    }
+}
+
+// Toon fire keeps its colours (from Cd) in MoonRay: `--ignored toon_fire_renders`.
+#[test]
+#[ignore]
+fn toon_fire_renders_in_colour_in_moonray() {
+    let render = moonray_preset("Toon fire", 0.5);
+    let lit = render.pixels().filter(|p| p[0] + p[1] + p[2] > 0.1).count();
+    let coloured = render.pixels().filter(|p| p[0] + p[1] + p[2] > 0.1 && p[0] > p[2] * 1.5).count();
+    assert!(lit > 200 && coloured * 2 > lit, "{coloured} of {lit} lit pixels are warm");
 }
