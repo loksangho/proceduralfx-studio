@@ -938,7 +938,7 @@ pub fn relight_smoke(mesh: &Mesh, lights: &[VolumeLight]) -> Option<Vec<f32>> {
         let f = flame.map_or(0.0, |v| v[i]);
         let fire_weight = (f * 1.2).clamp(0.0, 1.0);
         let fire = fire_color(f);
-        out.extend((0..3).map(|c| (smoke[c] * (1.0 - fire_weight) + fire[c] * fire_weight * 1.3).min(1.0)));
+        out.extend((0..3).map(|c| crate::color::to_linear((smoke[c] * (1.0 - fire_weight) + fire[c] * fire_weight * 1.3).min(1.0))));
     }
     Some(out)
 }
@@ -988,7 +988,8 @@ fn pyro_output(s: &PyroState, set: &PyroSettings) -> Mesh {
                 for (column, value) in columns.iter_mut().zip([density, s.temperature[i], flame, alpha, g.h * 0.85]) {
                     column.push(value);
                 }
-                colors.extend(color);
+                // Shaded for the screen: stored as the linear colour that shows as this.
+                colors.extend(color.map(crate::color::to_linear));
                 // Fire glows in renders: blackbody-like colour scaled by the flame amount.
                 emission.extend(fire.map(|c| c * flame));
                 velocity.extend([s.u[i], s.v[i], s.w[i]]);

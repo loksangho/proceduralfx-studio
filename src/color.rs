@@ -4,6 +4,20 @@
 
 use super::{hash01, poly, Mesh, Vec3};
 
+// Cd is linear light, as in Houdini and renderers: 0.5 is half as much light as 1, which
+// a screen shows at about 0.73. The viewport shows colours through to_display; colours a
+// node works out to look right on screen (smoke shading, heat maps) go in through
+// to_linear, so they show as they were made.
+pub fn to_display(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+pub fn to_linear(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
 pub const CLASSES: [&str; 2] = ["Points", "Primitives"];
 pub const MODES: [&str; 3] = ["Constant", "Random", "Ramp"];
 pub const AXES: [&str; 3] = ["X", "Y", "Z"];

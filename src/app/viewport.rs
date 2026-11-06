@@ -236,11 +236,9 @@ impl ProceduralFxStudioApp {
                 let [r, g, b] = attribute_color(value);
                 (r, g, b)
             };
-            Some(egui::Color32::from_rgb(
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-            ))
+            // Cd is linear: shown through the display transform, as Houdini does.
+            let [r, g, b] = [r, g, b].map(crate::color::to_display);
+            Some(egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
         };
         // Triangle corner colours follow Houdini's precedence: the first Cd found
         // on vertices, points, primitives, then the detail.
@@ -270,11 +268,9 @@ impl ProceduralFxStudioApp {
             } else {
                 attribute_color(*values.get(index * components)?)
             };
-            Some(egui::Color32::from_rgb(
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-            ))
+            // Cd is linear: shown through the display transform, as Houdini does.
+            let [r, g, b] = [r, g, b].map(crate::color::to_display);
+            Some(egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
         };
         let wire: Option<[u8; 4]> = match self.render_mode {
             RenderMode::Wireframe => Some([80, 220, 120, 255]),
@@ -540,7 +536,9 @@ impl ProceduralFxStudioApp {
                         let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
                         // Smoke lit by the scene's lights, when it has any.
                         let relit = (!volume_lights.is_empty()).then(|| sims::relight_smoke(mesh, &volume_lights)).flatten();
-                        let colors = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3));
+                        // Cd (or the relit smoke) is linear: shown through the display transform.
+                        let shown: Option<Vec<f32>> = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3)).map(|v| v.iter().map(|c| crate::color::to_display(*c)).collect());
+                        let colors = shown.as_ref();
                         let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
                         let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
                         // A fog volume (Pyro, a fog VDB) whose points are still on its grid is
@@ -682,7 +680,8 @@ impl ProceduralFxStudioApp {
         // draws these and the points below itself, depth-tested and uncapped.)
         if let Some(alpha) = splat_alpha.filter(|_| self.gpu_viewport.is_none()) {
             let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
-            let colors = mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3);
+            let shown: Option<Vec<f32>> = mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3).map(|v| v.iter().map(|c| crate::color::to_display(*c)).collect());
+            let colors = shown.as_ref();
             // Thin out very dense volumes, growing the remaining splats to compensate.
             const MAX_SPLATS: usize = 40_000;
             let stride = point_count.div_ceil(MAX_SPLATS).max(1);

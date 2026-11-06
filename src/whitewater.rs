@@ -345,7 +345,8 @@ fn output(state: &State, set: &WhitewaterSettings) -> Mesh {
     );
     mesh.point_attributes.insert(
         "Cd".into(),
-        state.particles.iter().flat_map(|q| if q.kind == BUBBLE { [0.75, 0.85, 0.95] } else { [0.95, 0.97, 1.0] }).collect(),
+        // Picked as screen colours: stored as the linear Cd that shows as them.
+        state.particles.iter().flat_map(|q| if q.kind == BUBBLE { [0.75, 0.85, 0.95] } else { [0.95, 0.97, 1.0] }.map(crate::color::to_linear)).collect(),
     );
     // The renderer draws these points as spheres of radius pscale.
     mesh.point_attributes.insert(RENDER_POINTS.into(), vec![1.0]);

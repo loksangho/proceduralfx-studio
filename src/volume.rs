@@ -237,7 +237,8 @@ pub fn encode_voxels(voxels: &[([i64; 3], f32)], class: Class, voxel: f32, origi
         values.push(*v);
         let (a, c) = display(class, voxel, *v);
         alpha.push(a);
-        colors.extend(c);
+        // A screen colour: stored as the linear Cd that shows as it.
+        colors.extend(c.map(crate::color::to_linear));
     }
     let n = mesh.vertices.len();
     let name = match class {

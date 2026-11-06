@@ -533,7 +533,8 @@ fn blur(values: &mut Vec<f32>, g: &Grid, passes: usize) {
 // Black-to-white preview of a 0..1 mask, tinted red where it's 1.
 fn mask_colour(m: f32) -> [f32; 3] {
     let m = m.clamp(0.0, 1.0);
-    [0.15 + 0.85 * m, 0.15 + 0.35 * m, 0.15 + 0.2 * m]
+    // Picked as screen colours: stored as the linear Cd that shows as them.
+    [0.15 + 0.85 * m, 0.15 + 0.35 * m, 0.15 + 0.2 * m].map(crate::color::to_linear)
 }
 
 pub fn terrain_mask(input: &Mesh, set: &MaskSettings) -> Result<Mesh, String> {

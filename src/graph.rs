@@ -500,7 +500,7 @@ impl Graph {
                             let tri = mesh.indices[t];
                             std::array::from_fn::<f32, 3, _>(|k| tri.iter().map(|v| cd[v * 3 + k]).sum::<f32>() / 3.0)
                         }
-                        None => [0.8; 3],
+                        None => [crate::color::to_linear(0.8); 3],
                     }).collect()
                 });
                 let mut textures: Vec<Option<String>> = Vec::new();

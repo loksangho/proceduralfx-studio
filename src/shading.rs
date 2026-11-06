@@ -357,7 +357,8 @@ impl Values {
         let [sr, sg, sb] = self.color("shadow_color");
         let highlight = self.color("highlight_color").map(|c| c * self.float("highlight"));
         let emission = self.color("emission_color").map(|c| c * self.float("emission_intensity"));
-        let [or, og, ob] = self.color("outline_color");
+        // A colour (linear, as MoonRay takes it): shown through the display transform.
+        let [or, og, ob] = self.color("outline_color").map(crate::color::to_display);
         crate::gpu_viewport::ToonMaterial {
             shade: [self.float("bands").round().clamp(2.0, 8.0), self.float("softness").clamp(0.0, 1.0), self.float("terminator"), self.float("highlight_size").clamp(0.0, 1.0)],
             shadow: [sr, sg, sb, self.float("outline_width").max(0.0)],

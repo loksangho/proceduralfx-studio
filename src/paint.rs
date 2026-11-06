@@ -39,7 +39,8 @@ pub fn values_for(values: &[f32], count: usize, default: f32) -> Vec<f32> {
 // Low values dark blue, high values warm yellow, over the painted range.
 fn heat(t: f32) -> [f32; 3] {
     let t = t.clamp(0.0, 1.0);
-    [0.1 + 0.9 * t, 0.15 + 0.7 * t * t, 0.45 * (1.0 - t) + 0.1]
+    // Picked as screen colours: stored as the linear Cd that shows as them.
+    [0.1 + 0.9 * t, 0.15 + 0.7 * t * t, 0.45 * (1.0 - t) + 0.1].map(crate::color::to_linear)
 }
 
 pub fn attribute_paint(input: &Mesh, attribute: &str, values: &[f32], set: &PaintSettings) -> Result<Mesh, String> {
