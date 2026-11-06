@@ -277,7 +277,8 @@ pub(crate) fn shader_values_ui(ui: &mut egui::Ui, values: &mut shading::Values) 
 
 // Add-menu search: every word typed must appear in the node's name, menu name or category.
 pub(crate) fn node_matches(kind: &NodeKind, category: &str, query: &str) -> bool {
-    let haystack = format!("{} {} {}", kind.name(), kind.menu_name(), category).to_lowercase().replace('_', " ");
+    let (plain, houdini) = kind.plain_name().unwrap_or(("", ""));
+    let haystack = format!("{} {} {} {plain} {houdini}", kind.name(), kind.menu_name(), category).to_lowercase().replace('_', " ");
     query.to_lowercase().split_whitespace().all(|word| haystack.contains(word) || haystack.replace(' ', "").contains(word))
 }
 
@@ -618,5 +619,34 @@ pub(crate) fn copyable_status(ui: &mut egui::Ui, text: &str, truncate: bool) -> 
         response.on_hover_text("Copied")
     } else {
         response.on_hover_text(format!("{text}\n\nClick to copy"))
+    }
+}
+
+#[cfg(test)]
+mod plain_name_tests {
+    use super::*;
+
+    // The Tab menu finds nodes by plain words and by their Houdini names, and shows both.
+    #[test]
+    fn nodes_are_found_by_plain_and_houdini_names() {
+        let all: Vec<(&str, NodeKind)> = NodeKind::templates().into_iter().flat_map(|(cat, kinds)| kinds.into_iter().map(move |k| (cat, k))).collect();
+        let found = |query: &str| all.iter().filter(|(cat, k)| node_matches(k, cat, query)).map(|(_, k)| k.name()).collect::<Vec<_>>();
+        assert!(found("liquid").contains(&"flip"), "{:?}", found("liquid"));
+        assert!(found("fire and smoke").contains(&"pyro"));
+        assert!(found("attribute wrangle").contains(&"wrangle"));
+        assert!(found("pop network").contains(&"popnet"));
+        assert!(found("popnet").contains(&"popnet"), "the Houdini-style name still works");
+        let popnet = all.iter().find(|(_, k)| k.name() == "popnet").unwrap();
+        assert_eq!(popnet.1.menu_display(), "Particle simulation (POP Network)");
+        let sphere = all.iter().find(|(_, k)| k.name() == "sphere").unwrap();
+        assert_eq!(sphere.1.menu_display(), "sphere", "plain names already need nothing");
+    }
+
+    #[test]
+    fn standard_attributes_say_what_they_mean() {
+        assert!(attribute_meaning("pscale").unwrap().contains("size"));
+        assert!(attribute_meaning("prim:Cd").unwrap().starts_with("Colour"));
+        assert!(attribute_meaning("group_top").unwrap().contains("group"));
+        assert!(attribute_meaning("my_thing").is_none());
     }
 }

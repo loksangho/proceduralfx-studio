@@ -573,7 +573,10 @@ impl ProceduralFxStudioApp {
                             .collect::<Vec<_>>()
                             .join("   ")
                         };
-                        ui.monospace(&attribute.name);
+                        let name = ui.monospace(&attribute.name);
+                        if let Some(meaning) = attribute_meaning(&attribute.name) {
+                            name.on_hover_text(meaning);
+                        }
                         ui.label(class);
                         ui.label(format!("{}{}", attribute.components, if attribute.size_ok { "" } else { " ⚠" }));
                         ui.monospace(ranges);

@@ -240,6 +240,45 @@ pub(crate) struct SheetColumn {
     pub(crate) source: SheetSource,
 }
 
+// What a standard attribute means, in plain words, for people new to Houdini's names.
+pub(crate) fn attribute_meaning(name: &str) -> Option<&'static str> {
+    let name = name.rsplit(':').next().unwrap_or(name);
+    if let Some(group) = name.strip_prefix("group_") {
+        return (!group.is_empty()).then_some("Group membership: 1 if the element is in this group, 0 if not");
+    }
+    Some(match name {
+        "P" => "Position: where the point is (x, y, z)",
+        "N" => "Normal: the direction the surface faces",
+        "Cd" => "Colour: red, green and blue, from 0 to 1, in linear light (as Houdini and renderers use it)",
+        "Alpha" => "Opacity: 0 is invisible, 1 is solid",
+        "v" => "Velocity: how fast and in which direction it moves, in units per second",
+        "pscale" => "Point size: the radius particles and copies are drawn at",
+        "width" => "Width: how thick a curve or hair is",
+        "age" => "Age: how many seconds since the particle was born",
+        "life" => "Life: how many seconds the particle lives",
+        "id" => "ID: a number that stays with a particle or piece while others are born or die",
+        "uv" => "Texture coordinates: where on an image each point samples",
+        "orient" => "Orientation: a rotation (quaternion) for copies and pieces",
+        "up" => "Up direction: with N, how copies are turned",
+        "scale" => "Scale: how much copies are stretched on each axis",
+        "rest" => "Rest position: where the point was before it was moved, so noise and textures stick",
+        "force" => "Force: a push on the particle, each second",
+        "mass" => "Mass: how heavy it is, so how much forces move it",
+        "accel" => "Acceleration: how its velocity changes each second",
+        "piece" => "Piece: which piece the element belongs to",
+        "name" => "Name: text naming the piece (a string attribute)",
+        "path" => "Path: text giving the piece's place in a hierarchy (a string attribute)",
+        "emission" => "Glow: light it gives off, red, green and blue; above 1 is brighter than white",
+        "density" => "Density: how thick smoke or a volume is here",
+        "temperature" => "Temperature: how hot the gas is; hotter rises and glows",
+        "flame" => "Flame: where the fire burns",
+        "dead" => "Dead: 1 when the particle is to be removed",
+        "ptnum" => "Point number",
+        "primnum" => "Primitive (polygon) number",
+        _ => return None,
+    })
+}
+
 pub(crate) fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn> {
     let column = |header: String, tooltip: &str, source| SheetColumn { header, tooltip: tooltip.to_string(), source };
     let mut columns = Vec::new();
@@ -250,7 +289,7 @@ pub(crate) fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn
     match domain {
         SheetDomain::Points => {
             for (c, label) in component_labels("P", 3).into_iter().enumerate() {
-                columns.push(column(label, "P: point position (3 floats)", SheetSource::Position(c)));
+                columns.push(column(label, "P (3 floats)\nPosition: where the point is (x, y, z)", SheetSource::Position(c)));
             }
         }
         SheetDomain::Vertices => {
@@ -265,6 +304,9 @@ pub(crate) fn sheet_columns(mesh: &Mesh, domain: SheetDomain) -> Vec<SheetColumn
     for attribute in attributes {
         let kind = if crate::strings::is_string_key(&attribute.key) { "string" } else if attribute.integral { "ints" } else { "floats" };
         let mut tooltip = format!("{} ({} {kind})", attribute.name, attribute.components);
+        if let Some(meaning) = attribute_meaning(&attribute.name) {
+            tooltip = format!("{tooltip}\n{meaning}");
+        }
         if !attribute.size_ok {
             tooltip.push_str(" · warning: the value count does not match the element count");
         }

@@ -262,7 +262,7 @@ pub(crate) fn node_search_ui(ui: &mut egui::Ui, query: &mut String, pick: &mut u
         *pick = search_step(*pick, found.len(), down, up);
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
             for (i, (cat, kind)) in found.iter().enumerate() {
-                let row = ui.selectable_label(i == *pick, format!("{}   ({cat})", kind.menu_name()));
+                let row = ui.selectable_label(i == *pick, format!("{}   ({cat})", kind.menu_display()));
                 if i == *pick && (down || up) {
                     row.scroll_to_me(None);
                 }
@@ -281,7 +281,7 @@ pub(crate) fn node_search_ui(ui: &mut egui::Ui, query: &mut String, pick: &mut u
     for (cat, kinds) in templates {
         ui.menu_button(*cat, |ui| {
             for kind in kinds {
-                let button = ui.button(kind.menu_name());
+                let button = ui.button(kind.menu_display());
                 let button = match kind.menu_help() {
                     Some(help) => button.on_hover_text(help),
                     None => button,
@@ -1726,6 +1726,73 @@ impl NodeKind {
             NodeKind::Jitter { .. } => "point_jitter".into(),
             NodeKind::Subnet { spec: assets::Spec { asset: Some((name, _)), .. }, .. } => name.clone(),
             other => other.name().to_owned(),
+        }
+    }
+
+    // A plain name for a node whose Houdini name means little to someone new to Houdini,
+    // and that Houdini name: the Tab menu shows "Particle simulation (POP Network)", and
+    // finds it by either.
+    pub(crate) fn plain_name(&self) -> Option<(&'static str, &'static str)> {
+        let houdini = match self {
+            NodeKind::Pop(n) => n.def().label,
+            other => other.name(),
+        };
+        let plain = match houdini {
+            "popnet" => ("Particle simulation", "POP Network"),
+            "pyro" => ("Fire and smoke simulation", "Pyro"),
+            "flip" => ("Liquid simulation", "FLIP"),
+            "cloth_solver" => ("Cloth simulation", "Vellum Cloth"),
+            "rbd_solver" => ("Rigid body simulation", "RBD Solver"),
+            "rbd_bullet_solver" => ("Breaking and bouncing pieces", "RBD Bullet Solver"),
+            "whitewater_solver" => ("Foam and spray", "Whitewater"),
+            "crowd_solver" => ("Crowd simulation", "Crowd Solver"),
+            "sop_solver" => ("Frame-to-frame feedback", "SOP Solver"),
+            "particles" => ("Simple particles", "Particles"),
+            "particle_surface" => ("Mesh from particles", "Particle Fluid Surface"),
+            "wrangle" => ("Code", "Attribute Wrangle, VEX"),
+            "volume_wrangle" => ("Volume code", "Volume Wrangle, VEX"),
+            "heightfield_wrangle" => ("Terrain code", "Heightfield Wrangle, VEX"),
+            "attribute_vop" => ("Code from nodes", "Attribute VOP"),
+            "vdb" => ("Volume from a mesh", "VDB from Polygons"),
+            "convert_vdb" => ("Convert a volume", "Convert VDB"),
+            "blast" => ("Delete parts", "Blast"),
+            "fuse" => ("Join close points", "Fuse"),
+            "copy_to_points" => ("Copy onto points", "Copy to Points"),
+            "xform" => ("Move, rotate, scale", "Transform"),
+            "object_merge" => ("Bring in another object", "Object Merge"),
+            "pack" => ("Pack into pieces", "Pack"),
+            "unpack" => ("Unpack pieces", "Unpack"),
+            "attribute_promote" => ("Move an attribute between points and primitives", "Attribute Promote"),
+            "attribute_transfer" => ("Copy attributes from nearby", "Attribute Transfer"),
+            "connectivity" => ("Number the connected pieces", "Connectivity"),
+            "enumerate" => ("Number the elements", "Enumerate"),
+            "clip" => ("Cut with a plane", "Clip"),
+            "peak" => ("Push along the normals", "Peak"),
+            "metaball" => ("Blobs", "Metaball"),
+            "lsystem" => ("Branching plants", "L-System"),
+            "trail" => ("Motion trail", "Trail"),
+            "time_shift" => ("Time offset", "Time Shift"),
+            "cop_network" => ("Image network", "COP Network"),
+            "top_network" => ("Task network", "TOP Network"),
+            "material_builder" => ("Material from nodes", "Material Builder"),
+            "moonray_render" => ("Render with MoonRay", "ROP"),
+            "sop_import" => ("Geometry into USD", "SOP Import"),
+            "POP Source" => ("Emit particles", "POP Source"),
+            "POP Solver" => ("Move the particles", "POP Solver"),
+            "POP Wrangle" => ("Particle code", "POP Wrangle, VEX"),
+            "POP VOP" => ("Particle code from nodes", "POP VOP"),
+            "POP Replicate" => ("Spawn particles from particles", "POP Replicate"),
+            "POP Advect" => ("Carry particles along a flow", "POP Advect"),
+            _ => return None,
+        };
+        Some(plain)
+    }
+
+    // What the Tab menu shows: the plain name with the Houdini name after it, if it has one.
+    pub(crate) fn menu_display(&self) -> String {
+        match self.plain_name() {
+            Some((plain, houdini)) => format!("{plain} ({houdini})"),
+            None => self.menu_name(),
         }
     }
 
