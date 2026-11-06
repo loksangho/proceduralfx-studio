@@ -806,8 +806,13 @@ impl ProceduralFxStudioApp {
                 self.dirty = true;
             }
         }
+        // A sequence's frames are one entry in the viewer, played as an animation.
+        let frame_of = self.sequence.as_ref().map(|job| (job.next <= 1, sequence_fps(&job.times)));
         let outcome = outcome.result.map(|(message, image)| {
-            self.viewer.add(image, self.open_viewer_after_render);
+            match frame_of {
+                Some((first, fps)) => self.viewer.add_frame(image, first, fps, self.open_viewer_after_render),
+                None => self.viewer.add(image, self.open_viewer_after_render),
+            }
             format!("{message} in {seconds:.1}s")
         });
         self.last_render_summary = match &outcome {
@@ -1468,5 +1473,13 @@ impl ProceduralFxStudioApp {
             lights = self.scene_lights();
         }
         Ok(RenderScene { parts, lights, environment, camera, volumes: Vec::new() })
+    }
+}
+
+// The frame rate a sequence rendered at these times plays at: real time.
+pub(crate) fn sequence_fps(times: &[f32]) -> f32 {
+    match times {
+        [a, b, ..] if b > a => (1.0 / (b - a)).clamp(1.0, 120.0),
+        _ => sims::SIM_FPS,
     }
 }
