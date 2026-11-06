@@ -37,11 +37,53 @@ pub(crate) struct VatWindow {
     pub(crate) mode: Option<vat::Mode>,
     pub(crate) godot: bool,
     pub(crate) unity: bool,
+    // The engine it's for (sets godot and unity).
+    pub(crate) engine: engines::Engine,
 }
 
 pub(crate) enum VatMessage {
     Progress(usize, usize),
     Done(Result<String, String>),
+}
+
+// The export windows' engine choice: a menu that also sets which engine files are written.
+pub(crate) fn engine_choice(ui: &mut egui::Ui, id: &str, engine: &mut engines::Engine, godot: &mut bool, unity: &mut bool) {
+    ui.label("Game engine").on_hover_text("Which engine it's for: the files written for it, and how to use them there (below)");
+    egui::ComboBox::from_id_salt(id).selected_text(engine.name()).show_ui(ui, |ui| {
+        for choice in engines::Engine::ALL {
+            ui.selectable_value(engine, choice, choice.name()).on_hover_text(choice.hint());
+        }
+    });
+    (*godot, *unity) = engine.writes();
+    ui.end_row();
+}
+
+// How to use the export in the chosen engine: its steps, the crate's links for Bevy, and
+// code to copy.
+pub(crate) fn engine_note(ui: &mut egui::Ui, id: &str, engine: engines::Engine, steps: &[String], code: Option<&str>) {
+    egui::CollapsingHeader::new(format!("Use in {}", engine.name())).id_salt(id).default_open(true).show(ui, |ui| {
+        for (i, step) in steps.iter().enumerate() {
+            ui.label(format!("{}. {step}", i + 1));
+        }
+        if engine == engines::Engine::Bevy {
+            ui.horizontal(|ui| {
+                ui.hyperlink_to("bevy_procedural_fx on crates.io", engines::BEVY_CRATE);
+                ui.hyperlink_to("Documentation", engines::BEVY_DOCS);
+            });
+        }
+        if let Some(code) = code {
+            ui.horizontal(|ui| {
+                ui.weak("main.rs");
+                if ui.small_button("Copy").on_hover_text("Copy this code").clicked() {
+                    ui.ctx().copy_text(code.to_owned());
+                }
+            });
+            egui::ScrollArea::vertical().id_salt(id).max_height(170.0).show(ui, |ui| {
+                let mut text = code.to_owned();
+                ui.add(egui::TextEdit::multiline(&mut text).code_editor().desired_width(f32::INFINITY).interactive(true));
+            });
+        }
+    });
 }
 
 pub(crate) const LIVE_SHEET_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);

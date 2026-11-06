@@ -52,11 +52,15 @@ pub struct Settings {
     pub pixel_palette: String,
     pub pixel_dither: bool,
     pub pixel_outline: bool,
+    // The engine it's for (sets godot and unity), and the name last exported to, for the
+    // export window's note on using it there.
+    pub engine: crate::engines::Engine,
+    pub last_name: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false, glow: false, pixel_art: false, pixel_scale: 4, pixel_colors: 16, pixel_palette: String::new(), pixel_dither: false, pixel_outline: false }
+        Settings { open: false, width: 256, height: 256, every: 1, columns: 0, trim: true, live: false, seamless: false, blend: 8, godot: false, unity: false, fill_grid: false, motion_vectors: false, normal_map: false, glow: false, pixel_art: false, pixel_scale: 4, pixel_colors: 16, pixel_palette: String::new(), pixel_dither: false, pixel_outline: false, engine: crate::engines::Engine::Bevy, last_name: String::new() }
     }
 }
 

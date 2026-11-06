@@ -438,3 +438,23 @@ fn double_clicking_a_camera_looks_through_it() {
     double_click(&mut h);
     assert!(!h.state().looking_through, "back to the free view: {}", h.state().status);
 }
+
+// Export Sprite Sheet says how to use the sheet in the chosen engine: for Bevy, the crate
+// and code to copy; choosing Godot writes Godot's files and says how to use them.
+#[test]
+fn the_export_window_says_how_to_use_the_sheet_in_each_engine() {
+    let mut app = empty_network();
+    app.sprite_sheet.open = true;
+    let mut h = harness(app);
+    h.get_by_label_contains("Use in Bevy");
+    h.get_by_label("bevy_procedural_fx on crates.io");
+    h.get_by_label("Copy").click();
+    h.run_steps(2);
+    h.get_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("Bevy")).expect("the engine menu").click();
+    h.run_steps(2);
+    h.get_by_label("Godot 4").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Use in Godot 4");
+    assert!(h.query_by_label("Copy").is_none(), "no Bevy code for Godot");
+    assert!(h.state().sprite_sheet.godot && !h.state().sprite_sheet.unity, "Godot's files are written");
+}

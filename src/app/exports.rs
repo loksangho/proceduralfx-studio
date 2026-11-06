@@ -139,6 +139,7 @@ impl ProceduralFxStudioApp {
             ui.label("Bakes an object's motion over the playback range into vertex animation textures: a mesh (OBJ) and two textures (EXR) of every frame's motion. A shader in the game moves the mesh on the GPU.");
             ui.add_space(4.0);
             egui::Grid::new("vat_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                engine_choice(ui, "vat_engine", &mut w.engine, &mut w.godot, &mut w.unity);
                 ui.label("Object");
                 let chosen = w.object.filter(|o| objects.iter().any(|(id, _)| id == o)).or(default_object);
                 let title = objects.iter().find(|(id, _)| Some(*id) == chosen).map_or("(none)", |(_, t)| t.as_str());
@@ -175,13 +176,11 @@ impl ProceduralFxStudioApp {
                     ui.label(format!("frame{} of the playback range: {count} frame{}", if w.every == 1 { "" } else { "s" }, if count == 1 { "" } else { "s" }));
                 });
                 ui.end_row();
-                ui.label("Also for");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut w.godot, "Godot").on_hover_text("A spatial shader and a ShaderMaterial (name_vat_material.tres), with import settings that keep the textures exact. Put name.obj on a MeshInstance3D and the material on it.");
-                    ui.checkbox(&mut w.unity, "Unity").on_hover_text("A URP shader and material (name_vat.mat), with import settings that keep the textures exact. Put name.obj in the scene and the material on it. Needs the Linear colour space (URP's default).");
-                });
-                ui.end_row();
             });
+            ui.add_space(4.0);
+            let stem = objects.iter().find(|(id, _)| Some(*id) == w.object.or(default_object)).map_or("vat", |(_, t)| t.as_str());
+            let (steps, code) = engines::vat_note(w.engine, stem);
+            engine_note(ui, "vat_engine_note", w.engine, &steps, code.as_deref());
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.add_enabled(!busy && chosen_ok(&objects, default_object, w.object) && count > 0, egui::Button::new("Export…")).clicked() {
@@ -245,6 +244,7 @@ impl ProceduralFxStudioApp {
             ui.label("Renders the playback range through the render camera with the real-time renderer, then packs the frames into one PNG.");
             ui.add_space(4.0);
             egui::Grid::new("sprite_sheet_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                engine_choice(ui, "sheet_engine", &mut s.engine, &mut s.godot, &mut s.unity);
                 ui.label("Frame size");
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut s.width).range(8..=4096).suffix(" px"));
@@ -356,12 +356,6 @@ impl ProceduralFxStudioApp {
                     }
                 });
                 ui.end_row();
-                ui.label("Also for");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut s.godot, "Godot").on_hover_text("Also write name.tres, a Godot 4 SpriteFrames resource: put it on an AnimatedSprite2D and it plays the sheet, looping, at its frame rate. Export into your Godot project, or copy the PNG and .tres together.");
-                    ui.checkbox(&mut s.unity, "Unity").on_hover_text("Also write name.png.meta, so Unity imports the PNG already sliced into one sprite per frame (name_0, name_1...), uncompressed and full size. Export into your project's Assets folder; select the sprites and drag them into the scene to make an animation.");
-                });
-                ui.end_row();
                 ui.label("Live");
                 ui.checkbox(&mut s.live, "Keep updating").on_hover_text(
                     "After exporting, export again to the same files whenever the scene, camera or these settings change. \
@@ -370,7 +364,11 @@ impl ProceduralFxStudioApp {
                 ui.end_row();
             });
             ui.add_space(4.0);
-            ui.weak("Uses the camera chosen in the toolbar's render camera menu. Beside the PNG, name.pfx.json gives the frame size, columns and rows, frame count and frame rate. The bevy_procedural_fx crate plays it in Bevy.");
+            ui.weak("Uses the camera chosen in the toolbar's render camera menu.");
+            ui.add_space(4.0);
+            let stem = if s.last_name.is_empty() { "sprite_sheet".to_owned() } else { s.last_name.clone() };
+            let (steps, code) = engines::sheet_note(s.engine, &stem, s);
+            engine_note(ui, "sheet_engine_note", s.engine, &steps, code.as_deref());
             ui.add_space(4.0);
             let busy = self.flipbook_recording.is_some();
             ui.horizontal(|ui| {
@@ -397,7 +395,9 @@ impl ProceduralFxStudioApp {
             self.preview_sprite_sheet();
         }
         if export {
-            if let Some(path) = FileDialog::new().set_title("Save the sprite sheet").set_file_name("sprite_sheet.png").add_filter("PNG image", &["png"]).save_file() {
+            let name = if self.sprite_sheet.last_name.is_empty() { "sprite_sheet".to_owned() } else { self.sprite_sheet.last_name.clone() };
+            if let Some(path) = FileDialog::new().set_title("Save the sprite sheet").set_file_name(&format!("{name}.png")).add_filter("PNG image", &["png"]).save_file() {
+                self.sprite_sheet.last_name = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
                 self.live_sheet = None;
                 self.start_sprite_sheet(path, false);
             }
