@@ -147,12 +147,12 @@
       <div>
         <h3>Founder's license</h3>
         <div class="amount">A$49 <small>once</small></div>
-        <p>Commercial use for one person, every version, forever. For the first 100 people who use it for real work.</p>
+        <p>Commercial use for one person, every version, forever. Only 100 will be issued, counting a few given free to early testers.</p>
         <ul><li>Effects for games you sell, with no revenue limit</li><li>Every future version included</li><li>A$10 of AI credit included</li><li>Full refund within 14 days</li></ul>
       </div>
       <div class="founder-buy">
         <p class="seats" id="founder-seats">Limited to 100</p>
-        <label class="agree" id="founder-agree"><input type="checkbox" id="founder-agree-box"> I have read and agree to the <a href="/founder" target="_blank">Founder's license</a> and the <a href="/terms" target="_blank">terms</a>.</label>
+        <label class="agree" id="founder-agree"><input type="checkbox" id="founder-agree-box"> <span>I have read and agree to the <a href="/founder" target="_blank">Founder's license</a> and the <a href="/terms" target="_blank">terms</a>.</span></label>
         <a class="btn btn-primary disabled" id="founder-buy" href="https://ai.build3dstudio.com/founder" aria-disabled="true">Buy a Founder's license</a>
         <p class="small muted">Later licenses will cost more, and their prices will be published here first.</p>
       </div>
@@ -201,7 +201,7 @@ fetch("https://ai.build3dstudio.com/v1/founders")
     if (f.left > 0) {
       seats.textContent = f.left + " of " + f.seats + " left";
     } else {
-      seats.textContent = "All " + f.seats + " sold. Thank you, founders!";
+      seats.textContent = "All " + f.seats + " taken. Thank you, founders!";
       buy.removeAttribute("href");
       buy.classList.add("disabled");
       buy.textContent = "Sold out";

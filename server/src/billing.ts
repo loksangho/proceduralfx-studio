@@ -24,7 +24,8 @@ export interface Billing {
   checkoutTopup(customerId: string, userId: string, amount: number, currency: string, returnUrl: string): Promise<string>;
   // Checkout for a Founder's license; Stripe asks for the buyer's email.
   // `siteUrl` is where the license and terms are, which the buyer agrees to before paying.
-  checkoutFounder(amount: number, currency: string, returnUrl: string, cancelUrl: string, siteUrl: string): Promise<string>;
+  // Returns the checkout's address and its session id, which the payment event carries.
+  checkoutFounder(amount: number, currency: string, returnUrl: string, cancelUrl: string, siteUrl: string): Promise<{ url: string; id: string }>;
   portal(customerId: string, returnUrl: string): Promise<string>;
   // The price of the customer's active subscription, if any.
   activePrice(customerId: string): Promise<string | null>;
@@ -164,7 +165,7 @@ export class StripeBilling implements Billing {
       success_url: `${returnUrl}/founder/thanks`,
       cancel_url: cancelUrl,
     });
-    return s.url!;
+    return { url: s.url!, id: s.id };
   }
 
   async portal(customer: string, returnUrl: string) {

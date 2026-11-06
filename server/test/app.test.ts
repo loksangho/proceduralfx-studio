@@ -67,8 +67,9 @@ class FakeBilling implements Billing {
     this.check(c);
     return `https://stripe.test/topup/${amount}${currency}`;
   }
+  founderCheckouts = 0;
   async checkoutFounder(amount: number, currency: string) {
-    return `https://stripe.test/founder/${amount}${currency}`;
+    return { url: `https://stripe.test/founder/${amount}${currency}`, id: `cs_f${++this.founderCheckouts}` };
   }
   async portal() {
     return "https://stripe.test/portal";
@@ -241,6 +242,11 @@ for (const [name, makeStore] of stores) test(`Founder's licenses: checkout, seat
     const buy = await fetch(`${t.base}/founder`, { redirect: "manual" });
     assert.equal(buy.status, 303);
     assert.equal(buy.headers.get("location"), "https://stripe.test/founder/49aud");
+    // Two open checkouts hold both seats: a third buyer waits instead of paying for a seat
+    // that isn't there.
+    assert.equal((await fetch(`${t.base}/founder`, { redirect: "manual" })).status, 303);
+    assert.equal((await fetch(`${t.base}/founder`, { redirect: "manual" })).status, 503);
+    assert.equal((await seats()).open, false);
 
     // A buyer who has used the assistant already, under the same email.
     await signIn(t);

@@ -61,6 +61,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     }
     if (event.kind === "ignored") return;
     if (event.kind === "founder") {
+      founderHolds.delete(event.id);
       await recordFounder(event);
       return;
     }
@@ -229,6 +230,17 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
   });
   // --- The Founder's license (from the website, no sign-in) -----------------------------
 
+  // Open checkouts each hold a seat until they're paid or expire (Stripe closes them after
+  // 30 minutes), so buyers at checkout together can't take more seats than there are.
+  // At most two per visitor, so reloading the button can't hold every seat.
+  const founderHolds = new Map<string, { until: number; ip: string }>();
+  const HOLD_MS = 31 * 60 * 1000;
+  function heldSeats() {
+    const now = Date.now();
+    for (const [id, hold] of founderHolds) if (hold.until < now) founderHolds.delete(id);
+    return founderHolds.size;
+  }
+
   // How many are left, for the website's pricing section.
   app.get(
     "/v1/founders",
@@ -237,7 +249,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       res.set("access-control-allow-origin", "*");
       res.set("cache-control", "public, max-age=60");
       res.json({
-        open: config.founderSeats > 0 && billing !== null && sold < config.founderSeats,
+        open: config.founderSeats > 0 && billing !== null && sold + heldSeats() < config.founderSeats,
         seats: config.founderSeats,
         sold,
         left: Math.max(0, config.founderSeats - sold),
@@ -254,10 +266,19 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
     wrap(async (req, res) => {
       if (!perIp.allow(`founder:${ip(req)}`)) return res.status(429).send(messagePage("Too many tries", "Please wait a minute and try again."));
       if (!billing || config.founderSeats <= 0) return res.status(404).send(messagePage("Not on sale", "Founder's licenses aren't on sale right now."));
-      if ((await store.founderCount()) >= config.founderSeats) {
-        return res.status(410).send(messagePage("Sold out", `All ${config.founderSeats} Founder's licenses have been sold. Thank you to everyone who took one!`));
+      const taken = await store.founderCount();
+      if (taken >= config.founderSeats) {
+        return res.status(410).send(messagePage("All taken", `All ${config.founderSeats} Founder's licenses have been taken. Thank you to everyone who took one!`));
       }
-      res.redirect(303, await billing.checkoutFounder(config.founderPrice, config.currency, config.publicUrl, `${config.siteUrl}/#pricing`, config.siteUrl));
+      if (taken + heldSeats() >= config.founderSeats) {
+        return res.status(503).send(messagePage("The last licenses are in checkout", "Someone is buying the last Founder's licenses right now. If they don't finish, their places come free within 30 minutes: please try again then."));
+      }
+      const from = ip(req);
+      const mine = [...founderHolds.entries()].filter(([, h]) => h.ip === from).sort((a, b) => a[1].until - b[1].until);
+      if (mine.length >= 2) founderHolds.delete(mine[0][0]);
+      const checkout = await billing.checkoutFounder(config.founderPrice, config.currency, config.publicUrl, `${config.siteUrl}/#pricing`, config.siteUrl);
+      founderHolds.set(checkout.id, { until: Date.now() + HOLD_MS, ip: from });
+      res.redirect(303, checkout.url);
     }),
   );
 
@@ -464,7 +485,7 @@ export function createApp({ config, store, send, billing, mail }: Deps) {
       if (!email) return res.status(400).json({ error: "an email address is needed" });
       const licensee = String(req.body?.licensee ?? "").trim().slice(0, 100);
       if (config.founderSeats <= 0) return res.status(409).json({ error: "Founder's licenses are off (set FOUNDER_SEATS)" });
-      if ((await store.founderCount()) >= config.founderSeats) return res.status(409).json({ error: `all ${config.founderSeats} seats are taken` });
+      if ((await store.founderCount()) + heldSeats() >= config.founderSeats) return res.status(409).json({ error: `all ${config.founderSeats} seats are taken or in checkout` });
       const founder = await recordFounder({ id: `gift:${email}`, email, licensee, paidMicros: 0 }, true);
       if (!founder) return res.status(200).json({ email, already: true });
       res.status(201).json(founder);

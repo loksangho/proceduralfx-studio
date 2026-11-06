@@ -12,11 +12,11 @@
 <header class="top"><div class="wrap"><a class="brand" href="/"><img src="/img/logo.png" alt=""><span>ProceduralFX Studio</span></a><nav><a class="keep" href="/#download">Download</a></nav></div></header>
 <main class="legal">
 <h1>Founder's License</h1>
-<p class="updated">Last updated 1 November 2026</p>
+<p class="updated">Last updated 6 November 2026</p>
 
 <div class="summary">
-<p><strong>In short:</strong> for A$49, paid once, one person can use ProceduralFX Studio for commercial work, such as effects for a game you sell. It covers every version, including future ones, forever, with no revenue limit. It comes with A$10 of AI credit. Only the first 100 are sold. Full refund within 14 days if it's not for you.</p>
-<p><a class="btn btn-primary" href="https://ai.build3dstudio.com/founder">Buy a Founder's license: A$49</a></p>
+<p><strong>In short:</strong> for A$49, paid once, one person can use ProceduralFX Studio for commercial work, such as effects for a game you sell. It covers every version, including future ones, forever, with no revenue limit. It comes with A$10 of AI credit. Only 100 will be issued, counting a few given free to early testers. Full refund within 14 days if it's not for you.</p>
+<p><a class="btn btn-primary" href="#buy">Buy a Founder's license: A$49</a></p>
 </div>
 
 <h2>Why it exists</h2>
@@ -35,7 +35,7 @@
 <h2>Price and availability</h2>
 <ul>
 <li>A$49, paid once, in Australian dollars, including any applicable tax. There's no subscription.</li>
-<li>Only 100 are sold. The pricing section of our home page shows how many are left. If two people buy the last one at the same moment, both keep their license.</li>
+<li>Only 100 will be issued, counting a few given free to early testers. The pricing section of our home page shows how many are left. An open checkout holds its place for 30 minutes, so the count can't be oversold; if two people still buy the last one at the same moment, both keep their license.</li>
 <li>Later licenses (Indie and Studio) will cost more. Their prices will be published on this site before Founder's licenses sell out, and before anyone is asked to pay them.</li>
 </ul>
 
@@ -57,6 +57,21 @@
 <li><strong>Governing law.</strong> This license is governed by the laws of New South Wales, Australia.</li>
 </ol>
 <p>Questions? Email <a href="mailto:support@build3dstudio.com">support@build3dstudio.com</a>.</p>
+
+<h2 id="buy">Buy</h2>
+<div class="founder-buy">
+<label class="agree"><input type="checkbox" id="founder-agree-box"> <span>I have read and agree to this Founder's license and the <a href="/terms" target="_blank">terms</a>.</span></label>
+<a class="btn btn-primary disabled" id="founder-buy" href="https://ai.build3dstudio.com/founder" aria-disabled="true">Buy a Founder's license: A$49</a>
+</div>
+<script>
+// The buy button works once the license is agreed to; checkout asks again before payment.
+(function () {
+  var box = document.getElementById("founder-agree-box"), buy = document.getElementById("founder-buy");
+  function update() { buy.classList.toggle("disabled", !box.checked); buy.setAttribute("aria-disabled", String(!box.checked)); }
+  box.addEventListener("change", update);
+  update();
+})();
+</script>
 </main>
 <footer><div class="wrap"><span>© 2026 ProceduralFX Studio</span><nav><a href="/promise">Our promise</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/refunds">Refunds</a><a href="mailto:support@build3dstudio.com">Contact</a></nav><p class="legal-note">Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></div></footer>
 </body>
