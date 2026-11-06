@@ -295,5 +295,5 @@ the exact terms.
 
 ---
 
-Familiar if you've used Houdini. Houdini is a trademark of Side Effects Software Inc.
+Houdini is a trademark of Side Effects Software Inc.
 ProceduralFX Studio is not affiliated with or endorsed by SideFX.

@@ -44,9 +44,9 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("rbd_solver", "Rigid bodies (rapier, Bullet-style): each connected piece, or each value of `piece`, falls and collides. Input 2: static collider."),
     ("cloth_solver", "XPBD cloth, hair, softbody or grains with a collider, a ground plane, self-collision and pinning (f@pin, a pin group or animated pins)."),
     ("sop_solver", "Runs its network once per step on the previous step's result (Prev_Frame), for custom simulations."),
-    ("popnet", "A particle simulation built from POP nodes inside it, as in Houdini: double-click to edit. A POP Source births particles into a POP Solver, with forces (Gravity, Force, Wind, Drag, Attract), colour, groups, kills, collisions and VEX (POP Wrangle, POP VOP) wired before or after the solver. Inputs 0-3 are geometry to birth from, collide with or read in VEX. Outputs points with v, age, life and id."),
+    ("popnet", "A particle simulation built from POP nodes inside it: double-click to edit. A POP Source births particles into a POP Solver, with forces (Gravity, Force, Wind, Drag, Attract), colour, groups, kills, collisions and VEX (POP Wrangle, POP VOP) wired before or after the solver. Inputs 0-3 are geometry to birth from, collide with or read in VEX. Outputs points with v, age, life and id."),
     ("solver_input", "Inside a SOP Solver: Prev_Frame (the last step) or Input_1 (the solver's input)."),
-    ("subnet", "A network packaged as one node, like a Houdini subnet or digital asset: double-click to build inside, between Subnet Input nodes and the display node. Promote parameters of the nodes inside to show them on the Subnet as its own sliders. Save it as an asset to reuse it: it appears in the TAB menu under Assets, and copies can update to newer versions."),
+    ("subnet", "A network packaged as one node: double-click to build inside, between Subnet Input nodes and the display node. Promote parameters of the nodes inside to show them on the Subnet as its own sliders. Save it as an asset to reuse it: it appears in the TAB menu under Assets, and copies can update to newer versions."),
     ("subnet_input", "Inside a Subnet: what's wired into one of the Subnet's four inputs."),
     // Import / export
     ("file", "Reads geometry: OBJ, FBX, Alembic (animated .abc is read at the current time), STL, USD (usd/usda/usdc/usdz) or VDB. $F in the name reads one file per frame."),
@@ -367,7 +367,7 @@ pre, code {{ font-family:ui-monospace, Menlo, monospace; font-size:13px; }} pre 
 </style></head>
 <body>
 <nav><b>ProceduralFX Studio</b><input id="q" type="search" placeholder="Search nodes and VEX…" autofocus>{nav}</nav>
-<main><h1>Documentation</h1><p class="muted">Version {version}. Generated from the app, so it lists exactly what this version has.</p>{body}<p class="muted">Familiar if you've used Houdini. Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></main>
+<main><h1>Documentation</h1><p class="muted">Version {version}. Generated from the app, so it lists exactly what this version has.</p>{body}<p class="muted">Houdini is a trademark of Side Effects Software Inc. ProceduralFX Studio is not affiliated with or endorsed by SideFX.</p></main>
 <script>
 // Cards in each section sit in a grid; search hides those that don't match every word.
 document.querySelectorAll('section').forEach(sec => {{
@@ -413,7 +413,7 @@ foreach (int pt; near) sum += point(0, "P", pt);
 <h4>Primitives are polygons</h4>
 <p>Over primitives, a wrangle runs once per polygon (a quad, an n-gon or a triangle): <code>@primnum</code>, <code>@numprim</code> and <code>nprimitives()</code> count polygons, <code>@P</code> is the polygon's centre, and what it writes covers the whole polygon. <code>primpoints()</code> lists its points in order, and <code>addprim(0, "poly", ...)</code> takes any number of points.</p>
 <h4>Expressions in parameters</h4>
-<p>Type an expression into any number field (click it to type) and the parameter follows it at every frame, instead of keys; typing a plain number replaces it, and right-click → <b>Delete Channel</b> removes it (and any keys), keeping the current value. The node's <b>Animation</b> section shows each parameter's expression, for editing or clearing. Expressions are VEX, with Houdini's variables <code>$F</code> (frame), <code>$FF</code> (fractional frame), <code>$T</code> (seconds) and <code>$FPS</code>.</p>
+<p>Type an expression into any number field (click it to type) and the parameter follows it at every frame, instead of keys; typing a plain number replaces it, and right-click → <b>Delete Channel</b> removes it (and any keys), keeping the current value. The node's <b>Animation</b> section shows each parameter's expression, for editing or clearing. Expressions are VEX, with the variables <code>$F</code> (frame), <code>$FF</code> (fractional frame), <code>$T</code> (seconds) and <code>$FPS</code>.</p>
 <pre>$F                    // Scatter's seed: a new pattern every frame
 sin($T * 2) * 0.5     // a wobbling value
 fit($F, 1, 48, 0, 10) // ramps from 0 to 10 over two seconds

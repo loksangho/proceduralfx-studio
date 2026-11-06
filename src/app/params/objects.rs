@@ -54,7 +54,7 @@ impl ProceduralFxStudioApp {
                     ui.colored_label(egui::Color32::from_rgb(230, 190, 90), "⚠ Nothing inside has the display flag, so there are no particles. Double-click to enter it and set the display flag on the last node.");
                 }
                 c |= pfield(ui, pslider(substeps, 1..=16).text("Substeps")).changed();
-                ui.small("A particle simulation built from POP nodes: double-click it to edit. A new one has a POP Source in the POP Solver's third input (post-solve, as in Houdini: particles are born at the source at the end of each step), with Gravity Force after it. Inputs 0-3 are geometry for POP Sources to birth from (input 0 by default), for POP Collide to collide with, and for POP Wrangles to read (point(1, ...) reads input 0).");
+                ui.small("A particle simulation built from POP nodes: double-click it to edit. A new one has a POP Source in the POP Solver's third input (post-solve: particles are born at the source at the end of each step), with Gravity Force after it. Inputs 0-3 are geometry for POP Sources to birth from (input 0 by default), for POP Collide to collide with, and for POP Wrangles to read (point(1, ...) reads input 0).");
                 ui.small("The output is points with v, age, life and id, plus what the POPs add (Cd, groups...): ready for Copy to Points, Particle Fluid Surface, Loop Particles or a sprite sheet.");
             }
             NodeKind::MoonRayRender { executable, arguments, output, width, height, samples, opts } => {

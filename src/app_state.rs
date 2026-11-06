@@ -249,7 +249,7 @@ pub(crate) fn attribute_meaning(name: &str) -> Option<&'static str> {
     Some(match name {
         "P" => "Position: where the point is (x, y, z)",
         "N" => "Normal: the direction the surface faces",
-        "Cd" => "Colour: red, green and blue, from 0 to 1, in linear light (as Houdini and renderers use it)",
+        "Cd" => "Colour: red, green and blue, from 0 to 1, in linear light (as renderers use it)",
         "Alpha" => "Opacity: 0 is invisible, 1 is solid",
         "v" => "Velocity: how fast and in which direction it moves, in units per second",
         "pscale" => "Point size: the radius particles and copies are drawn at",
