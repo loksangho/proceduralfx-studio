@@ -33,7 +33,7 @@ fn toolbar_texts(width: f32) -> Vec<(String, egui::Rect)> {
 
 #[test]
 fn every_control_fits_at_any_window_width() {
-    let controls = ["OBJ", "MAT", "OUT", "STAGE", "IMG", "TASKS", "Shaded", "Normals", "Points", "Edges", "↶", "↷", "✥ Move", "⤢ Scale", "◆ Key", "Auto Key", "📈 Graph", "▶ Render", "Camera", "⚙"];
+    let controls = ["OBJ", "MAT", "OUT", "STAGE", "IMG", "TASKS", "Shaded", "Normals", "Points", "Edges", "↶", "↷", "✥ Move", "⇲ Scale", "◆ Key", "Auto Key", "📈 Graph", "▶ Render", "Camera", "⚙"];
     for width in [1800.0, 1280.0, 1000.0, 800.0, 640.0, 480.0, 380.0] {
         let texts = toolbar_texts(width);
         for control in controls {

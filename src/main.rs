@@ -180,6 +180,7 @@ fn main() -> eframe::Result<()> {
             eframe::NativeOptions { renderer, ..options },
             Box::new(move |cc| {
                 opened.store(true, Ordering::SeqCst);
+                install_fonts(&cc.egui_ctx);
                 let mut app = ProceduralFxStudioApp::default();
                 if let Some(dir) = recovery_dir() {
                     let (session, leftovers) = recovery::Session::start(dir);

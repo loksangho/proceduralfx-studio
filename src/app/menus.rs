@@ -418,7 +418,7 @@ impl ProceduralFxStudioApp {
                 for (mode, label, hover) in [
                     (GizmoMode::Translate, "✥ Move", "Move the selected object (W)"),
                     (GizmoMode::Rotate, "⟳ Rotate", "Rotate the selected object (E)"),
-                    (GizmoMode::Scale, "⤢ Scale", "Scale the selected geometry object (R)"),
+                    (GizmoMode::Scale, "⇲ Scale", "Scale the selected geometry object (R)"),
                 ] {
                     ui.selectable_value(&mut self.gizmo_mode, mode, label).on_hover_text(hover);
                 }

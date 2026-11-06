@@ -650,3 +650,49 @@ mod plain_name_tests {
         assert!(attribute_meaning("my_thing").is_none());
     }
 }
+
+// The symbols egui's own fonts lack (arrows, box drawing, shapes, ticks: ← → ▼ ● ✓...),
+// from DejaVu Sans cut down to those ranges (assets/fonts, with its licence), tried after
+// egui's fonts in both families so they never show as boxes.
+pub(crate) fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("dejavu_symbols".into(), std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/DejaVuSans-Symbols.ttf"))));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push("dejavu_symbols".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod font_tests {
+    use crate::*;
+    // Every character the app's text uses has a glyph, so none shows as a box. Reads the
+    // source for the characters, so a new one is checked as soon as it's used.
+    #[test]
+    fn every_character_the_app_shows_has_a_glyph() {
+        let mut used = std::collections::BTreeSet::new();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "app_tests") {
+                        stack.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    for line in std::fs::read_to_string(&path).unwrap().lines().filter(|l| !l.trim_start().starts_with("//")) {
+                        used.extend(line.chars().filter(|c| !c.is_ascii()));
+                    }
+                }
+            }
+        }
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        for font in [egui::FontId::proportional(14.0), egui::FontId::monospace(14.0)] {
+            let missing: String = used.iter().filter(|c| !ctx.fonts_mut(|f| f.has_glyph(&font, **c))).collect();
+            assert!(missing.is_empty(), "{:?} has no glyph for: {missing}", font.family);
+        }
+    }
+}

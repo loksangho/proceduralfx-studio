@@ -650,7 +650,7 @@ impl ProceduralFxStudioApp {
             NodeKind::AttributePaint { attribute, values, settings: set } => {
                 let painting = self.paint_active;
                 if ui
-                    .selectable_label(painting, if painting { "🖌 Painting — drag in the viewport (Ctrl erases)" } else { "🖌 Paint in viewport" })
+                    .selectable_label(painting, if painting { "✏ Painting — drag in the viewport (Ctrl erases)" } else { "✏ Paint in viewport" })
                     .on_hover_text("While on, dragging in the viewport paints instead of orbiting. Right/middle drag still pans.")
                     .clicked()
                 {
