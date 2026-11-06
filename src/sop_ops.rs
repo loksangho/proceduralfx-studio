@@ -467,7 +467,7 @@ pub(crate) fn read_vdb_file(path: &str) -> Result<Mesh, String> {
     #[cfg(not(feature = "native-openvdb"))]
     {
         let _ = path;
-        Err("reading .vdb files needs the native-openvdb build".into())
+        Err("this copy of the app was built without OpenVDB, so it can't read .vdb files (from the source: ./proceduralfx_studio.sh run-release)".into())
     }
 }
 
@@ -554,7 +554,7 @@ pub(crate) fn write_render_volume(mesh: &Mesh, index: usize) -> Result<RenderVol
     #[cfg(not(feature = "native-openvdb"))]
     {
         let _ = (voxels, voxel, origin, volume);
-        Err("rendering volumes needs the native-openvdb build".into())
+        Err("this copy of the app was built without OpenVDB, so MoonRay can't render volumes (from the source: ./proceduralfx_studio.sh run-release)".into())
     }
 }
 
@@ -588,7 +588,7 @@ pub(crate) fn write_vdb_file(mesh: &Mesh, path: &str) -> Result<(), String> {
     #[cfg(not(feature = "native-openvdb"))]
     {
         let _ = (voxels, class, voxel, origin, background, path);
-        Err("writing .vdb files needs the native-openvdb build".into())
+        Err("this copy of the app was built without OpenVDB, so it can't write .vdb files (from the source: ./proceduralfx_studio.sh run-release)".into())
     }
 }
 

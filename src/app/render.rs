@@ -1458,7 +1458,8 @@ pub(crate) fn sequence_fps(times: &[f32]) -> f32 {
     }
 }
 
-// The folders MoonRay's shaders (RDL2 DSOs) may be in, ":"-joined: next to the MoonRay
+// The folders MoonRay's shaders (RDL2 DSOs) may be in, joined as a path list (":" apart,
+// ";" on Windows): next to the MoonRay
 // being run (followed through links, as a build tree or an install keeps them), next to
 // the app (its bundle's Resources), then RDL2_DSO_PATH. Only folders that exist.
 pub(crate) fn rdl2_dso_paths(moonray: &Path) -> String {
@@ -1474,19 +1475,21 @@ pub(crate) fn rdl2_dso_paths(moonray: &Path) -> String {
     if let Ok(app) = std::env::current_exe() {
         candidates.extend(near(&app));
     }
-    if let Ok(existing) = std::env::var("RDL2_DSO_PATH") {
-        candidates.extend(existing.split(':').filter(|p| !p.is_empty()).map(PathBuf::from));
+    if let Some(existing) = std::env::var_os("RDL2_DSO_PATH") {
+        candidates.extend(std::env::split_paths(&existing).filter(|p| !p.as_os_str().is_empty()));
     }
-    let mut paths: Vec<String> = Vec::new();
+    let (mut paths, mut seen): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
     for candidate in candidates {
         // A folder of shaders: has a .so in it (Resources and MacOS hold other things too).
         let has_shaders = std::fs::read_dir(&candidate).is_ok_and(|entries| entries.flatten().any(|e| e.path().extension().is_some_and(|x| x == "so")));
-        let path = candidate.to_string_lossy().into_owned();
-        if has_shaders && !paths.contains(&path) {
-            paths.push(path);
+        // Once each, however it was reached.
+        let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if has_shaders && !seen.contains(&real) {
+            seen.push(real);
+            paths.push(candidate);
         }
     }
-    paths.join(":")
+    std::env::join_paths(paths).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1504,19 +1507,23 @@ mod shader_search_tests {
         std::fs::create_dir_all(build.join("rdl2dso")).unwrap();
         std::fs::write(build.join("rdl2dso/DwaBaseMaterial.so"), b"").unwrap();
         std::fs::write(build.join("bin/moonray"), b"").unwrap();
+        let found = |paths: &str, folder: &Path| {
+            let wanted = std::fs::canonicalize(folder).ok();
+            std::env::split_paths(paths).any(|p| std::fs::canonicalize(p).ok() == wanted)
+        };
         let paths = rdl2_dso_paths(&build.join("bin/moonray"));
-        assert!(paths.split(':').any(|p| Path::new(p) == build.join("rdl2dso")), "{paths}");
+        assert!(found(&paths, &build.join("rdl2dso")), "{paths}");
+        assert_eq!(std::env::split_paths(&paths).count(), 1, "once: {paths}");
         #[cfg(unix)]
         {
             std::fs::create_dir_all(root.join("elsewhere")).unwrap();
             std::os::unix::fs::symlink(build.join("bin/moonray"), root.join("elsewhere/moonray")).unwrap();
             let paths = rdl2_dso_paths(&root.join("elsewhere/moonray"));
-            let wanted = std::fs::canonicalize(build.join("rdl2dso")).unwrap();
-            assert!(paths.split(':').any(|p| std::fs::canonicalize(p).is_ok_and(|p| p == wanted)), "through the link: {paths}");
+            assert!(found(&paths, &build.join("rdl2dso")), "through the link: {paths}");
         }
         let empty = root.join("empty");
         std::fs::create_dir_all(empty.join("rdl2dso")).unwrap();
-        assert!(!rdl2_dso_paths(&empty.join("moonray")).split(':').any(|p| Path::new(p) == empty.join("rdl2dso")));
+        assert!(!found(&rdl2_dso_paths(&empty.join("moonray")), &empty.join("rdl2dso")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

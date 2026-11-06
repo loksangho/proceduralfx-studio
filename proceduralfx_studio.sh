@@ -4,6 +4,7 @@ set -euo pipefail
 # Helper script for running or packaging the app on macOS.
 # Usage:
 #   ./proceduralfx_studio.sh            # run in debug via `cargo run`
+#   ./proceduralfx_studio.sh run-release  # run optimised, with USD, OpenVDB (volume renders) and Alembic
 #   ./proceduralfx_studio.sh package-macos  # build release and create .app with bundled MoonRay if present
 #   ./proceduralfx_studio.sh preview-exr <file.exr> [out.png]
 #   ./proceduralfx_studio.sh render-moonray <scene.rdla> <out.exr> [width] [height]
@@ -92,6 +93,17 @@ if [[ ${1-} == "render-moonray" ]]; then
   "$MOONRAY_BIN" -in "$SCENE" -out "$OUT_EXR" -size "$WIDTH" "$HEIGHT"
   preview_exr "$OUT_EXR"
   exit 0
+fi
+
+# The full app, optimised, built in its own folder (target/full) so that test builds
+# (plain `cargo test --release`, without the native features) don't replace it.
+if [[ ${1-} == "run-release" ]]; then
+  if [[ -n "${HD_RENDER_BIN-}" ]]; then
+    python3 scripts/hydra_plugins.py "$PFX_HYDRA" "$PFX_BUILD/hydra-plugins" >/dev/null
+    export PFX_HD_RENDER="$HD_RENDER_BIN" PFX_HYDRA_PLUGIN_PATH="$PFX_BUILD/hydra-plugins"
+  fi
+  OPENVDB_ROOT="$OPENVDB_ROOT" PKG_CONFIG_PATH="$PKG_CONFIG_PATH" \
+  exec cargo run --release --target-dir target/full --features "${APP_FEATURES:-native-openvdb native-usd}"
 fi
 
 if [[ ${1-} == "package-macos" ]]; then
