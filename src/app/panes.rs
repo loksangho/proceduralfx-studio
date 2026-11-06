@@ -178,7 +178,7 @@ impl ProceduralFxStudioApp {
             "Network: RMB add node • drag output→input to wire\n\
                      click input to disconnect • dbl-click = display\n\
                      OBJ: Geometry / Light / Camera nodes need no wiring •\n\
-                     dbl-click Geometry to enter • U = up • dbl-click Light/Camera = activate\n\
+                     dbl-click Geometry to enter • U = up • dbl-click Camera = look through • dbl-click Light = on/off\n\
                      MMB hold on a node = Node Info\n\
                      TAB search/add • H home network • T template\n\
                      B bypass • Ctrl+D duplicate • Del delete\n\

@@ -503,9 +503,15 @@ impl ProceduralFxStudioApp {
                 }
             }
             Action::Display(id) => match self.graph.nodes.get(&id).map(|n| &n.kind) {
+                // Look through the camera (it stays as it is); again, back to the free view.
+                // Driving it with the view is Parameters' "Use as viewport camera".
                 Some(NodeKind::Camera { .. }) => {
                     self.selected = Some(id);
-                    self.use_camera_requested = true;
+                    let already = self.looking_through && self.active_camera == Some(id);
+                    self.look_through(if already { None } else { Some(id) });
+                    if already {
+                        self.status = "Back to the free view".into();
+                    }
                 }
                 Some(kind) if kind.is_object() => {
                     if let Some(n) = self.graph.nodes.get_mut(&id) {

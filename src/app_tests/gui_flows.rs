@@ -413,3 +413,28 @@ fn the_app_starts_empty_and_still() {
     assert!(!app.animate, "not playing");
     assert!(app.selected.is_none());
 }
+
+// Double-clicking a camera looks through it without changing it; again, back to the free view.
+#[test]
+fn double_clicking_a_camera_looks_through_it() {
+    let mut app = ProceduralFxStudioApp::default();
+    app.load_state("pfs 2\nnode 0 120 120 0 obj camera 0 1 0 0 0 0 1.2 0.5 0 0 0 6\nnext 1\n".into());
+    app.current_network = None;
+    let mut h = harness(app);
+    let before = h.state().graph.nodes[&0].kind.params();
+    let centre = node_on_screen(&h, 0).center();
+    let double_click = |h: &mut Harness<ProceduralFxStudioApp>| {
+        pointer(h, centre);
+        h.run_steps(60);
+        for pressed in [true, false, true, false] {
+            press(h, centre, pressed);
+            h.step();
+        }
+        h.run_steps(3);
+    };
+    double_click(&mut h);
+    assert!(h.state().looking_through && h.state().active_camera == Some(0), "looking through it: {}", h.state().status);
+    assert_eq!(h.state().graph.nodes[&0].kind.params(), before, "the camera itself is unchanged");
+    double_click(&mut h);
+    assert!(!h.state().looking_through, "back to the free view: {}", h.state().status);
+}
