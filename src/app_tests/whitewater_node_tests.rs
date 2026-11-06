@@ -142,4 +142,8 @@ fn toon_fire_renders_in_colour_in_moonray() {
     // As bright as the viewport shows it: its lit bands at their full colour, glowing.
     let bright = render.pixels().filter(|p| p[0] > 0.9).count();
     assert!(bright * 3 > lit, "{bright} of {lit} lit pixels are bright");
+    // Outlined, as in the viewport: dark pixels around the flames.
+    let alpha = image::open(std::env::temp_dir().join("pfx_toon_fire.exr")).unwrap().to_rgba32f();
+    let outline = alpha.pixels().filter(|p| p[3] > 0.9 && p[0] + p[1] + p[2] < 0.3).count();
+    assert!(outline > 40, "{outline} outline pixels");
 }

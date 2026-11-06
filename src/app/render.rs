@@ -925,6 +925,48 @@ impl ProceduralFxStudioApp {
             }
         }
 
+        // Toon outlines, as the viewport draws them (an inverted hull): each toon part again,
+        // pushed out along its normals by the outline's width in pixels at that distance,
+        // turned inside out and single-sided, so only its far side shows, around the edges.
+        let view = self.render_view(scene);
+        let outlines: Vec<Option<[f32; 3]>> = parts
+            .iter()
+            .map(|(mesh, m)| match m {
+                PartMaterial::Node(id) => match self.graph.nodes.get(id).map(|n| &n.kind) {
+                    Some(NodeKind::Shader(v)) if v.table == shading::Table::Toon && v.float("outline_width") > 0.0 && !mesh.indices.is_empty() => Some(v.color("outline_color")),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for (index, (mesh, m)) in parts.iter().enumerate() {
+            let (Some(colour), PartMaterial::Node(id)) = (outlines[index], m) else { continue };
+            let Some(NodeKind::Shader(v)) = self.graph.nodes.get(id).map(|n| &n.kind) else { continue };
+            let pixels = v.float("outline_width");
+            let normals = mesh.compute_normals();
+            let mut body = format!("RdlMeshGeometry(\"/scene/objects/mesh{index}_outline\") {{\n    [\"vertex_list_0\"] = {{\n");
+            for (p, n) in mesh.vertices.iter().zip(&normals) {
+                let depth = p.sub(view.eye).dot(view.fwd);
+                let o = p.add(n.scale(pixels * view.pixel_size(depth, width, height)));
+                body.push_str(&format!("        Vec3({:.6}, {:.6}, {:.6}),\n", o.x, o.y, -o.z));
+            }
+            // Winding the other way round from the mesh's: facing inwards.
+            body.push_str("    },\n    [\"vertices_by_index\"] = {\n");
+            for tri in &mesh.indices {
+                body.push_str(&format!("        {}, {}, {},\n", tri[0], tri[1], tri[2]));
+            }
+            body.push_str("    },\n    [\"face_vertex_count\"] = {\n");
+            for _ in &mesh.indices {
+                body.push_str("        3,\n");
+            }
+            body.push_str("    },\n    [\"side_type\"] = 1,\n    [\"visible_shadow\"] = false,\n    [\"visible_diffuse_reflection\"] = false,\n    [\"visible_diffuse_transmission\"] = false,\n    [\"visible_glossy_reflection\"] = false,\n    [\"visible_glossy_transmission\"] = false,\n    [\"is_subd\"] = false\n}\n\n");
+            body.push_str(&format!(
+                "DwaBaseMaterial(\"/scene/materials/outline{index}\") {{\n    [\"albedo\"] = Rgb(0, 0, 0),\n    [\"specular\"] = 0.0,\n    [\"show_emission\"] = true,\n    [\"emission\"] = {},\n}}\n\n",
+                shading::rgb(colour)
+            ));
+            f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        }
+
         // Hair and other curves: linear RdlCurveGeometry, radius from the width attribute.
         for (index, (mesh, _)) in parts.iter().enumerate() {
             let curves = groom::curves(mesh);
@@ -1037,6 +1079,9 @@ impl ProceduralFxStudioApp {
         writeln!(f, "GeometrySet(\"/scene/geometrysets/GeometrySet1\") {{") .map_err(|e| e.to_string())?;
         for geometry in part_geometry.iter().flatten() {
             writeln!(f, "    {geometry},") .map_err(|e| e.to_string())?;
+        }
+        for index in (0..parts.len()).filter(|i| outlines[*i].is_some()) {
+            writeln!(f, "    RdlMeshGeometry(\"/scene/objects/mesh{index}_outline\"),") .map_err(|e| e.to_string())?;
         }
         for index in 0..scene.volumes.len() {
             writeln!(f, "    VdbGeometry(\"/scene/volumes/volume{index}\"),") .map_err(|e| e.to_string())?;
@@ -1224,29 +1269,16 @@ impl ProceduralFxStudioApp {
                 writeln!(f, "    {{{geometry}, \"\", {material}, LightSet(\"/scene/lightsets/{lights}\"), undef(), undef(), undef(), undef()}},") .map_err(|e| e.to_string())?;
             }
         }
+        for index in (0..parts.len()).filter(|i| outlines[*i].is_some()) {
+            writeln!(f, "    {{RdlMeshGeometry(\"/scene/objects/mesh{index}_outline\"), \"\", DwaBaseMaterial(\"/scene/materials/outline{index}\"), LightSet(\"/scene/lightsets/toon\"), undef(), undef(), undef(), undef()}},") .map_err(|e| e.to_string())?;
+        }
         for index in 0..scene.volumes.len() {
             writeln!(f, "    {{VdbGeometry(\"/scene/volumes/volume{index}\"), \"\", LightSet(\"/scene/lightsets/LightSet1\"), VdbVolume(\"/scene/volumes/shader{index}\")}},") .map_err(|e| e.to_string())?;
         }
         writeln!(f, "}}\n") .map_err(|e| e.to_string())?;
 
         // Camera from the stage, the selected/chosen camera node, or the viewport.
-        let (rig, _) = self.resolve_render_camera();
-        let (sx, cx) = rig.rot_x.sin_cos();
-        let (sy, cy) = rig.rot_y.sin_cos();
-        let mut right = Vec3::new(cy, 0.0, -sy);
-        let mut up = Vec3::new(-sx * sy, cx, -sx * cy);
-        let mut fwd = Vec3::new(cx * sy, sx, cx * cy);
-        let pan_scale = rig.zoom / self.viewport_focal_px.max(1.0);
-        let target = rig
-            .target
-            .sub(right.scale(rig.pan[0] * pan_scale))
-            .add(up.scale(rig.pan[1] * pan_scale));
-        let mut eye = target.sub(fwd.scale(rig.zoom));
-        let mut lens = None;
-        if let Some((stage_eye, stage_right, stage_up, stage_fwd, focal, aperture)) = scene.camera {
-            (eye, right, up, fwd) = (stage_eye, stage_right, stage_up, stage_fwd);
-            lens = Some((focal, aperture));
-        }
+        let RenderView { rig, eye, right, up, fwd, lens } = self.render_view(scene);
         // z is mirrored (see mesh export); MoonRay cameras look down local -Z.
         let xform = format!(
             "Mat4({:.6},{:.6},{:.6},0, {:.6},{:.6},{:.6},0, {:.6},{:.6},{:.6},0, {:.6},{:.6},{:.6},1)",
@@ -1275,6 +1307,26 @@ impl ProceduralFxStudioApp {
         }
         writeln!(f, "}}") .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    // Where the render camera is and how it looks: from the stage, the selected or chosen
+    // camera node, or the viewport (in the app's left-handed space).
+    pub(crate) fn render_view(&self, scene: &RenderScene) -> RenderView {
+        let (rig, _) = self.resolve_render_camera();
+        let (sx, cx) = rig.rot_x.sin_cos();
+        let (sy, cy) = rig.rot_y.sin_cos();
+        let mut right = Vec3::new(cy, 0.0, -sy);
+        let mut up = Vec3::new(-sx * sy, cx, -sx * cy);
+        let mut fwd = Vec3::new(cx * sy, sx, cx * cy);
+        let pan_scale = rig.zoom / self.viewport_focal_px.max(1.0);
+        let target = rig.target.sub(right.scale(rig.pan[0] * pan_scale)).add(up.scale(rig.pan[1] * pan_scale));
+        let mut eye = target.sub(fwd.scale(rig.zoom));
+        let mut lens = None;
+        if let Some((stage_eye, stage_right, stage_up, stage_fwd, focal, aperture)) = scene.camera {
+            (eye, right, up, fwd) = (stage_eye, stage_right, stage_up, stage_fwd);
+            lens = Some((focal, aperture));
+        }
+        RenderView { rig, eye, right, up, fwd, lens }
     }
 
     // (position, travel direction, color, intensity, kind) for every active Light node,
@@ -1645,3 +1697,27 @@ fn particle_material(name: &str, mesh: &Mesh) -> String {
 // How strong toon materials' own light is: MoonRay's toon diffuse is flat, at half what a
 // plain surface facing a light of strength 1 gets, so 2 shows a lit band at its colour.
 pub(crate) const TOON_LIGHT: f32 = 2.0 * DISTANT_LIGHT_SCALE;
+
+// The render camera, as render_view works it out.
+pub(crate) struct RenderView {
+    pub(crate) rig: CamRig,
+    pub(crate) eye: Vec3,
+    pub(crate) right: Vec3,
+    pub(crate) up: Vec3,
+    pub(crate) fwd: Vec3,
+    // A stage camera's (focal length, horizontal aperture), in mm.
+    pub(crate) lens: Option<(f32, f32)>,
+}
+
+impl RenderView {
+    // How many world units one pixel of a `width` × `height` render covers at `depth`
+    // in front of the camera: as the camera written below sees it.
+    pub(crate) fn pixel_size(&self, depth: f32, width: usize, height: usize) -> f32 {
+        let min_dim = width.min(height).max(1) as f32;
+        match self.lens {
+            Some((focal, aperture)) => depth.max(0.0) * aperture / (focal.max(1e-3) * width.max(1) as f32),
+            None if self.rig.orthographic => self.rig.zoom / self.rig.focal.max(1e-3) / min_dim,
+            None => depth.max(0.0) / (self.rig.focal.max(1e-3) * min_dim),
+        }
+    }
+}
