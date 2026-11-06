@@ -281,6 +281,12 @@ impl ProceduralFxStudioApp {
         self.welcome_window(ctx);
         self.vat_window(ctx);
         self.viewer.ui(ctx);
+        // Escape stops a MoonRay render (and its sequence) where it is, unless something
+        // else is using it: typing, picking a group, or recording a flipbook.
+        let rendering = self.moonray_rx.is_some() || self.sequence.is_some();
+        if rendering && self.group_pick.is_none() && self.flipbook_recording.is_none() && ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_render();
+        }
 
 
         // Node Info: a pinned window, and the popup while the middle button is held on a node.

@@ -1527,6 +1527,24 @@ mod shader_search_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Cancelling stops the renderer where it is, rather than letting its frame finish.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_render_stops_at_once() {
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let log = std::env::temp_dir().join(format!("pfx_cancel_{}.log", std::process::id()));
+        let started = std::time::Instant::now();
+        let result = run_logged(Command::new("sleep").arg("30"), &log, &cancel);
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(result.err().as_deref(), Some("Render cancelled"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
     #[test]
     fn moonray_errors_read_plainly() {
         let log = "\u{1b}[31mError: RDLA Error: scene.rdla:20: global variable 'DwaBaseMaterial' was never declared (assign a value to it before using it), or if 'DwaBaseMaterial' is a constructor for a DSO type, the DSO could not be found\n\u{1b}[0m";

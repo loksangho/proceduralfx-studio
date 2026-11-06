@@ -465,7 +465,7 @@ impl ProceduralFxStudioApp {
         };
         let render = |app: &mut Self, ui: &mut egui::Ui| {
             if app.moonray_rx.is_some() || app.sequence.is_some() {
-                if ui.button("■ Cancel").clicked() {
+                if ui.button("■ Cancel").on_hover_text("Stop the render now (Esc)").clicked() {
                     app.cancel_render();
                 }
                 if let Some(started) = app.render_started {

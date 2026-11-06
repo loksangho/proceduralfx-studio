@@ -763,12 +763,16 @@ pub(crate) fn run_logged(cmd: &mut Command, log_path: &std::path::Path, cancel: 
             return Ok(status);
         }
         if cancel.load(Ordering::Relaxed) {
+            // The Windows helper stops its container when its input closes, given a moment;
+            // MoonRay itself is stopped at once, mid-frame.
             drop(child.stdin.take());
-            for _ in 0..50 {
-                if child.try_wait().ok().flatten().is_some() {
-                    return Err("Render cancelled".into());
+            if cfg!(windows) {
+                for _ in 0..50 {
+                    if child.try_wait().ok().flatten().is_some() {
+                        return Err("Render cancelled".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             let _ = child.kill();
             let _ = child.wait();
