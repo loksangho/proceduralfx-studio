@@ -2305,6 +2305,7 @@ impl Graph {
                 NodeKind::Connectivity(settings) => self.report(id, sopkit::connectivity(&input(0, cache), settings)),
                 NodeKind::Resample(settings) => self.report(id, sopkit::resample(&input(0, cache), settings)),
                 NodeKind::Curve(settings) => self.report(id, curve::curve(settings)),
+                NodeKind::Circle(settings) => circle::circle(settings),
                 NodeKind::AttributeRemap(settings) => self.report(id, remap::remap(&input(0, cache), settings)),
                 NodeKind::AttributeFade(settings) => {
                     let connected = |slot: usize| self.input_of(id, slot).is_some();

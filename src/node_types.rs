@@ -1330,6 +1330,8 @@ pub(crate) enum NodeKind {
     Resample(sopkit::ResampleSettings),
     // A curve through (or near) points you place: polyline, smooth or B-spline, open or closed.
     Curve(curve::CurveSettings),
+    // A circle, ellipse, arc or slice: one polygon or a curve (see circle.rs).
+    Circle(circle::CircleSettings),
     // Reshapes an attribute's values through a ramp, from an input range to an output range.
     AttributeRemap(remap::RemapSettings),
     // Scales a point attribute in, holds it and scales it out over time (see fade.rs).
@@ -1613,6 +1615,7 @@ impl NodeKind {
             NodeKind::Connectivity(_) => names(&["class"]),
             NodeKind::Resample(_) => names(&["by_length", "length", "segments"]),
             NodeKind::Curve(_) => names(&["type", "closed", "divisions"]),
+            NodeKind::Circle(_) => names(&["type", "orientation", "radius.x", "radius.y", "center.x", "center.y", "center.z", "divisions", "arc_type", "arc_begin", "arc_end"]),
             NodeKind::AttributeRemap(_) => names(&["class", "auto_range", "input_min", "input_max", "output_min", "output_max"]),
             NodeKind::AttributeFade(_) => names(&["frame_offset", "fade_in", "hold", "fade_out", "seconds", "visualize"]),
             NodeKind::LSystem(_) => names(&["generations", "angle", "step", "step_scale", "thickness", "thickness_scale", "angle_random", "seed"]),
@@ -2068,6 +2071,7 @@ impl NodeKind {
                 vec![
                     NodeKind::Add { count: 0, spacing: 1.0, layout: 0, points: vec![[0.0; 3]], delete_geometry: false },
                     NodeKind::Curve(curve::CurveSettings::defaults()),
+                    NodeKind::Circle(circle::CircleSettings::defaults()),
                     NodeKind::Grid { size: 4.0, res: 20 },
                     NodeKind::Plane { size: 4.0, res: 20 },
                     NodeKind::Cone { radius: 1.0, height: 2.0, rows: 1, cols: 32, caps: true },
@@ -2472,6 +2476,7 @@ impl NodeKind {
             NodeKind::Connectivity(_) => "connectivity",
             NodeKind::Resample(_) => "resample",
             NodeKind::Curve(_) => "curve",
+            NodeKind::Circle(_) => "circle",
             NodeKind::AttributeRemap(_) => "attribute_remap",
             NodeKind::AttributeFade(_) => "attribute_fade",
             NodeKind::VolumeWrangle { .. } => "volume_wrangle",
@@ -2614,7 +2619,7 @@ impl NodeKind {
             | NodeKind::AttributeBlur(_)
             | NodeKind::AttributeRemap(_)
             | NodeKind::AttributePromote(_) => 1,
-            NodeKind::Curve(_) => 0,
+            NodeKind::Curve(_) | NodeKind::Circle(_) => 0,
             NodeKind::AttributeFade(_) => 3,
             // Input 0 is the geometry they change; 1-3 are read by point(1, ...), @opinput1_P and the like.
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => vex::INPUTS,
@@ -2858,6 +2863,7 @@ impl NodeKind {
             NodeKind::Connectivity(c) => vec![c.class as f32],
             NodeKind::Resample(r) => vec![r.by_length as u8 as f32, r.length, r.segments as f32],
             NodeKind::Curve(c) => c.params(),
+            NodeKind::Circle(c) => c.params(),
             NodeKind::AttributeRemap(r) => r.params(),
             NodeKind::AttributeFade(f) => f.params(),
             NodeKind::PointDeform(s) => vec![s.influences as f32, s.fit_neighbours as f32, s.rotate as u8 as f32],
@@ -3265,6 +3271,7 @@ impl NodeKind {
                 })
             }
             "curve" => NodeKind::Curve(curve::CurveSettings::from_params(p)),
+            "circle" => NodeKind::Circle(circle::CircleSettings::from_params(p)),
             "attribute_remap" => NodeKind::AttributeRemap(remap::RemapSettings::from_params(p)),
             "attribute_fade" => NodeKind::AttributeFade(fade::FadeSettings::from_params(p)),
             "connectivity" => NodeKind::Connectivity(sopkit::ConnectivitySettings { class: u(0).min(1), ..sopkit::ConnectivitySettings::defaults() }),

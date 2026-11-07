@@ -854,6 +854,33 @@ impl ProceduralFxStudioApp {
                     c |= ui.add(egui::TextEdit::singleline(&mut set.attribute).desired_width(120.0)).changed();
                 });
             }
+            NodeKind::Circle(set) => {
+                let menu = |ui: &mut egui::Ui, label: &str, value: &mut usize, choices: &[&str]| -> bool {
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        for (k, name) in choices.iter().enumerate() {
+                            changed |= ui.selectable_value(value, k, *name).changed();
+                        }
+                    });
+                    changed
+                };
+                c |= menu(ui, "Type", &mut set.kind, &circle::TYPES);
+                c |= menu(ui, "Orientation", &mut set.plane, &circle::PLANES);
+                ui.horizontal(|ui| {
+                    ui.label("Radius");
+                    for r in set.radius.iter_mut() {
+                        c |= pfield(ui, pdrag(r).speed(0.01)).changed();
+                    }
+                });
+                c |= vec3_ui(ui, "Center", &mut set.center, 0.02);
+                c |= pfield(ui, pslider(&mut set.divisions, 3..=256).text("Divisions")).changed();
+                c |= menu(ui, "Arc", &mut set.arc, &circle::ARCS);
+                if set.arc != 0 {
+                    c |= pfield(ui, pslider(&mut set.angles[0], -360.0..=360.0).text("Begin°")).changed();
+                    c |= pfield(ui, pslider(&mut set.angles[1], -360.0..=360.0).text("End°")).changed();
+                }
+            }
             NodeKind::Curve(set) => {
                 ui.small("A curve through (or near) the points below, in order. Curves are points with curveu (0 at the start, 1 at the end): POP Curve Force, Resample and Copy to Points use them.");
                 let drawing = self.curve_draw;

@@ -65,6 +65,7 @@ mod presets;
 mod ramp;
 mod randomize;
 mod curve;
+mod circle;
 mod remap;
 mod remesh;
 mod fade;

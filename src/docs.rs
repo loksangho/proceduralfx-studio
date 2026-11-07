@@ -15,6 +15,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("environment_light", "HDRI image-based lighting for MoonRay, matched in the viewport's lighting and background."),
     // Generators
     ("add", "Points: explicit positions and/or a line or grid of them, added to the optional input. Can delete the input's polygons but keep its points."),
+    ("circle", "A circle, ellipse, arc or slice of pie, as one polygon or as a curve (with curveu), in the XY, YZ or ZX plane, with a radius on each of its axes, a centre and a number of divisions. Arcs run from Begin to End degrees: open (a polygon closes them with a straight edge) or sliced through the centre."),
     ("curve", "A curve through the points you place, in order: a polyline, a smooth curve through every point (Catmull-Rom), or a smoother one drawn toward them (B-spline). Open or closed, with curveu from 0 at its start to 1 at its end, for POP Curve Force, Resample, Copy to Points and the renderers. Turn on Draw in the viewport to click points onto a construction plane, drag them and right-click to remove them."),
     ("grid", "A flat square grid of quads in the XZ plane."),
     ("plane", "A flat plane."),

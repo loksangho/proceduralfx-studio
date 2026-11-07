@@ -37,6 +37,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | --- | --- | --- |
 | add | `add` | point_count=0, spacing=1, layout=0, delete_geometry=0, #4=0, #5=0, #6=0 |
 | curve | `curve` | type=1, closed=0, divisions=12, #3=-2, #4=0, #5=0, #6=-1, #7=1, #8=0, #9=1, #10=-0.5, #11=0, #12=2, #13=0.5, #14=0 |
+| circle | `circle` | type=0, orientation=2, radius.x=1, radius.y=1, center.x=0, center.y=0, center.z=0, divisions=24, arc_type=0, arc_begin=0, arc_end=360 |
 | grid | `grid` | size=4, resolution=20 |
 | plane | `plane` | size=4, resolution=20 |
 | cone | `cone` | radius=1, height=2, rows=1, columns=32, caps=1 |
