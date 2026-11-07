@@ -1210,10 +1210,61 @@ pub(crate) fn fill_missing_normals(a: &Mesh, b: &mut Mesh) {
     }
 }
 
+// When an attribute is on points in one mesh and on primitives or corners (vertex:) in the
+// other (a point Cd and a model's corner colours, say), the merged mesh would keep only the
+// finer one and fill the other mesh's elements with its default: white, for Cd. So the mesh
+// with the coarser one gets it at the finer level too, from its own values.
+fn match_attribute_levels(other: &Mesh, m: &mut Mesh) {
+    let level = |key: &str| if key.starts_with("vertex:") { 2 } else if key.starts_with("prim:") { 1 } else { 0 };
+    let base = |key: &str| key.strip_prefix("vertex:").or_else(|| key.strip_prefix("prim:")).unwrap_or(key).to_owned();
+    let usable = |key: &str| !key.contains(':') || key.starts_with("vertex:") || key.starts_with("prim:");
+    let (points, tris) = (m.vertices.len(), m.indices.len());
+    if tris == 0 {
+        return;
+    }
+    let mut wanted: Vec<(String, usize)> = Vec::new();
+    for key in other.point_attributes.keys().filter(|k| usable(k)) {
+        let name = base(key);
+        if name.starts_with("__") || name.starts_with("group:") || crate::strings::is_string_key(key) {
+            continue;
+        }
+        let have = [0, 1, 2].into_iter().filter(|l| m.point_attributes.contains_key(&[name.clone(), format!("prim:{name}"), format!("vertex:{name}")][*l])).max();
+        if let Some(have) = have.filter(|h| *h < level(key)) {
+            wanted.push((name, have * 10 + level(key)));
+        }
+    }
+    for (name, code) in wanted {
+        let (from, to) = (code / 10, code % 10);
+        let source = match from {
+            1 => m.point_attributes.get(&format!("prim:{name}")).filter(|v| v.len() % tris == 0).map(|v| (v.clone(), v.len() / tris)),
+            _ => m.point_attributes.get(&name).filter(|v| points > 0 && v.len() % points == 0).map(|v| (v.clone(), v.len() / points)),
+        };
+        let Some((values, w)) = source.filter(|(_, w)| *w > 0) else { continue };
+        let value_of = |t: usize, corner: usize| -> Vec<f32> {
+            match from {
+                1 => values[t * w..t * w + w].to_vec(),
+                _ => {
+                    let p = m.indices[t][corner];
+                    values[p * w..p * w + w].to_vec()
+                }
+            }
+        };
+        let made: Vec<f32> = if to == 2 {
+            (0..tris).flat_map(|t| (0..3).flat_map(move |k| value_of(t, k))).collect()
+        } else {
+            // Points to primitives: the average of the triangle's points.
+            (0..tris).flat_map(|t| (0..w).map(move |c| (0..3).map(|k| value_of(t, k)[c]).sum::<f32>() / 3.0)).collect()
+        };
+        m.point_attributes.insert(if to == 2 { format!("vertex:{name}") } else { format!("prim:{name}") }, made);
+    }
+}
+
 pub(crate) fn node_merge(mut a: Mesh, mut b: Mesh) -> Mesh {
     poly::offset_for_merge(&a, &mut b);
     fill_missing_normals(&a, &mut b);
     fill_missing_normals(&b, &mut a);
+    match_attribute_levels(&a, &mut b);
+    match_attribute_levels(&b, &mut a);
     let (a_points, a_prims) = (a.vertices.len(), a.indices.len());
     let (b_points, b_prims) = (b.vertices.len(), b.indices.len());
     a.vertices.extend(b.vertices);
@@ -2228,4 +2279,32 @@ pub(crate) fn native_volume_to_mesh(volume: &NativeVolume) -> Option<Mesh> {
         mini_openvdb_free(triangles.cast());
     }
     Some(mesh)
+}
+
+#[cfg(test)]
+mod merge_level_tests {
+    use super::*;
+
+    #[test]
+    fn merging_keeps_colours_stored_at_different_levels() {
+        // A red box coloured per primitive, merged with a blue one coloured per corner: the
+        // red one's corners stay red rather than turning white.
+        let mut red = node_box(1.0, 1);
+        red.point_attributes.insert("prim:Cd".into(), [1.0, 0.0, 0.0].repeat(red.indices.len()));
+        let mut blue = node_box(1.0, 1);
+        blue.point_attributes.insert("vertex:Cd".into(), [0.0, 0.0, 1.0].repeat(blue.indices.len() * 3));
+        let corners = red.indices.len() * 3;
+        let both = node_merge(red.clone(), blue.clone());
+        let cd = &both.point_attributes["vertex:Cd"];
+        assert!(cd[..corners * 3].chunks(3).all(|c| c == [1.0, 0.0, 0.0]), "the red box's corners are red");
+        assert!(cd[corners * 3..].chunks(3).all(|c| c == [0.0, 0.0, 1.0]));
+        // Either way round, and a point colour against a primitive one.
+        let other_way = node_merge(blue, red.clone());
+        assert!(other_way.point_attributes["vertex:Cd"][corners * 3..].chunks(3).all(|c| c == [1.0, 0.0, 0.0]));
+        let mut green = node_box(1.0, 1);
+        green.point_attributes.insert("Cd".into(), [0.0, 1.0, 0.0].repeat(green.vertices.len()));
+        let mixed = node_merge(green, red);
+        let prim = &mixed.point_attributes["prim:Cd"];
+        assert!(prim[..prim.len() / 2].chunks(3).all(|c| c == [0.0, 1.0, 0.0]), "the green box's primitives are green");
+    }
 }
