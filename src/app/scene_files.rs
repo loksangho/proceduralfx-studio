@@ -50,6 +50,26 @@ impl ProceduralFxStudioApp {
     // Starts a new scene from a starter effect: its nodes, the playback range it's made for,
     // its camera as the render camera, and sprite-sheet settings to suit (a seamless loop
     // for looping effects). Undoable, like opening a file; saving asks where.
+    // File → New: an empty scene, not saved anywhere yet, with the usual timeline. Like
+    // opening a scene, Ctrl+Z brings back the one before.
+    pub(crate) fn new_scene(&mut self) {
+        self.undo.push(self.last_state.clone());
+        self.load_state("pfs 2\nnext 0\n".into());
+        self.scene_path = None;
+        self.selected = None;
+        self.node_selection.clear();
+        self.current_network = None;
+        self.preset = None;
+        self.look_through(None);
+        self.render_camera = RenderCamera::Auto;
+        self.animate = false;
+        (self.playback_start, self.playback_end) = (0.0, 20.0);
+        self.time = 0.0;
+        self.mark_saved();
+        self.dirty = true;
+        self.status = "New empty scene (Ctrl+Z brings back the one before)".into();
+    }
+
     pub(crate) fn load_preset(&mut self, preset: &presets::Preset) {
         self.undo.push(self.last_state.clone());
         self.load_state(preset.scene.to_owned());

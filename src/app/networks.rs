@@ -592,10 +592,13 @@ impl ProceduralFxStudioApp {
     pub(crate) fn shortcuts(&mut self, ctx: &egui::Context) {
         // File shortcuts work even while a text field (e.g. VEX code) has focus.
         // Save As is consumed first so Cmd+Shift+S isn't taken as Cmd+S.
-        let (open, save, save_as) = ctx.input_mut(|i| {
+        let (new, open, save, save_as) = ctx.input_mut(|i| {
             let save_as = i.consume_shortcut(&SHORTCUT_SAVE_AS);
-            (i.consume_shortcut(&SHORTCUT_OPEN), i.consume_shortcut(&SHORTCUT_SAVE), save_as)
+            (i.consume_shortcut(&SHORTCUT_NEW), i.consume_shortcut(&SHORTCUT_OPEN), i.consume_shortcut(&SHORTCUT_SAVE), save_as)
         });
+        if new {
+            self.new_scene();
+        }
         // Quitting closes the window, which asks about unsaved changes first.
         if ctx.input_mut(|i| i.consume_shortcut(&SHORTCUT_QUIT)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

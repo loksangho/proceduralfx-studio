@@ -18,6 +18,10 @@ impl ProceduralFxStudioApp {
     pub(crate) fn file_menu(&mut self, ui: &mut egui::Ui) {
         let menu_ctx = ui.ctx().clone();
         let shortcut = |s: &egui::KeyboardShortcut| menu_ctx.format_shortcut(s);
+        if ui.add(egui::Button::new("New").shortcut_text(shortcut(&SHORTCUT_NEW))).on_hover_text("An empty scene (Ctrl+Z brings back this one)").clicked() {
+            self.new_scene();
+            ui.close();
+        }
         if ui.add(egui::Button::new("Open…").shortcut_text(shortcut(&SHORTCUT_OPEN))).clicked() {
             self.open_scene_dialog();
             ui.close();

@@ -749,3 +749,25 @@ fn dragging_a_box_selects_nodes() {
     assert!((h.state().graph_pan - pan).length() > 50.0, "the view moved");
     assert_eq!(selection(&h), vec![4]);
 }
+
+// File → New starts an empty scene with no file yet; Ctrl+Z brings back the one before.
+#[test]
+fn file_new_starts_an_empty_scene() {
+    let mut app = one_grid();
+    app.scene_path = Some(std::path::PathBuf::from("/tmp/old.pfs"));
+    let mut h = harness(app);
+    h.get_by_label("File").click();
+    h.run_steps(2);
+    h.get_by_label_contains("New Ctrl").click_accesskit();
+    settle(&mut h);
+    let app = h.state();
+    assert!(app.graph.nodes.is_empty(), "nothing in the scene");
+    assert!(app.scene_path.is_none() && !app.has_unsaved_changes(), "not saved anywhere, and nothing to save");
+    assert_eq!((app.playback_start, app.playback_end), (0.0, 20.0));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    settle(&mut h);
+    assert_eq!(h.state().graph.nodes.len(), 2, "undo brings the grid back");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+    settle(&mut h);
+    assert!(h.state().graph.nodes.is_empty(), "Ctrl+N does the same");
+}

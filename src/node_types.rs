@@ -666,6 +666,7 @@ pub(crate) fn write_file_atomically(path: &std::path::Path, contents: &str) -> s
     })
 }
 
+pub(crate) const SHORTCUT_NEW: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
 pub(crate) const SHORTCUT_OPEN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
 pub(crate) const SHORTCUT_SAVE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
 pub(crate) const SHORTCUT_QUIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
