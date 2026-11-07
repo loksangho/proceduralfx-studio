@@ -560,10 +560,11 @@ impl Graph {
             } else if let Some((color, texture, uses_cd)) = object_material.and_then(|m| self.material_preview(m)) {
                 let coloured = mesh.point_attributes.keys().any(|k| k == "Cd" || k.ends_with(":Cd"));
                 if !(coloured && uses_cd) && !mesh.indices.is_empty() {
-                    // The material's colour, over any the geometry has (a model's corner colours too).
-                    for key in ["Cd", "vertex:Cd", "detail:Cd"] {
-                        mesh.point_attributes.remove(key);
-                    }
+                    // The material's colour on the surfaces, over any colour they have (corner
+                    // colours come first, so it's set there too). Point Cd stays for the loose
+                    // points and curves the material doesn't cover, such as glow splats.
+                    mesh.point_attributes.remove("detail:Cd");
+                    mesh.point_attributes.insert("vertex:Cd".into(), color.repeat(mesh.indices.len() * 3));
                     mesh.point_attributes.insert("prim:Cd".into(), color.repeat(mesh.indices.len()));
                 }
                 if let Some(id) = object_material.filter(|id| self.is_toon(*id) && !mesh.indices.is_empty()) {

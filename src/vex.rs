@@ -1830,7 +1830,14 @@ impl Parser {
             return self.call(name, args, token);
         }
         match name.as_str() {
-            "M_PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::PI))),
+            // As Houdini's math.h, which wrangles include, defines them.
+            "M_PI" | "PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::PI))),
+            "M_PI_2" => return Ok(Expr::Const(Value::Float(std::f32::consts::FRAC_PI_2))),
+            "M_PI_4" => return Ok(Expr::Const(Value::Float(std::f32::consts::FRAC_PI_4))),
+            "M_SQRT2" => return Ok(Expr::Const(Value::Float(std::f32::consts::SQRT_2))),
+            "M_SQRT1_2" => return Ok(Expr::Const(Value::Float(std::f32::consts::FRAC_1_SQRT_2))),
+            "M_LN2" => return Ok(Expr::Const(Value::Float(std::f32::consts::LN_2))),
+            "M_LN10" => return Ok(Expr::Const(Value::Float(std::f32::consts::LN_10))),
             "M_TWO_PI" => return Ok(Expr::Const(Value::Float(std::f32::consts::TAU))),
             "M_E" => return Ok(Expr::Const(Value::Float(std::f32::consts::E))),
             // Rotation and transform orders for eulertoquaternion / maketransform.
@@ -5049,7 +5056,7 @@ Attributes @P @N @Cd @pscale (read/write), @ptnum @primnum @vtxnum @numpt @numpr
            @numvtx @elemnum @numelem @Time @TimeInc @Frame (read-only). Typed: f@mass i@id v@vel s@name
            p@orient (vector4) 3@rot (matrix3) 4@xform (matrix); ch(\"amp\") adds a slider
 Groups     @group_top: 1 if the element is in group top, else 0; @group_top = 1 adds it
-Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   M_PI  M_E
+Literals   1  2.5  1e-3  \"text\"  {1, 0, 0}   PI (M_PI)  M_E
 Operators  + - * / %  == != < <= > >=  && || !  ?:  = += -= *= /= %=  ++ --
            .x .y .z (.r .g .b) on vectors, [i] on arrays/vectors (negative from end),
            a[start:end:step] slices arrays and strings (a[1:3], a[-2:], a[::-1])
@@ -5068,6 +5075,15 @@ Notes      int / int is integer division (1 / 2 == 0, write 1.0 / 2 for 0.5).
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn maths_constants_are_there_as_in_houdini() {
+        let out = run_wrangle(Mesh::default(), &[], "f@a = PI; f@b = M_PI_2; f@c = M_SQRT2; f@d = M_TWO_PI;", 0.0, 1.0 / 24.0, 0, None, None);
+        let a = |k: &str| out.point_attributes[&format!("detail:{k}")][0];
+        assert!((a("a") - std::f32::consts::PI).abs() < 1e-6 && (a("b") - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert!((a("c") - 2f32.sqrt()).abs() < 1e-6 && (a("d") - std::f32::consts::TAU).abs() < 1e-6);
+    }
+
 
     #[test]
     fn relbbox_places_points_in_the_bounding_box() {

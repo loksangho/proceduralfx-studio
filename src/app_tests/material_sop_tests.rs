@@ -95,7 +95,14 @@ fn an_objects_material_colours_over_a_models_corner_colours() {
     let raw = g.cook(gold, 0.0, &mut HashMap::new());
     assert!(raw.point_attributes.contains_key("vertex:Cd"), "the corners have their own colour");
     let shown = g.cook_display(&[geo], 0.0, &mut HashMap::new());
-    assert!(!shown.point_attributes.contains_key("vertex:Cd"), "the material's colour wins");
-    let cd = &shown.point_attributes["prim:Cd"];
-    assert!(cd[2] > 0.5 && cd[0] < 0.2, "blue: {:?}", &cd[..3]);
+    let corners = &shown.point_attributes["vertex:Cd"];
+    assert!(corners.chunks(3).all(|c| c[2] > 0.5 && c[0] < 0.2), "the material's colour wins on every corner: {:?}", &corners[..3]);
+    // Loose points beside the surface (glow splats) keep their own colour.
+    let mut g2 = g.clone();
+    if let Some(NodeKind::Wrangle { code, .. }) = g2.nodes.get_mut(&gold).map(|n| &mut n.kind) {
+        *code = "v@Cd = set(1, 0.8, 0.2); int p = addpoint(0, {0, 2, 0}); setpointattrib(0, \"Cd\", p, {1, 0.8, 0.2});".into();
+    }
+    let with_points = g2.cook_display(&[geo], 0.0, &mut HashMap::new());
+    let cd = &with_points.point_attributes["Cd"];
+    assert_eq!(&cd[cd.len() - 3..], &[1.0, 0.8, 0.2], "the loose point keeps its gold");
 }
