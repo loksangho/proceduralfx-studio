@@ -464,8 +464,15 @@ impl Graph {
 
     // What the viewport shows for `ids`: like cook_many, but geometry objects without colour
     // attributes take their MAT material's colour, so the viewport matches renders.
+    #[cfg_attr(not(test), allow(dead_code))] // the tests' one-mesh view of a display
     pub(crate) fn cook_display(&self, ids: &[NodeId], time: f32, cache: &mut HashMap<NodeId, Mesh>) -> Mesh {
-        let mut merged: Option<Mesh> = None;
+        merge_parts(self.cook_display_parts(ids, time, cache))
+    }
+
+    // Each displayed node's geometry as the viewport shows it, one mesh each, so each object's
+    // look (colours, opacity, points' size...) comes from itself alone.
+    pub(crate) fn cook_display_parts(&self, ids: &[NodeId], time: f32, cache: &mut HashMap<NodeId, Mesh>) -> Vec<Mesh> {
+        let mut parts = Vec::with_capacity(ids.len());
         for id in ids {
             let mut mesh = self.cook(*id, time, cache);
             // Packed geometry shows as itself.
@@ -558,12 +565,9 @@ impl Graph {
                     }
                 }
             }
-            merged = Some(match merged {
-                Some(acc) => node_merge(acc, mesh),
-                None => mesh,
-            });
+            parts.push(mesh);
         }
-        merged.unwrap_or_default()
+        parts
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // only the tests call it
@@ -2941,4 +2945,9 @@ impl Graph {
         g.channels.retain(|c, _| g.nodes.contains_key(&c.node));
         g
     }
+}
+
+// The parts of a display as one mesh, in order (for picking, the info and the spreadsheet).
+pub(crate) fn merge_parts(parts: Vec<Mesh>) -> Mesh {
+    parts.into_iter().reduce(node_merge).unwrap_or_default()
 }

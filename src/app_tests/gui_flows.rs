@@ -624,14 +624,13 @@ fn the_other_objects_show_while_inside_one() {
     let (grid, cube) = (crate::node_grid(4.0, 4.0, 8, 8), crate::node_box(1.0, 1));
     let app = h.state();
     assert_eq!(app.current_mesh.vertices.len(), cube.vertices.len(), "the open object is what's picked");
-    assert_eq!(app.context_mesh.vertices.len(), grid.vertices.len(), "the other object is shown");
-    assert_eq!(app.shown_mesh.1.vertices.len(), cube.vertices.len() + grid.vertices.len());
-    assert_eq!(&app.shown_mesh.1.vertices[..cube.vertices.len()], &app.current_mesh.vertices[..], "the open one comes first");
+    assert_eq!(app.context_parts.len(), 1, "the other object is shown");
+    assert_eq!(app.context_parts[0].vertices.len(), grid.vertices.len());
     // A bypassed object doesn't show.
     h.state_mut().graph.nodes.get_mut(&0).unwrap().bypass = true;
     h.state_mut().dirty = true;
     settle(&mut h);
-    assert!(h.state().context_mesh.vertices.is_empty());
+    assert!(h.state().context_parts.is_empty());
 }
 
 // An expression typed into POP Source's Impulse activation makes it follow it, even when
@@ -656,4 +655,20 @@ fn an_expression_typed_into_impulse_activation_sticks() {
         let channel = ChannelId { node: 1, target: ChannelTarget::Param(index) };
         assert_eq!(h.state().graph.channels.get(&channel).and_then(|c| c.expression.as_deref()), Some(expression), "{label}: {}", h.state().status);
     }
+}
+
+// Objects are drawn each from their own geometry: one coloured per corner beside one coloured
+// per face (or see-through) doesn't change the other's look.
+#[test]
+fn each_object_is_shown_from_its_own_attributes() {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 8\nparent 1 0\ndisplay 0 1\nnode 2 200 20 0 obj geometry -1\nnode 3 40 20 0 obj box 1 1\nparent 3 2\ndisplay 2 3\nnext 4\n".into());
+    app.enter_network(None);
+    app.animate = false;
+    let mut h = harness(app);
+    settle(&mut h);
+    let app = h.state();
+    assert_eq!(app.shown_parts.len(), 2, "at the top, both objects, each its own mesh");
+    let total: usize = app.shown_parts.iter().map(|p| p.vertices.len()).sum();
+    assert_eq!(total, app.current_mesh.vertices.len(), "and the picked mesh is them merged");
 }

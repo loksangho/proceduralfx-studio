@@ -170,6 +170,7 @@ impl ProceduralFxStudioApp {
             self.simulation_key.clear();
             self.cancelled_simulation_key.clear();
             self.frame_cache.clear();
+            self.frame_parts.clear();
             self.frame_cache_order.clear();
             self.frame_cache_hits = 0;
             self.frame_cache_misses = 0;
@@ -194,6 +195,7 @@ impl ProceduralFxStudioApp {
         }
         if let Some(mesh) = self.frame_cache.get(&frame_key) {
             self.current_mesh = mesh.clone();
+            self.shown_parts = self.frame_parts.get(&frame_key).cloned().unwrap_or_default();
             self.mesh_revision += 1;
             self.frame_cache_hits += 1;
             // Routine, so it doesn't replace a message worth reading (a finished export, say).
@@ -217,8 +219,8 @@ impl ProceduralFxStudioApp {
                 std::thread::spawn(move || {
                     FLIP_CANCEL.with(|flag| *flag.borrow_mut() = Some(worker_cancel));
                     let mut worker_cache = HashMap::new();
-                    let mesh = graph.cook_display(&worker_displays, time, &mut worker_cache);
-                    let _ = tx.send(mesh);
+                    let parts = graph.cook_display_parts(&worker_displays, time, &mut worker_cache);
+                    let _ = tx.send(parts);
                 });
                 self.simulation_rx = Some(rx);
                 self.simulation_cancel = Some(cancel);
@@ -230,14 +232,20 @@ impl ProceduralFxStudioApp {
                 self.status = format!("{}… press Escape to cancel", self.graph.cooking_label(&displays));
             } else if let Some(rx) = &self.simulation_rx {
                 match rx.try_recv() {
-                    Ok(mesh) => {
+                    Ok(parts) => {
+                        let mesh = crate::graph::merge_parts(parts.clone());
+                        self.shown_parts = if parts.len() > 1 { parts } else { Vec::new() };
                         self.current_mesh = mesh.clone();
                         self.mesh_revision += 1;
                         const MAX_FRAME_CACHE: usize = 120;
                         if self.frame_cache.len() >= MAX_FRAME_CACHE {
                             if let Some(oldest) = self.frame_cache_order.pop_front() {
                                 self.frame_cache.remove(&oldest);
+                                self.frame_parts.remove(&oldest);
                             }
+                        }
+                        if !self.shown_parts.is_empty() {
+                            self.frame_parts.insert(frame_key.clone(), self.shown_parts.clone());
                         }
                         self.frame_cache.insert(frame_key.clone(), mesh);
                         self.frame_cache_order.push_back(frame_key);
@@ -261,13 +269,19 @@ impl ProceduralFxStudioApp {
                 }
             }
         } else {
-            self.current_mesh = self.graph.cook_display(&displays, self.time, &mut cache);
+            let parts = self.graph.cook_display_parts(&displays, self.time, &mut cache);
+            self.current_mesh = crate::graph::merge_parts(parts.clone());
+            self.shown_parts = if parts.len() > 1 { parts } else { Vec::new() };
             self.mesh_revision += 1;
             const MAX_FRAME_CACHE: usize = 120;
             if self.frame_cache.len() >= MAX_FRAME_CACHE {
                 if let Some(oldest) = self.frame_cache_order.pop_front() {
                     self.frame_cache.remove(&oldest);
+                    self.frame_parts.remove(&oldest);
                 }
+            }
+            if !self.shown_parts.is_empty() {
+                self.frame_parts.insert(frame_key.clone(), self.shown_parts.clone());
             }
             self.frame_cache.insert(frame_key.clone(), self.current_mesh.clone());
             self.frame_cache_order.push_back(frame_key);
@@ -278,9 +292,9 @@ impl ProceduralFxStudioApp {
         };
         // Inside one object, the others still show around it, as at the top.
         let others = self.context_displays();
-        let had_context = !self.context_mesh.vertices.is_empty();
-        self.context_mesh = if others.is_empty() { Mesh::default() } else { self.graph.cook_display(&others, self.time, &mut cache) };
-        if had_context || !self.context_mesh.vertices.is_empty() {
+        let had_context = !self.context_parts.is_empty();
+        self.context_parts = if others.is_empty() { Vec::new() } else { self.graph.cook_display_parts(&others, self.time, &mut cache) };
+        if had_context || !self.context_parts.is_empty() {
             self.mesh_revision += 1;
         }
         self.node_stats = cache

@@ -173,22 +173,17 @@ impl ProceduralFxStudioApp {
         // Polygon diagonals: hidden in the wireframe, so not pickable as edges either.
         let diagonals: HashSet<(usize, usize)> = mesh.indices.iter().zip(poly::outline_edges(mesh)).flat_map(|(t, shown)| (0..3).filter(move |k| !shown[*k]).map(move |k| (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3])))).collect();
         let (pending_edge_loop, clear_selection_on_miss) = self.pick_components(ctx, &response, &projected, &diagonals, gizmo_clicked);
-        // What's drawn: the network's geometry, then the other objects around it (after it, so
-        // its point and primitive numbers, and the selection, stay as they are).
-        if !self.context_mesh.vertices.is_empty() && self.shown_mesh.0 != self.mesh_revision {
-            self.shown_mesh = (self.mesh_revision, node_merge(self.current_mesh.clone(), self.context_mesh.clone()));
-        }
-        let mesh = if self.context_mesh.vertices.is_empty() { &self.current_mesh } else { &self.shown_mesh.1 };
+        // What's drawn: each shown object from its own mesh (so one object's attributes never
+        // change another's look), then, inside a network, the other objects around it.
+        let main_parts: Vec<&Mesh> = if self.shown_parts.is_empty() { vec![&self.current_mesh] } else { self.shown_parts.iter().collect() };
+        let parts: Vec<&Mesh> = main_parts.into_iter().chain(self.context_parts.iter()).collect();
+        // Picking, the selection and the CPU's points use the network's own geometry.
+        let mesh = &self.current_mesh;
         // GPU: the lit surfaces stay uploaded until the mesh, lights or display mode change,
         // so moving the camera skips building them (gpu_viewport.rs).
         let gpu_key = self.gpu_viewport.is_some().then(|| self.viewport_scene_key());
         let gpu_fresh = gpu_key.is_some_and(|key| self.gpu_viewport.as_ref().is_some_and(|gpu| gpu.has_scene(key)));
-        let built = if gpu_fresh { &Mesh::default() } else { mesh };
-        // Stored normals (Normal node) shade the surface; otherwise they're computed.
-        let corner_normals = sops::corner_normals(built);
-        // UV Quick Shade: the texture and each triangle corner's UV.
-        let quickshade = sops::quickshade_file(built).and_then(|file| sops::corner_uvs(built).map(|uvs| (quickshade_texture(&file), uvs)));
-        let textured = quickshade.is_some() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals);
+        let empty = Mesh::default();
         let ambient = self.ambient_light.clamp(0.0, 1.0);
         let lights = self.scene_lights();
         let environment = self.environment_light().and_then(|(file, scale, rotation, _)| envlight::load(&file).ok().map(|map| (map, scale, rotation)));
@@ -231,57 +226,6 @@ impl ProceduralFxStudioApp {
             // Which edges (0-1, 1-2, 2-0) the wireframe draws: polygon outlines, not their diagonals.
             edges: [bool; 3],
         }
-        let cd = mesh.point_attributes.get("Cd");
-        let cd_color = |index: usize| -> Option<egui::Color32> {
-            let values = cd?;
-            let vertex_count = mesh.vertices.len();
-            let (r, g, b) = if values.len() >= vertex_count.saturating_mul(3) {
-                (
-                    values.get(index * 3).copied()?,
-                    values.get(index * 3 + 1).copied()?,
-                    values.get(index * 3 + 2).copied()?,
-                )
-            } else {
-                let value = values.get(index).copied()?;
-                let [r, g, b] = attribute_color(value);
-                (r, g, b)
-            };
-            // Cd is linear: shown through the display transform, as Houdini does.
-            let [r, g, b] = [r, g, b].map(crate::color::to_display);
-            Some(egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
-        };
-        // Triangle corner colours follow Houdini's precedence: the first Cd found
-        // on vertices, points, primitives, then the detail.
-        let (point_count, prim_count) = (mesh.vertices.len(), mesh.indices.len());
-        let surface_cd = [
-            ("vertex:Cd", SheetDomain::Vertices, prim_count * 3),
-            ("Cd", SheetDomain::Points, point_count),
-            ("prim:Cd", SheetDomain::Primitives, prim_count),
-            ("detail:Cd", SheetDomain::Detail, 1),
-        ]
-        .into_iter()
-        .find_map(|(key, domain, count)| {
-            let values = mesh.point_attributes.get(key)?;
-            (count > 0 && values.len() >= count).then(|| (values.as_slice(), values.len() / count, domain))
-        });
-        let corner_color = |tri_index: usize, corner: usize, point: usize| -> Option<egui::Color32> {
-            let (values, components, domain) = surface_cd?;
-            let index = match domain {
-                SheetDomain::Vertices => tri_index * 3 + corner,
-                SheetDomain::Points => point,
-                SheetDomain::Primitives => tri_index,
-                SheetDomain::Detail => 0,
-            };
-            let [r, g, b] = if components >= 3 {
-                let at = index * components;
-                [*values.get(at)?, *values.get(at + 1)?, *values.get(at + 2)?]
-            } else {
-                attribute_color(*values.get(index * components)?)
-            };
-            // Cd is linear: shown through the display transform, as Houdini does.
-            let [r, g, b] = [r, g, b].map(crate::color::to_display);
-            Some(egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
-        };
         let wire: Option<[u8; 4]> = match self.render_mode {
             RenderMode::Wireframe => Some([80, 220, 120, 255]),
             RenderMode::ShadedWireframe => Some([0, 0, 0, 110]),
@@ -289,179 +233,227 @@ impl ProceduralFxStudioApp {
         };
         let mut queue: Vec<Poly> = Vec::new();
         let (mut gpu_faces, mut gpu_edges) = (Vec::new(), Vec::new());
-        let outlines = poly::outline_edges(built);
-        // Toon Shader faces: cel-shaded per pixel on the GPU, with outlines (gpu_viewport.rs).
-        let toon_ids = built.point_attributes.get(TOON_ATTR).filter(|v| v.len() == built.indices.len() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals));
         let mut toon_slots: HashMap<usize, usize> = HashMap::new();
         let mut toon_table: Vec<gpu_viewport::ToonMaterial> = Vec::new();
         let mut gpu_toon: Vec<gpu_viewport::ToonVertex> = Vec::new();
-        // Smooth point normals push the outline out without gaps at hard edges.
-        let smooth_normals = if toon_ids.is_some() { built.compute_normals() } else { Vec::new() };
-        // See-through faces: the material's opacity, times Alpha when it uses point alpha.
-        let opacity = built.point_attributes.get(OPACITY_ATTR).filter(|v| v.len() == built.indices.len() * 2);
-        let point_alpha = built.point_attributes.get("Alpha").filter(|a| a.len() == built.vertices.len());
-        let prim_alpha = built.point_attributes.get("prim:Alpha").filter(|a| a.len() == built.indices.len());
-        let corner_alpha = |tri_index: usize, point: usize| -> f32 {
-            let Some(o) = opacity else { return 1.0 };
-            let (amount, uses_alpha) = (o[tri_index * 2], o[tri_index * 2 + 1] > 0.5);
-            let alpha = if uses_alpha { point_alpha.map(|a| a[point]).or(prim_alpha.map(|a| a[tri_index])).unwrap_or(1.0) } else { 1.0 };
-            (amount * alpha).clamp(0.0, 1.0)
-        };
-        for (tri_index, tri) in built.indices.iter().enumerate() {
-            if self.isolate_selection {
-                let keep = match self.selection_mode {
-                    SelectionMode::Vertex => self.selected_vertices.iter().any(|&i| tri.contains(&i)),
-                    SelectionMode::Triangle => self.selected_triangles.contains(&tri_index),
-                    SelectionMode::Edge => self.selected_edges.iter().any(|&(a, b)| {
-                        tri.contains(&a) && tri.contains(&b)
-                    }),
-                };
-                if !keep {
-                    continue;
-                }
+        let mut scene_texture: Option<Arc<raster::Texture>> = None;
+        for part in &parts {
+            let built: &Mesh = if gpu_fresh { &empty } else { part };
+            let mesh: &Mesh = built;
+            // Stored normals (Normal node) shade the surface; otherwise they're computed.
+            let corner_normals = sops::corner_normals(built);
+            // UV Quick Shade: the texture and each triangle corner's UV.
+            let quickshade = sops::quickshade_file(built).and_then(|file| sops::corner_uvs(built).map(|uvs| (quickshade_texture(&file), uvs)));
+            // One texture shows (the viewport has one): the first object's.
+            if scene_texture.is_none() {
+                scene_texture = quickshade.as_ref().map(|(texture, _)| texture.clone());
             }
-            let (v0, v1, v2) = (mesh.vertices[tri[0]], mesh.vertices[tri[1]], mesh.vertices[tri[2]]);
-            let face_normal = v1.sub(v0).cross(v2.sub(v0)).normalize();
-            let shade = |n: Vec3, point: Vec3| -> egui::Color32 {
-                match self.render_mode {
-                    RenderMode::Wireframe => egui::Color32::TRANSPARENT,
-                    RenderMode::Normals => egui::Color32::from_rgb(
-                        ((n.x * 0.5 + 0.5) * 255.0) as u8,
-                        ((n.y * 0.5 + 0.5) * 255.0) as u8,
-                        ((n.z * 0.5 + 0.5) * 255.0) as u8,
-                    ),
-                    RenderMode::FlatShaded => {
-                        let rgb = illumination(face_normal, point);
-                        egui::Color32::from_rgb(
-                            (200.0 * rgb[0]) as u8,
-                            (205.0 * rgb[1]) as u8,
-                            (215.0 * rgb[2]) as u8,
-                        )
-                    }
-                    _ => {
-                        let rgb = illumination(n, point);
-                        egui::Color32::from_rgb(
-                            (200.0 * rgb[0]) as u8,
-                            (205.0 * rgb[1]) as u8,
-                            (215.0 * rgb[2]) as u8,
-                        )
-                    }
-                }
-            };
-            let lit_color = |corner: usize, point: Vec3, normal: Vec3| {
-                let Some(base) = corner_color(tri_index, corner, tri[corner]) else {
-                    return shade(normal, point);
-                };
-                let lighting_normal = if self.render_mode == RenderMode::FlatShaded {
-                    face_normal
-                } else {
-                    normal
-                };
-                let light = illumination(lighting_normal, point);
-                egui::Color32::from_rgb(
-                    (f32::from(base.r()) * light[0]).clamp(0.0, 255.0) as u8,
-                    (f32::from(base.g()) * light[1]).clamp(0.0, 255.0) as u8,
-                    (f32::from(base.b()) * light[2]).clamp(0.0, 255.0) as u8,
-                )
-            };
-            let corner_n = corner_normals[tri_index];
-            let colors = if textured {
-                // White, lit; the texture supplies the colour.
-                let lit = |point: Vec3, normal: Vec3| {
-                    let n = if self.render_mode == RenderMode::FlatShaded { face_normal } else { normal };
-                    let l = illumination(n, point);
-                    egui::Color32::from_rgb((255.0 * l[0]).min(255.0) as u8, (255.0 * l[1]).min(255.0) as u8, (255.0 * l[2]).min(255.0) as u8)
-                };
-                [lit(v0, corner_n[0]), lit(v1, corner_n[1]), lit(v2, corner_n[2])]
-            } else {
-                [lit_color(0, v0, corner_n[0]), lit_color(1, v1, corner_n[1]), lit_color(2, v2, corner_n[2])]
-            };
-            let uv = quickshade.as_ref().filter(|_| textured).map(|(_, uvs)| uvs[tri_index].map(|c| egui::pos2(c[0], 1.0 - c[1])));
-            // A toon face: its material's slot in the table, its corners' colours and light.
-            let toon = toon_ids.map(|ids| ids[tri_index]).filter(|id| *id >= 0.5).and_then(|id| {
-                let id = (id - 1.0).round() as usize;
-                let look = match &self.graph.nodes.get(&id)?.kind {
-                    NodeKind::Shader(v) if v.table == shading::Table::Toon => v.toon_look(),
-                    _ => return None,
-                };
-                let slot = *toon_slots.entry(id).or_insert_with(|| {
-                    toon_table.push(look);
-                    toon_table.len() - 1
-                });
-                let corners = [v0, v1, v2];
-                let base = |k: usize| corner_color(tri_index, k, tri[k]).map_or([0.8; 3], |c| [c.r(), c.g(), c.b()].map(|v| v as f32 / 255.0));
-                let light = |k: usize| {
-                    let n = if self.render_mode == RenderMode::FlatShaded { face_normal } else { corner_n[k] };
-                    let rgb = illumination(n, corners[k]);
-                    ((rgb[0] + rgb[1] + rgb[2]) / 3.0 - ambient).clamp(0.0, 1.0)
-                };
-                Some((slot.min(gpu_viewport::MAX_TOONS - 1), look, [base(0), base(1), base(2)], [light(0), light(1), light(2)]))
+            let quickshade = quickshade.filter(|(texture, _)| scene_texture.as_ref().is_some_and(|t| Arc::ptr_eq(t, texture)));
+            let textured = quickshade.is_some() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals);
+            // Triangle corner colours follow Houdini's precedence: the first Cd found
+            // on vertices, points, primitives, then the detail.
+            let (point_count, prim_count) = (mesh.vertices.len(), mesh.indices.len());
+            let surface_cd = [
+                ("vertex:Cd", SheetDomain::Vertices, prim_count * 3),
+                ("Cd", SheetDomain::Points, point_count),
+                ("prim:Cd", SheetDomain::Primitives, prim_count),
+                ("detail:Cd", SheetDomain::Detail, 1),
+            ]
+            .into_iter()
+            .find_map(|(key, domain, count)| {
+                let values = mesh.point_attributes.get(key)?;
+                (count > 0 && values.len() >= count).then(|| (values.as_slice(), values.len() / count, domain))
             });
-            let colors = match &toon {
-                // The CPU viewport bands each corner.
-                Some((_, look, base, light)) if gpu_key.is_none() => std::array::from_fn(|k| {
-                    let c = look.shade(base[k], light[k]);
-                    egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
-                }),
-                _ => colors,
+            let corner_color = |tri_index: usize, corner: usize, point: usize| -> Option<egui::Color32> {
+                let (values, components, domain) = surface_cd?;
+                let index = match domain {
+                    SheetDomain::Vertices => tri_index * 3 + corner,
+                    SheetDomain::Points => point,
+                    SheetDomain::Primitives => tri_index,
+                    SheetDomain::Detail => 0,
+                };
+                let [r, g, b] = if components >= 3 {
+                    let at = index * components;
+                    [*values.get(at)?, *values.get(at + 1)?, *values.get(at + 2)?]
+                } else {
+                    attribute_color(*values.get(index * components)?)
+                };
+                // Cd is linear: shown through the display transform, as Houdini does.
+                let [r, g, b] = [r, g, b].map(crate::color::to_display);
+                Some(egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
             };
-            if gpu_key.is_some() {
-                // World-space corners; the GPU does the camera.
-                let corner = |k: usize| [[v0, v1, v2][k].x, [v0, v1, v2][k].y, [v0, v1, v2][k].z];
-                let rgba = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
-                if let Some((slot, _, base, light)) = &toon {
-                    gpu_toon.extend((0..3).map(|k| {
-                        let n = smooth_normals.get(tri[k]).copied().unwrap_or(face_normal);
-                        gpu_viewport::ToonVertex { position: corner(k), light: light[k], color: [base[k][0], base[k][1], base[k][2], 1.0], normal: [n.x, n.y, n.z], material: *slot as f32 }
-                    }));
-                } else if self.render_mode != RenderMode::Wireframe {
-                    // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
-                    gpu_faces.extend((0..3).map(|k| {
-                        let mut colour = rgba(colors[k]);
-                        colour[3] = corner_alpha(tri_index, tri[k]);
-                        gpu_viewport::Vertex::new(corner(k), colour, uv.map(|uv| [uv[k].x, uv[k].y]))
-                    }));
+            let outlines = poly::outline_edges(built);
+            // Toon Shader faces: cel-shaded per pixel on the GPU, with outlines (gpu_viewport.rs).
+            let toon_ids = built.point_attributes.get(TOON_ATTR).filter(|v| v.len() == built.indices.len() && !matches!(self.render_mode, RenderMode::Wireframe | RenderMode::Normals));
+            // Smooth point normals push the outline out without gaps at hard edges.
+            let smooth_normals = if toon_ids.is_some() { built.compute_normals() } else { Vec::new() };
+            // See-through faces: the material's opacity, times Alpha when it uses point alpha.
+            let opacity = built.point_attributes.get(OPACITY_ATTR).filter(|v| v.len() == built.indices.len() * 2);
+            let point_alpha = built.point_attributes.get("Alpha").filter(|a| a.len() == built.vertices.len());
+            let prim_alpha = built.point_attributes.get("prim:Alpha").filter(|a| a.len() == built.indices.len());
+            let corner_alpha = |tri_index: usize, point: usize| -> f32 {
+                let Some(o) = opacity else { return 1.0 };
+                let (amount, uses_alpha) = (o[tri_index * 2], o[tri_index * 2 + 1] > 0.5);
+                let alpha = if uses_alpha { point_alpha.map(|a| a[point]).or(prim_alpha.map(|a| a[tri_index])).unwrap_or(1.0) } else { 1.0 };
+                (amount * alpha).clamp(0.0, 1.0)
+            };
+            for (tri_index, tri) in built.indices.iter().enumerate() {
+                if self.isolate_selection {
+                    let keep = match self.selection_mode {
+                        SelectionMode::Vertex => self.selected_vertices.iter().any(|&i| tri.contains(&i)),
+                        SelectionMode::Triangle => self.selected_triangles.contains(&tri_index),
+                        SelectionMode::Edge => self.selected_edges.iter().any(|&(a, b)| {
+                            tri.contains(&a) && tri.contains(&b)
+                        }),
+                    };
+                    if !keep {
+                        continue;
+                    }
                 }
-                // Toon faces have their outline instead of the wireframe.
-                if let Some(c) = wire.filter(|_| toon.is_none()) {
-                    let colour = c.map(|v| v as f32 / 255.0);
-                    gpu_edges.extend((0..3).filter(|&k| outlines[tri_index][k]).flat_map(|k| [k, (k + 1) % 3]).map(|k| gpu_viewport::Vertex::new(corner(k), colour, None)));
-                }
-                continue;
-            }
-            let camera_triangle = [to_cam(v0), to_cam(v1), to_cam(v2)];
-            let clipped = clip_triangle(camera_triangle);
-            if clipped.len() < 3 {
-                continue;
-            }
-            let first = clipped[0];
-            for i in 1..clipped.len() - 1 {
-                let a = project_cam(first);
-                let b = project_cam(clipped[i]);
-                let c = project_cam(clipped[i + 1]);
-                let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-                if !area.is_finite() || area.abs() < 1e-4 {
+                let (v0, v1, v2) = (mesh.vertices[tri[0]], mesh.vertices[tri[1]], mesh.vertices[tri[2]]);
+                let face_normal = v1.sub(v0).cross(v2.sub(v0)).normalize();
+                let shade = |n: Vec3, point: Vec3| -> egui::Color32 {
+                    match self.render_mode {
+                        RenderMode::Wireframe => egui::Color32::TRANSPARENT,
+                        RenderMode::Normals => egui::Color32::from_rgb(
+                            ((n.x * 0.5 + 0.5) * 255.0) as u8,
+                            ((n.y * 0.5 + 0.5) * 255.0) as u8,
+                            ((n.z * 0.5 + 0.5) * 255.0) as u8,
+                        ),
+                        RenderMode::FlatShaded => {
+                            let rgb = illumination(face_normal, point);
+                            egui::Color32::from_rgb(
+                                (200.0 * rgb[0]) as u8,
+                                (205.0 * rgb[1]) as u8,
+                                (215.0 * rgb[2]) as u8,
+                            )
+                        }
+                        _ => {
+                            let rgb = illumination(n, point);
+                            egui::Color32::from_rgb(
+                                (200.0 * rgb[0]) as u8,
+                                (205.0 * rgb[1]) as u8,
+                                (215.0 * rgb[2]) as u8,
+                            )
+                        }
+                    }
+                };
+                let lit_color = |corner: usize, point: Vec3, normal: Vec3| {
+                    let Some(base) = corner_color(tri_index, corner, tri[corner]) else {
+                        return shade(normal, point);
+                    };
+                    let lighting_normal = if self.render_mode == RenderMode::FlatShaded {
+                        face_normal
+                    } else {
+                        normal
+                    };
+                    let light = illumination(lighting_normal, point);
+                    egui::Color32::from_rgb(
+                        (f32::from(base.r()) * light[0]).clamp(0.0, 255.0) as u8,
+                        (f32::from(base.g()) * light[1]).clamp(0.0, 255.0) as u8,
+                        (f32::from(base.b()) * light[2]).clamp(0.0, 255.0) as u8,
+                    )
+                };
+                let corner_n = corner_normals[tri_index];
+                let colors = if textured {
+                    // White, lit; the texture supplies the colour.
+                    let lit = |point: Vec3, normal: Vec3| {
+                        let n = if self.render_mode == RenderMode::FlatShaded { face_normal } else { normal };
+                        let l = illumination(n, point);
+                        egui::Color32::from_rgb((255.0 * l[0]).min(255.0) as u8, (255.0 * l[1]).min(255.0) as u8, (255.0 * l[2]).min(255.0) as u8)
+                    };
+                    [lit(v0, corner_n[0]), lit(v1, corner_n[1]), lit(v2, corner_n[2])]
+                } else {
+                    [lit_color(0, v0, corner_n[0]), lit_color(1, v1, corner_n[1]), lit_color(2, v2, corner_n[2])]
+                };
+                let uv = quickshade.as_ref().filter(|_| textured).map(|(_, uvs)| uvs[tri_index].map(|c| egui::pos2(c[0], 1.0 - c[1])));
+                // A toon face: its material's slot in the table, its corners' colours and light.
+                let toon = toon_ids.map(|ids| ids[tri_index]).filter(|id| *id >= 0.5).and_then(|id| {
+                    let id = (id - 1.0).round() as usize;
+                    let look = match &self.graph.nodes.get(&id)?.kind {
+                        NodeKind::Shader(v) if v.table == shading::Table::Toon => v.toon_look(),
+                        _ => return None,
+                    };
+                    let slot = *toon_slots.entry(id).or_insert_with(|| {
+                        toon_table.push(look);
+                        toon_table.len() - 1
+                    });
+                    let corners = [v0, v1, v2];
+                    let base = |k: usize| corner_color(tri_index, k, tri[k]).map_or([0.8; 3], |c| [c.r(), c.g(), c.b()].map(|v| v as f32 / 255.0));
+                    let light = |k: usize| {
+                        let n = if self.render_mode == RenderMode::FlatShaded { face_normal } else { corner_n[k] };
+                        let rgb = illumination(n, corners[k]);
+                        ((rgb[0] + rgb[1] + rgb[2]) / 3.0 - ambient).clamp(0.0, 1.0)
+                    };
+                    Some((slot.min(gpu_viewport::MAX_TOONS - 1), look, [base(0), base(1), base(2)], [light(0), light(1), light(2)]))
+                });
+                let colors = match &toon {
+                    // The CPU viewport bands each corner.
+                    Some((_, look, base, light)) if gpu_key.is_none() => std::array::from_fn(|k| {
+                        let c = look.shade(base[k], light[k]);
+                        egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+                    }),
+                    _ => colors,
+                };
+                if gpu_key.is_some() {
+                    // World-space corners; the GPU does the camera.
+                    let corner = |k: usize| [[v0, v1, v2][k].x, [v0, v1, v2][k].y, [v0, v1, v2][k].z];
+                    let rgba = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
+                    if let Some((slot, _, base, light)) = &toon {
+                        gpu_toon.extend((0..3).map(|k| {
+                            let n = smooth_normals.get(tri[k]).copied().unwrap_or(face_normal);
+                            gpu_viewport::ToonVertex { position: corner(k), light: light[k], color: [base[k][0], base[k][1], base[k][2], 1.0], normal: [n.x, n.y, n.z], material: *slot as f32 }
+                        }));
+                    } else if self.render_mode != RenderMode::Wireframe {
+                        // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
+                        gpu_faces.extend((0..3).map(|k| {
+                            let mut colour = rgba(colors[k]);
+                            colour[3] = corner_alpha(tri_index, tri[k]);
+                            gpu_viewport::Vertex::new(corner(k), colour, uv.map(|uv| [uv[k].x, uv[k].y]))
+                        }));
+                    }
+                    // Toon faces have their outline instead of the wireframe.
+                    if let Some(c) = wire.filter(|_| toon.is_none()) {
+                        let colour = c.map(|v| v as f32 / 255.0);
+                        gpu_edges.extend((0..3).filter(|&k| outlines[tri_index][k]).flat_map(|k| [k, (k + 1) % 3]).map(|k| gpu_viewport::Vertex::new(corner(k), colour, None)));
+                    }
                     continue;
                 }
-                queue.push(Poly {
-                    // Near-plane clipped pieces fall back to untextured shading (and show all their edges).
-                    uv: if clipped.len() == 3 { uv } else { None },
-                    edges: if clipped.len() == 3 { outlines[tri_index] } else { [true; 3] },
-                    pts: [a, b, c],
-                    depth: [first.z, clipped[i].z, clipped[i + 1].z],
-                    colors: if clipped.len() == 3 {
-                        colors
-                    } else {
-                        let average = egui::Color32::from_rgb(
-                            ((colors[0].r() as u16 + colors[1].r() as u16 + colors[2].r() as u16) / 3) as u8,
-                            ((colors[0].g() as u16 + colors[1].g() as u16 + colors[2].g() as u16) / 3) as u8,
-                            ((colors[0].b() as u16 + colors[1].b() as u16 + colors[2].b() as u16) / 3) as u8,
-                        );
-                        [average; 3]
-                    },
-                });
+                let camera_triangle = [to_cam(v0), to_cam(v1), to_cam(v2)];
+                let clipped = clip_triangle(camera_triangle);
+                if clipped.len() < 3 {
+                    continue;
+                }
+                let first = clipped[0];
+                for i in 1..clipped.len() - 1 {
+                    let a = project_cam(first);
+                    let b = project_cam(clipped[i]);
+                    let c = project_cam(clipped[i + 1]);
+                    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                    if !area.is_finite() || area.abs() < 1e-4 {
+                        continue;
+                    }
+                    queue.push(Poly {
+                        // Near-plane clipped pieces fall back to untextured shading (and show all their edges).
+                        uv: if clipped.len() == 3 { uv } else { None },
+                        edges: if clipped.len() == 3 { outlines[tri_index] } else { [true; 3] },
+                        pts: [a, b, c],
+                        depth: [first.z, clipped[i].z, clipped[i + 1].z],
+                        colors: if clipped.len() == 3 {
+                            colors
+                        } else {
+                            let average = egui::Color32::from_rgb(
+                                ((colors[0].r() as u16 + colors[1].r() as u16 + colors[2].r() as u16) / 3) as u8,
+                                ((colors[0].g() as u16 + colors[1].g() as u16 + colors[2].g() as u16) / 3) as u8,
+                                ((colors[0].b() as u16 + colors[1].b() as u16 + colors[2].b() as u16) / 3) as u8,
+                            );
+                            [average; 3]
+                        },
+                    });
+                }
             }
         }
+        let cd_color = |i: usize| cd_color_of(mesh, i);
         // Surfaces and wireframe go through a depth buffer (gpu_viewport.rs, else
         // raster.rs), at the screen's pixel density, then onto the viewport as one image.
         let view_display = self.view_displays().first().copied();
@@ -524,62 +516,70 @@ impl ProceduralFxStudioApp {
             let render_camera = capture.flatten().map(|size| (self.resolve_render_camera().0.realtime_camera(size, near_plane, focal), size));
             if let (Some(gpu), Some(key)) = (self.gpu_viewport.as_mut(), gpu_key) {
                 if !gpu_fresh {
-                    gpu.set_scene(key, &gpu_faces, &gpu_edges, &gpu_toon, &toon_table, quickshade.as_ref().map(|(texture, _)| texture.clone()));
+                    gpu.set_scene(key, &gpu_faces, &gpu_edges, &gpu_toon, &toon_table, scene_texture.clone());
                 }
                 if !gpu.has_points(points_key) {
-                    let at = |i: usize| [mesh.vertices[i].x, mesh.vertices[i].y, mesh.vertices[i].z];
-                    let (mut dots, mut splats) = (Vec::new(), Vec::new());
-                    // Hair and other curves, piece by piece, as thick as their width attribute
-                    // (a plain line where they have none), in their Cd or hair colour.
-                    let widths = mesh.point_attributes.get("width").filter(|w| w.len() == point_count);
-                    let width = |i: usize| widths.map_or(-1.0, |w| w[i].max(0.0));
-                    let curves: Vec<gpu_viewport::Strand> = curve_ranges
-                        .iter()
-                        .flat_map(|range| {
+                    let (mut dots, mut splats, mut curves) = (Vec::new(), Vec::new(), Vec::new());
+                    // One fog volume is ray-marched: the first object's.
+                    let mut volume: Option<gpu_volume::VolumeGrid> = None;
+                    for part in &parts {
+                        let mesh: &Mesh = part;
+                        let point_count = mesh.vertices.len();
+                        let at = |i: usize| [mesh.vertices[i].x, mesh.vertices[i].y, mesh.vertices[i].z];
+                        let cd_color = |i: usize| cd_color_of(mesh, i);
+                        let curve_ranges = groom::curves(mesh);
+                        let referenced = used_points(mesh, &curve_ranges);
+                        let has_unreferenced_points = !kinefx::Skeleton::is_skeleton(mesh) && referenced.iter().any(|&r| !r);
+                        let splat_alpha = mesh.point_attributes.get("Alpha").filter(|a| a.len() == point_count && point_count > 0 && has_unreferenced_points);
+                        // Hair and other curves, piece by piece, as thick as their width attribute
+                        // (a plain line where they have none), in their Cd or hair colour.
+                        let widths = mesh.point_attributes.get("width").filter(|w| w.len() == point_count);
+                        let width = |i: usize| widths.map_or(-1.0, |w| w[i].max(0.0));
+                        curves.extend(curve_ranges.iter().flat_map(|range| {
                             let c = cd_color(range.start).unwrap_or(egui::Color32::from_rgb(200, 165, 115));
                             let color = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0];
                             (range.start..range.end.saturating_sub(1)).map(move |i| gpu_viewport::Strand { a: at(i), width_a: width(i), b: at(i + 1), width_b: width(i + 1), color })
-                        })
-                        .collect();
-                    if let Some(alpha) = splat_alpha {
-                        // Soft splats in world units, as opaque at the centre as the CPU's two discs.
-                        let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
-                        // Smoke lit by the scene's lights, when it has any.
-                        let relit = (!volume_lights.is_empty()).then(|| sims::relight_smoke(mesh, &volume_lights)).flatten();
-                        // Cd (or the relit smoke) is linear: shown through the display transform.
-                        let shown: Option<Vec<f32>> = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3)).map(|v| v.iter().map(|c| crate::color::to_display(*c)).collect());
-                        let colors = shown.as_ref();
-                        let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
-                        let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
-                        // A fog volume (Pyro, a fog VDB) whose points are still on its grid is
-                        // ray-marched instead (gpu_volume.rs): smooth at any distance.
-                        let grid = volume::is_volume(mesh)
-                            .then(|| {
-                                let detail = |name: &str| mesh.point_attributes.get(name).filter(|v| !v.is_empty());
-                                let fog = detail("detail:volume_class").is_some_and(|c| c[0] >= 0.5);
-                                let voxel = detail("detail:volume_voxelsize")?[0];
-                                let origin = detail("detail:volume_origin").filter(|o| o.len() >= 3)?;
-                                let voxels: Vec<_> = (0..point_count).filter(|&i| alpha[i] > 0.004 && !referenced[i]).map(|i| (at(i), triple(colors, i, 0.8), alpha[i], triple(emission, i, 0.0))).collect();
-                                fog.then(|| gpu_volume::VolumeGrid::from_points([origin[0], origin[1], origin[2]], voxel, &voxels)).flatten()
-                            })
-                            .flatten();
-                        gpu.set_volume(grid.as_ref());
-                        splats.extend((0..point_count).filter(|&i| grid.is_none() && alpha[i] > 0.004 && !referenced[i]).map(|i| {
-                            let a = alpha[i].clamp(0.0, 1.0);
-                            let [r, g, b] = triple(colors, i, 0.8).map(|c| c.clamp(0.0, 1.0));
-                            gpu_viewport::Point::new(at(i), pscale.map_or(0.05, |p| p[i]), [r, g, b, 1.0 - (1.0 - a * 0.5) * (1.0 - a * 0.6)], triple(emission, i, 0.0))
                         }));
-                    } else if self.show_points || particle_display || has_unreferenced_points {
-                        gpu.set_volume(None);
-                        let radius = if particle_display || has_unreferenced_points { 3.5 } else { 2.0 };
-                        dots.extend((0..point_count).filter(|&i| !(has_unreferenced_points && referenced[i])).map(|i| {
-                            let c = point_attribute_color(i);
-                            gpu_viewport::Point::new(at(i), radius, [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0], [0.0; 3])
-                        }));
+                        if let Some(alpha) = splat_alpha {
+                            // Soft splats in world units, as opaque at the centre as the CPU's two discs.
+                            let pscale = mesh.point_attributes.get("pscale").filter(|v| v.len() == point_count);
+                            // Smoke lit by the scene's lights, when it has any.
+                            let relit = (!volume_lights.is_empty()).then(|| sims::relight_smoke(mesh, &volume_lights)).flatten();
+                            // Cd (or the relit smoke) is linear: shown through the display transform.
+                            let shown: Option<Vec<f32>> = relit.as_ref().or_else(|| mesh.point_attributes.get("Cd").filter(|v| v.len() == point_count * 3)).map(|v| v.iter().map(|c| crate::color::to_display(*c)).collect());
+                            let colors = shown.as_ref();
+                            let emission = mesh.point_attributes.get("emission").filter(|v| v.len() == point_count * 3);
+                            let triple = |values: Option<&Vec<f32>>, i: usize, default: f32| values.map_or([default; 3], |v| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
+                            // A fog volume (Pyro, a fog VDB) whose points are still on its grid is
+                            // ray-marched instead (gpu_volume.rs): smooth at any distance.
+                            let grid = (volume.is_none() && volume::is_volume(mesh))
+                                .then(|| {
+                                    let detail = |name: &str| mesh.point_attributes.get(name).filter(|v| !v.is_empty());
+                                    let fog = detail("detail:volume_class").is_some_and(|c| c[0] >= 0.5);
+                                    let voxel = detail("detail:volume_voxelsize")?[0];
+                                    let origin = detail("detail:volume_origin").filter(|o| o.len() >= 3)?;
+                                    let voxels: Vec<_> = (0..point_count).filter(|&i| alpha[i] > 0.004 && !referenced[i]).map(|i| (at(i), triple(colors, i, 0.8), alpha[i], triple(emission, i, 0.0))).collect();
+                                    fog.then(|| gpu_volume::VolumeGrid::from_points([origin[0], origin[1], origin[2]], voxel, &voxels)).flatten()
+                                })
+                                .flatten();
+                            let marched = grid.is_some();
+                            if marched {
+                                volume = grid;
+                            }
+                            splats.extend((0..point_count).filter(|&i| !marched && alpha[i] > 0.004 && !referenced[i]).map(|i| {
+                                let a = alpha[i].clamp(0.0, 1.0);
+                                let [r, g, b] = triple(colors, i, 0.8).map(|c| c.clamp(0.0, 1.0));
+                                gpu_viewport::Point::new(at(i), pscale.map_or(0.05, |p| p[i]), [r, g, b, 1.0 - (1.0 - a * 0.5) * (1.0 - a * 0.6)], triple(emission, i, 0.0))
+                            }));
+                        } else if self.show_points || particle_display || has_unreferenced_points {
+                            let radius = if particle_display || has_unreferenced_points { 3.5 } else { 2.0 };
+                            dots.extend((0..point_count).filter(|&i| !(has_unreferenced_points && referenced[i])).map(|i| {
+                                let c = cd_color(i).unwrap_or(point_color);
+                                gpu_viewport::Point::new(at(i), radius, [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0], [0.0; 3])
+                            }));
+                        }
                     }
-                    if splat_alpha.is_none() && !(self.show_points || particle_display || has_unreferenced_points) {
-                        gpu.set_volume(None);
-                    }
+                    gpu.set_volume(volume.as_ref());
                     gpu.set_points(points_key, &dots, &splats, &curves);
                 }
                 let camera = gpu_viewport::Camera {
@@ -629,7 +629,7 @@ impl ProceduralFxStudioApp {
                 let mut raster = raster::Raster::new(w, h, self.orthographic);
                 let to_pixel = |p: egui::Pos2, z: f32| raster::ScreenVertex { x: (p.x - rect_min.x) * scale, y: (p.y - rect_min.y) * scale, z };
                 let rgb = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
-                let texture = quickshade.as_ref().map(|(texture, _)| texture.clone());
+                let texture = scene_texture.clone();
                 // Wireframe mode shows every edge, so its (transparent) faces don't occlude.
                 let triangles: Vec<raster::Triangle> = if self.render_mode == RenderMode::Wireframe {
                     Vec::new()
@@ -798,4 +798,18 @@ impl ProceduralFxStudioApp {
         }
         self.draw_cooking_notice(ui, ctx, &painter, response.rect);
     }
+}
+
+// A point's Cd as the viewport shows it (linear Cd through the display transform; one value:
+// a heat colour), if the mesh has point colours.
+fn cd_color_of(mesh: &Mesh, index: usize) -> Option<egui::Color32> {
+    let values = mesh.point_attributes.get("Cd")?;
+    let vertex_count = mesh.vertices.len();
+    let [r, g, b] = if values.len() >= vertex_count.saturating_mul(3) {
+        [*values.get(index * 3)?, *values.get(index * 3 + 1)?, *values.get(index * 3 + 2)?]
+    } else {
+        attribute_color(*values.get(index)?)
+    };
+    let [r, g, b] = [r, g, b].map(crate::color::to_display);
+    Some(egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
 }

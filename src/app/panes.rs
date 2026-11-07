@@ -492,7 +492,10 @@ impl ProceduralFxStudioApp {
         match (source_node, self.sheet_cache.as_mut()) {
             (Some(_), Some((_, _, cached))) => *cached = mesh,
             _ if self.sheet_from_selected => {}
-            _ => self.current_mesh = mesh,
+            _ => {
+                self.current_mesh = mesh;
+                self.shown_parts.clear();
+            }
         }
     }
 

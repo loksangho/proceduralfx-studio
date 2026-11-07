@@ -634,8 +634,12 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) template_mesh: Mesh,
     // Inside a geometry network: the other objects, shown around it (not pickable), and the
     // viewport's mesh with them (built when the shown geometry changes).
-    pub(crate) context_mesh: Mesh,
-    pub(crate) shown_mesh: (u64, Mesh),
+    pub(crate) context_parts: Vec<Mesh>,
+    // The displayed objects, one mesh each, when there's more than one (current_mesh is them
+    // merged): the viewport draws each from its own attributes. Empty: current_mesh alone.
+    pub(crate) shown_parts: Vec<Mesh>,
+    // The same, for frames in frame_cache.
+    pub(crate) frame_parts: HashMap<String, Vec<Mesh>>,
     // Cooked results of nodes that don't change with time, with the fingerprint each was
     // cooked at (Graph::cook_fingerprint): good while it still matches.
     pub(crate) static_cache: HashMap<NodeId, (u64, Mesh)>,
@@ -644,7 +648,7 @@ pub(crate) struct ProceduralFxStudioApp {
     pub(crate) frame_cache_order: VecDeque<String>,
     pub(crate) frame_cache_hits: usize,
     pub(crate) frame_cache_misses: usize,
-    pub(crate) simulation_rx: Option<Receiver<Mesh>>,
+    pub(crate) simulation_rx: Option<Receiver<Vec<Mesh>>>,
     pub(crate) simulation_key: String,
     // The status message a background cook's progress message replaced, put back when the
     // cook finishes (a preset's hint, say).
@@ -919,8 +923,9 @@ impl Default for ProceduralFxStudioApp {
             last_state,
             template: None,
             template_mesh: Mesh::default(),
-            context_mesh: Mesh::default(),
-            shown_mesh: (u64::MAX, Mesh::default()),
+            context_parts: Vec::new(),
+            shown_parts: Vec::new(),
+            frame_parts: HashMap::new(),
             static_cache: HashMap::new(),
             cache_key: String::new(),
             frame_cache: HashMap::new(),

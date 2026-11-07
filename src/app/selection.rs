@@ -111,6 +111,7 @@ impl ProceduralFxStudioApp {
             }
         }
         self.current_mesh = input.clone();
+        self.shown_parts.clear();
         self.mesh_revision += 1;
         self.group_pick = Some(GroupPick { node: id, target, domain, input, previous_mode });
         self.status = "Select in the viewport, then press Enter (or ✓) to set the group; Esc cancels".into();

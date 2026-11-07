@@ -476,6 +476,7 @@ impl ProceduralFxStudioApp {
             if ui.button("Reset simulations").on_hover_text("Forget cached solver steps and frames, freeing their memory, and simulate again from the start").clicked() {
                 sims::clear_all();
                 self.frame_cache.clear();
+                self.frame_parts.clear();
                 self.frame_cache_order.clear();
                 c = true;
             }
