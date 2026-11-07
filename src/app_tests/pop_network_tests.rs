@@ -56,18 +56,21 @@ fn a_new_pop_network_births_and_falls() {
     assert_eq!(menu.iter().filter(|k| matches!(k, NodeKind::Pop(_))).count(), pop::OPS.len());
     assert!(menu.iter().all(|k| matches!(k, NodeKind::Pop(_) | NodeKind::Merge)));
 
-    // 200 a second for a second from the origin, living 1.5-2.5 s: all 200 alive.
+    // 200 a second from the origin, living 1.5-2.5 s: by 1 s (frame 25) 25 steps have run,
+    // the first on frame 1 as in Houdini, so 25/24 of 200, all alive.
     let out = cook(&app, net, 1.0);
-    assert_eq!(out.vertices.len(), 200);
+    assert_eq!(out.vertices.len(), 208);
+    // Frame 1 already has the first step's births.
+    assert_eq!(cook(&app, net, 0.0).vertices.len(), 8);
     for name in ["v", "age", "life", "id"] {
         assert!(out.point_attributes.contains_key(name), "{name}");
     }
     assert!(!out.point_attributes.contains_key("detail:pop_next_id"));
     // Launched up at about 1, pulled down by gravity: the oldest are falling now.
-    let oldest = (0..200).max_by(|&a, &b| out.point_attributes["age"][a].total_cmp(&out.point_attributes["age"][b])).unwrap();
+    let oldest = (0..208).max_by(|&a, &b| out.point_attributes["age"][a].total_cmp(&out.point_attributes["age"][b])).unwrap();
     assert!(out.point_attributes["v"][oldest * 3 + 1] < -5.0);
     // Viewing a POP inside shows the network's particles.
-    assert_eq!(cook(&app, gravity, 1.0).vertices.len(), 200);
+    assert_eq!(cook(&app, gravity, 1.0).vertices.len(), 208);
     // Scrubbing back gives the same frame.
     let again = cook(&app, net, 0.5);
     let _later = cook(&app, net, 1.5);

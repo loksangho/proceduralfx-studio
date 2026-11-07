@@ -188,14 +188,16 @@ pub fn sop_solver(
 pub fn pop_network(key: u64, time: f32, substeps: usize, mut step: impl FnMut(&Mesh, f32, f32, usize, bool) -> Mesh) -> Mesh {
     let substeps = substeps.clamp(1, 16);
     let dt = 1.0 / (SIM_FPS * substeps as f32);
+    // As in Houdini, the first step is at the start frame (frame 1, time 0), so its births
+    // show on frame 1 and its parameters are read there: each step is at the time it starts.
     run(
         key,
-        step_count(time, substeps),
+        step_count(time, substeps) + 1,
         12,
         Mesh::default,
         |mesh: &Mesh| mesh.clone(),
         |mesh: &Mesh| mesh.clone(),
-        |state, at| *state = step(state, at as f32 * dt, dt, at, (at - 1) % substeps == 0),
+        |state, at| *state = step(state, (at - 1) as f32 * dt, dt, at, (at - 1) % substeps == 0),
         crate::pop::output,
     )
 }
