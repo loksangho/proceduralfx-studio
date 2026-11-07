@@ -685,3 +685,67 @@ fn the_assistants_notes_scroll_instead_of_running_off_the_bottom() {
     assert!(last.bottom() <= 900.0 && last.top() >= 0.0, "the newest note is on screen: {last:?}");
     assert!(h.query_by_label("• Step 0: adding nodes and checking the result").is_none_or(|n| n.rect().bottom() < last.top()), "the oldest has scrolled up");
 }
+
+// Dragging on empty network space selects the nodes in the box; Shift adds, Ctrl takes away,
+// and Alt-dragging pans instead.
+#[test]
+fn dragging_a_box_selects_nodes() {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 40 0 obj box 1 1\nparent 1 0\nnode 2 40 140 0 obj box 1 1\nparent 2 0\nnode 3 40 240 0 obj box 1 1\nparent 3 0\nnode 4 40 400 0 obj box 1 1\nparent 4 0\nnext 5\n".into());
+    app.current_network = Some(0);
+    app.selected = None;
+    let mut h = harness(app);
+    let corner = |h: &Harness<ProceduralFxStudioApp>, id: NodeId, dx: f32, dy: f32| {
+        let r = node_on_screen(h, id);
+        if dx < 0.0 { r.left_top() + egui::vec2(dx, dy) } else { r.right_bottom() + egui::vec2(dx, dy) }
+    };
+    // A drag with modifier keys held throughout.
+    let drag_with = |h: &mut Harness<ProceduralFxStudioApp>, from: egui::Pos2, to: egui::Pos2, m: egui::Modifiers| {
+        let step = |h: &mut Harness<ProceduralFxStudioApp>, n: usize| {
+            for _ in 0..n {
+                h.input_mut().modifiers = m;
+                h.step();
+            }
+        };
+        let button = |h: &mut Harness<ProceduralFxStudioApp>, at: egui::Pos2, pressed: bool| {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: m });
+        };
+        h.hover_at(from);
+        step(h, 2);
+        button(h, from, true);
+        step(h, 2);
+        for k in 1..=8 {
+            h.hover_at(from + (to - from) * (k as f32 / 8.0));
+            step(h, 2);
+        }
+        button(h, to, false);
+        step(h, 2);
+    };
+    let selection = |h: &Harness<ProceduralFxStudioApp>| {
+        let mut s = h.state().selected_nodes();
+        s.sort_unstable();
+        s
+    };
+    // A box round the left column: nodes 1, 2 and 3.
+    let (from, to) = (corner(&h, 1, -15.0, -15.0), corner(&h, 3, 15.0, 15.0));
+    drag(&mut h, from, to);
+    assert_eq!(selection(&h), vec![1, 2, 3]);
+    // Shift: node 4 joins them.
+    let (from, to) = (corner(&h, 4, -15.0, -15.0), corner(&h, 4, 15.0, 15.0));
+    drag_with(&mut h, from, to, egui::Modifiers::SHIFT);
+    assert_eq!(selection(&h), vec![1, 2, 3, 4]);
+    // Ctrl: node 2 leaves.
+    let (from, to) = (corner(&h, 2, -15.0, -15.0), corner(&h, 2, 15.0, 15.0));
+    drag_with(&mut h, from, to, egui::Modifiers::COMMAND);
+    assert_eq!(selection(&h), vec![1, 3, 4]);
+    // A plain box elsewhere replaces the selection.
+    let (from, to) = (corner(&h, 4, -15.0, -15.0), corner(&h, 4, 15.0, 15.0));
+    drag_with(&mut h, from, to, egui::Modifiers::NONE);
+    assert_eq!(selection(&h), vec![4]);
+    // Alt-drag pans, selecting nothing new.
+    let pan = h.state().graph_pan;
+    let start = corner(&h, 1, -15.0, -30.0);
+    drag_with(&mut h, start, start + egui::vec2(120.0, 60.0), egui::Modifiers::ALT);
+    assert!((h.state().graph_pan - pan).length() > 50.0, "the view moved");
+    assert_eq!(selection(&h), vec![4]);
+}

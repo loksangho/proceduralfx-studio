@@ -913,14 +913,16 @@ impl ProceduralFxStudioApp {
             y += step;
         }
 
-        // Shift-drag on empty space draws a box that selects the nodes it touches.
-        let shift = ui.input(|i| i.modifiers.shift);
-        if canvas.drag_started_by(egui::PointerButton::Primary) && shift {
-            self.node_box = canvas.interact_pointer_pos();
+        // Dragging on empty space draws a box that selects the nodes it touches, as in
+        // Houdini: Shift adds them to the selection, Ctrl (⌘ on a Mac) takes them out.
+        // The middle button pans, and so does dragging with Alt held (for trackpads).
+        let (shift, remove) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+        let pan_key = ui.input(|i| i.modifiers.alt);
+        if canvas.drag_started_by(egui::PointerButton::Primary) && !pan_key && self.dragging_link.is_none() {
+            // Where the button went down: by the time it counts as a drag, the pointer has moved.
+            self.node_box = ui.input(|i| i.pointer.press_origin()).or_else(|| canvas.interact_pointer_pos());
         }
-        if canvas.dragged_by(egui::PointerButton::Middle)
-            || (canvas.dragged_by(egui::PointerButton::Primary) && self.dragging_link.is_none() && self.node_box.is_none())
-        {
+        if canvas.dragged_by(egui::PointerButton::Middle) || (canvas.dragged_by(egui::PointerButton::Primary) && pan_key && self.node_box.is_none()) {
             self.graph_pan += canvas.drag_delta();
         }
         if let (Some(start), Some(now)) = (self.node_box, ui.input(|i| i.pointer.interact_pos())) {
@@ -933,14 +935,18 @@ impl ProceduralFxStudioApp {
                     .map(|(id, _)| *id)
                     .collect();
                 inside.sort_unstable();
-                // The box adds to what's already selected.
-                let mut chosen = self.selected_nodes();
-                for id in inside {
-                    if !chosen.contains(&id) {
-                        chosen.push(id);
+                let mut chosen = if shift || remove { self.selected_nodes() } else { Vec::new() };
+                if remove {
+                    chosen.retain(|id| !inside.contains(id));
+                } else {
+                    for id in inside {
+                        if !chosen.contains(&id) {
+                            chosen.push(id);
+                        }
                     }
                 }
-                self.selected = chosen.last().copied();
+                // The node the panel shows: one still selected, the last boxed otherwise.
+                self.selected = self.selected.filter(|s| chosen.contains(s)).or(chosen.last().copied());
                 self.node_selection = chosen;
             }
         }

@@ -205,6 +205,7 @@ impl ProceduralFxStudioApp {
         // the parameters when there isn't (so they never cover them).
         let notes = egui::RichText::new(
             "Network: RMB add node • drag output→input to wire\n\
+                     drag empty space = box select (Shift adds, Ctrl removes) • MMB or Alt-drag = pan\n\
                      click input to disconnect • dbl-click = display\n\
                      OBJ: Geometry / Light / Camera nodes need no wiring •\n\
                      dbl-click Geometry to enter • U = up • dbl-click Camera = look through • dbl-click Light = on/off\n\
