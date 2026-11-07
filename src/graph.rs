@@ -510,6 +510,9 @@ impl Graph {
                         None => [crate::color::to_linear(0.8); 3],
                     }).collect()
                 });
+                // Corner colours (a model's) stay where a material uses Cd, and give way elsewhere.
+                let mut corner_cd = mesh.point_attributes.get("vertex:Cd").filter(|c| c.len() == n * 9).cloned();
+                let has_cd = point_cd.is_some() || corner_cd.is_some();
                 let mut textures: Vec<Option<String>> = Vec::new();
                 let mut toon = vec![0.0f32; n];
                 let mut opacity: Option<Vec<f32>> = None;
@@ -523,8 +526,13 @@ impl Graph {
                     }
                     let preview = material.and_then(|m| self.material_preview(m));
                     if let Some((colour, texture, uses_cd)) = preview {
-                        if !(uses_cd && point_cd.is_some()) {
+                        if !(uses_cd && has_cd) {
                             colours[t * 3..t * 3 + 3].copy_from_slice(&colour);
+                            if let Some(corners) = corner_cd.as_mut() {
+                                for k in 0..3 {
+                                    corners[(t * 3 + k) * 3..(t * 3 + k) * 3 + 3].copy_from_slice(&colour);
+                                }
+                            }
                         }
                         textures.push(texture);
                     } else {
@@ -533,6 +541,9 @@ impl Graph {
                 }
                 mesh.point_attributes.remove("Cd");
                 mesh.point_attributes.insert("prim:Cd".into(), colours);
+                if let Some(corners) = corner_cd {
+                    mesh.point_attributes.insert("vertex:Cd".into(), corners);
+                }
                 if toon.iter().any(|t| *t > 0.0) {
                     mesh.point_attributes.insert(TOON_ATTR.into(), toon);
                 }
@@ -549,7 +560,10 @@ impl Graph {
             } else if let Some((color, texture, uses_cd)) = object_material.and_then(|m| self.material_preview(m)) {
                 let coloured = mesh.point_attributes.keys().any(|k| k == "Cd" || k.ends_with(":Cd"));
                 if !(coloured && uses_cd) && !mesh.indices.is_empty() {
-                    mesh.point_attributes.remove("Cd");
+                    // The material's colour, over any the geometry has (a model's corner colours too).
+                    for key in ["Cd", "vertex:Cd", "detail:Cd"] {
+                        mesh.point_attributes.remove(key);
+                    }
                     mesh.point_attributes.insert("prim:Cd".into(), color.repeat(mesh.indices.len()));
                 }
                 if let Some(id) = object_material.filter(|id| self.is_toon(*id) && !mesh.indices.is_empty()) {

@@ -73,3 +73,29 @@ fn geometry_menus_have_no_shading_networks_and_search_matches_words() {
     assert!(find("rigging ik").iter().any(|n| n == "two_bone_ik"), "category words match too");
     assert!(find("zzzz").is_empty());
 }
+
+// A material that doesn't use Cd shows its own colour over a model's corner colours (as a
+// USDZ's texture brings them); one that does keeps them.
+#[test]
+fn an_objects_material_colours_over_a_models_corner_colours() {
+    let mut g = Graph::default();
+    // A Principled Shader, blue, not using point colour.
+    let mut shader = shading::Values::new(shading::Table::Principled);
+    shader.set("base_color", [0.0, 0.3, 1.0]);
+    let blue = g.add(NodeKind::Shader(shader), egui::pos2(0.0, 0.0));
+    g.nodes.get_mut(&blue).unwrap().context = AppContext::Mat;
+    let geo = g.add(NodeKind::Geometry { material: Some(blue) }, egui::pos2(0.0, 0.0));
+    let grid = g.add(NodeKind::Grid { size: 2.0, res: 3 }, egui::pos2(0.0, 0.0));
+    let gold = g.add(NodeKind::Wrangle { code: "v@Cd = set(1, 0.8, 0.2);".into(), domain: 3 }, egui::pos2(0.0, 80.0));
+    for id in [grid, gold] {
+        g.nodes.get_mut(&id).unwrap().parent = Some(geo);
+    }
+    g.connect(grid, gold, 0);
+    g.set_display(gold);
+    let raw = g.cook(gold, 0.0, &mut HashMap::new());
+    assert!(raw.point_attributes.contains_key("vertex:Cd"), "the corners have their own colour");
+    let shown = g.cook_display(&[geo], 0.0, &mut HashMap::new());
+    assert!(!shown.point_attributes.contains_key("vertex:Cd"), "the material's colour wins");
+    let cd = &shown.point_attributes["prim:Cd"];
+    assert!(cd[2] > 0.5 && cd[0] < 0.2, "blue: {:?}", &cd[..3]);
+}
