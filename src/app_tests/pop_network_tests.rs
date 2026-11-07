@@ -310,7 +310,7 @@ fn a_stream_in_the_network_pushes_only_its_particles() {
 
     let out = cook(&app, net, 0.5);
     let n = out.vertices.len();
-    let member = &out.point_attributes["group:stream_stream1"];
+    let member = &out.point_attributes[&pop::stream_group(&app.graph.nodes[&stream].title(stream))];
     let joined = member.iter().filter(|m| **m > 0.5).count();
     assert!(joined > n / 4 && joined < n * 3 / 4, "{joined} of {n} in the stream");
     let (v, age) = (&out.point_attributes["v"], &out.point_attributes["age"]);
@@ -319,7 +319,6 @@ fn a_stream_in_the_network_pushes_only_its_particles() {
         assert_eq!(pushed, member[i] > 0.5, "particle {i}: only the stream is pushed");
         assert!(v[i * 3 + 2] > 0.1, "particle {i}: the drag after the merge reaches everyone");
     }
-    assert!(!out.point_attributes.contains_key(pop::STREAM_MASK));
 }
 
 #[test]
@@ -351,4 +350,54 @@ fn a_curve_force_carries_particles_along_a_curve_node() {
         assert!(p.y > 0.5 && v[i * 3 + 1] > 0.5, "particle {i} at {p:?} rides up the curve");
         assert!(p.z.abs() < 0.05, "{p:?}");
     }
+}
+
+// As in Houdini: a POP Source's particles are a stream that the POPs below it act on; a
+// source wired into two streams births once; a stream below a stream takes from it only.
+#[test]
+fn sources_are_streams_and_branches_share_one_set_of_particles() {
+    let (mut app, net) = new_network();
+    let (solver, gravity) = (child(&app, net, pop::SOLVER), child(&app, net, pop::GRAVITY));
+    set(&mut app, gravity, "force", &[0.0, 0.0, 0.0]);
+    let first = child(&app, net, pop::SOURCE);
+    set(&mut app, first, "birth_rate", &[240.0]);
+    // A second source, merged with the first's chain into the post-solve input.
+    let second = pop_child(&mut app, net, pop::SOURCE);
+    set(&mut app, second, "birth_rate", &[240.0]);
+    // Below the first source: two streams (a half and the rest), one of them with a stream
+    // below it, each colouring its particles.
+    let colour = |app: &mut ProceduralFxStudioApp, c: [f32; 3]| {
+        let id = pop_child(app, net, pop::COLOR);
+        set(app, id, "color", &c);
+        id
+    };
+    let half = pop_child(&mut app, net, pop::STREAM);
+    set(&mut app, half, "ratio", &[0.5]);
+    let all_of_it = pop_child(&mut app, net, pop::STREAM);
+    set(&mut app, all_of_it, "rule", &[0.0]);
+    let inner = pop_child(&mut app, net, pop::STREAM);
+    set(&mut app, inner, "rule", &[0.0]);
+    let (red, green, blue) = (colour(&mut app, [1.0, 0.0, 0.0]), colour(&mut app, [0.0, 1.0, 0.0]), colour(&mut app, [0.0, 0.0, 1.0]));
+    let merge = app.graph.add(NodeKind::Merge, egui::pos2(0.0, 0.0));
+    app.graph.nodes.get_mut(&merge).unwrap().parent = Some(net);
+    app.graph.links.retain(|l| !(l.to == solver && l.from == first));
+    for (from, to, slot) in [(first, all_of_it, 0), (all_of_it, green, 0), (first, half, 0), (half, inner, 0), (inner, red, 0), (green, merge, 0), (red, merge, 1), (second, blue, 0), (blue, merge, 2), (merge, solver, 2)] {
+        app.graph.connect(from, to, slot);
+    }
+    let out = cook(&app, net, 0.5);
+    // Two sources' worth of births (240 a second each, 13 steps), not one per branch.
+    assert_eq!(out.vertices.len(), 2 * 130);
+    let group = |id: NodeId| out.point_attributes[&pop::stream_group(&app.graph.nodes[&id].title(id))].iter().map(|g| *g > 0.5).collect::<Vec<bool>>();
+    let (from_first, from_second, in_half) = (group(first), group(second), group(half));
+    assert_eq!(from_first.iter().filter(|g| **g).count(), 130, "each source's births are its stream");
+    assert!(from_first.iter().zip(&from_second).all(|(a, b)| a != b));
+    let cd = &out.point_attributes["Cd"];
+    for i in 0..out.vertices.len() {
+        let c = &cd[i * 3..i * 3 + 3];
+        let expected = if from_second[i] { [0.0, 0.0, 1.0] } else if in_half[i] { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+        assert_eq!(c, expected, "particle {i}: only its own streams colour it");
+    }
+    assert!(in_half.iter().zip(&group(inner)).all(|(h, i)| h == i), "the stream below takes all of the half, and only it");
+    let halves = in_half.iter().filter(|g| **g).count();
+    assert!(halves > 30 && halves < 100, "{halves}");
 }

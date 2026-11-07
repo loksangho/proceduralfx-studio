@@ -1522,102 +1522,131 @@ impl Graph {
             stack.extend(self.links.iter().filter(|l| l.to == at).map(|l| l.from));
         }
         let s = pop::Step { time, dt, step, frame_start, node_seed: 0, inputs, colliders: &colliders };
-        let mut out = self.pop_eval(display, prev, &s, None, &mut HashSet::new());
-        // A stream left open at the end doesn't carry into the next step.
-        out.point_attributes.remove(pop::STREAM_MASK);
+        let out = self.pop_run(display, prev.clone(), &s);
         SOLVER_TIME_INC.with(|inc| inc.set(outer_inc));
         out
     }
 
-    // The particles a node inside a POP Network gives. `onto`: the particles it acts on when
-    // it's in a solver's second or third input (or below such a node); None in the main
-    // stream, where a POP with nothing above it acts on the last step's particles.
-    pub(crate) fn pop_eval(&self, id: NodeId, prev: &Mesh, s: &pop::Step, onto: Option<Mesh>, visiting: &mut HashSet<NodeId>) -> Mesh {
-        let Some(node) = self.nodes.get(&id) else {
-            return onto.unwrap_or_else(|| prev.clone());
-        };
-        // A loop in the wiring: stop here.
-        if !visiting.insert(id) {
-            return onto.unwrap_or_else(|| prev.clone());
+    // Runs the part of a POP Network that ends at `root` on `particles`, as Houdini's POPs
+    // do: one set of particles, each node run once, its inputs first (a Merge's in input
+    // order), and each node acting on the stream it's in. A POP Source starts the stream of
+    // its own particles (the group stream_<name>); a POP Stream narrows the stream above it;
+    // a Merge or a POP Solver brings the streams back together, so what's below them acts
+    // on every particle. A node with nothing above it acts on every particle too.
+    pub(crate) fn pop_run(&self, root: NodeId, particles: Mesh, s: &pop::Step) -> Mesh {
+        fn visit(g: &Graph, id: NodeId, seen: &mut HashSet<NodeId>, order: &mut Vec<NodeId>) {
+            if !seen.insert(id) {
+                return;
+            }
+            // A solver's inputs run inside it (see pop_solve).
+            let solver = matches!(g.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::Pop(p)) if p.op == pop::SOLVER);
+            if !solver {
+                let mut inputs: Vec<(usize, NodeId)> = g.links.iter().filter(|l| l.to == id).map(|l| (l.slot, l.from)).collect();
+                inputs.sort_unstable();
+                for (_, from) in inputs {
+                    visit(g, from, seen, order);
+                }
+            }
+            order.push(id);
         }
-        let mut inputs: Vec<(usize, NodeId)> = self.links.iter().filter(|l| l.to == id).map(|l| (l.slot, l.from)).collect();
-        inputs.sort_unstable();
-        let input = |slot: usize| inputs.iter().find(|(k, _)| *k == slot).map(|(_, from)| *from);
-        let upstream = |slot: usize, onto: Option<Mesh>, visiting: &mut HashSet<NodeId>| match input(slot) {
-            Some(from) => self.pop_eval(from, prev, s, onto, visiting),
-            None => onto.unwrap_or_else(|| prev.clone()),
+        let mut order = Vec::new();
+        visit(self, root, &mut HashSet::new(), &mut order);
+        let mut particles = particles;
+        // The group each node's output stream is (None: every particle).
+        let mut streams: HashMap<NodeId, Option<String>> = HashMap::new();
+        for id in order {
+            let Some(node) = self.nodes.get(&id) else { continue };
+            let input_stream = self.links.iter().filter(|l| l.to == id && l.slot == 0).find_map(|l| streams.get(&l.from).cloned()).flatten();
+            let kind = self.kind_at(id, s.time);
+            let out = match kind.as_ref() {
+                _ if node.bypass => input_stream,
+                NodeKind::Merge => None,
+                NodeKind::Pop(p) if p.op == pop::OBJECT => None,
+                NodeKind::Pop(p) if p.op == pop::SOLVER => {
+                    particles = self.pop_solve(id, particles, s);
+                    None
+                }
+                NodeKind::Pop(p) => {
+                    let (out, stream) = self.pop_node(id, node, p, particles, input_stream.as_deref(), s);
+                    particles = out;
+                    stream
+                }
+                // Anything else passes the particles and their stream through.
+                _ => input_stream,
+            };
+            streams.insert(id, out);
+        }
+        particles
+    }
+
+    // A POP Solver: its first input's network (the objects), then its pre-solve input's, a
+    // step, the colliders, and its post-solve input's.
+    fn pop_solve(&self, id: NodeId, particles: Mesh, s: &pop::Step) -> Mesh {
+        let input = |slot: usize| self.links.iter().find(|l| l.to == id && l.slot == slot).map(|l| l.from);
+        let run = |slot: usize, particles: Mesh| match input(slot) {
+            Some(from) => self.pop_run(from, particles, s),
+            None => particles,
         };
-        let kind = self.kind_at(id, s.time);
-        let out = match kind.as_ref() {
-            _ if node.bypass => upstream(0, onto, visiting),
-            // Each input in turn: the first gives the particles, the rest act on them.
-            // A POP Stream ends at the Merge, so each input starts from all the particles.
-            NodeKind::Merge => {
-                let outer = onto.as_ref().and_then(|m| m.point_attributes.get(pop::STREAM_MASK).cloned());
-                let mut particles = onto;
-                for (_, from) in &inputs {
-                    let mut out = self.pop_eval(*from, prev, s, particles, visiting);
-                    match &outer {
-                        Some(stream) if stream.len() == out.vertices.len() => {
-                            out.point_attributes.insert(pop::STREAM_MASK.into(), stream.clone());
-                        }
-                        _ => {
-                            out.point_attributes.remove(pop::STREAM_MASK);
-                        }
-                    }
-                    particles = Some(out);
+        let mut particles = run(1, run(0, particles));
+        pop::integrate(&mut particles, s.dt);
+        if !s.colliders.is_empty() {
+            pop::bounce_off(&mut particles, s.colliders, None);
+        }
+        run(2, particles)
+    }
+
+    // One POP (not a solver or object) on the particles, acting on `stream` (a group; None:
+    // all of them) and its own group; returns them and the stream it hands on.
+    fn pop_node(&self, id: NodeId, node: &Node, p: &pop::PopNode, mut particles: Mesh, stream: Option<&str>, s: &pop::Step) -> (Mesh, Option<String>) {
+        pop::tidy(&mut particles);
+        let n = particles.vertices.len();
+        let in_stream: Option<Vec<bool>> = stream.map(|key| particles.point_attributes.get(key).filter(|g| g.len() == n).map_or_else(|| vec![false; n], |g| g.iter().map(|v| *v > 0.5).collect()));
+        let group = groups::point_mask(&particles, &node.group).ok().flatten();
+        let mask = match (in_stream, group) {
+            (Some(a), Some(b)) => Some(a.iter().zip(&b).map(|(x, y)| *x && *y).collect::<Vec<bool>>()),
+            (a, b) => a.or(b),
+        };
+        // VEX input 0 is the particles; 1-3 are the POP Network's inputs 0-2.
+        let others = &s.inputs[..s.inputs.len().min(vex::INPUTS - 1)];
+        let passed = stream.map(str::to_owned);
+        match p.op {
+            pop::WRANGLE => (node_wrangle(particles, others, p.text(0), s.time, 2, mask.as_deref(), Some(&node.channels)), passed),
+            pop::VOP => match self.vop_code(id) {
+                Ok(code) => (node_wrangle(particles, others, &code, s.time, 2, mask.as_deref(), Some(&node.channels)), passed),
+                Err(_) => (particles, passed),
+            },
+            _ => {
+                if let Some(code) = p.expression_code() {
+                    particles = node_wrangle(particles, others, &code, s.time, 2, None, Some(&node.channels));
                 }
-                particles.unwrap_or_else(|| prev.clone())
-            }
-            NodeKind::Pop(p) if p.op == pop::OBJECT => onto.unwrap_or_else(|| prev.clone()),
-            NodeKind::Pop(p) if p.op == pop::SOLVER => {
-                let mut objects = upstream(0, onto, visiting);
-                objects.point_attributes.remove(pop::STREAM_MASK);
-                let mut particles = match input(1) {
-                    Some(pre) => self.pop_eval(pre, prev, s, Some(objects), visiting),
-                    None => objects,
+                let step = pop::Step { node_seed: (id as u32).wrapping_mul(0x9e37_79b9), ..*s };
+                let before = particles.vertices.len();
+                // A stream with no name of its own takes its node's.
+                let named;
+                let p = if p.op == pop::STREAM && p.text(0).trim().is_empty() {
+                    let mut q = p.clone();
+                    q.texts[0] = p.stream_name(&node.title(id));
+                    named = q;
+                    &named
+                } else {
+                    p
                 };
-                // Streams in the pre-solve input end there.
-                particles.point_attributes.remove(pop::STREAM_MASK);
-                pop::integrate(&mut particles, s.dt);
-                if !s.colliders.is_empty() {
-                    pop::bounce_off(&mut particles, s.colliders, None);
-                }
-                let mut out = match input(2) {
-                    Some(post) => self.pop_eval(post, prev, s, Some(particles), visiting),
-                    None => particles,
-                };
-                out.point_attributes.remove(pop::STREAM_MASK);
-                out
-            }
-            NodeKind::Pop(p) => {
-                let mut particles = upstream(0, onto, visiting);
-                pop::tidy(&mut particles);
-                // Its group's particles, and below a POP Stream, only the stream's.
-                let mask = pop::stream_mask(&particles, groups::point_mask(&particles, &node.group).ok().flatten());
-                // VEX input 0 is the particles; 1-3 are the POP Network's inputs 0-2.
-                let others = &s.inputs[..s.inputs.len().min(vex::INPUTS - 1)];
+                pop::apply(p, &mut particles, &step, mask.as_deref());
                 match p.op {
-                    pop::WRANGLE => node_wrangle(particles, others, p.text(0), s.time, 2, mask.as_deref(), Some(&node.channels)),
-                    pop::VOP => match self.vop_code(id) {
-                        Ok(code) => node_wrangle(particles, others, &code, s.time, 2, mask.as_deref(), Some(&node.channels)),
-                        Err(_) => particles,
-                    },
-                    _ => {
-                        if let Some(code) = p.expression_code() {
-                            particles = node_wrangle(particles, others, &code, s.time, 2, None, Some(&node.channels));
-                        }
-                        let step = pop::Step { node_seed: (id as u32).wrapping_mul(0x9e37_79b9), ..*s };
-                        pop::apply(p, &mut particles, &step, mask.as_deref());
-                        particles
+                    // Its births join its stream, which is what it hands on.
+                    pop::SOURCE => {
+                        let key = pop::stream_group(&p.stream_name(&node.title(id)));
+                        let total = particles.vertices.len();
+                        let members = particles.point_attributes.entry(key.clone()).or_default();
+                        members.resize(total, 0.0);
+                        members[before.min(total)..].fill(1.0);
+                        (particles, Some(key))
                     }
+                    pop::STREAM => (particles, Some(pop::stream_group(&p.stream_name(&node.title(id))))),
+                    _ => (particles, passed),
                 }
             }
-            // Anything else passes the particles through.
-            _ => upstream(0, onto, visiting),
-        };
-        visiting.remove(&id);
-        out
+        }
     }
 
     // Identifies a solver's simulation by everything that affects it: its settings,

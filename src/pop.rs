@@ -132,6 +132,7 @@ pub const OPS: &[PopOp] = &[
         label: "POP Source",
         name: "popsource",
         help: "Births particles from one of the POP Network's inputs (the origin when it isn't connected). They copy the source's attributes, such as Cd and pscale, and its velocity v if you inherit it. \
+               Its particles are a stream, the group stream_<Stream name> (the node's own name when that's empty): the POPs wired below it act only on them, until a Merge or the solver. \
                Impulse births come once a frame, constant births at the birth rate; each happens only while its activation is above 0, so an expression switches it on and off (Impulse activation $F == 1 births on the first frame only; Constant activation $T < 0.5 stops after half a second).",
         inputs: 1,
         params: &[
@@ -150,7 +151,7 @@ pub const OPS: &[PopOp] = &[
             f("impulse_activation", "Impulse activation", "Birth", 0.0, 1.0, 1.0),
             f("constant_activation", "Constant activation", "Birth", 0.0, 1.0, 1.0),
         ],
-        texts: &[],
+        texts: &[("Stream name", "")],
         ramps: &[],
     },
     PopOp {
@@ -379,9 +380,9 @@ pub const OPS: &[PopOp] = &[
     PopOp {
         label: "POP Stream",
         name: "popstream",
-        help: "Splits off a stream of particles: the POPs wired below it act only on the particles in the stream (all of them, a random fraction, those in a box, or those an expression picks). \
-               Wire the stream, with the POPs below it, into a Merge with the rest; the stream ends there. A stream below another takes particles from that stream only. \
-               Its particles are also in the group stream_<name>, for other POPs' Group fields.",
+        help: "A stream within the stream above it (a POP Source's particles, or another stream's; all of them when nothing's above): the POPs wired below it act only on its particles, which it picks from the stream above (all of them, a random fraction, those in a box, or those an expression picks). \
+               Wire it, with the POPs below it, into a Merge with the rest; the stream ends there. \
+               Its particles are the group stream_<Stream name> (the node's own name when that's empty), for other POPs' Group fields too.",
         inputs: 1,
         params: &[
             f("rule", "Rule", "", 0.0, 3.0, 1.0),
@@ -391,7 +392,7 @@ pub const OPS: &[PopOp] = &[
             t("births_only", "Only decide for new particles (members stay members)", "", true),
             f("seed", "Seed", "", 0.0, 10000.0, 1.0),
         ],
-        texts: &[("Stream name", "stream1"), ("Expression", "@P.y > 1")],
+        texts: &[("Stream name", ""), ("Expression", "@P.y > 1")],
         ramps: &[],
     },
 ];
@@ -500,6 +501,13 @@ impl PopNode {
         })
     }
 
+    // The name of a POP Source's or POP Stream's stream: its Stream name, or `fallback` (its
+    // node's name) when that's empty.
+    pub fn stream_name(&self, fallback: &str) -> String {
+        let own = if matches!(self.op, SOURCE | STREAM) { self.text(0).trim() } else { "" };
+        if own.is_empty() { fallback.trim().to_owned() } else { own.to_owned() }
+    }
+
     pub fn label(&self, id: usize) -> String {
         format!("{}{id}", self.def().name)
     }
@@ -524,16 +532,9 @@ impl PopNode {
 // Where an Expression rule's result is left for apply().
 pub const EXPRESSION: &str = "__popexpr";
 
-// The particles in the current POP Stream (1) and the rest (0), for the POPs below it. A
-// Merge or a solver ends the stream (see pop_eval in graph.rs).
-pub const STREAM_MASK: &str = "__popstream";
-
-// The particles a POP acts on: those in its group (`mask`; all when None) and, below a POP
-// Stream, in the stream.
-pub fn stream_mask(m: &Mesh, mask: Option<Vec<bool>>) -> Option<Vec<bool>> {
-    let n = m.vertices.len();
-    let Some(stream) = m.point_attributes.get(STREAM_MASK).filter(|s| s.len() == n) else { return mask };
-    Some((0..n).map(|i| stream[i] > 0.5 && mask.as_ref().is_none_or(|g| g.get(i).copied().unwrap_or(false))).collect())
+// A stream's group: stream_<name>, as in Houdini.
+pub fn stream_group(name: &str) -> String {
+    format!("group:stream_{}", name.trim().replace(char::is_whitespace, "_"))
 }
 
 // ============================================================================
@@ -901,10 +902,12 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
         }
         GROUP | STREAM => {
             let base = node.text(0).trim().replace(char::is_whitespace, "_");
+            // A stream with no name of its own is named by pop_run (its node's name), which
+            // passes it in the text.
             if base.is_empty() {
                 return;
             }
-            let name = if node.op == STREAM { format!("group:stream_{base}") } else { format!("group:{base}") };
+            let name = if node.op == STREAM { stream_group(&base) } else { format!("group:{base}") };
             let expression = m.point_attributes.remove(EXPRESSION);
             let (age, id) = (m.point_attributes["age"].clone(), m.point_attributes["id"].clone());
             let positions = m.vertices.clone();
@@ -925,10 +928,13 @@ pub fn apply(node: &PopNode, m: &mut Mesh, s: &Step, mask: Option<&[bool]>) {
                 group[i] = if inside { 1.0 } else if births_only { group[i] } else { 0.0 };
             }
             if node.op == STREAM {
-                // The POPs below act on the stream: its members that were in the stream above
-                // (if this one is below another), and in this node's group.
-                let members: Vec<f32> = (0..n).map(|i| if masked(mask, i) && m.point_attributes[&name][i] > 0.5 { 1.0 } else { 0.0 }).collect();
-                m.point_attributes.insert(STREAM_MASK.into(), members);
+                // Only ever particles of the stream above (and in this node's group).
+                let group = attr(m, &name, 1, 0.0);
+                for (i, g) in group.iter_mut().enumerate() {
+                    if !masked(mask, i) {
+                        *g = 0.0;
+                    }
+                }
             }
         }
         KILL => {
@@ -1358,7 +1364,6 @@ pub fn output(state: &Mesh) -> Mesh {
     let mut out = state.clone();
     out.point_attributes.remove("detail:pop_next_id");
     out.point_attributes.remove(EXPRESSION);
-    out.point_attributes.remove(STREAM_MASK);
     out
 }
 
@@ -1533,23 +1538,23 @@ mod tests {
     }
 
     #[test]
-    fn streams_mark_their_particles_for_the_pops_below() {
+    fn streams_pick_their_particles_from_the_stream_above() {
         let mut m = Mesh { vertices: (0..10).map(|i| Vec3::new(i as f32, 0.0, 0.0)).collect(), ..Mesh::default() };
         tidy(&mut m);
         m.point_attributes.insert("id".into(), (0..10).map(|i| i as f32).collect());
         let mut stream = with(STREAM, &[("rule", &[2.0]), ("center", &[2.0, 0.0, 0.0]), ("size", &[5.0, 2.0, 2.0])]);
         stream.texts[0] = "left".into();
         apply(&stream, &mut m, &step(1, &[]), None);
-        assert_eq!(m.point_attributes["group:stream_left"].iter().filter(|g| **g > 0.5).count(), 5);
-        let only = stream_mask(&m, None).unwrap();
-        assert_eq!(only.iter().filter(|k| **k).count(), 5);
-        // A stream below another takes from that one only.
+        let left = &m.point_attributes["group:stream_left"];
+        assert_eq!(left.iter().filter(|g| **g > 0.5).count(), 5);
+        // Below it, a stream of x 2 to 6 takes from it only: x 2, 3 and 4.
+        let above: Vec<bool> = left.iter().map(|g| *g > 0.5).collect();
         let mut inner = with(STREAM, &[("rule", &[2.0]), ("center", &[4.0, 0.0, 0.0]), ("size", &[5.0, 2.0, 2.0])]);
         inner.texts[0] = "inner".into();
-        let outer = stream_mask(&m, None);
-        apply(&inner, &mut m, &step(1, &[]), outer.as_deref());
-        assert_eq!(stream_mask(&m, None).unwrap().iter().filter(|k| **k).count(), 3, "x 2, 3 and 4");
-        assert!(output(&m).point_attributes.get(STREAM_MASK).is_none());
+        apply(&inner, &mut m, &step(1, &[]), Some(&above));
+        assert_eq!(m.point_attributes["group:stream_inner"].iter().filter(|g| **g > 0.5).count(), 3);
+        assert_eq!(PopNode::new(STREAM).stream_name("popstream4"), "popstream4", "unnamed: the node's name");
+        assert_eq!(stream.stream_name("popstream4"), "left");
     }
 
     #[test]
