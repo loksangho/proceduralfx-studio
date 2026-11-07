@@ -446,7 +446,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | --- | --- | --- |
 | POP Object | `pop` | operation=0 |
 | POP Solver | `pop` | operation=1 |
-| POP Source | `pop` | operation=2, input=0, emission=0, birth_rate=200, impulse=0, life=2, life_variance=0.5, inherit=1, velocity.x=0, velocity.y=1, velocity.z=0, variance.x=0.3, variance.y=0.3, variance.z=0.3, along_normal=0, seed=1 |
+| POP Source | `pop` | operation=2, input=0, emission=0, birth_rate=200, impulse=0, life=2, life_variance=0.5, inherit=1, velocity.x=0, velocity.y=1, velocity.z=0, variance.x=0.3, variance.y=0.3, variance.z=0.3, along_normal=0, seed=1, impulse_activation=1, constant_activation=1 |
 | Gravity Force | `pop` | operation=3, force.x=0, force.y=-9.8, force.z=0 |
 | POP Force | `pop` | operation=4, force.x=0, force.y=0, force.z=0, noise=0, frequency=1, speed=0.5 |
 | POP Wind | `pop` | operation=5, wind.x=1, wind.y=0, wind.z=0, air_resistance=1, noise=0, frequency=1, speed=0.5 |

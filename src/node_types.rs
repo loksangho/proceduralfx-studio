@@ -754,10 +754,134 @@ pub(crate) fn pdrag<'a, N: egui::emath::Numeric>(value: &'a mut N) -> egui::Drag
 // The closest the view gets to what it looks at, so tiny things (a 0.001 sphere) can fill it.
 pub(crate) const MIN_ZOOM: f32 = 0.001;
 
-pub(crate) fn pslider<'a, N: egui::emath::Numeric>(value: &'a mut N, range: std::ops::RangeInclusive<N>) -> egui::Slider<'a> {
+pub(crate) fn pslider<'a, N: egui::emath::Numeric>(value: &'a mut N, range: std::ops::RangeInclusive<N>) -> PSlider<'a> {
     let current = value.to_f64();
     FIELD_VALUE.with(|v| v.set(current));
-    egui::Slider::new(value, range).custom_parser(typed_parser(current, N::INTEGRAL))
+    PSlider { slider: egui::Slider::new(value, range).custom_parser(typed_parser(current, N::INTEGRAL)), label: String::new(), value: current }
+}
+
+// The selected node's parameters that follow an expression, for the sliders showing them:
+// set by the Parameters pane before it draws (see parameters_pane), matched to a slider by
+// its value. A slider's name, clicked, switches it between its value and its expression.
+pub(crate) struct ExpressionField {
+    pub(crate) channel: ChannelId,
+    pub(crate) value: f32,
+    pub(crate) text: String,
+    pub(crate) shown: bool,
+    pub(crate) taken: bool,
+    // The parameter's name, as letters and digits ("birthrate"), to tell sliders showing the
+    // same value apart; and whether a slider carried that name last frame (then only it may
+    // show the expression).
+    pub(crate) key: String,
+    pub(crate) named: bool,
+}
+
+pub(crate) fn name_key(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+pub(crate) enum ExpressionEdit {
+    Toggle(ChannelId),
+    Set(ChannelId, String),
+}
+
+thread_local! {
+    pub(crate) static EXPRESSION_FIELDS: std::cell::RefCell<Vec<ExpressionField>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static EXPRESSION_EDITS: std::cell::RefCell<Vec<ExpressionEdit>> = const { std::cell::RefCell::new(Vec::new()) };
+    // Expressions a slider carried the name of this frame.
+    pub(crate) static EXPRESSION_NAMED: std::cell::RefCell<Vec<ChannelId>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// A parameter slider (see pslider): an egui Slider that knows its name, so the name can
+// switch it to its expression.
+pub(crate) struct PSlider<'a> {
+    slider: egui::Slider<'a>,
+    label: String,
+    value: f64,
+}
+
+impl<'a> PSlider<'a> {
+    pub(crate) fn text(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+    pub(crate) fn logarithmic(mut self, on: bool) -> Self {
+        self.slider = self.slider.logarithmic(on);
+        self
+    }
+    pub(crate) fn smallest_positive(mut self, v: f64) -> Self {
+        self.slider = self.slider.smallest_positive(v);
+        self
+    }
+    pub(crate) fn clamping(mut self, c: egui::SliderClamping) -> Self {
+        self.slider = self.slider.clamping(c);
+        self
+    }
+    pub(crate) fn suffix(mut self, s: impl ToString) -> Self {
+        self.slider = self.slider.suffix(s);
+        self
+    }
+    pub(crate) fn show_value(mut self, on: bool) -> Self {
+        self.slider = self.slider.show_value(on);
+        self
+    }
+}
+
+impl egui::Widget for PSlider<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        // The expression this slider shows, if any: the first not yet claimed with its value.
+        // Matched by value and name; by value alone only for a parameter no slider names.
+        let field = EXPRESSION_FIELDS.with(|f| {
+            let mut fields = f.borrow_mut();
+            let v = self.value as f32;
+            let label = name_key(&self.label);
+            let same = |e: &ExpressionField| (e.value - v).abs() <= 1e-4 * v.abs().max(1.0);
+            let named = |e: &ExpressionField| e.key.len() >= 2 && !label.is_empty() && (label.contains(&e.key) || e.key.contains(&label));
+            for e in fields.iter().filter(|e| same(e) && named(e)) {
+                EXPRESSION_NAMED.with(|n| n.borrow_mut().push(e.channel));
+            }
+            let at = fields.iter().position(|e| !e.taken && same(e) && named(e)).or_else(|| fields.iter().position(|e| !e.taken && same(e) && !e.named))?;
+            let hit = &mut fields[at];
+            hit.taken = true;
+            Some((hit.channel, hit.text.clone(), hit.shown))
+        });
+        let Some((channel, text, shown)) = field.filter(|_| !self.label.is_empty()) else {
+            return ui.add(if self.label.is_empty() { self.slider } else { self.slider.text(self.label) });
+        };
+        let tint = egui::Color32::from_rgb(120, 210, 140);
+        let name = |ui: &mut egui::Ui, hint: &str| {
+            let r = ui.add(egui::Label::new(egui::RichText::new(&self.label).color(tint)).sense(egui::Sense::click())).on_hover_text(hint);
+            if r.clicked() {
+                EXPRESSION_EDITS.with(|e| e.borrow_mut().push(ExpressionEdit::Toggle(channel)));
+            }
+            r
+        };
+        ui.horizontal(|ui| {
+            if shown {
+                // What's being typed, kept while the field has focus.
+                let key = ui.make_persistent_id(("expression_edit", channel));
+                let mut edited = ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| text.clone());
+                let width = ui.spacing().slider_width + ui.spacing().interact_size.x + ui.spacing().item_spacing.x;
+                let field = ui.add(egui::TextEdit::singleline(&mut edited).id(key.with("field")).font(egui::TextStyle::Monospace).text_color(tint).desired_width(width));
+                if field.lost_focus() {
+                    if edited != text {
+                        EXPRESSION_EDITS.with(|e| e.borrow_mut().push(ExpressionEdit::Set(channel, edited)));
+                    }
+                    ui.data_mut(|d| d.remove::<String>(key));
+                } else if field.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(key, edited));
+                } else {
+                    ui.data_mut(|d| d.remove::<String>(key));
+                }
+                name(ui, "Its expression: click the name to show its value instead. A plain number replaces the expression.")
+            } else {
+                let slider = ui.add(self.slider);
+                name(ui, &format!("Follows the expression {text}: click the name to show it"));
+                slider
+            }
+        })
+        .inner
+    }
 }
 
 // A parameter field (pdrag/pslider) with its right-click menu.

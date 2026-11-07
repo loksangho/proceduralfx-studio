@@ -131,7 +131,8 @@ pub const OPS: &[PopOp] = &[
     PopOp {
         label: "POP Source",
         name: "popsource",
-        help: "Births particles from one of the POP Network's inputs (the origin when it isn't connected). They copy the source's attributes, such as Cd and pscale, and its velocity v if you inherit it.",
+        help: "Births particles from one of the POP Network's inputs (the origin when it isn't connected). They copy the source's attributes, such as Cd and pscale, and its velocity v if you inherit it. \
+               Impulse births come once a frame, constant births at the birth rate; each happens only while its activation is above 0, so an expression switches it on and off (Impulse activation $F == 1 births on the first frame only; Constant activation $T < 0.5 stops after half a second).",
         inputs: 1,
         params: &[
             f("input", "Source: POP Network input", "Source", 0.0, 3.0, 0.0),
@@ -145,6 +146,9 @@ pub const OPS: &[PopOp] = &[
             vector("variance", "Velocity variance", "Velocity", 0.0, 1000.0, [0.3, 0.3, 0.3]),
             f("along_normal", "Speed along the source's normals", "Velocity", -1000.0, 1000.0, 0.0),
             f("seed", "Seed", "Velocity", 0.0, 10000.0, 1.0),
+            // Added later: kept at the end so older scenes load their values in place.
+            f("impulse_activation", "Impulse activation", "Birth", 0.0, 1.0, 1.0),
+            f("constant_activation", "Constant activation", "Birth", 0.0, 1.0, 1.0),
         ],
         texts: &[],
         ramps: &[],
@@ -1078,8 +1082,12 @@ fn source(node: &PopNode, m: &mut Mesh, s: &Step) {
     let sampler = Sampler::new(mesh);
     let points = mesh.vertices.len();
     let emission = node.index("emission");
-    let mut count = steady(node.v("birth_rate"), s.step, s.dt) + if s.frame_start { node.v("impulse").max(0.0) as usize } else { 0 };
-    if emission == 2 && s.frame_start {
+    // Each kind of birth happens while its activation is above 0.
+    let (impulse_on, constant_on) = (node.v("impulse_activation") > 0.0, node.v("constant_activation") > 0.0);
+    let impulse_now = s.frame_start && impulse_on;
+    let mut count = if constant_on { steady(node.v("birth_rate"), s.step, s.dt) } else { 0 } + if impulse_now { node.v("impulse").max(0.0) as usize } else { 0 };
+    // All points births one at every point with the impulses.
+    if emission == 2 && impulse_now {
         count += points;
     }
     if count == 0 {
@@ -1090,7 +1098,7 @@ fn source(node: &PopNode, m: &mut Mesh, s: &Step) {
     let seed = (node.v("seed") as u32) ^ s.node_seed;
     let mut births = Mesh::default();
     let (mut v, mut age, mut life, mut ids) = (Vec::with_capacity(count * 3), Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count));
-    let all_points = if emission == 2 && s.frame_start { points } else { 0 };
+    let all_points = if emission == 2 && impulse_now { points } else { 0 };
     for k in 0..count {
         let id = first.wrapping_add(k as u32);
         let r = |j: u32| hash01(id.wrapping_mul(13).wrapping_add(j), seed);
@@ -1397,6 +1405,14 @@ mod tests {
         ids.sort_by(f32::total_cmp);
         ids.dedup();
         assert_eq!(ids.len(), 240);
+        // Activations: off, no births of that kind.
+        let mut m = Mesh::default();
+        let quiet = with(SOURCE, &[("birth_rate", &[240.0]), ("impulse", &[10.0]), ("constant_activation", &[0.0])]);
+        apply(&quiet, &mut m, &step(1, &inputs), None);
+        assert_eq!(m.vertices.len(), 10, "the impulse only");
+        let mut m = Mesh::default();
+        apply(&with(SOURCE, &[("birth_rate", &[240.0]), ("impulse", &[10.0]), ("impulse_activation", &[0.0])]), &mut m, &step(1, &inputs), None);
+        assert_eq!(m.vertices.len(), 10, "the constant rate only (240 / 24)");
         // All points, once a frame: one at each corner.
         let corners = with(SOURCE, &[("birth_rate", &[0.0]), ("emission", &[2.0])]);
         let mut m = Mesh::default();

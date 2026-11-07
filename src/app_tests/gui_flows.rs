@@ -548,3 +548,65 @@ fn curve_points_are_placed_moved_and_removed_in_the_viewport() {
     assert_eq!(points(&h).len(), 2);
     assert!(h.state().has_unsaved_changes());
 }
+
+// A parameter with an expression: its name, clicked, shows the expression in place of the
+// value; typing a new one changes it, and a plain number replaces it.
+#[test]
+fn clicking_a_parameter_name_switches_between_its_value_and_expression() {
+    let mut app = one_grid();
+    let channel = ChannelId { node: 1, target: ChannelTarget::Param(0) };
+    app.graph.channels.entry(channel).or_default().expression = Some("1 + 2".into());
+    app.graph.apply_animation(0.0);
+    let mut h = harness(app);
+    assert!(matches!(h.state().graph.nodes[&1].kind, NodeKind::Grid { size, .. } if (size - 3.0).abs() < 1e-5));
+    h.get_by_label("Size").click();
+    h.run_steps(3);
+    assert!(h.state().shown_expressions.contains(&channel), "the name shows the expression");
+    // Edit it: 2 * 3.
+    let field = h.get_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.value().is_some_and(|v| v.contains('+') || v.contains('*'))).expect("the expression's field");
+    field.click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("2 * 3".into()));
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(h.state().graph.channels[&channel].expression.as_deref(), Some("2 * 3"));
+    assert!(matches!(h.state().graph.nodes[&1].kind, NodeKind::Grid { size, .. } if (size - 6.0).abs() < 1e-5));
+    // Click the name again: the value is back; then a plain number replaces the expression.
+    h.get_by_label("Size").click();
+    h.run_steps(3);
+    assert!(!h.state().shown_expressions.contains(&channel));
+    h.get_by_label("Size").click();
+    h.run_steps(3);
+    let field = h.get_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.value().is_some_and(|v| v.contains('+') || v.contains('*'))).expect("the expression's field");
+    field.click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("4".into()));
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert!(!h.state().graph.channels.contains_key(&channel));
+    assert!(matches!(h.state().graph.nodes[&1].kind, NodeKind::Grid { size, .. } if (size - 4.0).abs() < 1e-5));
+}
+
+// A slider showing the same value as an expression doesn't take it over: POP Source's Seed
+// is 1, as is its Impulse activation's expression on the first frame.
+#[test]
+fn an_expression_stays_with_its_own_parameter() {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 2 40 20 0 obj popnet 1\nparent 2 0\nnode 1 40 20 0 obj pop 2\nparent 1 2\ndisplay 0 2\nnext 3\n".into());
+    app.current_network = Some(2);
+    app.selected = Some(1);
+    let index = app.graph.nodes[&1].kind.param_names().iter().position(|n| n == "impulse_activation").unwrap();
+    let channel = ChannelId { node: 1, target: ChannelTarget::Param(index) };
+    app.graph.channels.entry(channel).or_default().expression = Some("$F == 1".into());
+    app.graph.apply_animation(0.0);
+    let mut h = harness(app);
+    h.run_steps(3);
+    // Seed is still an ordinary slider; Impulse activation's name switches to its expression.
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Slider, "Seed").is_some(), "Seed keeps its slider");
+    h.get_by_label("Impulse activation").click();
+    h.run_steps(3);
+    assert!(h.state().shown_expressions.contains(&channel));
+    assert!(h.get_all_by_role(egui::accesskit::Role::TextInput).any(|n| n.value().as_deref() == Some("$F == 1")));
+}

@@ -96,6 +96,37 @@ impl ProceduralFxStudioApp {
         self.dirty = true;
     }
 
+    // An expression typed where a parameter shows its expression: a new one, or a plain
+    // number (or nothing), which replaces it with that value.
+    pub(crate) fn set_expression(&mut self, channel: ChannelId, text: &str) {
+        let number = text.parse::<f32>().ok();
+        if number.is_some() || text.is_empty() {
+            if let Some(ch) = self.graph.channels.get_mut(&channel) {
+                ch.expression = None;
+                if ch.is_empty() {
+                    self.graph.channels.remove(&channel);
+                }
+            }
+            self.shown_expressions.remove(&channel);
+            if let (Some(v), ChannelTarget::Param(i)) = (number, channel.target) {
+                self.graph.set_param(channel.node, i, v);
+            }
+            self.status = "The expression is replaced by its value".into();
+        } else {
+            match vex::eval_expression(text, self.time) {
+                Ok(_) => {
+                    self.graph.channels.entry(channel).or_default().expression = Some(text.to_owned());
+                    self.status = format!("The parameter follows {text}");
+                }
+                Err(e) => {
+                    self.status = format!("Expression error: {e}");
+                    return;
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
     pub(crate) fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(id) = self.selected else {
             ui.label("Select a node to edit its parameters.");

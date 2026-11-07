@@ -162,7 +162,36 @@ impl ProceduralFxStudioApp {
         TYPED.with(|t| *t.borrow_mut() = None);
         EXPRESSION_TIME.with(|t| t.set(self.time));
         let quick = self.preset_controls(ui);
+        // The selected node's expressions, for its sliders to show (see PSlider).
+        let fields: Vec<ExpressionField> = self.selected.map_or_else(Vec::new, |id| {
+            let names = self.graph.nodes.get(&id).map(|n| n.kind.param_names()).unwrap_or_default();
+            self.graph
+                .node_channels(id)
+                .filter_map(|(c, ch)| {
+                    let key = match c.target {
+                        ChannelTarget::Param(i) => names.get(i).map(|n| name_key(n)).unwrap_or_default(),
+                        ChannelTarget::Xform(i) => XFORM_NAMES.get(i).map(|n| name_key(n)).unwrap_or_default(),
+                    };
+                    Some(ExpressionField { channel: *c, value: self.graph.channel_value(*c)?, text: ch.expression.clone()?, shown: self.shown_expressions.contains(c), taken: false, key, named: self.named_expressions.contains(c) })
+                })
+                .collect()
+        });
+        EXPRESSION_FIELDS.with(|f| *f.borrow_mut() = fields);
+        EXPRESSION_EDITS.with(|e| e.borrow_mut().clear());
+        EXPRESSION_NAMED.with(|n| n.borrow_mut().clear());
         let edited = self.params_ui(ui) | quick;
+        EXPRESSION_FIELDS.with(|f| f.borrow_mut().clear());
+        self.named_expressions = EXPRESSION_NAMED.with(|n| std::mem::take(&mut *n.borrow_mut())).into_iter().collect();
+        for change in EXPRESSION_EDITS.with(|e| std::mem::take(&mut *e.borrow_mut())) {
+            match change {
+                ExpressionEdit::Toggle(c) => {
+                    if !self.shown_expressions.remove(&c) {
+                        self.shown_expressions.insert(c);
+                    }
+                }
+                ExpressionEdit::Set(c, text) => self.set_expression(c, text.trim()),
+            }
+        }
         if let (Some(typed), Some(before)) = (TYPED.with(|t| t.borrow_mut().take()), before) {
             self.apply_typed(before, typed);
         }
