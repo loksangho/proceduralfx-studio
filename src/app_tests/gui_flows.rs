@@ -610,3 +610,26 @@ fn an_expression_stays_with_its_own_parameter() {
     assert!(h.state().shown_expressions.contains(&channel));
     assert!(h.get_all_by_role(egui::accesskit::Role::TextInput).any(|n| n.value().as_deref() == Some("$F == 1")));
 }
+
+// Inside one object, the viewport still shows the other objects; picking and the info stay
+// with the open one.
+#[test]
+fn the_other_objects_show_while_inside_one() {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 1 40 20 0 obj grid 4 8\nparent 1 0\ndisplay 0 1\nnode 2 200 20 0 obj geometry -1\nnode 3 40 20 0 obj box 1 1\nparent 3 2\ndisplay 2 3\nnext 4\n".into());
+    app.enter_network(Some(2));
+    app.animate = false;
+    let mut h = harness(app);
+    settle(&mut h);
+    let (grid, cube) = (crate::node_grid(4.0, 4.0, 8, 8), crate::node_box(1.0, 1));
+    let app = h.state();
+    assert_eq!(app.current_mesh.vertices.len(), cube.vertices.len(), "the open object is what's picked");
+    assert_eq!(app.context_mesh.vertices.len(), grid.vertices.len(), "the other object is shown");
+    assert_eq!(app.shown_mesh.1.vertices.len(), cube.vertices.len() + grid.vertices.len());
+    assert_eq!(&app.shown_mesh.1.vertices[..cube.vertices.len()], &app.current_mesh.vertices[..], "the open one comes first");
+    // A bypassed object doesn't show.
+    h.state_mut().graph.nodes.get_mut(&0).unwrap().bypass = true;
+    h.state_mut().dirty = true;
+    settle(&mut h);
+    assert!(h.state().context_mesh.vertices.is_empty());
+}

@@ -173,7 +173,12 @@ impl ProceduralFxStudioApp {
         // Polygon diagonals: hidden in the wireframe, so not pickable as edges either.
         let diagonals: HashSet<(usize, usize)> = mesh.indices.iter().zip(poly::outline_edges(mesh)).flat_map(|(t, shown)| (0..3).filter(move |k| !shown[*k]).map(move |k| (t[k].min(t[(k + 1) % 3]), t[k].max(t[(k + 1) % 3])))).collect();
         let (pending_edge_loop, clear_selection_on_miss) = self.pick_components(ctx, &response, &projected, &diagonals, gizmo_clicked);
-        let mesh = &self.current_mesh;
+        // What's drawn: the network's geometry, then the other objects around it (after it, so
+        // its point and primitive numbers, and the selection, stay as they are).
+        if !self.context_mesh.vertices.is_empty() && self.shown_mesh.0 != self.mesh_revision {
+            self.shown_mesh = (self.mesh_revision, node_merge(self.current_mesh.clone(), self.context_mesh.clone()));
+        }
+        let mesh = if self.context_mesh.vertices.is_empty() { &self.current_mesh } else { &self.shown_mesh.1 };
         // GPU: the lit surfaces stay uploaded until the mesh, lights or display mode change,
         // so moving the camera skips building them (gpu_viewport.rs).
         let gpu_key = self.gpu_viewport.is_some().then(|| self.viewport_scene_key());

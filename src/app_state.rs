@@ -632,6 +632,10 @@ pub(crate) struct ProceduralFxStudioApp {
 
     pub(crate) template: Option<NodeId>,
     pub(crate) template_mesh: Mesh,
+    // Inside a geometry network: the other objects, shown around it (not pickable), and the
+    // viewport's mesh with them (built when the shown geometry changes).
+    pub(crate) context_mesh: Mesh,
+    pub(crate) shown_mesh: (u64, Mesh),
     // Cooked results of nodes that don't change with time, with the fingerprint each was
     // cooked at (Graph::cook_fingerprint): good while it still matches.
     pub(crate) static_cache: HashMap<NodeId, (u64, Mesh)>,
@@ -915,6 +919,8 @@ impl Default for ProceduralFxStudioApp {
             last_state,
             template: None,
             template_mesh: Mesh::default(),
+            context_mesh: Mesh::default(),
+            shown_mesh: (u64::MAX, Mesh::default()),
             static_cache: HashMap::new(),
             cache_key: String::new(),
             frame_cache: HashMap::new(),

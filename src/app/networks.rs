@@ -44,6 +44,18 @@ impl ProceduralFxStudioApp {
         }
     }
 
+    // The other objects shown while inside a geometry network: every other one that isn't
+    // bypassed (at the top level, all of them show).
+    pub(crate) fn context_displays(&self) -> Vec<NodeId> {
+        let Some(inside) = self.network().filter(|id| matches!(self.graph.nodes.get(id).map(|n| &n.kind), Some(NodeKind::Geometry { .. }))) else {
+            return Vec::new();
+        };
+        if self.context != AppContext::Obj {
+            return Vec::new();
+        }
+        self.graph.geometry_ids().into_iter().filter(|id| *id != inside && self.graph.nodes.get(id).is_some_and(|n| !n.bypass)).collect()
+    }
+
     // Opens `network` (None: the top level). The editor takes the context its nodes
     // live in: OBJ for geometry networks, MAT for a Material Builder; going back to
     // the top stays in the context of the network being left.
@@ -264,6 +276,13 @@ impl ProceduralFxStudioApp {
             Some(id) if self.graph.nodes.contains_key(&id) => self.graph.cook(id, self.time, &mut cache),
             _ => Mesh::default(),
         };
+        // Inside one object, the others still show around it, as at the top.
+        let others = self.context_displays();
+        let had_context = !self.context_mesh.vertices.is_empty();
+        self.context_mesh = if others.is_empty() { Mesh::default() } else { self.graph.cook_display(&others, self.time, &mut cache) };
+        if had_context || !self.context_mesh.vertices.is_empty() {
+            self.mesh_revision += 1;
+        }
         self.node_stats = cache
             .iter()
             .map(|(id, m)| (*id, (m.vertices.len(), m.indices.len())))
