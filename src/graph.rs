@@ -1708,6 +1708,7 @@ impl Graph {
             n.kind,
             NodeKind::Noise { .. }
                 | NodeKind::Ripple { .. }
+                | NodeKind::AttributeFade(_)
                 | NodeKind::Particles { .. }
                 | NodeKind::PopNet { .. }
                 | NodeKind::LoopParticles { .. }
@@ -2305,6 +2306,11 @@ impl Graph {
                 NodeKind::Resample(settings) => self.report(id, sopkit::resample(&input(0, cache), settings)),
                 NodeKind::Curve(settings) => self.report(id, curve::curve(settings)),
                 NodeKind::AttributeRemap(settings) => self.report(id, remap::remap(&input(0, cache), settings)),
+                NodeKind::AttributeFade(settings) => {
+                    let connected = |slot: usize| self.input_of(id, slot).is_some();
+                    let (starts, holds) = (connected(1).then(|| input(1, cache)), connected(2).then(|| input(2, cache)));
+                    self.report(id, fade::fade(&input(0, cache), starts.as_ref(), holds.as_ref(), time, settings))
+                }
                 NodeKind::PointDeform(settings) => self.report(id, deform::point_deform(&input(0, cache), &input(1, cache), &input(2, cache), settings)),
                 NodeKind::TransformPieces => {
                     let rest = self.input_of(id, 2).map(|_| input(2, cache));

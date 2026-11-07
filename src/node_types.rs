@@ -1324,6 +1324,9 @@ pub(crate) enum NodeKind {
     Curve(curve::CurveSettings),
     // Reshapes an attribute's values through a ramp, from an input range to an output range.
     AttributeRemap(remap::RemapSettings),
+    // Scales a point attribute in, holds it and scales it out over time (see fade.rs).
+    // Input 2: optional start frames; input 3: optional hold scales.
+    AttributeFade(fade::FadeSettings),
     // Flow control (see flow.rs): For-Each and Compile blocks are Begin/End pairs.
     ForEachBegin,
     ForEachEnd(flow::ForEachSettings),
@@ -1477,7 +1480,8 @@ impl NodeKind {
             | NodeKind::AttributePaint { .. }
             | NodeKind::GuideProcess(_)
             | NodeKind::HairDeform(_)
-            | NodeKind::AttributeRemap(_) => GroupSupport::Restrict,
+            | NodeKind::AttributeRemap(_)
+            | NodeKind::AttributeFade(_) => GroupSupport::Restrict,
             NodeKind::Wrangle { .. }
             | NodeKind::AttributeVop { .. }
             | NodeKind::Blast { .. }
@@ -1602,6 +1606,7 @@ impl NodeKind {
             NodeKind::Resample(_) => names(&["by_length", "length", "segments"]),
             NodeKind::Curve(_) => names(&["type", "closed", "divisions"]),
             NodeKind::AttributeRemap(_) => names(&["class", "auto_range", "input_min", "input_max", "output_min", "output_max"]),
+            NodeKind::AttributeFade(_) => names(&["frame_offset", "fade_in", "hold", "fade_out", "seconds", "visualize"]),
             NodeKind::LSystem(_) => names(&["generations", "angle", "step", "step_scale", "thickness", "thickness_scale", "angle_random", "seed"]),
             NodeKind::TestGeometry(_) => names(&["shape", "size", "on_ground", "colours", "p", "q", "detail", "clip", "look", "looping"]),
             NodeKind::PointDeform(_) => names(&["influences", "fit_neighbours", "follow_rotation"]),
@@ -1737,6 +1742,7 @@ impl NodeKind {
             NodeKind::Enumerate(s) => vec![s.attribute.clone(), s.piece_attribute.clone()],
             NodeKind::AttributeBlur(s) => vec![s.pattern.clone()],
             NodeKind::AttributeRemap(s) => vec![s.attribute.clone(), s.ramp.clone()],
+            NodeKind::AttributeFade(s) => s.texts(),
             NodeKind::AttributePromote(s) => vec![s.pattern.clone(), s.rename.clone()],
             NodeKind::AttributeTransfer(s) => vec![s.pattern.clone()],
             NodeKind::Vop(v) => vec![v.name.clone()],
@@ -1816,6 +1822,11 @@ impl NodeKind {
             NodeKind::AttributeRemap(s) => {
                 next(&mut s.attribute);
                 next(&mut s.ramp);
+            }
+            NodeKind::AttributeFade(s) => {
+                for field in [&mut s.attribute, &mut s.start_attribute, &mut s.hold_attribute, &mut s.in_ramp, &mut s.out_ramp] {
+                    next(field);
+                }
             }
             NodeKind::AttributePromote(s) => {
                 next(&mut s.pattern);
@@ -1934,6 +1945,7 @@ impl NodeKind {
             "metaball" => ("Blobs", "Metaball"),
             "lsystem" => ("Branching plants", "L-System"),
             "attribute_remap" => ("Reshape an attribute with a ramp", "Attribute Remap"),
+            "attribute_fade" => ("Fade an attribute in and out over time", "Attribute Fade"),
             "POP Curve Force" => ("Flow along a curve", "POP Curve Force"),
             "POP Stream" => ("Act on some of the particles", "POP Stream"),
             "trail" => ("Motion trail", "Trail"),
@@ -2273,6 +2285,7 @@ impl NodeKind {
                     NodeKind::Enumerate(enumerate::EnumerateSettings::defaults()),
                     NodeKind::AttributeBlur(blur::BlurSettings::defaults()),
                     NodeKind::AttributeRemap(remap::RemapSettings::defaults()),
+                    NodeKind::AttributeFade(fade::FadeSettings::defaults()),
                     NodeKind::AttributePromote(promote::PromoteSettings::defaults()),
                     NodeKind::Wrangle { code: "@P.y += sin(@P.x * 3.0) * 0.2;".into(), domain: 2 },
                     NodeKind::AttributeVop { domain: 2 },
@@ -2452,6 +2465,7 @@ impl NodeKind {
             NodeKind::Resample(_) => "resample",
             NodeKind::Curve(_) => "curve",
             NodeKind::AttributeRemap(_) => "attribute_remap",
+            NodeKind::AttributeFade(_) => "attribute_fade",
             NodeKind::VolumeWrangle { .. } => "volume_wrangle",
             NodeKind::HeightfieldWrangle { .. } => "heightfield_wrangle",
             NodeKind::LSystem(_) => "lsystem",
@@ -2537,6 +2551,7 @@ impl NodeKind {
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => {
                 (&["0: geometry to change", "1 (read-only)", "2 (read-only)", "3 (read-only)"], &[])
             }
+            NodeKind::AttributeFade(_) => (&["Geometry to fade", "Start frames (optional)", "Hold scales (optional)"], &[]),
             NodeKind::PopNet { .. } => (&["0: POP Source input 0 (VEX input 1)", "1: input 1 (VEX input 2)", "2: input 2 (VEX input 3)", "3: input 3"], &[]),
             NodeKind::Pop(n) if n.op == pop::SOLVER => (&["Objects (POP Object, Static Objects)", "Pre-solve: forces", "Post-solve: POP Sources"], &[]),
             NodeKind::Pop(_) => (&["Particles"], &[]),
@@ -2592,6 +2607,7 @@ impl NodeKind {
             | NodeKind::AttributeRemap(_)
             | NodeKind::AttributePromote(_) => 1,
             NodeKind::Curve(_) => 0,
+            NodeKind::AttributeFade(_) => 3,
             // Input 0 is the geometry they change; 1-3 are read by point(1, ...), @opinput1_P and the like.
             NodeKind::Wrangle { .. } | NodeKind::VolumeWrangle { .. } | NodeKind::HeightfieldWrangle { .. } | NodeKind::AttributeVop { .. } => vex::INPUTS,
             NodeKind::LSystem(_) | NodeKind::TestGeometry(_) => 0,
@@ -2835,6 +2851,7 @@ impl NodeKind {
             NodeKind::Resample(r) => vec![r.by_length as u8 as f32, r.length, r.segments as f32],
             NodeKind::Curve(c) => c.params(),
             NodeKind::AttributeRemap(r) => r.params(),
+            NodeKind::AttributeFade(f) => f.params(),
             NodeKind::PointDeform(s) => vec![s.influences as f32, s.fit_neighbours as f32, s.rotate as u8 as f32],
             NodeKind::TransformPieces => vec![],
             NodeKind::ForEachBegin | NodeKind::CompileBegin => vec![],
@@ -3241,6 +3258,7 @@ impl NodeKind {
             }
             "curve" => NodeKind::Curve(curve::CurveSettings::from_params(p)),
             "attribute_remap" => NodeKind::AttributeRemap(remap::RemapSettings::from_params(p)),
+            "attribute_fade" => NodeKind::AttributeFade(fade::FadeSettings::from_params(p)),
             "connectivity" => NodeKind::Connectivity(sopkit::ConnectivitySettings { class: u(0).min(1), ..sopkit::ConnectivitySettings::defaults() }),
             "resample" => {
                 let d = sopkit::ResampleSettings::defaults();

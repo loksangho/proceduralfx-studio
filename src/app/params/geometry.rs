@@ -924,6 +924,29 @@ impl ProceduralFxStudioApp {
                     c = true;
                 }
             }
+            NodeKind::AttributeFade(set) => {
+                ui.small("Fades a point attribute in, holds it, then fades it out, from each point's start frame. The attribute's value is scaled (1 when it doesn't have one yet).");
+                let text_row = |ui: &mut egui::Ui, label: &str, hint: &str, text: &mut String| {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(120.0)).changed()
+                    })
+                    .inner
+                };
+                c |= text_row(ui, "Fade attribute", "fade, Alpha, pscale…", &mut set.attribute);
+                c |= text_row(ui, "Start frame attribute", "fadestart", &mut set.start_attribute);
+                c |= text_row(ui, "Hold scale attribute", "holdscale", &mut set.hold_attribute);
+                ui.small("Points without a start frame start at 0; without a hold scale, 1. Inputs 2 and 3 can give them instead.");
+                c |= ui.checkbox(&mut set.seconds, "Times in seconds (otherwise frames)").changed();
+                let unit = if set.seconds { " s" } else { " frames" };
+                c |= pfield(ui, pslider(&mut set.offset, -240.0..=240.0).clamping(egui::SliderClamping::Never).suffix(unit).text("Frame offset")).on_hover_text("Added to every point's start").changed();
+                c |= pfield(ui, pslider(&mut set.fade_in, 0.0..=240.0).clamping(egui::SliderClamping::Never).suffix(unit).text("Fade in")).changed();
+                c |= pfield(ui, pslider(&mut set.hold, 0.0..=480.0).clamping(egui::SliderClamping::Never).suffix(unit).text("Hold")).changed();
+                c |= pfield(ui, pslider(&mut set.fade_out, 0.0..=240.0).clamping(egui::SliderClamping::Never).suffix(unit).text("Fade out")).changed();
+                c |= ui.checkbox(&mut set.visualize, "Visualize: Cd shows the fade").changed();
+                c |= ramp_editor(ui, (id, "fade_in"), "Fade-in ramp (start → whole)", &mut set.in_ramp, 1, || ramp::Ramp::parse(fade::FADE_IN_RAMP, 1).unwrap());
+                c |= ramp_editor(ui, (id, "fade_out"), "Fade-out ramp (whole → gone)", &mut set.out_ramp, 1, || ramp::Ramp::parse(fade::FADE_OUT_RAMP, 1).unwrap());
+            }
             NodeKind::AttributeRemap(set) => {
                 ui.small("Reshapes an attribute's values through the ramp: each value's place in the input range (0 at its start, 1 at its end) is looked up on the ramp, and the result spans the output range. Vectors and colours have each component remapped.");
                 ui.horizontal(|ui| {

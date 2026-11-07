@@ -220,6 +220,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | enumerate | `enumerate` | 2 text field(s); class=0, start=0, increment=1 |
 | attribute_blur | `attribute_blur` | 1 text field(s); mode=0, weighting=0, iterations=10, step=1, radius=0.2, max_points=10, pin_border=0 |
 | attribute_remap | `attribute_remap` | 2 text field(s); class=0, auto_range=1, input_min=0, input_max=1, output_min=0, output_max=1 |
+| attribute_fade | `attribute_fade` | 5 text field(s); frame_offset=0, fade_in=12, hold=24, fade_out=12, seconds=0, visualize=0 |
 | attribute_promote | `attribute_promote` | 2 text field(s); from=0, to=2, method=0, delete_original=1 |
 | wrangle | `wrangle` | the run-over domain (0–3), `:`, then the code in hex |
 | attribute_vop | `attribute_vop` | run_over=2 |

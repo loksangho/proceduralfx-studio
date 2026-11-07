@@ -67,6 +67,7 @@ mod randomize;
 mod curve;
 mod remap;
 mod remesh;
+mod fade;
 mod recovery;
 mod raster;
 mod sims;

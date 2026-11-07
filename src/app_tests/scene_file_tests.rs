@@ -550,3 +550,25 @@ fn transforms_scale_and_turn_about_their_pivot() {
     assert!(matches!(loaded.nodes[&xf].kind, NodeKind::Transform { p: [1.0, 0.0, 0.0], .. }));
     assert!(matches!(NodeKind::from_params("xform", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]), Some(NodeKind::Transform { p: [0.0, 0.0, 0.0], .. })));
 }
+
+#[test]
+fn attribute_fade_follows_time_in_a_network_and_saves() {
+    let mut g = Graph::default();
+    let points = g.add(NodeKind::Add { count: 3, spacing: 1.0, layout: 0, points: Vec::new(), delete_geometry: false }, egui::pos2(0.0, 0.0));
+    // Each point starts 10 frames after the one before.
+    let starts = g.add(NodeKind::Wrangle { code: "f@fadestart = 1 + @ptnum * 10;".into(), domain: 2 }, egui::pos2(0.0, 80.0));
+    let mut set = fade::FadeSettings { fade_in: 10.0, hold: 0.0, fade_out: 10.0, ..fade::FadeSettings::defaults() };
+    set.in_ramp = "0 0 constant; 0.5 1 constant".into();
+    let fade = g.add(NodeKind::AttributeFade(set), egui::pos2(0.0, 160.0));
+    g.connect(points, starts, 0);
+    g.connect(starts, fade, 0);
+    assert!(g.time_dependent(fade));
+    let at = |g: &Graph, frame: f32| g.cook(fade, (frame - 1.0) / sims::SIM_FPS, &mut HashMap::new()).point_attributes["fade"].clone();
+    // Frame 7: the first point is past half its fade-in (whole, by the stepped ramp); the others haven't started.
+    assert_eq!(at(&g, 7.0), vec![1.0, 0.0, 0.0]);
+    let near = |a: Vec<f32>, b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+    assert!(near(at(&g, 17.0), [0.4, 1.0, 0.0]), "{:?}", at(&g, 17.0));
+    let loaded = Graph::deserialize(&g.serialize());
+    assert!(matches!(&loaded.nodes[&fade].kind, NodeKind::AttributeFade(f) if f.in_ramp.starts_with("0 0 constant") && f.fade_in == 10.0));
+    assert!(near(at(&loaded, 17.0), [0.4, 1.0, 0.0]));
+}
