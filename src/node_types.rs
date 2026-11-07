@@ -1055,7 +1055,8 @@ pub(crate) enum NodeKind {
     Bevel { amount: f32, segments: usize },
     Fuse { tol: f32 },
     Subdivide { levels: usize },
-    Remesh { target: usize },
+    // Even triangles of one size: adds or removes triangles (see remesh.rs).
+    Remesh(remesh::RemeshSettings),
     Mirror { axis: usize },
     Copy { count: usize, t: [f32; 3], r: [f32; 3], s: f32 },
     // Optional piece attribute: each point copies the piece with its value of it.
@@ -1510,7 +1511,7 @@ impl NodeKind {
             NodeKind::LopPrune { .. } => names(&["hide"]),
             NodeKind::LopReference { .. } => names(&["sublayer"]),
             NodeKind::Subdivide { .. } => names(&["levels"]),
-            NodeKind::Remesh { .. } => names(&["target_triangles"]),
+            NodeKind::Remesh(_) => names(&["target_triangles", "target_size", "iterations", "smoothing", "sharp_angle"]),
             NodeKind::SolverInput { .. } => names(&[""]),
             NodeKind::Subnet { spec, .. } => spec.params.iter().map(|p| p.label.clone()).collect(),
             NodeKind::SubnetInput { .. } => names(&["input"]),
@@ -2049,7 +2050,7 @@ impl NodeKind {
                 "Topology",
                 vec![
                     NodeKind::Subdivide { levels: 1 },
-                    NodeKind::Remesh { target: 2_000 },
+                    NodeKind::Remesh(remesh::RemeshSettings::defaults()),
                     NodeKind::Fuse { tol: 0.001 },
                     NodeKind::Mirror { axis: 0 },
                     NodeKind::Copy { count: 5, t: [1.5, 0.0, 0.0], r: [0.0; 3], s: 1.0 },
@@ -2257,7 +2258,7 @@ impl NodeKind {
             NodeKind::Bevel { .. } => "bevel",
             NodeKind::Fuse { .. } => "fuse",
             NodeKind::Subdivide { .. } => "subdivide",
-            NodeKind::Remesh { .. } => "remesh",
+            NodeKind::Remesh(_) => "remesh",
             NodeKind::Mirror { .. } => "mirror",
             NodeKind::Copy { .. } => "copy",
             NodeKind::CopyToPoints { .. } => "copy_to_points",
@@ -2505,7 +2506,7 @@ impl NodeKind {
             2 => egui::Color32::from_rgb(170, 120, 200),
             _ => match self {
                 NodeKind::Subdivide { .. }
-                | NodeKind::Remesh { .. }
+                | NodeKind::Remesh(_)
                 | NodeKind::Fuse { .. }
                 | NodeKind::Mirror { .. }
                 | NodeKind::Copy { .. }
@@ -2829,7 +2830,7 @@ impl NodeKind {
             NodeKind::Subnet { values, .. } => values.clone(),
             NodeKind::SubnetInput { index } => vec![*index as f32],
             NodeKind::Subdivide { levels } => vec![*levels as f32],
-            NodeKind::Remesh { target } => vec![*target as f32],
+            NodeKind::Remesh(r) => r.params(),
             NodeKind::Merge | NodeKind::Null => vec![],
             NodeKind::Geometry { material } => vec![material.map_or(-1.0, |m| m as f32)],
             NodeKind::Material { kind, color, roughness, value } => {
@@ -2877,7 +2878,7 @@ impl NodeKind {
             "bevel" => NodeKind::Bevel { amount: g(0), segments: u(1).clamp(1, 8) },
             "fuse" => NodeKind::Fuse { tol: g(0) },
             "subdivide" => NodeKind::Subdivide { levels: u(0).clamp(1, 4) },
-            "remesh" => NodeKind::Remesh { target: u(0).clamp(4, 200_000) },
+            "remesh" => NodeKind::Remesh(remesh::RemeshSettings::from_params(p)),
             "mirror" => NodeKind::Mirror { axis: u(0) },
             "copy" => NodeKind::Copy { count: u(0), t: v3(1), r: v3(4), s: g(7) },
             "copy_to_points" => NodeKind::CopyToPoints {

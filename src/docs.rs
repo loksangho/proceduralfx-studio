@@ -81,7 +81,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("transform_pieces", "Moves each piece (piece or name attribute) rigidly with a template point's P, orient/transform and pscale (input 2), optionally relative to rest points (input 3)."),
     // Topology
     ("subdivide", "Subdivides polygons (smooth)."),
-    ("remesh", "Rebuilds the mesh with even triangles of a target count."),
+    ("remesh", "Rebuilds the surface with even, nearly equilateral triangles of one size, set by a triangle count or an edge length: it splits long edges and collapses short ones, so it adds or removes triangles. Points stay on the original surface, seams are joined, borders and edges sharper than Sharp angle are kept, and attributes (Cd, uv…) carry over."),
     ("fuse", "Merges points closer than a distance."),
     ("mirror", "Mirrors across an axis and keeps both halves."),
     ("copy", "Copies the input several times with a cumulative transform."),

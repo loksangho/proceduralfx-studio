@@ -456,10 +456,26 @@ impl ProceduralFxStudioApp {
             NodeKind::Subdivide { levels } => {
                 c |= pfield(ui, pslider(levels, 1..=4).text("Levels")).changed();
             }
-            NodeKind::Remesh { target } => {
-                c |= pfield(ui, pslider(target, 4..=50_000).logarithmic(true).text("Target triangles"))
-                    .changed();
-                ui.label("Adds shared-edge subdivisions until the target is reached.");
+            NodeKind::Remesh(set) => {
+                ui.small("Rebuilds the surface with even triangles of one size: splits long edges and collapses short ones, so it adds triangles or takes them away. Points stay on the original surface; borders and sharp edges are kept.");
+                let mut by_size = set.size > 0.0;
+                ui.horizontal(|ui| {
+                    ui.label("Size by");
+                    c |= ui.selectable_value(&mut by_size, false, "Triangle count").changed();
+                    c |= ui.selectable_value(&mut by_size, true, "Edge length").changed();
+                });
+                if by_size {
+                    if set.size <= 0.0 {
+                        set.size = 0.1;
+                    }
+                    c |= pfield(ui, pslider(&mut set.size, 0.0001..=100.0).logarithmic(true).text("Target size")).on_hover_text("The edge length the triangles aim for").changed();
+                } else {
+                    set.size = 0.0;
+                    c |= pfield(ui, pslider(&mut set.target, 4..=500_000).logarithmic(true).text("Target triangles")).on_hover_text("About how many triangles the result has").changed();
+                }
+                c |= pfield(ui, pslider(&mut set.iterations, 1..=20).text("Iterations")).on_hover_text("More gives more even triangles, and takes longer").changed();
+                c |= pfield(ui, pslider(&mut set.smoothing, 0.0..=1.0).text("Smoothing")).on_hover_text("How far points slide toward their neighbours each iteration, across the surface").changed();
+                c |= pfield(ui, pslider(&mut set.sharp_angle, 0.0..=180.0).text("Sharp angle")).on_hover_text("Edges where the faces meet at more than this (degrees) are kept as hard edges; 0 keeps none").changed();
             }
             NodeKind::GroupCreate(set) => {
                 ui.horizontal(|ui| {

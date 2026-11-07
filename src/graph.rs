@@ -1911,7 +1911,7 @@ impl Graph {
                 }
                 NodeKind::Fuse { tol } => node_fuse(input(0, cache), *tol),
                 NodeKind::Subdivide { levels } => node_subdivide(input(0, cache), *levels),
-                NodeKind::Remesh { target } => node_remesh(input(0, cache), *target),
+                NodeKind::Remesh(settings) => self.report(id, remesh::remesh(&input(0, cache), settings)),
                 NodeKind::Mirror { axis } => node_mirror(input(0, cache), *axis),
                 NodeKind::Copy { count, t, r, s } => node_copy(input(0, cache), *count, *t, *r, *s),
                 NodeKind::CopyToPoints { scale, rotation, piece_attribute } => {

@@ -118,7 +118,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | Node | Saved as | Parameters |
 | --- | --- | --- |
 | subdivide | `subdivide` | levels=1 |
-| remesh | `remesh` | target_triangles=2000 |
+| remesh | `remesh` | target_triangles=2000, target_size=0, iterations=4, smoothing=0.5, sharp_angle=40 |
 | fuse | `fuse` | distance=0.001 |
 | mirror | `mirror` | axis=0 |
 | copy | `copy` | copies=5, t.x=1.5, t.y=0, t.z=0, r.x=0, r.y=0, r.z=0, uniform_scale=1 |

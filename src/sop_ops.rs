@@ -896,17 +896,6 @@ pub(crate) fn node_subdivide_once(input: Mesh) -> Mesh {
     m
 }
 
-pub(crate) fn node_remesh(input: Mesh, target_triangles: usize) -> Mesh {
-    let target = target_triangles.clamp(4, 200_000);
-    let mut mesh = input;
-    let mut levels = 0;
-    while mesh.indices.len() < target && levels < 4 {
-        mesh = node_subdivide_once(mesh);
-        levels += 1;
-    }
-    mesh
-}
-
 // The input plus its mirror image (merged, so attributes and polygons come along).
 pub(crate) fn node_mirror(mesh: Mesh, axis: usize) -> Mesh {
     let mut copy = mesh.clone();
