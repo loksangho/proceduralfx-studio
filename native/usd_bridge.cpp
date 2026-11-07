@@ -21,6 +21,7 @@
 
 #include <pxr/pxr.h>
 #include <pxr/base/gf/matrix4d.h>
+#include <pxr/base/tf/diagnosticMgr.h>
 #include <pxr/base/tf/token.h>
 #include <pxr/usd/sdf/layer.h>
 #include <pxr/usd/usd/primRange.h>
@@ -230,6 +231,35 @@ void describe_prim(std::ostringstream &out, const UsdPrim &prim, UsdTimeCode tim
     }
 }
 
+// USD's warnings, errors and status messages, printed as USD prints them, except a warning
+// that's only noise: many files (Sketchfab's, for one) bind materials without applying the
+// MaterialBindingAPI schema, which USD reads anyway but warns about on every such prim. (Its
+// USD_SHADE_WARN_ON_MISSING_MATERIAL_BINDING_API setting is read as USD loads, before the
+// app could change it.) With a delegate installed, USD leaves the printing to it.
+class QuietDiagnostics : public TfDiagnosticMgr::Delegate {
+    static void print(const TfDiagnosticBase &d) {
+        fprintf(stderr, "%s", TfDiagnosticMgr::FormatDiagnostic(d.GetDiagnosticCode(), d.GetContext(), d.GetCommentary(), TfDiagnosticInfo()).c_str());
+    }
+
+  public:
+    void IssueError(const TfError &e) override {
+        if (!e.GetQuiet()) print(e);
+    }
+    void IssueFatalError(const TfCallContext &, const std::string &) override {}
+    void IssueStatus(const TfStatus &s) override {
+        if (!s.GetQuiet()) print(s);
+    }
+    void IssueWarning(const TfWarning &w) override {
+        if (w.GetQuiet() || w.GetCommentary().find("MaterialBindingAPI is not applied") != std::string::npos) return;
+        print(w);
+    }
+};
+
+void quiet_noisy_warnings() {
+    static std::once_flag once;
+    std::call_once(once, [] { TfDiagnosticMgr::GetInstance().AddDelegate(new QuietDiagnostics()); });
+}
+
 }  // namespace
 
 extern "C" {
@@ -237,6 +267,7 @@ extern "C" {
 // Returns the prim description for `path` at `seconds` (converted with the
 // stage's timeCodesPerSecond), or null with *error set. Free with pfx_usd_free.
 char *pfx_usd_load(const char *path, double seconds, int reload, char **error) {
+    quiet_noisy_warnings();
     try {
         std::lock_guard<std::mutex> guard(stage_lock);
         auto &stages = open_stages();
