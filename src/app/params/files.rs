@@ -15,7 +15,7 @@ impl ProceduralFxStudioApp {
                     c |= ui.add(egui::TextEdit::singleline(file).hint_text("/path/to/model.$F4.obj").desired_width(220.0)).changed();
                     if ui.button("Browse…").clicked() {
                         if let Some(chosen) = FileDialog::new()
-                            .add_filter("Geometry", &["obj", "fbx", "abc", "stl", "usd", "usda", "usdc", "usdz", "vdb"])
+                            .add_filter("Geometry", &["obj", "fbx", "glb", "gltf", "abc", "stl", "usd", "usda", "usdc", "usdz", "vdb"])
                             .pick_file()
                         {
                             *file = chosen.to_string_lossy().into_owned();
@@ -66,7 +66,7 @@ impl ProceduralFxStudioApp {
                     if ui.button("Choose…").clicked() {
                         if let Some(chosen) = FileDialog::new()
                             .set_file_name("geometry.obj")
-                            .add_filter("Geometry", &["obj", "fbx", "abc", "stl", "usd", "usda", "usdc", "vdb"])
+                            .add_filter("Geometry", &["obj", "fbx", "glb", "gltf", "abc", "stl", "usd", "usda", "usdc", "vdb"])
                             .save_file()
                         {
                             *file = chosen.to_string_lossy().into_owned();
@@ -88,7 +88,7 @@ impl ProceduralFxStudioApp {
                         self.file_export_request = Some((id, true));
                     }
                 });
-                ui.small("The extension picks the format: .obj, .fbx, .abc (Alembic: the timeline range goes in one animated file), .stl, .usd/.usda/.usdc or .vdb (VDB input). The geometry passes through unchanged.");
+                ui.small("The extension picks the format: .obj, .fbx, .glb or .gltf (glTF, for game engines and the web), .abc (Alembic: the timeline range goes in one animated file), .stl, .usd/.usda/.usdc or .vdb (VDB input). The geometry passes through unchanged.");
             }
             _ => return None,
         }

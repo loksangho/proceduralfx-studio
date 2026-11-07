@@ -41,6 +41,7 @@ mod fileio;
 mod flipbook;
 mod gpu_viewport;
 mod gpu_volume;
+mod gltfio;
 mod flow;
 mod fracture;
 mod groom;

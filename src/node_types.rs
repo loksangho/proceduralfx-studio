@@ -1120,7 +1120,7 @@ pub(crate) enum NodeKind {
     Vdb { voxel_size: f32, padding: usize, operation: usize, iterations: usize, output: usize },
     // Converts a VDB or volume (VDB, Pyro, .vdb files). mode: 0 polygons at `iso`, 1 fog volume.
     ConvertVdb { mode: usize, iso: f32 },
-    // Reads geometry from disk: .obj, .fbx, .stl, .usd/.usda/.usdc/.usdz and .vdb; $F is the frame.
+    // Reads geometry from disk: .obj, .fbx, .glb/.gltf, .stl, .usd/.usda/.usdc/.usdz and .vdb; $F is the frame.
     // A file to read; for FBX, the take to play (by name, empty: the first) and whether it loops.
     FileImport { file: String, take: String, looping: bool },
     // Passes its input through and writes it to disk on demand (same formats; $F for sequences).

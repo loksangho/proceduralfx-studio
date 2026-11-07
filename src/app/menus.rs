@@ -88,6 +88,10 @@ impl ProceduralFxStudioApp {
             ui.close();
             self.export_mesh_dialog("STL", "stl");
         }
+        if ui.button("Export glTF (GLB)…").on_hover_text("Writes the displayed mesh to a binary glTF file (.glb) for game engines and the web").clicked() {
+            ui.close();
+            self.export_mesh_dialog("glTF", "glb");
+        }
     }
 
     // Asks where to write the displayed mesh, named after the scene and beside it by default.

@@ -29,6 +29,8 @@ rayon = "1"
 pollster = "0.4"
 # The app log (applog.rs); already used by eframe and wgpu.
 log = "0.4"
+# glTF and GLB import (fileio.rs); export is written by hand.
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "KHR_materials_emissive_strength"] }
 
 [features]
 default = []

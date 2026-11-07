@@ -50,8 +50,8 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("subnet", "A network packaged as one node: double-click to build inside, between Subnet Input nodes and the display node. Promote parameters of the nodes inside to show them on the Subnet as its own sliders. Save it as an asset to reuse it: it appears in the TAB menu under Assets, and copies can update to newer versions."),
     ("subnet_input", "Inside a Subnet: what's wired into one of the Subnet's four inputs."),
     // Import / export
-    ("file", "Reads geometry: OBJ, FBX, Alembic (animated .abc is read at the current time), STL, USD (usd/usda/usdc/usdz) or VDB. $F in the name reads one file per frame."),
-    ("file_export", "Writes its input to OBJ, FBX, Alembic, STL, USD or VDB (the current frame, or one file per frame with $F). Alembic writes the whole frame range into one animated .abc."),
+    ("file", "Reads geometry: OBJ, FBX, glTF (.glb/.gltf, with its textures as colours), Alembic (animated .abc is read at the current time), STL, USD (usd/usda/usdc/usdz) or VDB. $F in the name reads one file per frame."),
+    ("file_export", "Writes its input to OBJ, FBX, glTF (.glb or a self-contained .gltf), Alembic, STL, USD or VDB (the current frame, or one file per frame with $F). Alembic writes the whole frame range into one animated .abc."),
     ("extract_centroid", "One point per piece (whole geometry, piece/name attribute or connected pieces) at its average point or bounding box centre, with a piece attribute."),
     ("match_size", "Moves geometry so a side or centre per axis lines up with a target (input 2's bounding box, or a point/box you give), optionally scaling it to fit, uniformly or per axis."),
     ("convert_line", "Turns every polygon edge into a two-point line (a curve) with restlength; quad diagonals are skipped."),

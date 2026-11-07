@@ -69,6 +69,7 @@ pub fn read_geometry(path: &str) -> Result<Mesh, String> {
         "obj" => read_obj(&std::fs::read_to_string(path).map_err(|e| e.to_string())?),
         "stl" => read_stl(&std::fs::read(path).map_err(|e| e.to_string())?),
         "fbx" => read_fbx(path),
+        "glb" | "gltf" => crate::gltfio::read(path),
         other => Err(format!("unsupported geometry format .{other}")),
     }
 }
@@ -81,6 +82,8 @@ pub fn write_geometry(mesh: &Mesh, path: &str) -> Result<(), String> {
         "obj" => write_obj(mesh).into_bytes(),
         "stl" => write_stl(mesh),
         "fbx" => write_fbx(mesh, std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("mesh")),
+        "glb" => crate::gltfio::write(mesh, true)?,
+        "gltf" => crate::gltfio::write(mesh, false)?,
         other => return Err(format!("unsupported geometry format .{other}")),
     };
     std::fs::write(path, bytes).map_err(|e| e.to_string())
