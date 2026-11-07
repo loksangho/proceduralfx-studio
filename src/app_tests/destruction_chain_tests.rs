@@ -5,7 +5,7 @@ fn fracture_outputs_feed_the_bullet_solver() {
     let mut g = Graph::default();
     g.next_id += 10_100;
     let block = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
-    let lift = g.add(NodeKind::Transform { t: [0.0, 2.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let lift = g.add(NodeKind::Transform { t: [0.0, 2.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     g.connect(block, lift, 0);
     let frac = g.add(NodeKind::MaterialFracture(fracture::FractureSettings { pieces: 6, ..fracture::FractureSettings::defaults(0) }), egui::pos2(0.0, 0.0));
     g.connect(lift, frac, 0);
@@ -46,7 +46,7 @@ fn fracture_outputs_feed_the_bullet_solver() {
     assert_eq!(g.input_slots(merge), 3, "the gap closed: two inputs and a free port");
     // A wire dropped on a Merge (body or a used port) always adds an input.
     assert_eq!(g.drop_slot(merge), Some(2));
-    let xf = g.add(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let xf = g.add(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     assert_eq!(g.drop_slot(xf), Some(0), "other nodes: the first free input");
     let boolean = g.add(NodeKind::Boolean(boolean::BooleanSettings { operation: 2, mode: 0, resolution: 128 }), egui::pos2(0.0, 0.0));
     let a = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
@@ -75,7 +75,7 @@ fn fracture_outputs_feed_the_bullet_solver() {
     // Pack, move, unpack: the pieces come back turned with their points.
     let pack = g.add(NodeKind::Pack(packed::PackSettings::defaults()), egui::pos2(0.0, 0.0));
     g.connect(frac, pack, 0);
-    let spin = g.add(NodeKind::Transform { t: [0.0; 3], r: [0.0, 90.0, 0.0], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let spin = g.add(NodeKind::Transform { t: [0.0; 3], r: [0.0, 90.0, 0.0], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     g.connect(pack, spin, 0);
     let unpack = g.add(NodeKind::Unpack { transfer: true }, egui::pos2(0.0, 0.0));
     g.connect(spin, unpack, 0);

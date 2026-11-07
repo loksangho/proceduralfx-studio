@@ -9,7 +9,7 @@ fn write_vat_scenes() {
     let mut g = Graph::default();
     let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
     let b = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
-    let up = g.add(NodeKind::Transform { t: [0.0, 1.5, 0.0], r: [20.0, 30.0, 0.0], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let up = g.add(NodeKind::Transform { t: [0.0, 1.5, 0.0], r: [20.0, 30.0, 0.0], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     let frac = g.add(kind("material_fracture"), egui::pos2(0.0, 0.0));
     let rbd = g.add(kind("rbd_solver"), egui::pos2(0.0, 0.0));
     for n in [b, up, frac, rbd] { g.nodes.get_mut(&n).unwrap().parent = Some(geo); }

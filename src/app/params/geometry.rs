@@ -84,10 +84,24 @@ impl ProceduralFxStudioApp {
                 c |= pfield(ui, pslider(rows, 3..=96).text("Rows")).changed();
                 c |= pfield(ui, pslider(cols, 3..=128).text("Columns")).changed();
             }
-            NodeKind::Transform { t, r, s } => {
+            NodeKind::Transform { t, r, s, p } => {
                 c |= vec3_ui(ui, "Translate", t, 0.02);
                 c |= vec3_ui(ui, "Rotate°  ", r, 0.5);
                 c |= vec3_ui(ui, "Scale    ", s, 0.01);
+                c |= vec3_ui(ui, "Pivot    ", p, 0.02);
+                ui.horizontal(|ui| {
+                    if ui.button("Centre pivot").on_hover_text("Puts the pivot at the centre of the input's bounding box, so it scales and turns about its middle").clicked() {
+                        if let Some((lo, hi)) = self.graph.cook_fresh(self.graph.input_of(id, 0), self.time).bounds() {
+                            *p = [(lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, (lo.z + hi.z) * 0.5];
+                            c = true;
+                        }
+                    }
+                    if ui.button("Pivot at origin").clicked() {
+                        *p = [0.0; 3];
+                        c = true;
+                    }
+                });
+                ui.small("Scales and rotates about the pivot, then translates.");
             }
             NodeKind::Noise { freq, amp } => {
                 c |= pfield(ui, pslider(freq, 0.0..=10.0).text("Frequency")).changed();

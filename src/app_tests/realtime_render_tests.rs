@@ -24,7 +24,7 @@ fn point_alpha_shows_in_real_time_renders() {
     let mut g = Graph::default();
     let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
     let grid = g.add(NodeKind::Grid { size: 2.0, res: 8 }, egui::pos2(0.0, 0.0));
-    let turn = g.add(NodeKind::Transform { t: [0.0; 3], r: [90.0, 0.0, 0.0], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let turn = g.add(NodeKind::Transform { t: [0.0; 3], r: [90.0, 0.0, 0.0], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     let alpha = g.add(NodeKind::Wrangle { code: "f@Alpha = @P.x < -0.1 ? 0.25 : 1.0;".into(), domain: 2 }, egui::pos2(0.0, 0.0));
     for n in [grid, turn, alpha] {
         g.nodes.get_mut(&n).unwrap().parent = Some(geo);

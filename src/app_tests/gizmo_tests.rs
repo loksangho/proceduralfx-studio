@@ -58,7 +58,7 @@ fn transform_sops_get_a_gizmo_in_their_objects_space() {
     app.context = AppContext::Obj;
     let object = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(0.0, 0.0));
     app.graph.nodes.get_mut(&object).unwrap().xform = ObjectXform { t: [5.0, 0.0, 0.0], r: [0.0, 90.0, 0.0], s: [2.0, 2.0, 2.0] };
-    let xf = app.graph.add(NodeKind::Transform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let xf = app.graph.add(NodeKind::Transform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     app.graph.nodes.get_mut(&xf).unwrap().parent = Some(object);
     app.selected = Some(xf);
     let t = app.gizmo_target().unwrap();

@@ -1170,7 +1170,8 @@ pub(crate) enum NodeKind {
     Box { size: f32, div: usize },
     Sphere { radius: f32, rows: usize, cols: usize },
     Torus { major: f32, minor: f32, rows: usize, cols: usize },
-    Transform { t: [f32; 3], r: [f32; 3], s: [f32; 3] },
+    // Scale and rotate about the pivot p, then translate by t.
+    Transform { t: [f32; 3], r: [f32; 3], s: [f32; 3], p: [f32; 3] },
     Noise { freq: f32, amp: f32 },
     Taper { factor: f32 },
     Twist { angle: f32 },
@@ -1640,7 +1641,7 @@ impl NodeKind {
             NodeKind::Subnet { spec, .. } => spec.params.iter().map(|p| p.label.clone()).collect(),
             NodeKind::SubnetInput { .. } => names(&["input"]),
             NodeKind::Add { .. } => names(&["point_count", "spacing", "layout", "delete_geometry"]),
-            NodeKind::Transform { .. } => XFORM_NAMES.iter().map(|s| s.to_string()).collect(),
+            NodeKind::Transform { .. } => XFORM_NAMES.iter().chain(&["px", "py", "pz"]).map(|s| s.to_string()).collect(),
             NodeKind::RbdBullet(_) => names(&["density", "friction", "bounce", "gravity", "substeps", "ground", "ground_height", "glue_strength_scale", "velocity.x", "velocity.y", "velocity.z"]),
             NodeKind::RbdConfigure(_) => names(&["density", "friction", "bounce", "active", "velocity.x", "velocity.y", "velocity.z", "", "", "", "", ""]),
             NodeKind::Pack(_) => names(&["pack", "pivot"]),
@@ -1674,7 +1675,7 @@ impl NodeKind {
                 (0, "tx"), (1, "ty"), (2, "tz"), (3, "rx"), (4, "ry"), (5, "rz"),
                 (6, "focal"), (7, "near"), (9, "pan.x"), (10, "pan.y"), (11, "zoom"),
             ]),
-            NodeKind::Transform { .. } => XFORM_NAMES.iter().enumerate().map(|(i, n)| (ChannelTarget::Param(i), n.to_string())).collect(),
+            NodeKind::Transform { .. } => XFORM_NAMES.iter().chain(&["px", "py", "pz"]).enumerate().map(|(i, n)| (ChannelTarget::Param(i), n.to_string())).collect(),
             NodeKind::Material { .. } => named(&[(1, "color.r"), (2, "color.g"), (3, "color.b"), (4, "roughness"), (5, "value")]),
             NodeKind::Muscle(_) => named(&[
                 (0, "origin.x"),
@@ -2155,7 +2156,7 @@ impl NodeKind {
             (
                 "Deformers",
                 vec![
-                    NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] },
+                    NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] },
                     NodeKind::Noise { freq: 2.2, amp: 0.3 },
                     NodeKind::Taper { factor: 0.3 },
                     NodeKind::Twist { angle: 1.0 },
@@ -2672,7 +2673,7 @@ impl NodeKind {
             NodeKind::Torus { major, minor, rows, cols } => {
                 vec![*major, *minor, *rows as f32, *cols as f32]
             }
-            NodeKind::Transform { t, r, s } => [t.as_slice(), r, s].concat(),
+            NodeKind::Transform { t, r, s, p } => [t.as_slice(), r, s, p].concat(),
             NodeKind::Noise { freq, amp } => vec![*freq, *amp],
             NodeKind::Taper { factor } => vec![*factor],
             NodeKind::Twist { angle } | NodeKind::Bend { angle } => vec![*angle],
@@ -2993,7 +2994,7 @@ impl NodeKind {
             "box" => NodeKind::Box { size: g(0), div: u(1) },
             "sphere" => NodeKind::Sphere { radius: g(0), rows: u(1), cols: u(2) },
             "torus" => NodeKind::Torus { major: g(0), minor: g(1), rows: u(2), cols: u(3) },
-            "xform" => NodeKind::Transform { t: v3(0), r: v3(3), s: v3(6) },
+            "xform" => NodeKind::Transform { t: v3(0), r: v3(3), s: v3(6), p: v3(9) },
             "noise" => NodeKind::Noise { freq: g(0), amp: g(1) },
             "taper" => NodeKind::Taper { factor: g(0) },
             "twist" => NodeKind::Twist { angle: g(0) },

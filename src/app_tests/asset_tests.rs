@@ -17,7 +17,7 @@ fn subnet_scene() -> (ProceduralFxStudioApp, NodeId, NodeId, NodeId) {
     // Put a Transform between the Subnet's input and OUT.
     let out = app.graph.display_of(subnet).expect("a new Subnet shows OUT");
     let input = app.graph.input_of(out, 0).expect("OUT is fed by Input_1");
-    let xform = app.graph.add(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let xform = app.graph.add(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     app.graph.nodes.get_mut(&xform).unwrap().parent = Some(subnet);
     app.graph.connect(input, xform, 0);
     app.graph.connect(xform, out, 0);
@@ -117,7 +117,7 @@ fn assets_are_saved_placed_from_the_tab_menu_and_updated() {
 
     // Version 2 adds a node: copies update and keep their slider's value.
     let inner = app.graph.display_of(subnet).unwrap();
-    let extra = app.graph.add(NodeKind::Transform { t: [0.0, 10.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let extra = app.graph.add(NodeKind::Transform { t: [0.0, 10.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     app.graph.nodes.get_mut(&extra).unwrap().parent = Some(subnet);
     app.graph.connect(inner, extra, 0);
     app.graph.displays.insert(subnet, extra);

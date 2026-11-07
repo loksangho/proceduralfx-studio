@@ -49,7 +49,7 @@ pub fn flag() -> String {
     let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(40.0, 20.0));
     let grid = g.add(NodeKind::Grid { size: 2.0, res: 24 }, egui::pos2(0.0, 0.0));
     // Upright, 2 wide and 1.3 high, its bottom edge a little off the ground.
-    let stand = g.add(NodeKind::Transform { t: [0.0, 1.2, 0.0], r: [90.0, 0.0, 0.0], s: [1.0, 1.0, 0.65] }, egui::pos2(0.0, 0.0));
+    let stand = g.add(NodeKind::Transform { t: [0.0, 1.2, 0.0], r: [90.0, 0.0, 0.0], s: [1.0, 1.0, 0.65], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     let code = "// Waves run along the flag from the pole at x = -1, growing towards the free edge.\n\
                     // Whole waves per period, so it loops exactly.\n\
                     float t = @Time / ch(\"period\");\n\
@@ -71,7 +71,7 @@ pub fn breaking_wall() -> String {
     let mut g = Graph::default();
     let geo = g.add(NodeKind::Geometry { material: None }, egui::pos2(40.0, 20.0));
     let block = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
-    let shape = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [3.0, 2.0, 0.3] }, egui::pos2(0.0, 0.0));
+    let shape = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [3.0, 2.0, 0.3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     let fracture = g.add(kind("material_fracture"), egui::pos2(0.0, 0.0));
     set(&mut g, fracture, "pieces", 24.0);
     let code = "// The blow lands on the wall's middle from the front: pieces near it are\n\
@@ -98,7 +98,7 @@ pub fn splash() -> String {
     app.graph = Graph::default();
     let geo = app.graph.add(NodeKind::Geometry { material: None }, egui::pos2(40.0, 20.0));
     let seed = app.graph.add(NodeKind::Sphere { radius: 0.15, rows: 6, cols: 8 }, egui::pos2(0.0, 0.0));
-    let lift = app.graph.add(NodeKind::Transform { t: [0.0, 0.2, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let lift = app.graph.add(NodeKind::Transform { t: [0.0, 0.2, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     app.graph.nodes.get_mut(&lift).unwrap().parent = Some(geo);
     app.graph.connect(seed, lift, 0);
     app.graph.nodes.get_mut(&seed).unwrap().parent = Some(geo);

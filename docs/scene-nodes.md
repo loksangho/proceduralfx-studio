@@ -99,7 +99,7 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| xform | `xform` | tx=0, ty=0, tz=0, rx=0, ry=0, rz=0, sx=1, sy=1, sz=1 |
+| xform | `xform` | tx=0, ty=0, tz=0, rx=0, ry=0, rz=0, sx=1, sy=1, sz=1, px=0, py=0, pz=0 |
 | noise | `noise` | frequency=2.2, amplitude=0.3 |
 | taper | `taper` | taper=0.3 |
 | twist | `twist` | twist_angle=1 |

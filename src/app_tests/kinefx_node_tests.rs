@@ -12,7 +12,7 @@ fn a_walking_skeleton_deforms_a_captured_mesh() {
     assert!(g.time_dependent(ik));
     // A "body": points down the left leg.
     let body = g.add(NodeKind::Add { count: 20, spacing: 0.045, layout: 1, points: Vec::new(), delete_geometry: false }, egui::pos2(0.0, 0.0));
-    let place = g.add(NodeKind::Transform { t: [0.13, 0.08, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let place = g.add(NodeKind::Transform { t: [0.13, 0.08, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     g.connect(body, place, 0);
     let capture = g.add(NodeKind::JointCapture(kinefx::CaptureSettings::defaults()), egui::pos2(0.0, 0.0));
     g.connect(place, capture, 0);

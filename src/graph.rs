@@ -1896,7 +1896,11 @@ impl Graph {
                 NodeKind::Torus { major, minor, rows, cols } => {
                     node_torus(*major, *minor, *rows, *cols)
                 }
-                NodeKind::Transform { t, r, s } => node_transform(input(0, cache), *t, *r, *s),
+                NodeKind::Transform { t, r, s, p } => {
+                    // About the pivot: move it to the origin, scale and rotate, move it back.
+                    let moved = if *p == [0.0; 3] { input(0, cache) } else { node_transform(input(0, cache), p.map(|c| -c), [0.0; 3], [1.0; 3]) };
+                    node_transform(moved, [t[0] + p[0], t[1] + p[1], t[2] + p[2]], *r, *s)
+                }
                 NodeKind::Noise { freq, amp } => {
                     node_noise_displace(input(0, cache), *freq, *amp, time)
                 }

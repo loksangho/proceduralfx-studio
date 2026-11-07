@@ -66,7 +66,7 @@ fn attribute_vops_read_their_other_inputs() {
     // The lift network, but its Bind reads P from a raised copy wired into input 1.
     let (mut g, grid, net) = lift_network();
     assert_eq!(g.nodes[&net].kind.num_inputs(), 4);
-    let raised = g.add(NodeKind::Transform { t: [0.0, 5.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let raised = g.add(NodeKind::Transform { t: [0.0, 5.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     g.connect(grid, raised, 0);
     g.connect(raised, net, 1);
     let bind = g.children(net).into_iter().find(|c| matches!(&g.nodes[c].kind, NodeKind::Vop(v) if v.op == vop::BIND)).unwrap();

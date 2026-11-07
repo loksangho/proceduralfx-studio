@@ -37,7 +37,7 @@ fn fractured_pieces_feed_rbd_and_crowds_and_muscles_cook() {
     let tube = g.add(NodeKind::Tube { r_bot: 0.16, r_top: 0.16, height: 1.0, rows: 8, cols: 16, caps: false }, egui::pos2(0.0, 0.0));
     let tube_mesh = g.cook(tube, 0.0, &mut HashMap::new());
     let (lo, _) = tube_mesh.bounds().unwrap();
-    let skin_src = g.add(NodeKind::Transform { t: [0.0, -lo.y, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let skin_src = g.add(NodeKind::Transform { t: [0.0, -lo.y, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     g.connect(tube, skin_src, 0);
     let skin = g.add(NodeKind::MuscleSkin(muscle::SkinSettings::defaults()), egui::pos2(0.0, 0.0));
     g.connect(skin_src, skin, 0);

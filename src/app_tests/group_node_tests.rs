@@ -31,7 +31,7 @@ fn chain(node: NodeKind, pattern: &str) -> (Graph, NodeId, NodeId) {
 
 #[test]
 fn deformers_and_wrangles_only_touch_their_group() {
-    let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, "right");
+    let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, "right");
     let before = g.cook(make, 0.0, &mut HashMap::new());
     let after = g.cook(transform, 0.0, &mut HashMap::new());
     for (a, b) in before.vertices.iter().zip(&after.vertices) {
@@ -54,7 +54,7 @@ fn deformers_and_wrangles_only_touch_their_group() {
         assert_eq!(out.point_attributes["group:tagged"][i], (p.z > 0.0) as u8 as f32);
     }
     // A bad group is an error on the node.
-    let (g, _, bad) = chain(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3] }, "nosuchgroup");
+    let (g, _, bad) = chain(NodeKind::Transform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, "nosuchgroup");
     assert!(g.cook(bad, 0.0, &mut HashMap::new()).vertices.is_empty());
     assert!(node_errors(|e| e.get(&bad).cloned()).is_some_and(|e| e.contains("nosuchgroup")));
 }
@@ -102,7 +102,7 @@ fn blast_scatter_and_vellum_use_groups() {
 #[test]
 fn picking_a_group_in_the_viewport() {
     let mut app = ProceduralFxStudioApp::default();
-    let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, "right");
+    let (g, make, transform) = chain(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, "right");
     app.graph = g;
     app.selected = Some(transform);
     app.start_group_pick(transform, PickTarget::NodeGroup);
@@ -146,7 +146,7 @@ fn duplicating_several_nodes_keeps_their_wiring() {
     let mut g = Graph::default();
     g.next_id += 9500;
     let source = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
-    let a = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 80.0));
+    let a = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 80.0));
     let b = g.add(NodeKind::Noise { freq: 1.0, amp: 0.2 }, egui::pos2(0.0, 160.0));
     let begin = g.add(NodeKind::ForEachBegin, egui::pos2(0.0, 240.0));
     let end = g.add(NodeKind::ForEachEnd(flow::ForEachSettings { begin: Some(begin), ..flow::ForEachSettings::new(0) }), egui::pos2(0.0, 320.0));

@@ -31,7 +31,7 @@ fn flip_steps_from_its_cache_and_feeds_whitewater() {
     let mut g = Graph::default();
     g.next_id += 9300;
     let emitter = g.add(NodeKind::Box { size: 1.0, div: 1 }, egui::pos2(0.0, 0.0));
-    let lift = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0, 1.0, 1.0] }, egui::pos2(0.0, 0.0));
+    let lift = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0; 3], s: [1.0, 1.0, 1.0], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     let fluid = g.add(flip(), egui::pos2(0.0, 0.0));
     let white = g.add(NodeKind::WhitewaterSolver(whitewater::WhitewaterSettings { emission_rate: 3000.0, min_speed: 0.2, ..whitewater::WhitewaterSettings::defaults() }), egui::pos2(0.0, 0.0));
     g.connect(emitter, lift, 0);

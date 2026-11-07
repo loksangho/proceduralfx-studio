@@ -15,7 +15,7 @@ fn foreach_loops_run_their_body_per_piece() {
     // Two boxes, merged: two connected pieces.
     let a = add_in(&mut app, geo, NodeKind::Box { size: 1.0, div: 1 });
     let b = add_in(&mut app, geo, NodeKind::Box { size: 1.0, div: 1 });
-    let shift = add_in(&mut app, geo, NodeKind::Transform { t: [5.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] });
+    let shift = add_in(&mut app, geo, NodeKind::Transform { t: [5.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] });
     app.graph.connect(b, shift, 0);
     let merge = add_in(&mut app, geo, NodeKind::Merge);
     app.graph.connect(a, merge, 0);
@@ -110,7 +110,7 @@ fn object_merge_brings_other_objects_in() {
     assert_eq!(merged.vertices.len(), original.vertices.len());
     assert!(merged.vertices.iter().zip(&original.vertices).all(|(a, b)| a.sub(*b).length() < 1e-5));
     // What's downstream of a merge can't feed it; nested nodes are named by their path.
-    let after = add_in(&mut app, target, NodeKind::Transform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] });
+    let after = add_in(&mut app, target, NodeKind::Transform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] });
     app.graph.connect(local, after, 0);
     let downstream = app.graph.downstream(local);
     assert!(downstream.contains(&after) && !downstream.contains(&sphere));

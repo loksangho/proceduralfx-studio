@@ -430,7 +430,7 @@ fn cloth_over_box(ground: bool) -> (Graph, NodeId, NodeId) {
     let grid = g.add(NodeKind::Grid { size: 4.0, res: 20 }, egui::pos2(0.0, 0.0));
     let cloth = g.add(NodeKind::VellumSolver(vellum::VellumSettings { ground, ..vellum::VellumSettings::defaults(0) }), egui::pos2(0.0, 0.0));
     let block = g.add(NodeKind::Box { size: 1.5, div: 4 }, egui::pos2(0.0, 0.0));
-    let lower = g.add(NodeKind::Transform { t: [0.0, -1.67, 0.0], r: [0.0; 3], s: [1.0; 3] }, egui::pos2(0.0, 0.0));
+    let lower = g.add(NodeKind::Transform { t: [0.0, -1.67, 0.0], r: [0.0; 3], s: [1.0; 3], p: [0.0; 3] }, egui::pos2(0.0, 0.0));
     g.connect(grid, cloth, 0);
     g.connect(block, lower, 0);
     g.connect(lower, cloth, 1);
@@ -532,4 +532,21 @@ fn chramp_ramps_save_and_load_with_the_wrangle() {
     let out = loaded.cook(wrangle, 0.0, &mut HashMap::new());
     // Left of the middle holds 0, from the middle on 2.
     assert!(out.vertices.iter().all(|p| (p.x < -1e-4 && p.y == 0.0) || (p.x >= -1e-4 && p.y == 2.0)), "{:?}", out.vertices);
+}
+
+#[test]
+fn transforms_scale_and_turn_about_their_pivot() {
+    let mut g = Graph::default();
+    let add = g.add(NodeKind::Add { count: 0, spacing: 1.0, layout: 0, points: vec![[0.0; 3], [1.0, 0.0, 0.0]], delete_geometry: false }, egui::pos2(0.0, 0.0));
+    // Half a turn about Y around the pivot (1, 0, 0), then up 1: (1, 0, 0) stays put but
+    // rises; the origin swings round to (2, 0, 0).
+    let xf = g.add(NodeKind::Transform { t: [0.0, 1.0, 0.0], r: [0.0, 180.0, 0.0], s: [2.0; 3], p: [1.0, 0.0, 0.0] }, egui::pos2(0.0, 80.0));
+    g.connect(add, xf, 0);
+    let out = g.cook(xf, 0.0, &mut HashMap::new());
+    assert!(out.vertices[1].sub(Vec3::new(1.0, 1.0, 0.0)).length() < 1e-4, "{:?}", out.vertices[1]);
+    assert!(out.vertices[0].sub(Vec3::new(3.0, 1.0, 0.0)).length() < 1e-4, "doubled and turned: {:?}", out.vertices[0]);
+    // Saved and loaded, the pivot stays; an older scene's transform has its pivot at the origin.
+    let loaded = Graph::deserialize(&g.serialize());
+    assert!(matches!(loaded.nodes[&xf].kind, NodeKind::Transform { p: [1.0, 0.0, 0.0], .. }));
+    assert!(matches!(NodeKind::from_params("xform", &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]), Some(NodeKind::Transform { p: [0.0, 0.0, 0.0], .. })));
 }

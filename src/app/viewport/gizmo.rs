@@ -149,7 +149,8 @@ impl ProceduralFxStudioApp {
             NodeKind::Light { position, rotation, .. } | NodeKind::Camera { position, rotation, .. } => {
                 target(ObjectXform { t: *position, r: *rotation, s: [1.0; 3] }, identity, GizmoStyle::Xform)
             }
-            NodeKind::Transform { t, r, s } => target(ObjectXform { t: *t, r: *r, s: *s }, space, GizmoStyle::Xform),
+            // At the pivot, where it ends up.
+            NodeKind::Transform { t, r, s, p } => target(ObjectXform { t: [t[0] + p[0], t[1] + p[1], t[2] + p[2]], r: *r, s: *s }, space, GizmoStyle::Xform),
             NodeKind::Pyro(p) => target(boxed(Vec3::from_arr(p.center), Vec3::from_arr(p.size)), space, GizmoStyle::Box),
             NodeKind::Flip { domain, .. } if domain[3] > 0.0 => {
                 target(boxed(Vec3::new(domain[0], domain[1], domain[2]), Vec3::new(domain[3], domain[4], domain[5])), space, GizmoStyle::Box)
@@ -224,8 +225,8 @@ impl ProceduralFxStudioApp {
                 *position = x.t;
                 *rotation = x.r;
             }
-            NodeKind::Transform { t, r, s } => {
-                *t = x.t;
+            NodeKind::Transform { t, r, s, p } => {
+                *t = [x.t[0] - p[0], x.t[1] - p[1], x.t[2] - p[2]];
                 *r = x.r;
                 *s = x.s;
             }
