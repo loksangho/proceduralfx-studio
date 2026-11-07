@@ -633,3 +633,27 @@ fn the_other_objects_show_while_inside_one() {
     settle(&mut h);
     assert!(h.state().context_mesh.vertices.is_empty());
 }
+
+// An expression typed into POP Source's Impulse activation makes it follow it, even when
+// the expression gives the value it already has (1, at the top of its slider).
+#[test]
+fn an_expression_typed_into_impulse_activation_sticks() {
+    let mut app = empty_network();
+    app.load_state("pfs 2\nnode 0 40 20 0 obj geometry -1\nnode 2 40 20 0 obj popnet 1\nparent 2 0\nnode 1 40 20 0 obj pop 2\nparent 1 2\ndisplay 0 2\nnext 3\n".into());
+    app.current_network = Some(2);
+    app.selected = Some(1);
+    let mut h = harness(app);
+    for (label, expression) in [("Impulse activation", "$F == 1"), ("Constant activation", "$T < 0.5")] {
+        h.get_by_role_and_label(egui::accesskit::Role::SpinButton, label).click();
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text(expression.into()));
+        h.key_press(egui::Key::Enter);
+        settle(&mut h);
+        let names = h.state().graph.nodes[&1].kind.param_names();
+        let key = name_key(label);
+        let index = names.iter().position(|n| name_key(n) == key).unwrap();
+        let channel = ChannelId { node: 1, target: ChannelTarget::Param(index) };
+        assert_eq!(h.state().graph.channels.get(&channel).and_then(|c| c.expression.as_deref()), Some(expression), "{label}: {}", h.state().status);
+    }
+}

@@ -723,6 +723,13 @@ thread_local! {
 // current time. An expression whose value equals the field's still changes the
 // field (by a step), so parameters_pane can tell which parameter it was typed into.
 pub(crate) fn typed_parser(current: f64, integral: bool) -> impl Fn(&str) -> Option<f64> {
+    typed_parser_in(current, integral, f64::MAX)
+}
+
+// The same, for a slider that stops at `max`: the step goes down when up would pass it (an
+// expression giving 1 typed into a 0-1 slider at 1 would otherwise be clamped back to 1, and
+// look like no change).
+pub(crate) fn typed_parser_in(current: f64, integral: bool, max: f64) -> impl Fn(&str) -> Option<f64> {
     move |text: &str| {
         let text = text.trim();
         if let Ok(v) = text.parse::<f64>() {
@@ -734,7 +741,7 @@ pub(crate) fn typed_parser(current: f64, integral: bool) -> impl Fn(&str) -> Opt
                 TYPED.with(|t| *t.borrow_mut() = Some(Typed::Expression(text.to_owned())));
                 let v = v as f64;
                 let step = if integral { 1.0 } else { (current.abs() * 1e-4).max(1e-4) };
-                Some(if v == current { v + step } else { v })
+                Some(if v != current { v } else if v + step <= max { v + step } else { v - step })
             }
             Err(error) => {
                 TYPED.with(|t| *t.borrow_mut() = Some(Typed::Error(error)));
@@ -757,7 +764,8 @@ pub(crate) const MIN_ZOOM: f32 = 0.001;
 pub(crate) fn pslider<'a, N: egui::emath::Numeric>(value: &'a mut N, range: std::ops::RangeInclusive<N>) -> PSlider<'a> {
     let current = value.to_f64();
     FIELD_VALUE.with(|v| v.set(current));
-    PSlider { slider: egui::Slider::new(value, range).custom_parser(typed_parser(current, N::INTEGRAL)), label: String::new(), value: current }
+    let max = range.end().to_f64();
+    PSlider { slider: egui::Slider::new(value, range).custom_parser(typed_parser_in(current, N::INTEGRAL, max)), label: String::new(), value: current }
 }
 
 // The selected node's parameters that follow an expression, for the sliders showing them:
