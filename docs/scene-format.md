@@ -71,7 +71,18 @@ Some nodes store several types under one saved name, for example `vop`, `cop`, `
 Two node types use their own layout:
 
 - **`wrangle`** stores one token, `<domain>:<code>`. Here `domain` is what the code runs
-  over: 0 once (detail), 1 primitives, 2 points, 3 vertices. `code` is the VEX in hex.
+  over, the Run over menu's choice. `code` is the VEX in hex. `attribute_vop`'s one number,
+  `run_over`, uses the same values:
+
+  | Value | Run over |
+  | --- | --- |
+  | 0 | Detail (once for the whole geometry) |
+  | 1 | Primitives |
+  | 2 | Points |
+  | 3 | Vertices |
+
+  Run over Detail, `@Cd`, `@P` and other attributes set one detail value, not each point's: the
+  app warns when code there writes attributes usually set per point.
 - **`moonray_render`** stores one token: `mr:` followed by 20 fields separated by `|`:
 
   | # | Field | # | Field |

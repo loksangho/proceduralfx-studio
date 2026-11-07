@@ -346,6 +346,15 @@ pub(crate) fn examples_menu(ui: &mut egui::Ui, code: &mut String, examples: &[(&
 
 // The VEX editor the wrangles share: the code, its ch() parameters, errors, the last
 // run's report and output, and the language reference. `noun` names what it runs over.
+// The warning for code that runs over Detail (domain 0) but sets point attributes.
+pub(crate) fn detail_warning_ui(ui: &mut egui::Ui, domain: usize, code: &str) {
+    if domain == 0 {
+        if let Some(warning) = vex::detail_warning(&vex::detail_writes_point_attributes(code, None)) {
+            ui.colored_label(egui::Color32::from_rgb(240, 190, 90), format!("⚠ {warning}"));
+        }
+    }
+}
+
 pub(crate) fn vex_editor_ui(ui: &mut egui::Ui, code: &mut String, domain: usize, noun: &str, channels: &mut vex::Channels, hint: &str) -> bool {
     let mut c = false;
     let dark = ui.visuals().dark_mode;
@@ -416,6 +425,8 @@ pub(crate) fn vex_editor_ui(ui: &mut egui::Ui, code: &mut String, domain: usize,
             }
         },
     }
+    // Over Detail, @Cd, @P and the like set one value for everything: say so where it's typed.
+    detail_warning_ui(ui, domain, code);
     if let Some(report) = report.as_ref().filter(|r| !r.output.is_empty()) {
         egui::CollapsingHeader::new(format!("Output ({} lines)", report.output.len()))
             .id_salt("wrangle_output")
@@ -1675,6 +1686,9 @@ impl NodeKind {
             NodeKind::PopNet { .. } => names(&["substeps"]),
             NodeKind::Top(n) => std::iter::once(String::new()).chain(n.def().params.iter().map(|p| if matches!(p.key, "node" | "param") { String::new() } else { p.key.to_owned() })).collect(),
             NodeKind::Material { .. } => names(&["", "color.r", "color.g", "color.b", "roughness", "value"]),
+            // After the operation: the type (Bind, Constant, Parameter, Export, Snippet), the axis
+            // (Component) or the comparison (Compare); the value; the input it reads.
+            NodeKind::Vop(_) => names(&["", "type", "value.x", "value.y", "value.z", "input"]),
             _ => Vec::new(),
         }
     }

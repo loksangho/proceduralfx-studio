@@ -695,6 +695,8 @@ pub(crate) struct ProceduralFxStudioApp {
     // Placing a Curve's points in the viewport: on, the construction plane (see
     // curve_draw.rs), the point being dragged, and where its handles were drawn last frame.
     pub(crate) curve_draw: bool,
+    // Run from the command line: finished renders aren't kept for the (absent) viewers.
+    pub(crate) headless: bool,
     // Parameters showing their expression instead of their value (their name was clicked).
     pub(crate) shown_expressions: std::collections::HashSet<ChannelId>,
     // Expressions a slider named last frame (see ExpressionField).
@@ -960,6 +962,7 @@ impl Default for ProceduralFxStudioApp {
             paint_active: false,
             paint_fill: None,
             curve_draw: false,
+            headless: false,
             shown_expressions: Default::default(),
             named_expressions: Default::default(),
             curve_plane: 0,

@@ -606,7 +606,9 @@ impl ProceduralFxStudioApp {
                     Ok((png, _)) if output.live => format!("Live sprite sheet: updated {}{cut_off}", png.display()),
                     Ok((png, sheet)) => {
                         // With Live on, the game shows the effect: don't open a window over it.
-                        self.viewer.add(png.clone(), !self.sprite_sheet.live);
+                        if !self.headless {
+                            self.viewer.add(png.clone(), !self.sprite_sheet.live);
+                        }
                         let (w, h) = sheet.image.dimensions();
                         format!("Sprite sheet: {} frames in {}×{} cells of {}×{} ({w}×{h} pixels), saved to {}{cut_off}", done.frames.len().saturating_sub(output.blend), sheet.columns, sheet.rows, sheet.cell[0], sheet.cell[1], png.display())
                     }
@@ -615,14 +617,17 @@ impl ProceduralFxStudioApp {
             } else if let Some(dir) = done.capture.and_then(|c| c.save_to) {
                 self.status = match flipbook::save_pngs(&done.frames, &dir, "render") {
                     Ok(first) => {
-                        self.viewer.add(first, !(done.frames.len() > 1));
                         let count = done.frames.len();
-                        // A range plays as an animation in the flipbook viewer, at its own rate.
-                        if count > 1 {
+                        // In the app, a range plays as an animation in the flipbook viewer, at its own rate.
+                        let play = count > 1 && !self.headless;
+                        if !self.headless {
+                            self.viewer.add(first, count == 1);
+                        }
+                        if play {
                             let step = (done.times[1] - done.times[0]).abs().max(1e-3);
                             self.flipbook_viewer = Some(flipbook::Viewer::new(done.frames, done.times, (1.0 / step).clamp(1.0, 120.0)));
                         }
-                        format!("Rendered {count} frame{} in real time to {}{}", if count == 1 { "" } else { "s" }, dir.display(), if count > 1 { "; playing them in the flipbook viewer" } else { "" })
+                        format!("Rendered {count} frame{} in real time to {}{}", if count == 1 { "" } else { "s" }, dir.display(), if play { "; playing them in the flipbook viewer" } else { "" })
                     }
                     Err(e) => format!("Real-time render: couldn't save the frames: {e}"),
                 };

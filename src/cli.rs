@@ -275,6 +275,7 @@ pub fn run(job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, 
     let gpu = gpu_viewport::headless().ok_or("no GPU was found for the real-time renderer")?;
     let mut app = ProceduralFxStudioApp::default();
     app.gpu_viewport = Some(gpu);
+    app.headless = true;
     let unread = unread_nodes(&text, &Graph::deserialize(&text));
     app.use_saved_timeline(&text);
     app.load_state(text);
@@ -424,7 +425,9 @@ fn run_vat(job: &Job, text: String, stem: &std::path::Path, object: Option<&str>
 
 // The command-line entry point: Some(exit code) if the arguments were a render command.
 pub fn main(args: &[String]) -> Option<i32> {
-    if args.get(1).is_some_and(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
+    // --help anywhere (sprite-sheet --help too) shows the usage.
+    let is_command = args.get(1).is_some_and(|a| matches!(a.as_str(), "render" | "sprite-sheet" | "animation" | "vat" | "--help" | "-h" | "help"));
+    if is_command && (args.get(1).is_some_and(|a| a == "help") || args.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h"))) {
         println!("{USAGE}");
         return Some(0);
     }
@@ -519,6 +522,10 @@ mod tests {
         assert!(error("render fire.pfs --frame").contains("needs a value"));
         assert_eq!(main(&args("render")), Some(2));
         assert_eq!(main(&args("--help")), Some(0));
+        // --help after a command shows the usage too, not an unknown option.
+        assert_eq!(main(&args("sprite-sheet --help")), Some(0));
+        assert_eq!(main(&args("render fire.pfs -h")), Some(0));
+        assert_eq!(main(&args("help")), Some(0));
     }
 
     #[test]
@@ -538,6 +545,7 @@ mod tests {
         let mut seen = Vec::new();
         let summary = run(&job, &mut |done, total| seen.push((done, total))).unwrap();
         assert!(summary.contains("no camera"), "{summary}");
+        assert!(!summary.contains("flipbook viewer"), "nothing plays on the command line: {summary}");
         for n in 1..=3 {
             let frame = image::open(dir.join(format!("ball_render/render.{n:04}.png"))).unwrap();
             assert_eq!((frame.width(), frame.height()), (64, 48));

@@ -26,6 +26,7 @@ impl ProceduralFxStudioApp {
                             node.channels.entry(name.clone()).or_insert(*default);
                         }
                         c |= channel_params_ui(ui, code, &mut node.channels);
+                        detail_warning_ui(ui, *domain, code);
                         egui::CollapsingHeader::new("Generated VEX").id_salt("vop_code").show(ui, |ui| {
                             ui.label(egui::RichText::new(code.as_str()).monospace().small());
                         });

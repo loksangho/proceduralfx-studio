@@ -223,8 +223,8 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 | attribute_remap | `attribute_remap` | 2 text field(s); class=0, auto_range=1, input_min=0, input_max=1, output_min=0, output_max=1 |
 | attribute_fade | `attribute_fade` | 5 text field(s); frame_offset=0, fade_in=12, hold=24, fade_out=12, seconds=0, visualize=0 |
 | attribute_promote | `attribute_promote` | 2 text field(s); from=0, to=2, method=0, delete_original=1 |
-| wrangle | `wrangle` | the run-over domain (0–3), `:`, then the code in hex |
-| attribute_vop | `attribute_vop` | run_over=2 |
+| wrangle | `wrangle` | the run-over domain (0 Detail, 1 Primitives, 2 Points, 3 Vertices), `:`, then the code in hex |
+| attribute_vop | `attribute_vop` | run_over=2 (0 Detail, 1 Primitives, 2 Points, 3 Vertices) |
 | normal | `normal` | domain=1, cusp_angle=60, weighting=0, reverse=0 |
 | measure | `measure` | 2 text field(s); measure=0, curvature=0, summary=1 |
 | connectivity | `connectivity` | 1 text field(s); class=1 |
@@ -486,91 +486,91 @@ Generated from the code by `node_reference_is_current` (see [scene-format.md](sc
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Bind | `vop` | 1 text field(s); operation=0, #1=1, #2=0, #3=0, #4=0, #5=0 |
-| Parameter | `vop` | 1 text field(s); operation=2, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Bind | `vop` | 1 text field(s); operation=0, type=1, value.x=0, value.y=0, value.z=0, input=0 |
+| Parameter | `vop` | 1 text field(s); operation=2, type=0, value.x=0, value.y=0, value.z=0, input=0 |
 
 ## Math
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Add | `vop` | 1 text field(s); operation=7, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Subtract | `vop` | 1 text field(s); operation=8, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Multiply | `vop` | 1 text field(s); operation=9, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Divide | `vop` | 1 text field(s); operation=10, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Negate | `vop` | 1 text field(s); operation=11, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Absolute | `vop` | 1 text field(s); operation=12, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Floor | `vop` | 1 text field(s); operation=13, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Fraction | `vop` | 1 text field(s); operation=14, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Power | `vop` | 1 text field(s); operation=15, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Square Root | `vop` | 1 text field(s); operation=16, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Sine | `vop` | 1 text field(s); operation=17, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Cosine | `vop` | 1 text field(s); operation=18, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Minimum | `vop` | 1 text field(s); operation=19, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Maximum | `vop` | 1 text field(s); operation=20, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Clamp | `vop` | 1 text field(s); operation=22, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Fit Range | `vop` | 1 text field(s); operation=23, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Ramp Smooth | `vop` | 1 text field(s); operation=24, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Modulo | `vop` | 1 text field(s); operation=48, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Round | `vop` | 1 text field(s); operation=49, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Ceiling | `vop` | 1 text field(s); operation=50, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Exponential | `vop` | 1 text field(s); operation=51, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Logarithm | `vop` | 1 text field(s); operation=52, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Tangent | `vop` | 1 text field(s); operation=53, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Arctangent2 | `vop` | 1 text field(s); operation=54, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Average | `vop` | 1 text field(s); operation=55, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Sign | `vop` | 1 text field(s); operation=56, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Add | `vop` | 1 text field(s); operation=7, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Subtract | `vop` | 1 text field(s); operation=8, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Multiply | `vop` | 1 text field(s); operation=9, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Divide | `vop` | 1 text field(s); operation=10, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Negate | `vop` | 1 text field(s); operation=11, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Absolute | `vop` | 1 text field(s); operation=12, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Floor | `vop` | 1 text field(s); operation=13, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Fraction | `vop` | 1 text field(s); operation=14, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Power | `vop` | 1 text field(s); operation=15, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Square Root | `vop` | 1 text field(s); operation=16, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Sine | `vop` | 1 text field(s); operation=17, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Cosine | `vop` | 1 text field(s); operation=18, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Minimum | `vop` | 1 text field(s); operation=19, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Maximum | `vop` | 1 text field(s); operation=20, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Clamp | `vop` | 1 text field(s); operation=22, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Fit Range | `vop` | 1 text field(s); operation=23, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Ramp Smooth | `vop` | 1 text field(s); operation=24, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Modulo | `vop` | 1 text field(s); operation=48, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Round | `vop` | 1 text field(s); operation=49, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Ceiling | `vop` | 1 text field(s); operation=50, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Exponential | `vop` | 1 text field(s); operation=51, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Logarithm | `vop` | 1 text field(s); operation=52, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Tangent | `vop` | 1 text field(s); operation=53, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Arctangent2 | `vop` | 1 text field(s); operation=54, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Average | `vop` | 1 text field(s); operation=55, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Sign | `vop` | 1 text field(s); operation=56, type=0, value.x=0, value.y=0, value.z=0, input=0 |
 
 ## Vector
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Component | `vop` | 1 text field(s); operation=4, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Dot Product | `vop` | 1 text field(s); operation=25, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Cross Product | `vop` | 1 text field(s); operation=26, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Length | `vop` | 1 text field(s); operation=27, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Normalize | `vop` | 1 text field(s); operation=28, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Distance | `vop` | 1 text field(s); operation=29, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Make Vector | `vop` | 1 text field(s); operation=30, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Rotate | `vop` | 1 text field(s); operation=31, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Reflect | `vop` | 1 text field(s); operation=57, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Component | `vop` | 1 text field(s); operation=4, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Dot Product | `vop` | 1 text field(s); operation=25, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Cross Product | `vop` | 1 text field(s); operation=26, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Length | `vop` | 1 text field(s); operation=27, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Normalize | `vop` | 1 text field(s); operation=28, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Distance | `vop` | 1 text field(s); operation=29, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Make Vector | `vop` | 1 text field(s); operation=30, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Rotate | `vop` | 1 text field(s); operation=31, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Reflect | `vop` | 1 text field(s); operation=57, type=0, value.x=0, value.y=0, value.z=0, input=0 |
 
 ## Geometry
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Get Attribute | `vop` | 1 text field(s); operation=38, #1=1, #2=0, #3=0, #4=0, #5=0 |
-| Point Cloud Average | `vop` | 1 text field(s); operation=39, #1=1, #2=0, #3=0, #4=0, #5=0 |
-| Nearest Point | `vop` | 1 text field(s); operation=40, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Distance to Surface | `vop` | 1 text field(s); operation=41, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Closest Point on Surface | `vop` | 1 text field(s); operation=42, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Neighbour Count | `vop` | 1 text field(s); operation=43, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Point Count | `vop` | 1 text field(s); operation=44, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Bounding Box Centre | `vop` | 1 text field(s); operation=45, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Bounding Box Size | `vop` | 1 text field(s); operation=46, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Relative to Bounding Box | `vop` | 1 text field(s); operation=47, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Get Attribute | `vop` | 1 text field(s); operation=38, type=1, value.x=0, value.y=0, value.z=0, input=0 |
+| Point Cloud Average | `vop` | 1 text field(s); operation=39, type=1, value.x=0, value.y=0, value.z=0, input=0 |
+| Nearest Point | `vop` | 1 text field(s); operation=40, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Distance to Surface | `vop` | 1 text field(s); operation=41, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Closest Point on Surface | `vop` | 1 text field(s); operation=42, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Neighbour Count | `vop` | 1 text field(s); operation=43, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Point Count | `vop` | 1 text field(s); operation=44, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Bounding Box Centre | `vop` | 1 text field(s); operation=45, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Bounding Box Size | `vop` | 1 text field(s); operation=46, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Relative to Bounding Box | `vop` | 1 text field(s); operation=47, type=0, value.x=0, value.y=0, value.z=0, input=0 |
 
 ## Noise
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Signed Noise | `vop` | 1 text field(s); operation=33, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Curl Noise | `vop` | 1 text field(s); operation=34, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Worley Noise | `vop` | 1 text field(s); operation=35, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Random | `vop` | 1 text field(s); operation=36, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Alligator Noise | `vop` | 1 text field(s); operation=58, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Signed Noise | `vop` | 1 text field(s); operation=33, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Curl Noise | `vop` | 1 text field(s); operation=34, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Worley Noise | `vop` | 1 text field(s); operation=35, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Random | `vop` | 1 text field(s); operation=36, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Alligator Noise | `vop` | 1 text field(s); operation=58, type=0, value.x=0, value.y=0, value.z=0, input=0 |
 
 ## Logic
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Compare | `vop` | 1 text field(s); operation=5, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Snippet | `vop` | 1 text field(s); operation=6, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| And | `vop` | 1 text field(s); operation=59, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Or | `vop` | 1 text field(s); operation=60, #1=0, #2=0, #3=0, #4=0, #5=0 |
-| Not | `vop` | 1 text field(s); operation=61, #1=0, #2=0, #3=0, #4=0, #5=0 |
+| Compare | `vop` | 1 text field(s); operation=5, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Snippet | `vop` | 1 text field(s); operation=6, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| And | `vop` | 1 text field(s); operation=59, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Or | `vop` | 1 text field(s); operation=60, type=0, value.x=0, value.y=0, value.z=0, input=0 |
+| Not | `vop` | 1 text field(s); operation=61, type=0, value.x=0, value.y=0, value.z=0, input=0 |
 
 ## Outputs
 
 | Node | Saved as | Parameters |
 | --- | --- | --- |
-| Export | `vop` | 1 text field(s); operation=3, #1=1, #2=0, #3=0, #4=0, #5=0 |
+| Export | `vop` | 1 text field(s); operation=3, type=1, value.x=0, value.y=0, value.z=0, input=0 |

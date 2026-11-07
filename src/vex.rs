@@ -4641,6 +4641,32 @@ pub fn eval_expression(expr: &str, time: f32) -> Result<f32, String> {
 
 // `inputs`: the wrangle's inputs 1-3 (fewer when they aren't connected), read by point(1, ...),
 // @opinput1_P and the like.
+// Attributes usually set on each point that are usually meant per point: written in a run over
+// Detail, they're one value for the whole geometry instead, which is rarely what's meant.
+const PER_POINT: [&str; 17] = ["P", "Cd", "N", "pscale", "Alpha", "v", "orient", "uv", "width", "force", "up", "scale", "age", "life", "rest", "emission", "density"];
+
+// The attributes `code`, run over Detail, would set as detail attributes although they're
+// usually per point (@Cd, @P, @pscale...), or are point attributes of `input` already.
+pub fn detail_writes_point_attributes(code: &str, input: Option<&Mesh>) -> Vec<String> {
+    let Ok(program) = compile(code) else { return Vec::new() };
+    let mut names: Vec<String> = program
+        .attrs
+        .iter()
+        .filter(|a| a.written && (a.kind == AttrKind::P || PER_POINT.contains(&a.name.as_str()) || input.is_some_and(|m| m.point_attributes.contains_key(&a.name) && !m.vertices.is_empty())))
+        .map(|a| a.name.clone())
+        .collect();
+    names.dedup();
+    names
+}
+
+// The warning for those, as the editor and the run's output give it.
+pub fn detail_warning(names: &[String]) -> Option<String> {
+    (!names.is_empty()).then(|| {
+        let list = names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(", ");
+        format!("This runs over Detail, so {list} {} one detail attribute for the whole geometry, not each point's. Did you mean Run over: Points?", if names.len() == 1 { "sets" } else { "set" })
+    })
+}
+
 pub fn run_wrangle(mesh: Mesh, inputs: &[Mesh], code: &str, time: f32, time_inc: f32, domain_index: usize, mask: Option<&[bool]>, channels: Option<&Channels>) -> Mesh {
     let start = Instant::now();
     let (mesh, mut report) = run_masked(mesh, inputs, code, time, time_inc, domain_index, mask, channels);
@@ -4836,13 +4862,14 @@ fn run_with(
     };
     // Reading an attribute nothing creates is almost always a typo or an unsupported global.
     let keys: Vec<String> = program.attrs.iter().map(|a| format!("{}{}", domain.prefix(), storage_name_as(&a.name, a.hint))).collect();
-    let warnings: Vec<String> = program
+    let detail_warning = (domain == Domain::Detail).then(|| detail_warning(&detail_writes_point_attributes(code, Some(&input)))).flatten().map(|w| format!("Warning: {w}"));
+    let warnings: Vec<String> = detail_warning.into_iter().chain(program
         .attrs
         .iter()
         .zip(&keys)
         // (A group nothing is in reads as 0 in Houdini too: no warning.)
         .filter(|(attr, key)| attr.kind == AttrKind::Other && !attr.written && !input.point_attributes.contains_key(*key) && opinput(&attr.name).is_none() && !attr.name.starts_with("group_"))
-        .map(|(attr, _)| format!("Warning: @{} does not exist on the input and is never set, so it reads as 0", attr.name))
+        .map(|(attr, _)| format!("Warning: @{} does not exist on the input and is never set, so it reads as 0", attr.name)))
         .collect();
 
     if allow_parallel && parallel_safe(code, domain, count) {
@@ -5075,6 +5102,20 @@ Notes      int / int is integer division (1 / 2 == 0, write 1.0 / 2 for 0.5).
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_detail_run_writing_point_attributes_is_warned_about() {
+        assert_eq!(detail_writes_point_attributes("@Cd = {1, 0, 0}; @pscale = 2; f@total = 3;", None), vec!["Cd".to_owned(), "pscale".to_owned()]);
+        assert!(detail_writes_point_attributes("int p = addpoint(0, {0, 1, 0}); setpointattrib(0, \"Cd\", p, {1, 0, 0});", None).is_empty(), "making points is what Detail is for");
+        let mut grid = crate::node_grid(1.0, 1.0, 2, 2);
+        grid.point_attributes.insert("heat".into(), vec![0.0; grid.vertices.len()]);
+        assert_eq!(detail_writes_point_attributes("f@heat = 1;", Some(&grid)), vec!["heat".to_owned()], "a point attribute of the input");
+        let out = run_wrangle(grid, &[], "@Cd = {1, 0, 0};", 0.0, 1.0 / 24.0, 0, None, None);
+        let _ = out;
+        assert!(last_report("@Cd = {1, 0, 0};", 0).is_some_and(|r| r.output.iter().any(|l| l.contains("Did you mean Run over: Points?"))));
+        assert!(detail_warning(&["P".into()]).unwrap().contains("@P sets"));
+    }
+
 
     #[test]
     fn maths_constants_are_there_as_in_houdini() {

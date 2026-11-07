@@ -239,7 +239,8 @@ fn node_reference() -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let special = match &kind {
-                NodeKind::Wrangle { .. } => "the run-over domain (0–3), `:`, then the code in hex".to_owned(),
+                NodeKind::Wrangle { .. } => "the run-over domain (0 Detail, 1 Primitives, 2 Points, 3 Vertices), `:`, then the code in hex".to_owned(),
+                NodeKind::AttributeVop { .. } => format!("{numbers} (0 Detail, 1 Primitives, 2 Points, 3 Vertices)"),
                 NodeKind::MoonRayRender { .. } => "`mr:` then 20 fields separated by `\\|` (see scene-format.md)".to_owned(),
                 _ if texts.is_empty() => numbers,
                 _ if numbers.is_empty() => format!("{} text field(s)", texts.len()),
