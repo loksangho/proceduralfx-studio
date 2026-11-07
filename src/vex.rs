@@ -1103,7 +1103,8 @@ pub const BUILTINS: &[(&str, usize, usize, &str, &str)] = &[
     ("getbbox_max", 1, 1, "Geometry", "getbbox_max(0)"),
     ("getbbox_center", 1, 1, "Geometry", "getbbox_center(0)"),
     ("getbbox_size", 1, 1, "Geometry", "getbbox_size(0)"),
-    ("relpointbbox", 2, 2, "Geometry", "relpointbbox(0, pos) position within the bounds, 0..1"),
+    ("relpointbbox", 2, 2, "Geometry", "relpointbbox(0, pos) position within the bounds of all the points (loose ones too), 0..1 on each axis"),
+    ("relbbox", 1, 2, "Geometry", "relbbox(0, pos) / relbbox(pos) position within the bounding box of the primitives (of input 0 when no input is given), 0..1 on each axis"),
     ("primuv", 4, 4, "Geometry", "primuv(0, \"name\", prim, uv) the attribute interpolated inside a primitive"),
     ("findattribval", 4, 4, "Geometry", "findattribval(0, \"point\" | \"prim\", \"name\", value) first match or -1"),
     ("idtopoint", 2, 2, "Geometry", "idtopoint(0, id) point with that @id, or -1"),
@@ -3412,6 +3413,9 @@ impl<'a> Runtime<'a> {
         Ok(if name == "getbbox" {
             // getbbox(min, max) has no input number: it reads input 0.
             if a.len() > 2 { Some(handle()?).filter(|n| *n > 0) } else { None }
+        } else if name == "relbbox" {
+            // relbbox(pos), as older VEX has it, reads input 0.
+            if a.len() > 1 { Some(handle()?).filter(|n| *n > 0) } else { None }
         } else if READS_INPUT.contains(&name) || name == "pcfind" || name == "pcopen" {
             Some(handle()?).filter(|n| *n > 0)
         } else if WRITES_INPUT.contains(&name) {
@@ -4364,6 +4368,20 @@ impl<'a> Runtime<'a> {
                 let (lo, hi) = self.bounds();
                 V(arr3(hi.sub(lo)))
             }
+            "relbbox" => {
+                // The primitives' bounds (the points they use); points only: all of them.
+                let mesh = self.input;
+                let (lo, hi) = if mesh.indices.is_empty() {
+                    self.bounds()
+                } else {
+                    mesh.indices.iter().flatten().map(|&i| mesh.vertices[i]).fold((Vec3::new(f32::MAX, f32::MAX, f32::MAX), Vec3::new(f32::MIN, f32::MIN, f32::MIN)), |(lo, hi), p| {
+                        (Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)), Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)))
+                    })
+                };
+                let p = a[a.len() - 1].vec()?;
+                let rel = |c: usize, l: f32, h: f32| if (h - l).abs() < 1e-12 { 0.0 } else { (p[c] - l) / (h - l) };
+                V([rel(0, lo.x, hi.x), rel(1, lo.y, hi.y), rel(2, lo.z, hi.z)])
+            }
             "relpointbbox" => {
                 let (lo, hi) = self.bounds();
                 let p = a[1].vec()?;
@@ -5050,6 +5068,32 @@ Notes      int / int is integer division (1 / 2 == 0, write 1.0 / 2 for 0.5).
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn relbbox_places_points_in_the_bounding_box() {
+        // A flat grid 2 by 4, moved off the origin, and a loose point far off that only
+        // relpointbbox counts.
+        let mut quad = crate::node_transform(crate::node_grid(2.0, 4.0, 2, 2), [1.0, 0.0, 2.0], [0.0; 3], [1.0; 3]);
+        let (lo, hi) = quad.bounds().unwrap();
+        quad.vertices.push(Vec3::new(10.0, 10.0, 10.0));
+        let code = "v@r = relbbox(@P); v@r0 = relbbox(0, @P); v@rp = relpointbbox(0, @P); v@other = relbbox(1, set(0, 0, 0));";
+        let mut other = Mesh { vertices: vec![Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.0, -1.0, 1.0)], ..Mesh::default() };
+        other.indices.push([0, 1, 2]);
+        let out = run_wrangle(quad.clone(), &[other], code, 0.0, 1.0 / 24.0, 2, None, None);
+        let r = &out.point_attributes["r"];
+        for (i, p) in quad.vertices.iter().enumerate().take(quad.vertices.len() - 1) {
+            let expect = [(p.x - lo.x) / (hi.x - lo.x), 0.0, (p.z - lo.z) / (hi.z - lo.z)];
+            assert!((r[i * 3] - expect[0]).abs() < 1e-5 && r[i * 3 + 1] == 0.0 && (r[i * 3 + 2] - expect[2]).abs() < 1e-5, "{i}: {:?}", &r[i * 3..i * 3 + 3]);
+        }
+        assert_eq!(out.point_attributes["r0"], out.point_attributes["r"]);
+        // relpointbbox's box reaches the loose point, so the quad sits low in it.
+        let n = quad.vertices.len() - 1;
+        assert_eq!(&out.point_attributes["rp"][n * 3..n * 3 + 3], &[1.0, 1.0, 1.0]);
+        assert_eq!(&out.point_attributes["r"][n * 3..n * 3 + 3], &[(10.0 - lo.x) / (hi.x - lo.x), 0.0, (10.0 - lo.z) / (hi.z - lo.z)]);
+        // Another input's bounds: the origin is in the middle of its box.
+        assert_eq!(&out.point_attributes["other"][..3], &[0.5, 0.5, 0.5]);
+    }
+
     use crate::ramp::Ramp;
 
     #[test]
