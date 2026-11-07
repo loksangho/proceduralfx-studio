@@ -1193,7 +1193,9 @@ pub(crate) fn attribute_element_count(key: &str, points: usize, prims: usize) ->
 // What an element without the attribute reads (Houdini's defaults for the common ones).
 pub(crate) fn attribute_default(key: &str) -> f32 {
     let name = key.rsplit(':').next().unwrap_or(key);
-    if matches!(name, "Cd" | "pscale" | "Alpha" | "width") { 1.0 } else { 0.0 }
+    // __opacity (the viewport's see-through faces): 1, opaque (its second value, "uses Alpha",
+    // then reads Alpha, which is 1 where there's none too).
+    if matches!(name, "Cd" | "pscale" | "Alpha" | "width" | "__opacity") { 1.0 } else { 0.0 }
 }
 
 // Normals one side has and the other lacks: the other gets real ones, not zeros
@@ -2303,6 +2305,14 @@ mod merge_level_tests {
         assert!(other_way.point_attributes["vertex:Cd"][corners * 3..].chunks(3).all(|c| c == [1.0, 0.0, 0.0]));
         let mut green = node_box(1.0, 1);
         green.point_attributes.insert("Cd".into(), [0.0, 1.0, 0.0].repeat(green.vertices.len()));
+        // Faces with no opacity of their own stay opaque beside see-through ones.
+        let mut glass = node_box(1.0, 1);
+        glass.point_attributes.insert(crate::OPACITY_ATTR.into(), [0.3, 0.0].repeat(glass.indices.len()));
+        let plain = node_box(1.0, 1);
+        let tris = plain.indices.len();
+        let pair = node_merge(glass, plain);
+        let o = &pair.point_attributes[crate::OPACITY_ATTR];
+        assert!(o[..tris * 2].chunks(2).all(|c| c[0] == 0.3) && o[tris * 2..].chunks(2).all(|c| c[0] == 1.0), "the plain box stays opaque");
         let mixed = node_merge(green, red);
         let prim = &mixed.point_attributes["prim:Cd"];
         assert!(prim[..prim.len() / 2].chunks(3).all(|c| c == [0.0, 1.0, 0.0]), "the green box's primitives are green");
