@@ -701,7 +701,7 @@ pub struct Panel {
     key_input: String,
     show_settings: bool,
     prompt: String,
-    log: Vec<String>,
+    pub(crate) log: Vec<String>,
     rx: Option<Receiver<Progress>>,
     cancel: Arc<AtomicBool>,
     // What runs the current (or last) request, for its cost.
@@ -1220,22 +1220,30 @@ impl Panel {
                      Most take 2 to 6 steps; a long one can cost more. What each request actually cost is shown when it finishes.",
                 );
             }
-            if !self.log.is_empty() {
-                ui.separator();
-                for line in &self.log {
-                    ui.weak(format!("• {line}"));
+            // The notes, any error and the summary scroll, following the newest note, so a
+            // long build never runs off the bottom; Accept and the cost stay below them.
+            let footer = if self.result.is_some() { 90.0 } else { 40.0 };
+            let room = (ui.available_height() - footer).max(80.0);
+            egui::ScrollArea::vertical().id_salt("assistant_notes").max_height(room).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+                if !self.log.is_empty() {
+                    ui.separator();
+                    for line in &self.log {
+                        ui.add(egui::Label::new(egui::RichText::new(format!("• {line}")).weak()).wrap());
+                    }
+                    if self.busy() {
+                        ui.add(egui::Spinner::new());
+                    }
                 }
-                if self.busy() {
-                    ui.add(egui::Spinner::new());
+                if let Some(error) = &self.error {
+                    ui.colored_label(egui::Color32::from_rgb(240, 110, 110), error);
                 }
-            }
-            if let Some(error) = &self.error {
-                ui.colored_label(egui::Color32::from_rgb(240, 110, 110), error);
-            }
+                if let Some((_, summary, ..)) = &self.result {
+                    ui.separator();
+                    ui.add(egui::Label::new(summary.as_str()).wrap());
+                }
+            });
             let mut discard = false;
-            if let Some((result, summary, changed, preset)) = &self.result {
-                ui.separator();
-                ui.label(summary);
+            if let Some((result, _, changed, preset)) = &self.result {
                 if *changed {
                     let moved_on = fingerprint(graph) != self.started_from;
                     if moved_on {

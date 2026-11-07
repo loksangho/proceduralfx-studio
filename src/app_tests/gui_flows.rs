@@ -672,3 +672,16 @@ fn each_object_is_shown_from_its_own_attributes() {
     let total: usize = app.shown_parts.iter().map(|p| p.vertices.len()).sum();
     assert_eq!(total, app.current_mesh.vertices.len(), "and the picked mesh is them merged");
 }
+
+// A long build's notes scroll inside the assistant's window, the newest in view.
+#[test]
+fn the_assistants_notes_scroll_instead_of_running_off_the_bottom() {
+    let mut app = one_grid();
+    app.assistant.open = true;
+    app.assistant.log = (0..80).map(|i| format!("Step {i}: adding nodes and checking the result")).collect();
+    let mut h = harness(app);
+    h.run_steps(6);
+    let last = h.get_by_label("• Step 79: adding nodes and checking the result").rect();
+    assert!(last.bottom() <= 900.0 && last.top() >= 0.0, "the newest note is on screen: {last:?}");
+    assert!(h.query_by_label("• Step 0: adding nodes and checking the result").is_none_or(|n| n.rect().bottom() < last.top()), "the oldest has scrolled up");
+}
