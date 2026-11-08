@@ -1982,13 +1982,167 @@ pub(crate) fn group_pick_ui(
     });
 }
 
+// Clip: cuts the geometry along the plane where `axis` is `offset`, keeping the side above
+// it (below with `invert`), as Houdini's Clip does. Triangles crossing the plane are cut
+// along it, with new points shared between neighbours (so surfaces stay closed) and their
+// attributes blended; each polygon stays one polygon, now with an edge along the cut.
+// Loose points (point clouds, particles) are kept on the kept side.
 pub(crate) fn node_clip(mesh: Mesh, axis: usize, offset: f32, invert: bool) -> Mesh {
-    let keep = |v: Vec3| {
-        let val = axis_of(v, axis);
-        if invert { val <= offset } else { val >= offset }
+    let side = |v: Vec3| {
+        let d = axis_of(v, axis) - offset;
+        if invert { -d } else { d }
     };
-    let vertices = mesh.vertices.clone();
-    keep_triangles(mesh, |_, tri| tri.iter().all(|&v| keep(vertices[v])))
+    let (n, tris) = (mesh.vertices.len(), mesh.indices.len());
+    let d: Vec<f32> = mesh.vertices.iter().map(|v| side(*v)).collect();
+    // Attributes by class, with their widths.
+    let width = |values: &Vec<f32>, count: usize| if count > 0 && !values.is_empty() && values.len() % count == 0 { Some(values.len() / count) } else { None };
+    let blend_whole = |key: &str| crate::strings::is_string_key(key) || key.contains("group:") || key == "id" || key.ends_with(":id") || key == poly::KEY;
+
+    // Points: the originals, then one per cut edge.
+    let mut vertices = mesh.vertices.clone();
+    // (lower, higher point, how far from lower to higher) for each new point.
+    let mut cuts: Vec<(usize, usize, f32)> = Vec::new();
+    let mut cut_of: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut cut_point = |a: usize, b: usize, t: f32, vertices: &mut Vec<Vec3>| -> usize {
+        let (lo, hi, t) = if a < b { (a, b, t) } else { (b, a, 1.0 - t) };
+        *cut_of.entry((lo, hi)).or_insert_with(|| {
+            vertices.push(mesh.vertices[lo].scale(1.0 - t).add(mesh.vertices[hi].scale(t)));
+            cuts.push((lo, hi, t));
+            vertices.len() - 1
+        })
+    };
+    // A corner of an output triangle: an original corner, or a cut between two of them.
+    #[derive(Clone, Copy)]
+    enum Corner {
+        Original(usize),
+        Cut(usize, usize, f32),
+    }
+    let mut out_tris: Vec<[usize; 3]> = Vec::new();
+    // Where each output triangle came from, and its corners (for vertex attributes).
+    let mut sources: Vec<(usize, [Corner; 3])> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for run in poly::runs(&mesh) {
+        let before = out_tris.len();
+        for t in run {
+            let tri = mesh.indices[t];
+            let dt = tri.map(|p| d[p]);
+            let (lo, hi) = (dt.iter().copied().fold(f32::MAX, f32::min), dt.iter().copied().fold(f32::MIN, f32::max));
+            if hi <= 0.0 {
+                continue;
+            }
+            if lo >= 0.0 {
+                out_tris.push(tri);
+                sources.push((t, [Corner::Original(0), Corner::Original(1), Corner::Original(2)]));
+                continue;
+            }
+            // Sutherland-Hodgman against the plane: three or four corners.
+            let mut poly_corners: Vec<(usize, Corner)> = Vec::with_capacity(4);
+            for k in 0..3 {
+                let next = (k + 1) % 3;
+                if dt[k] >= 0.0 {
+                    poly_corners.push((tri[k], Corner::Original(k)));
+                }
+                if (dt[k] >= 0.0) != (dt[next] >= 0.0) {
+                    let f = dt[k] / (dt[k] - dt[next]);
+                    let p = cut_point(tri[k], tri[next], f, &mut vertices);
+                    poly_corners.push((p, Corner::Cut(k, next, f)));
+                }
+            }
+            for k in 1..poly_corners.len().saturating_sub(1) {
+                let corners = [poly_corners[0], poly_corners[k], poly_corners[k + 1]];
+                out_tris.push(corners.map(|c| c.0));
+                sources.push((t, corners.map(|c| c.1)));
+            }
+        }
+        if out_tris.len() > before {
+            sizes.push(out_tris.len() - before);
+        }
+    }
+
+    let mut out = Mesh { vertices, indices: out_tris, ..Mesh::default() };
+    for (key, values) in &mesh.point_attributes {
+        if key == poly::KEY {
+            continue;
+        }
+        if key.starts_with("detail:") {
+            out.point_attributes.insert(key.clone(), values.clone());
+        } else if let Some(w) = key.starts_with("prim:").then(|| width(values, tris)).flatten() {
+            out.point_attributes.insert(key.clone(), sources.iter().flat_map(|(t, _)| values[t * w..t * w + w].to_vec()).collect());
+        } else if let Some(w) = key.starts_with("vertex:").then(|| width(values, tris * 3)).flatten() {
+            let whole = blend_whole(key);
+            let corner = |t: usize, k: usize| &values[(t * 3 + k) * w..(t * 3 + k) * w + w];
+            let mut v = Vec::with_capacity(sources.len() * 3 * w);
+            for (t, corners) in &sources {
+                for c in corners {
+                    match *c {
+                        Corner::Original(k) => v.extend_from_slice(corner(*t, k)),
+                        Corner::Cut(a, b, f) if whole => v.extend_from_slice(corner(*t, if f < 0.5 { a } else { b })),
+                        Corner::Cut(a, b, f) => v.extend(corner(*t, a).iter().zip(corner(*t, b)).map(|(x, y)| x + (y - x) * f)),
+                    }
+                }
+            }
+            out.point_attributes.insert(key.clone(), v);
+        } else if let Some(w) = width(values, n) {
+            let whole = blend_whole(key);
+            let mut v = values.clone();
+            for &(lo, hi, t) in &cuts {
+                let (a, b) = (&values[lo * w..lo * w + w], &values[hi * w..hi * w + w]);
+                if whole {
+                    // The point on the kept side's value.
+                    v.extend_from_slice(if d[lo] >= d[hi] { a } else { b });
+                } else {
+                    v.extend(a.iter().zip(b).map(|(x, y)| x + (y - x) * t));
+                }
+            }
+            out.point_attributes.insert(key.clone(), v);
+        }
+    }
+    // Keep the points the triangles use, and loose points on the kept side.
+    let mut used = vec![false; out.vertices.len()];
+    let mut in_original = vec![false; n];
+    for t in &mesh.indices {
+        for &p in t {
+            in_original[p] = true;
+        }
+    }
+    for t in &out.indices {
+        for &p in t {
+            used[p] = true;
+        }
+    }
+    for p in 0..n {
+        if !in_original[p] && d[p] >= 0.0 {
+            used[p] = true;
+        }
+    }
+    let mut out = keep_points(out, &used);
+    poly::tag(&mut out, 0, sizes);
+    out
+}
+
+// Drops the points not marked `keep`, renumbering triangles and point attributes (the
+// triangles must only use kept points).
+fn keep_points(mesh: Mesh, keep: &[bool]) -> Mesh {
+    let mut remap = vec![usize::MAX; mesh.vertices.len()];
+    let mut out = Mesh::default();
+    for (i, v) in mesh.vertices.iter().enumerate() {
+        if keep[i] {
+            remap[i] = out.vertices.len();
+            out.vertices.push(*v);
+        }
+    }
+    out.indices = mesh.indices.iter().map(|t| t.map(|p| remap[p])).collect();
+    let n = mesh.vertices.len();
+    for (key, values) in mesh.point_attributes {
+        if key.starts_with("prim:") || key.starts_with("vertex:") || key.starts_with("detail:") || n == 0 || values.len() % n != 0 {
+            out.point_attributes.insert(key, values);
+            continue;
+        }
+        let w = values.len() / n;
+        let kept: Vec<f32> = (0..n).filter(|&i| keep[i]).flat_map(|i| values[i * w..i * w + w].to_vec()).collect();
+        out.point_attributes.insert(key, kept);
+    }
+    out
 }
 
 pub(crate) fn node_blast(mesh: Mesh, component: usize, indices: &[usize], invert: bool) -> Mesh {
@@ -2316,5 +2470,52 @@ mod merge_level_tests {
         let mixed = node_merge(green, red);
         let prim = &mixed.point_attributes["prim:Cd"];
         assert!(prim[..prim.len() / 2].chunks(3).all(|c| c == [0.0, 1.0, 0.0]), "the green box's primitives are green");
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn clip_cuts_along_the_plane() {
+        // A circle (one polygon, a fan of triangles) clipped at x = 0.3: one polygon, straight
+        // along the cut, and its area the circle's segment beyond 0.3.
+        let circle = crate::circle::circle(&crate::circle::CircleSettings { plane: 2, divisions: 64, ..crate::circle::CircleSettings::defaults() });
+        let clipped = node_clip(circle, 0, 0.3, false);
+        assert_eq!(poly::count(&clipped), 1, "still one polygon");
+        assert!(clipped.vertices.iter().all(|p| p.x >= 0.3 - 1e-5));
+        let on_cut = clipped.vertices.iter().filter(|p| (p.x - 0.3).abs() < 1e-5).count();
+        assert!(on_cut >= 2, "points along the cut");
+        let area: f32 = clipped.indices.iter().map(|t| { let [a, b, c] = t.map(|k| clipped.vertices[k]); b.sub(a).cross(c.sub(a)).length() * 0.5 }).sum();
+        let segment = 0.3f32.acos() - 0.3 * (1.0 - 0.09f32).sqrt();
+        assert!((area - segment).abs() < 0.02, "{area} vs {segment}");
+        // Below instead, with Invert: the rest.
+        let rest = node_clip(crate::circle::circle(&crate::circle::CircleSettings { divisions: 64, ..crate::circle::CircleSettings::defaults() }), 0, 0.3, true);
+        assert!(rest.vertices.iter().all(|p| p.x <= 0.3 + 1e-5));
+
+        // A closed box cut in half stays joined along the cut (new points shared), with Cd
+        // blended where it's cut.
+        let mut cube = node_box(2.0, 1);
+        cube.point_attributes.insert("Cd".into(), cube.vertices.iter().flat_map(|p| [p.y * 0.5 + 0.5, 0.0, 0.0]).collect());
+        let half = node_clip(cube, 1, 0.0, false);
+        assert!(half.vertices.iter().all(|p| p.y >= -1e-5));
+        let mut edges: HashMap<(usize, usize), usize> = HashMap::new();
+        for t in &half.indices {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        assert!(edges.values().all(|c| *c <= 2), "no cracks");
+        let cd = &half.point_attributes["Cd"];
+        for (i, p) in half.vertices.iter().enumerate() {
+            assert!((cd[i * 3] - (p.y * 0.5 + 0.5)).abs() < 1e-5, "Cd follows the cut");
+        }
+        assert_eq!(poly::count(&half), 5, "the top and four half sides");
+
+        // Loose points: those on the kept side stay.
+        let points = Mesh { vertices: (0..5).map(|i| Vec3::new(i as f32 - 2.0, 0.0, 0.0)).collect(), ..Mesh::default() };
+        assert_eq!(node_clip(points, 0, 0.0, false).vertices.len(), 3);
     }
 }

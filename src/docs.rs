@@ -89,7 +89,7 @@ const NODE_DOCS: &[(&str, &str)] = &[
     ("copy", "Copies the input several times with a cumulative transform."),
     ("copy_to_points", "Copies input 1 onto the points of input 2: each copy is scaled by the point's pscale, turned by its orient (a quaternion, or one number: a turn about Y in degrees) and coloured by its Cd. Copies keep their own up direction: the points' N isn't used (set orient to tilt them). With a piece attribute (e.g. variant), each point copies only the piece of input 1 with its value of it: number the pieces with Enumerate and give the points random integers with Attribute Randomize."),
     ("extrude", "Extrudes the node's group (or everything) along the normals with distance, inset and divisions; connected or individual faces. Output front, back and sides, each optionally in a group (extrudeFront, extrudeSide, extrudeBack)."),
-    ("clip", "Cuts away one side of a plane."),
+    ("clip", "Cuts the geometry along a plane across an axis and keeps one side: polygons crossing it are cut along the plane (attributes such as Cd and uv blended there), so the edge is straight and closed shapes stay joined. Loose points on the kept side stay."),
     ("blast", "Deletes points or primitives (the node's group, or picked in the viewport)."),
     ("scatter", "Points on a surface (or inside a closed mesh), relaxed for even spacing; they get N, pscale and sourceprim."),
     ("boolean", "Union, intersect or subtract two closed meshes (exact BSP, or volume for messy input). Faces keep their input's attributes (materials, Cd, UVs, groups; in Exact mode) and are grouped a_faces/b_faces."),
