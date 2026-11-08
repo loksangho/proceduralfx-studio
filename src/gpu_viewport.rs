@@ -606,9 +606,9 @@ fn catch_errors(device: &wgpu::Device, failure: Arc<std::sync::Mutex<Option<Stri
 // instance per strand piece.
 struct Points {
     key: u64,
-    dots: Option<(wgpu::Buffer, u32)>,
-    splats: Option<(wgpu::Buffer, u32)>,
-    curves: Option<(wgpu::Buffer, u32)>,
+    dots: Chunks,
+    splats: Chunks,
+    curves: Chunks,
     // The splats' positions' bounding box corners (for their blending weights).
     corners: Vec<[f32; 3]>,
     // Every dot's, splat's and strand's bounding box corners, so the depth range
@@ -640,13 +640,30 @@ const REVEAL: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 
 // The uploaded scene: faces (three vertices each) and edges (two each), the texture
 // the faces use, and the corners of its bounding box (for the orthographic depth range).
+// Vertex buffers of a scene, each within the device's buffer size limit, drawn in turn: a
+// scene of millions of triangles is several buffers rather than one the device can't make.
+type Chunks = Vec<(wgpu::Buffer, u32)>;
+
+// `items` as vertex buffers of at most the device's largest buffer (and at most 64 MiB, to go
+// easy on memory), each holding whole groups of `group` vertices (3: triangles, 2: lines).
+fn chunked<T: bytemuck::Pod>(device: &wgpu::Device, label: &str, items: &[T], group: usize) -> Chunks {
+    let size = std::mem::size_of::<T>().max(1) as u64;
+    let limit = device.limits().max_buffer_size.min(64 << 20);
+    let per = ((limit / size) as usize / group * group).max(group);
+    items
+        .chunks(per)
+        .filter(|c| !c.is_empty())
+        .map(|c| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(c), usage: wgpu::BufferUsages::VERTEX }), c.len() as u32))
+        .collect()
+}
+
 struct Scene {
     key: u64,
-    faces: Option<(wgpu::Buffer, u32)>,
+    faces: Chunks,
     // Faces with any corner less than opaque, drawn after the rest, blended.
-    see_through: Option<(wgpu::Buffer, u32)>,
-    edges: Option<(wgpu::Buffer, u32)>,
-    toon: Option<(wgpu::Buffer, u32)>,
+    see_through: Chunks,
+    edges: Chunks,
+    toon: Chunks,
     texture: Option<Arc<raster::Texture>>,
     corners: Vec<[f32; 3]>,
 }
@@ -909,10 +926,7 @@ impl GpuViewport {
     // Toon faces (three ToonVertex each) use the materials in `toons` (at most MAX_TOONS).
     pub fn set_scene(&mut self, key: u64, faces: &[Vertex], edges: &[Vertex], toon: &[ToonVertex], toons: &[ToonMaterial], texture: Option<Arc<raster::Texture>>) {
         let device = &self.render_state.device;
-        let buffer = |label: &str, vertices: &[Vertex]| {
-            (!vertices.is_empty()).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(vertices), usage: wgpu::BufferUsages::VERTEX }), vertices.len() as u32))
-        };
-        let toon_buffer = (!toon.is_empty()).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("viewport toon faces"), contents: bytemuck::cast_slice(toon), usage: wgpu::BufferUsages::VERTEX }), toon.len() as u32));
+        let toon_buffer = chunked(device, "viewport toon faces", toon, 3);
         if !toons.is_empty() {
             let mut table = [ToonMaterial::default(); MAX_TOONS];
             for (slot, material) in table.iter_mut().zip(toons) {
@@ -933,9 +947,9 @@ impl GpuViewport {
         let (opaque, see_through): (Vec<Vertex>, Vec<Vertex>) = (opaque.concat(), see_through.concat());
         self.scene = Some(Scene {
             key,
-            faces: buffer("viewport faces", &opaque),
-            see_through: buffer("viewport see-through faces", &see_through),
-            edges: buffer("viewport edges", edges),
+            faces: chunked(device, "viewport faces", &opaque, 3),
+            see_through: chunked(device, "viewport see-through faces", &see_through, 3),
+            edges: chunked(device, "viewport edges", edges, 2),
             toon: toon_buffer,
             texture,
             corners,
@@ -944,7 +958,7 @@ impl GpuViewport {
 
     #[cfg(test)]
     pub fn splat_count(&self) -> u32 {
-        self.points.as_ref().and_then(|p| p.splats.as_ref()).map_or(0, |(_, n)| *n)
+        self.points.as_ref().map_or(0, |p| p.splats.iter().map(|(_, n)| *n).sum())
     }
 
     // Whether the points uploaded last have this key.
@@ -955,16 +969,13 @@ impl GpuViewport {
     // Uploads the dots, splats and curve pieces (drawn as strands) under `key`.
     pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point], curves: &[Strand]) {
         let device = &self.render_state.device;
-        let buffer = |label: &str, bytes: &[u8], count: usize| {
-            (count > 0).then(|| (device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage: wgpu::BufferUsages::VERTEX }), count as u32))
-        };
         let corners = box_corners(splats.iter().map(|p| p.position));
         let extent = box_corners(dots.iter().chain(splats).map(|p| p.position).chain(curves.iter().flat_map(|c| [c.a, c.b])));
         self.points = Some(Points {
             key,
-            dots: buffer("viewport dots", bytemuck::cast_slice(dots), dots.len()),
-            splats: buffer("viewport splats", bytemuck::cast_slice(splats), splats.len()),
-            curves: buffer("viewport curves", bytemuck::cast_slice(curves), curves.len()),
+            dots: chunked(device, "viewport dots", dots, 1),
+            splats: chunked(device, "viewport splats", splats, 1),
+            curves: chunked(device, "viewport curves", curves, 1),
             corners,
             extent,
         });
@@ -977,7 +988,7 @@ impl GpuViewport {
 
     // Whether anything is drawn through the blended targets.
     fn blends(&self) -> bool {
-        self.points.as_ref().is_some_and(|p| p.splats.is_some()) || self.volume.is_some()
+        self.points.as_ref().is_some_and(|p| !p.splats.is_empty()) || self.volume.is_some()
     }
 
     // Draws the uploaded scene through `camera` into an image of `size` pixels and
@@ -1053,7 +1064,7 @@ impl GpuViewport {
         let far = deepest + (deepest - camera.near).abs().max(1e-3) * 0.01;
         let splat_depth = self.points.iter().flat_map(|p| &p.corners).chain(volume_corners).map(|&p| camera.to_cam(p)[2]).fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], z| [lo.min(z), hi.max(z)]);
         state.queue.write_buffer(&self.camera, 0, bytemuck::cast_slice(&camera.uniform(far, splat_depth)));
-        let splats = self.points.as_ref().and_then(|p| p.splats.as_ref());
+        let splats = self.points.as_ref().map(|p| &p.splats).filter(|s| !s.is_empty());
         let textured = self.scene.as_ref().and_then(|s| s.texture.as_ref());
         let bind_group = textured.and(self.texture.as_ref()).map_or(&self.blank, |(_, b)| b);
         let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
@@ -1077,36 +1088,38 @@ impl GpuViewport {
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_bind_group(1, &self.camera_group, &[]);
             if let Some(scene) = &self.scene {
-                if let Some((buffer, count)) = &scene.faces {
+                for (buffer, count) in &scene.faces {
                     pass.set_pipeline(&self.surfaces);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
-                if let Some((buffer, count)) = &scene.toon {
+                if !scene.toon.is_empty() {
                     pass.set_bind_group(2, &self.toon_group, &[]);
                     for pipeline in [&self.toon, &self.outline] {
-                        pass.set_pipeline(pipeline);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw(0..*count, 0..1);
+                        for (buffer, count) in &scene.toon {
+                            pass.set_pipeline(pipeline);
+                            pass.set_vertex_buffer(0, buffer.slice(..));
+                            pass.draw(0..*count, 0..1);
+                        }
                     }
                 }
-                if let Some((buffer, count)) = &scene.see_through {
+                for (buffer, count) in &scene.see_through {
                     pass.set_pipeline(&self.see_through);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
-                if let Some((buffer, count)) = scene.edges.as_ref().filter(|_| edges) {
+                for (buffer, count) in scene.edges.iter().filter(|_| edges) {
                     pass.set_pipeline(&self.edges);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
             }
-            if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.curves.as_ref()) {
+            for (buffer, count) in self.points.iter().flat_map(|p| &p.curves) {
                 pass.set_pipeline(&self.strands);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..6, 0..*count);
             }
-            if let Some((buffer, count)) = self.points.as_ref().and_then(|p| p.dots.as_ref()) {
+            for (buffer, count) in self.points.iter().flat_map(|p| &p.dots) {
                 pass.set_pipeline(&self.dots);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..6, 0..*count);
@@ -1120,12 +1133,12 @@ impl GpuViewport {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("viewport depth"), color_attachments: &[], depth_stencil_attachment: depth(wgpu::LoadOp::Clear(1.0)), timestamp_writes: None, occlusion_query_set: None });
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_bind_group(1, &self.camera_group, &[]);
-                if let Some((faces, faces_count)) = self.scene.as_ref().and_then(|s| s.faces.as_ref()) {
+                for (faces, faces_count) in self.scene.iter().flat_map(|s| &s.faces) {
                     pass.set_pipeline(&self.depth_only);
                     pass.set_vertex_buffer(0, faces.slice(..));
                     pass.draw(0..*faces_count, 0..1);
                 }
-                if let Some((faces, faces_count)) = self.scene.as_ref().and_then(|s| s.toon.as_ref()) {
+                for (faces, faces_count) in self.scene.iter().flat_map(|s| &s.toon) {
                     pass.set_bind_group(2, &self.toon_group, &[]);
                     pass.set_pipeline(&self.toon_depth);
                     pass.set_vertex_buffer(0, faces.slice(..));
@@ -1141,7 +1154,7 @@ impl GpuViewport {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                if let Some((buffer, count)) = splats {
+                for (buffer, count) in splats.into_iter().flatten() {
                     pass.set_bind_group(0, bind_group, &[]);
                     pass.set_bind_group(1, &self.camera_group, &[]);
                     pass.set_pipeline(&self.splats);

@@ -382,3 +382,34 @@ fn a_gpu_failure_falls_back_to_the_cpu_viewport() {
     frame(&mut app);
     assert!(!app.current_mesh.vertices.is_empty());
 }
+
+// A toon-shaded mesh too big for one GPU buffer (here about a million triangles, 144 MB of
+// toon vertices) renders, in several buffers, rather than crashing the export.
+#[test]
+fn huge_toon_meshes_render_in_chunks() {
+    let Some(gpu) = gpu_viewport::headless() else {
+        eprintln!("no GPU here; skipping");
+        return;
+    };
+    let mut app = ProceduralFxStudioApp::default();
+    app.gpu_viewport = Some(gpu);
+    let mut g = Graph::default();
+    let toon = g.add(NodeKind::Shader(shading::Values::new(shading::Table::Toon)), egui::pos2(0.0, 0.0));
+    g.nodes.get_mut(&toon).unwrap().context = AppContext::Mat;
+    let geo = g.add(NodeKind::Geometry { material: Some(toon) }, egui::pos2(0.0, 0.0));
+    let sphere = g.add(NodeKind::Sphere { radius: 1.0, rows: 500, cols: 1000 }, egui::pos2(0.0, 0.0));
+    g.nodes.get_mut(&sphere).unwrap().parent = Some(geo);
+    g.displays.insert(geo, sphere);
+    assert!(g.cook(sphere, 0.0, &mut HashMap::new()).indices.len() > 900_000);
+    app.graph = g;
+    app.selected = None;
+    app.render_camera = RenderCamera::Viewport;
+    (app.cam_target, app.cam_rot_x, app.cam_rot_y, app.cam_zoom, app.cam_pan_x, app.cam_pan_y) = (Vec3::zero(), 0.0, 0.0, 6.0, 0.0, 0.0);
+    (app.playback_start, app.playback_end) = (0.0, 0.0);
+    app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, ..Default::default() };
+    app.dirty = true;
+    app.preview_sprite_sheet();
+    run_recording(&mut app);
+    let frame = &app.flipbook_viewer.as_ref().expect("the preview opens").frames()[0];
+    assert_eq!(frame.pixels[32 * 64 + 32].a(), 255, "the sphere is there");
+}

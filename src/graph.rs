@@ -1969,6 +1969,15 @@ impl Graph {
                 NodeKind::Copy { count, t, r, s } => node_copy(input(0, cache), *count, *t, *r, *s),
                 NodeKind::CopyToPoints { scale, rotation, piece_attribute } => {
                     let copies = node_copy_pieces_to_points(input(0, cache), input(1, cache), *scale, *rotation, piece_attribute);
+                    // A detailed model on many points gets heavy fast: say so on the node.
+                    let triangles = copies.as_ref().map_or(0, |m| m.indices.len());
+                    node_notes(|notes| {
+                        if triangles > COPY_WARN_TRIANGLES {
+                            notes.insert(id, format!("{} million triangles: viewing, rendering and exporting this is slow and uses a lot of memory. Lower the model's detail with Remesh before copying it, or use fewer points.", (triangles as f32 / 1e6 * 10.0).round() / 10.0));
+                        } else {
+                            notes.remove(&id);
+                        }
+                    });
                     self.report(id, copies)
                 }
                 NodeKind::AttributeCreate(settings) => {
@@ -2995,3 +3004,6 @@ impl Graph {
 pub(crate) fn merge_parts(parts: Vec<Mesh>) -> Mesh {
     parts.into_iter().reduce(node_merge).unwrap_or_default()
 }
+
+// Copy to Points warns past this many triangles.
+pub(crate) const COPY_WARN_TRIANGLES: usize = 1_000_000;

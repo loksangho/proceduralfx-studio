@@ -573,3 +573,23 @@ fn attribute_fade_follows_time_in_a_network_and_saves() {
     assert!(matches!(&loaded.nodes[&fade].kind, NodeKind::AttributeFade(f) if f.in_ramp.starts_with("0 0 constant") && f.fade_in == 10.0));
     assert!(near(at(&loaded, 17.0), [0.4, 1.0, 0.0]));
 }
+
+#[test]
+fn copy_to_points_warns_when_the_copies_get_heavy() {
+    let mut g = Graph::default();
+    // About 100,000 triangles a copy: 12 copies pass a million, 6 don't.
+    let model = g.add(NodeKind::Sphere { radius: 1.0, rows: 160, cols: 320 }, egui::pos2(0.0, 0.0));
+    let points = g.add(NodeKind::Add { count: 12, spacing: 3.0, layout: 0, points: Vec::new(), delete_geometry: false }, egui::pos2(0.0, 0.0));
+    let copy = g.add(NodeKind::CopyToPoints { scale: 1.0, rotation: [0.0; 3], piece_attribute: String::new() }, egui::pos2(0.0, 80.0));
+    g.connect(model, copy, 0);
+    g.connect(points, copy, 1);
+    let out = g.cook(copy, 0.0, &mut HashMap::new());
+    assert!(out.indices.len() > crate::graph::COPY_WARN_TRIANGLES);
+    let note = node_notes(|n| n.get(&copy).cloned()).expect("a warning on the node");
+    assert!(note.contains("million triangles") && note.contains("Remesh"), "{note}");
+    if let Some(NodeKind::Add { count, .. }) = g.nodes.get_mut(&points).map(|n| &mut n.kind) {
+        *count = 6;
+    }
+    g.cook(copy, 0.0, &mut HashMap::new());
+    assert!(node_notes(|n| n.get(&copy).cloned()).is_none(), "fewer copies: no warning");
+}
