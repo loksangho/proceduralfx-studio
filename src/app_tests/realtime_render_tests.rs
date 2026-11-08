@@ -383,10 +383,11 @@ fn a_gpu_failure_falls_back_to_the_cpu_viewport() {
     assert!(!app.current_mesh.vertices.is_empty());
 }
 
-// A toon-shaded mesh too big for one GPU buffer (here about a million triangles, 144 MB of
-// toon vertices) renders, in several buffers, rather than crashing the export.
+// A toon-shaded mesh too big for one GPU buffer renders, in several buffers, rather than
+// crashing the export. (Chunks are made small here, so a modest mesh splits: a million
+// triangles is too much for the software renderers CI machines have.)
 #[test]
-fn huge_toon_meshes_render_in_chunks() {
+fn big_toon_meshes_render_in_chunks() {
     let Some(gpu) = gpu_viewport::headless() else {
         eprintln!("no GPU here; skipping");
         return;
@@ -397,10 +398,9 @@ fn huge_toon_meshes_render_in_chunks() {
     let toon = g.add(NodeKind::Shader(shading::Values::new(shading::Table::Toon)), egui::pos2(0.0, 0.0));
     g.nodes.get_mut(&toon).unwrap().context = AppContext::Mat;
     let geo = g.add(NodeKind::Geometry { material: Some(toon) }, egui::pos2(0.0, 0.0));
-    let sphere = g.add(NodeKind::Sphere { radius: 1.0, rows: 500, cols: 1000 }, egui::pos2(0.0, 0.0));
+    let sphere = g.add(NodeKind::Sphere { radius: 1.0, rows: 48, cols: 96 }, egui::pos2(0.0, 0.0));
     g.nodes.get_mut(&sphere).unwrap().parent = Some(geo);
     g.displays.insert(geo, sphere);
-    assert!(g.cook(sphere, 0.0, &mut HashMap::new()).indices.len() > 900_000);
     app.graph = g;
     app.selected = None;
     app.render_camera = RenderCamera::Viewport;
@@ -408,8 +408,11 @@ fn huge_toon_meshes_render_in_chunks() {
     (app.playback_start, app.playback_end) = (0.0, 0.0);
     app.sprite_sheet = spritesheet::Settings { width: 64, height: 64, ..Default::default() };
     app.dirty = true;
+    let normal = gpu_viewport::CHUNK_BYTES.swap(64 << 10, std::sync::atomic::Ordering::Relaxed);
     app.preview_sprite_sheet();
     run_recording(&mut app);
+    gpu_viewport::CHUNK_BYTES.store(normal, std::sync::atomic::Ordering::Relaxed);
+    assert!(app.gpu_viewport.as_ref().unwrap().toon_chunks() > 4, "split into several buffers");
     let frame = &app.flipbook_viewer.as_ref().expect("the preview opens").frames()[0];
     assert_eq!(frame.pixels[32 * 64 + 32].a(), 255, "the sphere is there");
 }

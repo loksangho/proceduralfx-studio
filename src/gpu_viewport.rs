@@ -646,9 +646,12 @@ type Chunks = Vec<(wgpu::Buffer, u32)>;
 
 // `items` as vertex buffers of at most the device's largest buffer (and at most 64 MiB, to go
 // easy on memory), each holding whole groups of `group` vertices (3: triangles, 2: lines).
+// The most bytes a chunk holds (tests lower it, to split small scenes).
+pub(crate) static CHUNK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(64 << 20);
+
 fn chunked<T: bytemuck::Pod>(device: &wgpu::Device, label: &str, items: &[T], group: usize) -> Chunks {
     let size = std::mem::size_of::<T>().max(1) as u64;
-    let limit = device.limits().max_buffer_size.min(64 << 20);
+    let limit = device.limits().max_buffer_size.min(CHUNK_BYTES.load(std::sync::atomic::Ordering::Relaxed));
     let per = ((limit / size) as usize / group * group).max(group);
     items
         .chunks(per)
@@ -967,6 +970,12 @@ impl GpuViewport {
     }
 
     // Uploads the dots, splats and curve pieces (drawn as strands) under `key`.
+    // How many buffers the scene's toon faces are in (for tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn toon_chunks(&self) -> usize {
+        self.scene.as_ref().map_or(0, |s| s.toon.len())
+    }
+
     pub fn set_points(&mut self, key: u64, dots: &[Point], splats: &[Point], curves: &[Strand]) {
         let device = &self.render_state.device;
         let corners = box_corners(splats.iter().map(|p| p.position));
