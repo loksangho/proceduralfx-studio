@@ -49,6 +49,29 @@ jobs:
       # GPU, and a crash there then names the test that caused it.
       - name: Test
         run: cargo test --release ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
+      # A Windows crash (STATUS_ACCESS_VIOLATION, a stack overflow) prints no stack of its
+      # own: run the tests again under the console debugger and print where it happened.
+      - name: Where a Windows crash happened
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = cargo test --release --no-run --message-format=json 2>$null |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
+            Where-Object { $_.executable -and $_.target.kind -contains 'bin' } |
+            Select-Object -First 1 -ExpandProperty executable
+          $cdb = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
+          if (-not (Test-Path $cdb)) { Write-Output "No cdb on this machine"; exit 0 }
+          # Stop only where nothing handles the fault, print the stack, quit.
+          @(
+            '.symfix+'
+            ".sympath+ $(Split-Path $exe)"
+            'sxd -c2 ".lastevent; .ecxr; kn 80; q" av'
+            'sxd -c2 ".lastevent; kn 80; q" sov'
+            'g'
+            'q'
+          ) | Set-Content cdb-commands.txt
+          & $cdb -G -lines -cf cdb-commands.txt $exe --test-threads=1
+          exit 0
       # When a preset looks different (preset_pictures.rs), its new picture, the old one and
       # the difference, to look at.
       - name: Keep changed preset pictures

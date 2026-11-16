@@ -78,7 +78,9 @@ jobs:
       - name: Build the app
         shell: pwsh
         run: |
-          rustup default stable
+          # Rust 1.99, not stable: the Windows tests crash (STATUS_ACCESS_VIOLATION) under
+          # 1.100 and the cause isn't known yet. Back to stable once tests.yml passes.
+          rustup default 1.99.0
           $env:USD_ROOT = $env:PFX_WIN_DEPS
           $env:OPENVDB_ROOT = $env:PFX_WIN_DEPS
           $env:ALEMBIC_ROOT = $env:PFX_WIN_DEPS
