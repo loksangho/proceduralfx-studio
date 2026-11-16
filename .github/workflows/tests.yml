@@ -39,7 +39,10 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Rust 1.99, not stable: 1.100's std on Windows binds WaitOnAddress to vertdll.dll
+      # (the enclave-only ntdll), so the first thread wait crashes. Back to stable (here
+      # and in windows.yml) once a Rust release fixes it.
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       # The file dialogs (rfd) build against GTK 3 on Linux.
       - name: Linux packages

@@ -78,8 +78,8 @@ jobs:
       - name: Build the app
         shell: pwsh
         run: |
-          # Rust 1.99, not stable: the Windows tests crash (STATUS_ACCESS_VIOLATION) under
-          # 1.100 and the cause isn't known yet. Back to stable once tests.yml passes.
+          # Rust 1.99, not stable: 1.100's std binds WaitOnAddress to vertdll.dll, so the
+          # app would crash at its first thread wait. Back to stable once Rust fixes it.
           rustup default 1.99.0
           $env:USD_ROOT = $env:PFX_WIN_DEPS
           $env:OPENVDB_ROOT = $env:PFX_WIN_DEPS
